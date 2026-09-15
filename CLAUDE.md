@@ -7,9 +7,10 @@
 
 ## Project status
 
-- Repository initialized; only `README.md` and this file exist so far. No code, build system, or dependencies yet.
+- Repository initialized. `times.md` leaderboard template exists but has no entries yet (no generations trained).
 
 ## Structure
 
 - `README.md` — project title
 - `CLAUDE.md` — guidance for Claude Code sessions (keep current)
+- `times.md` — leaderboard of the AI's level times: best time per level, plus a per-generation history table. Update it whenever a training generation finishes (instructions in an HTML comment at the bottom of the file)
