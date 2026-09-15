@@ -1,0 +1,22 @@
+# Cyber Grind, stage 1 of the curriculum: clear the first waves.
+# Raise max_wave as the agent improves (then set it to 0 for full runs), and turn
+# rewards.aim down to 0 once it reliably finds and shoots enemies.
+env:
+  mode: cybergrind
+  frameskip: 4
+  max_steps: 4500
+  max_wave: 3
+  rewards:
+    aim: 0.02
+    damage_dealt: 1.0
+    kill: 2.0
+    damage_taken: 0.02
+    death: 10.0
+    style: 0.002
+    wave: 5.0
+
+train:
+  algo: ppo
+  run_name: cybergrind_ppo
+  timesteps: 5000000
+  save_every: 50000

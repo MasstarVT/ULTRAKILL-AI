@@ -1,0 +1,6 @@
+<!-- Copy this file to GamePaths.props (same folder) and point it at your ULTRAKILL install. -->
+<Project>
+  <PropertyGroup>
+    <UltrakillDir>C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL</UltrakillDir>
+  </PropertyGroup>
+</Project>

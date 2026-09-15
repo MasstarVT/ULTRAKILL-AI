@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultrakill-ai"
+version = "0.1.0"
+description = "Reinforcement learning agent for ULTRAKILL, driven through the UltrakillAIBridge BepInEx mod"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "gymnasium>=1.0",
+    "stable-baselines3>=2.4",
+    "sb3-contrib>=2.4",
+    "tensorboard>=2.16",
+    "pyyaml>=6.0",
+]
+# PyTorch is installed separately so you get the CUDA build, see README.
+
+[tool.setuptools.packages.find]
+include = ["ultrakill_ai*"]

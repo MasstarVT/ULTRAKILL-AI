@@ -1,0 +1,32 @@
+# Local game path (machine-specific)
+mod/GamePaths.props
+
+# .NET build output
+bin/
+obj/
+*.user
+.vs/
+
+# Never commit game assemblies or decompiled game code
+*.dll
+*.pdb
+decompiled/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Training output
+runs/
+models/
+*.zip
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

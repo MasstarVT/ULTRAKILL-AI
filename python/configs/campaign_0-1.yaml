@@ -1,0 +1,27 @@
+# Campaign level 0-1. Record a route first:
+#   python scripts/record_route.py --level "Level 0-1"
+env:
+  mode: campaign
+  level: "Level 0-1"
+  frameskip: 4
+  max_steps: 9000
+  checkpoint_resets: true
+  stuck_steps: 450
+  rewards:
+    route_point: 0.1
+    level_complete: 50.0
+    stuck: 1.0
+    damage_dealt: 1.0
+    kill: 2.0
+    damage_taken: 0.02
+    death: 10.0
+    style: 0.002
+
+train:
+  algo: rppo
+  run_name: campaign_0-1_rppo
+  timesteps: 10000000
+  save_every: 50000
+  hyperparams:
+    n_steps: 1024
+    batch_size: 256
