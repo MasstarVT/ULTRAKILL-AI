@@ -14,13 +14,19 @@ namespace UltrakillAIBridge
     {
         public const string Guid = "masstarvt.ultrakill.aibridge";
         public const string Name = "ULTRAKILL AI Bridge";
-        public const string Version = "0.2.0";
+        public const string Version = "0.3.0";
         public const int ProtocolVersion = 1;
 
         internal static ManualLogSource Log;
 
         internal static ConfigEntry<int> Port;
         internal static ConfigEntry<KeyCode> PanicKey;
+
+        /// <summary>Launched by scripts/games.py for parallel training (has -aibridge-port on the command line).</summary>
+        internal static bool IsTrainingInstance { get; private set; }
+
+        /// <summary>Port from -aibridge-port or the config; updated to the port actually bound.</summary>
+        internal static int ListenPort { get; set; }
 
         private static Harmony harmony;
 
@@ -31,6 +37,17 @@ namespace UltrakillAIBridge
             Port = Config.Bind("Bridge", "Port", 47800, "TCP port (localhost only) the Python side connects to.");
             PanicKey = Config.Bind("Bridge", "PanicKey", KeyCode.F8, "Drops the Python client and gives control back to you.");
 
+            ListenPort = Port.Value;
+            var args = System.Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length - 1; i++)
+            {
+                if (args[i] == "-aibridge-port" && int.TryParse(args[i + 1], out var port))
+                {
+                    ListenPort = port;
+                    IsTrainingInstance = true;
+                }
+            }
+
             // The game ships with runInBackground off, which stops Update (and therefore the bridge)
             // whenever the window loses focus, e.g. while starting a script from a terminal.
             Application.runInBackground = true;
@@ -39,6 +56,7 @@ namespace UltrakillAIBridge
             harmony.PatchAll(typeof(SafetyPatches));
             harmony.PatchAll(typeof(TimePatches));
             harmony.PatchAll(typeof(BackgroundPatches));
+            harmony.PatchAll(typeof(InstancePatches));
 
             // ULTRAKILL destroys BepInEx's manager GameObject during startup, which would take this
             // component with it. The bridge runs on its own hidden, persistent object instead.
@@ -46,7 +64,7 @@ namespace UltrakillAIBridge
             DontDestroyOnLoad(host);
             host.AddComponent<BridgeRunner>();
 
-            Log.LogInfo($"{Name} {Version} loaded");
+            Log.LogInfo($"{Name} {Version} loaded{(IsTrainingInstance ? " as a training instance" : "")}");
         }
     }
 
@@ -59,11 +77,35 @@ namespace UltrakillAIBridge
 
         private void Awake()
         {
-            server = new BridgeServer(Plugin.Port.Value);
-            server.Start();
+            // Training instances need their exact port. A normally launched game moves to the next free
+            // port if the configured one is taken (e.g. by training instances already running).
+            int attempts = Plugin.IsTrainingInstance ? 1 : 16;
+            int basePort = Plugin.ListenPort;
+            for (int i = 0; i < attempts; i++)
+            {
+                int port = basePort + i;
+                try
+                {
+                    server = new BridgeServer(port);
+                    server.Start();
+                    Plugin.ListenPort = port;
+                    Plugin.Log.LogInfo($"Listening on 127.0.0.1:{port}");
+                    break;
+                }
+                catch (System.Net.Sockets.SocketException e)
+                {
+                    Plugin.Log.LogWarning($"Port {port} unavailable: {e.Message}");
+                    server = null;
+                }
+            }
+            if (server == null)
+            {
+                Plugin.Log.LogError("Could not start the bridge server on any port");
+                enabled = false;
+                return;
+            }
             controller = new EpisodeController(server);
             StartCoroutine(EndOfFrameLoop());
-            Plugin.Log.LogInfo($"Listening on 127.0.0.1:{Plugin.Port.Value}");
         }
 
         private void Update()
