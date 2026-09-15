@@ -41,7 +41,7 @@ cd UltrakillAIBridge
 dotnet build -c Release
 ```
 
-The build copies `UltrakillAIBridge.dll` into `BepInEx/plugins/UltrakillAIBridge/`. Launch the game, then check `BepInEx/LogOutput.log` for `ULTRAKILL AI Bridge ... listening on 127.0.0.1:47800`.
+The build copies `UltrakillAIBridge.dll` into `BepInEx/plugins/UltrakillAIBridge/`. Launch the game, then check `BepInEx/LogOutput.log` for `Listening on 127.0.0.1:47800`.
 
 ### 4. Python environment
 Python 3.10+.
