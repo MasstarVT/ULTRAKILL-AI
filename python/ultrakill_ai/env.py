@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -95,6 +96,7 @@ class UltrakillEnv(gym.Env):
         self._last_end_reason = ""
         self._reset_seconds = 0.0
         self._deaths = 0
+        self._behaviour = dict.fromkeys(("steps", "firing", "on_target", "firing_on_target"), 0)
         self._arena_spawn: list[float] | None = None
         self._episode_start_stats: dict[str, Any] = {}
 
@@ -148,6 +150,7 @@ class UltrakillEnv(gym.Env):
         self._steps = 0
         self._steps_since_progress = 0
         self._deaths = 0
+        self._behaviour = dict.fromkeys(("steps", "firing", "on_target", "firing_on_target"), 0)
         self._last_end_reason = ""
 
         if self.route_tracker is not None and self._raw.get("player"):
@@ -157,7 +160,9 @@ class UltrakillEnv(gym.Env):
 
     def step(self, action):
         prev = self._raw
-        cur = self.client.step(decode_action(action))
+        command = decode_action(action)
+        self._note_behaviour(prev, command)
+        cur = self.client.step(command)
         self._raw = cur
         self._steps += 1
         self._track_enemies(cur)
@@ -265,6 +270,25 @@ class UltrakillEnv(gym.Env):
             raw = self.client.step(forward)
         raise RuntimeError("Failed to enter the Cyber Grind arena after reset")
 
+    def _note_behaviour(self, raw: dict[str, Any], command: dict[str, Any]) -> None:
+        """Per-episode diagnostics: is the agent shooting, and is it shooting at anything?"""
+        self._behaviour["steps"] += 1
+        firing = "fire1" in command["buttons"] or "fire2" in command["buttons"]
+        self._behaviour["firing"] += firing
+        player = raw.get("player")
+        if not player:
+            return
+        visible = [e for e in raw.get("enemies", []) if e["visible"]]
+        if not visible:
+            return
+        x, y, z = visible[0]["rel"]
+        if z <= 0:
+            return
+        angle = math.degrees(math.atan2(math.hypot(x, y), z))
+        on_target = angle <= 15.0
+        self._behaviour["on_target"] += on_target
+        self._behaviour["firing_on_target"] += on_target and firing
+
     def _track_enemies(self, raw: dict[str, Any]) -> None:
         for e in raw.get("enemies", []):
             if e["health"] > self._enemy_max_health.get(e["id"], 0.0):
@@ -286,6 +310,10 @@ class UltrakillEnv(gym.Env):
             "wave": (raw.get("cybergrind") or {}).get("wave", 0),
             "deaths": self._deaths,
         }
+        steps = max(1, self._behaviour["steps"])
+        info["firing_frac"] = self._behaviour["firing"] / steps
+        info["on_target_frac"] = self._behaviour["on_target"] / steps
+        info["firing_on_target_frac"] = self._behaviour["firing_on_target"] / steps
         if self.route_tracker is not None:
             info["route_progress"] = self.route_tracker.progress
         return info

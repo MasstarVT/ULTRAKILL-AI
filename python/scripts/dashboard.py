@@ -298,10 +298,13 @@ class Dashboard:
         bottom.grid(row=5, column=0, sticky="ew", pady=(6, 0))
         bottom.columnconfigure(0, weight=1)
         bottom.columnconfigure(1, weight=1, minsize=380)
+        bottom.columnconfigure(2, weight=1, minsize=260)
         self.end_reasons = tk.Label(bottom, text="", bg=BG, fg=MUTED, font=FONT_MONO, anchor="w", justify="left")
         self.end_reasons.grid(row=0, column=0, sticky="w")
         self.ppo = tk.Label(bottom, text="", bg=BG, fg=MUTED, font=FONT_MONO, anchor="w", justify="left")
         self.ppo.grid(row=0, column=1, sticky="w")
+        self.behaviour = tk.Label(bottom, text="", bg=BG, fg=MUTED, font=FONT_MONO, anchor="w", justify="left")
+        self.behaviour.grid(row=0, column=2, sticky="w")
         self.message = tk.Label(outer, text="", bg=BG, fg=ORANGE, font=FONT_SMALL, anchor="w")
         self.message.grid(row=6, column=0, sticky="ew")
 
@@ -403,6 +406,12 @@ class Dashboard:
         self._render_games(get("envs") or [], age if state == "running" else None)
 
         # End reasons + PPO
+        shooting = [
+            f"  {label} {mean[key] * 100:.0f}%"
+            for key, label in (("firing_frac", "firing        "), ("on_target_frac", "enemy in sight"), ("firing_on_target_frac", "firing at it  "))
+            if isinstance(mean.get(key), (int, float))
+        ]
+        self.behaviour.config(text="Shooting (last 100)\n" + "\n".join(shooting) if shooting else "")
         reasons = get("end_reasons_100") if isinstance(get("end_reasons_100"), dict) else {}
         total = sum(v for v in (num(x) for x in reasons.values()) if v) or 0
         items = []

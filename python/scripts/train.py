@@ -90,7 +90,7 @@ def main() -> None:
     model_dir.mkdir(parents=True, exist_ok=True)
     (model_dir / "env_config.yaml").write_text(yaml.safe_dump(env_cfg.to_dict()), encoding="utf-8")
 
-    info_keywords = ("kills", "wave", "style", "deaths") if env_cfg.mode == "cybergrind" else ("kills", "style", "route_progress")
+    info_keywords = ("kills", "wave", "style", "deaths", "firing_frac", "on_target_frac") if env_cfg.mode == "cybergrind" else ("kills", "style", "route_progress")
     num_envs = args.num_envs or train_cfg.get("num_envs", 1)
     base_port = args.base_port or env_cfg.port
     env_fns = [make_env(replace(env_cfg, port=base_port + i), info_keywords) for i in range(num_envs)]
