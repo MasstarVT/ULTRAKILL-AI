@@ -20,8 +20,10 @@ env:
   rewards:
     # At 820k steps the aim reward was only 0.04 per episode: the agent almost never had an enemy near
     # the crosshair. Stronger, wider aim shaping to teach it to face enemies before fighting them.
-    aim: 0.06
-    aim_cone_deg: 25.0
+    # Measured at 1.68M steps: firing 75% of steps but an enemy in the crosshair only 1.1% of the time.
+    # It sprays and kills by accident. Strong aim shaping until on_target_frac climbs, then lower it again.
+    aim: 0.15
+    aim_cone_deg: 20.0
     # Rebalanced at 329k steps: with kill 2 / death 10 the agent learned to avoid fights
     # (episode length 124 -> 772 steps, kills per game-minute ~22 -> ~3). One kill now offsets a death.
     damage_dealt: 2.0
