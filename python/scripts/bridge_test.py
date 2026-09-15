@@ -70,6 +70,7 @@ def main() -> None:
             unlimited_fps=not args.realtime,
             mute=not args.realtime,
             windowed=not args.realtime,
+            render=True,
             block_human_input=True,
         )
         for label, steps, action in SEQUENCE:

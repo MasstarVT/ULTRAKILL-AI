@@ -32,6 +32,8 @@ def main() -> None:
         cfg.unlimited_fps = False
         cfg.mute = False
         cfg.windowed = False
+        cfg.render = True
+    cfg.soft_death = False  # evaluate with real deaths
 
     if args.algo == "rppo":
         from sb3_contrib import RecurrentPPO as cls

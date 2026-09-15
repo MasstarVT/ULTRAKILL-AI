@@ -36,6 +36,7 @@ namespace UltrakillAIBridge.Env
 
         private State state = State.Idle;
         private int activeClient = -1;
+        private int replyClient = -1; // connection the next reply belongs to
         private int step;
         private int framesRemaining;
 
@@ -103,6 +104,7 @@ namespace UltrakillAIBridge.Env
                         break;
 
                     case State.Stepping:
+                        replyClient = activeClient;
                         if (--framesRemaining > 0)
                         {
                             injector.ApplyFrame();
@@ -114,6 +116,7 @@ namespace UltrakillAIBridge.Env
                         break;
 
                     case State.Resetting:
+                        replyClient = activeClient;
                         injector.ApplyFrame();
                         TickReset();
                         if (state == State.AwaitCommand) BlockForCommand();
@@ -163,6 +166,7 @@ namespace UltrakillAIBridge.Env
 
         private void HandleSafely(BridgeServer.Incoming incoming)
         {
+            replyClient = incoming.ClientId;
             try
             {
                 Handle(incoming);
@@ -254,6 +258,12 @@ namespace UltrakillAIBridge.Env
             resetSettleFrames = msg["reset_settle_frames"]?.Value<int>() ?? resetSettleFrames;
             if (msg["command_timeout_s"] != null) commandTimeoutMs = Mathf.Max(1, msg["command_timeout_s"].Value<int>()) * 1000;
             windowed = msg["windowed"]?.Value<bool>() ?? windowed;
+            TrainingSpeed.SoftDeathEnabled = msg["soft_death"]?.Value<bool>() ?? TrainingSpeed.SoftDeathEnabled;
+            if (msg["render"] != null)
+            {
+                TrainingSpeed.RenderingDisabled = !msg["render"].Value<bool>();
+                if (!TrainingSpeed.RenderingDisabled) TrainingSpeed.RestoreRendering();
+            }
             windowWidth = Mathf.Max(160, msg["window_width"]?.Value<int>() ?? windowWidth);
             windowHeight = Mathf.Max(90, msg["window_height"]?.Value<int>() ?? windowHeight);
             observer.Configure(msg);
@@ -298,7 +308,11 @@ namespace UltrakillAIBridge.Env
                 Screen.SetResolution(windowWidth, windowHeight, FullScreenMode.Windowed);
                 displayChanged = true;
             }
-            if (HasControl) ApplyCursorAndAudio();
+            if (HasControl)
+            {
+                ApplyCursorAndAudio();
+                TrainingSpeed.ApplyRendering(); // cameras come back with every scene load
+            }
         }
 
         public void ReleaseControl()
@@ -315,6 +329,7 @@ namespace UltrakillAIBridge.Env
                 Screen.SetResolution(savedWidth, savedHeight, savedScreenMode);
                 displayChanged = false;
             }
+            TrainingSpeed.RestoreRendering();
             InControl = false;
             state = State.Idle;
             activeClient = -1;
@@ -419,7 +434,7 @@ namespace UltrakillAIBridge.Env
             return false;
         }
 
-        private void Send(JObject obj) => server.Send(obj);
+        private void Send(JObject obj) => server.Send(obj, replyClient);
 
         private static JObject Error(string message) => new JObject { ["type"] = "error", ["message"] = message };
     }

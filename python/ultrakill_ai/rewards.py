@@ -47,6 +47,7 @@ def compute_reward(
     enemy_max_health: dict[int, float],
     route_gain: int = 0,
     stuck: bool = False,
+    died: bool | None = None,
 ) -> RewardResult:
     r = RewardResult()
     pp, cp = prev.get("player"), cur.get("player")
@@ -66,9 +67,12 @@ def compute_reward(
     r.add("kill", cfg.kill * max(0, cs.get("kills", 0) - ps.get("kills", 0)))
     r.add("style", cfg.style * max(0, cs.get("style", 0) - ps.get("style", 0)))
 
-    hp_lost = max(0, pp["hp"] - cp["hp"])
+    if died is None:
+        died = cp["dead"] and not pp["dead"]
+    # A soft death heals the player, so the lethal hit is the HP they had left.
+    hp_lost = pp["hp"] if died else max(0, pp["hp"] - cp["hp"])
     r.add("damage_taken", -cfg.damage_taken * hp_lost)
-    if cp["dead"] and not pp["dead"]:
+    if died:
         r.add("death", -cfg.death)
 
     r.add("step", -cfg.step_penalty)

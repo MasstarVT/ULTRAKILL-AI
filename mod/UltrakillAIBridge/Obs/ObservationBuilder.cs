@@ -139,6 +139,8 @@ namespace UltrakillAIBridge.Obs
                 ["level_over"] = nm.levelOver,
                 ["weapon_slot"] = gun != null ? gun.currentSlotIndex : -1,
                 ["weapon_variation"] = gun != null ? gun.currentVariationIndex : -1,
+                ["soft_deaths"] = Env.TrainingSpeed.SoftDeaths,
+                ["soft_death_instakill"] = Env.TrainingSpeed.LastSoftDeathInstakill,
             };
         }
 

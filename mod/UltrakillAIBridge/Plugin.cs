@@ -14,7 +14,7 @@ namespace UltrakillAIBridge
     {
         public const string Guid = "masstarvt.ultrakill.aibridge";
         public const string Name = "ULTRAKILL AI Bridge";
-        public const string Version = "0.3.0";
+        public const string Version = "0.4.0";
         public const int ProtocolVersion = 1;
 
         internal static ManualLogSource Log;
@@ -57,6 +57,8 @@ namespace UltrakillAIBridge
             harmony.PatchAll(typeof(TimePatches));
             harmony.PatchAll(typeof(BackgroundPatches));
             harmony.PatchAll(typeof(InstancePatches));
+            harmony.PatchAll(typeof(TrainingSpeed));
+            EnemyTracker.onEnemyAdded += TrainingSpeed.OnEnemyAdded;
 
             // ULTRAKILL destroys BepInEx's manager GameObject during startup, which would take this
             // component with it. The bridge runs on its own hidden, persistent object instead.

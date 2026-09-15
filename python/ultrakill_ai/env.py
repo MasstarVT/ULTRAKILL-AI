@@ -40,6 +40,9 @@ class EnvConfig:
     max_wave: int = 0  # Cyber Grind curriculum: end the episode once this many waves are cleared (0 = off)
     auto_enter_arena: bool = True  # Cyber Grind: put the player into the arena on reset so wave 1 starts
     reset_settle_frames: int = 10  # frames the player must be spawned before a reset completes
+    soft_death: bool = True  # Cyber Grind: lethal hits heal instead of killing; the episode still ends with the death
+    # penalty, but the next one continues in the same arena without a scene reload
+    render: bool = False  # the agent never sees pixels; turning cameras off saves CPU/GPU
     checkpoint_resets: bool = False  # campaign: after a death, respawn at the checkpoint instead of reloading
     stuck_steps: int = 450  # campaign: end the episode after this many steps without route progress
     route_dir: str = "routes"
@@ -88,6 +91,8 @@ class UltrakillEnv(gym.Env):
         self._steps_since_progress = 0
         self._last_end_reason = ""
         self._reset_seconds = 0.0
+        self._arena_spawn: list[float] | None = None
+        self._episode_start_stats: dict[str, Any] = {}
 
     @property
     def scene(self) -> str:
@@ -107,6 +112,8 @@ class UltrakillEnv(gym.Env):
             mute=self.cfg.mute,
             block_human_input=self.cfg.block_human_input,
             reset_settle_frames=self.cfg.reset_settle_frames,
+            soft_death=self.cfg.soft_death and self.cfg.mode == "cybergrind",
+            render=self.cfg.render,
             windowed=self.cfg.windowed,
             window_width=self.cfg.window_width,
             window_height=self.cfg.window_height,
@@ -122,10 +129,16 @@ class UltrakillEnv(gym.Env):
             self.cfg.mode == "campaign" and self.cfg.checkpoint_resets and self._last_end_reason == "death"
         )
         start = time.perf_counter()
-        self._raw = self.client.reset(self.scene, checkpoint=checkpoint)
-        if self.cfg.mode == "cybergrind" and self.cfg.auto_enter_arena:
-            self._raw = self._enter_arena(self._raw)
+        if self._can_soft_reset():
+            self._raw = self._soft_reset()
+        else:
+            self._raw = self.client.reset(self.scene, checkpoint=checkpoint)
+            if self.cfg.mode == "cybergrind" and self.cfg.auto_enter_arena:
+                self._raw = self._enter_arena(self._raw)
+            if self._raw.get("player"):
+                self._arena_spawn = list(self._raw["player"]["pos"])
         self._reset_seconds = time.perf_counter() - start
+        self._episode_start_stats = dict(self._raw.get("stats", {}))
         self._enemy_max_health = {}
         self._track_enemies(self._raw)
         self._steps = 0
@@ -151,11 +164,15 @@ class UltrakillEnv(gym.Env):
             self._steps_since_progress = 0 if route_gain else self._steps_since_progress + 1
 
         stuck = self.cfg.mode == "campaign" and self._steps_since_progress >= self.cfg.stuck_steps
-        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, route_gain, stuck)
+        prev_player = prev.get("player") or {}
+        died = player is None or player["dead"] or (
+            player.get("soft_deaths", 0) > prev_player.get("soft_deaths", player.get("soft_deaths", 0))
+        )
+        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, route_gain, stuck, died)
 
         terminated, truncated, reason = False, False, ""
         stats = cur.get("stats", {})
-        if player is None or player["dead"]:
+        if died:
             terminated, reason = True, "death"
         elif cur.get("scene") != self.scene:
             terminated, reason = True, "scene_changed"
@@ -182,6 +199,27 @@ class UltrakillEnv(gym.Env):
             self._connected = False
 
     # ------------------------------------------------------------------
+
+    def _can_soft_reset(self) -> bool:
+        """After a soft death or a timeout, Cyber Grind can continue in place instead of reloading the scene."""
+        player = self._raw.get("player") if self._raw else None
+        return (
+            self.cfg.mode == "cybergrind"
+            and self.cfg.soft_death
+            and self._last_end_reason in ("death", "max_steps")
+            and self._raw.get("scene") == self.scene
+            and player is not None
+            and not player["dead"]
+            and (self._raw.get("cybergrind") or {}).get("wave", 0) >= 1
+        )
+
+    def _soft_reset(self) -> dict[str, Any]:
+        player = self._raw["player"]
+        if player.get("soft_death_instakill") and self._arena_spawn is not None:
+            # Died in a pit: put the player back above the arena so they don't keep falling.
+            x, y, z = self._arena_spawn
+            return self.client.teleport([x, y + 10.0, z])
+        return self.client.get_obs()
 
     def _enter_arena(self, raw: dict[str, Any]) -> dict[str, Any]:
         """The Cyber Grind spawn is a ledge above the arena; waves only start once the player enters the grid's trigger.
@@ -221,9 +259,10 @@ class UltrakillEnv(gym.Env):
     def _info(self, raw: dict[str, Any]) -> dict[str, Any]:
         stats = raw.get("stats", {})
         player = raw.get("player") or {}
+        start = self._episode_start_stats
         info = {
-            "kills": stats.get("kills", 0),
-            "style": stats.get("style", 0),
+            "kills": stats.get("kills", 0) - start.get("kills", 0),
+            "style": stats.get("style", 0) - start.get("style", 0),
             "hp": player.get("hp", 0),
             "wave": (raw.get("cybergrind") or {}).get("wave", 0),
         }

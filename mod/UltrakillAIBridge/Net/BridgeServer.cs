@@ -133,11 +133,12 @@ namespace UltrakillAIBridge.Net
         /// <summary>Blocks the calling thread until a message or disconnect arrives. Returns null on timeout.</summary>
         public Incoming WaitReceive(int timeoutMs) => inbox.TryTake(out var msg, timeoutMs) ? msg : null;
 
-        public void Send(string json)
+        /// <summary>Sends to the given connection only, so a reply can never reach a client that connected afterwards.</summary>
+        public void Send(string json, int toClientId)
         {
             lock (clientLock)
             {
-                if (writer == null) return;
+                if (writer == null || toClientId != clientId) return;
                 try
                 {
                     writer.WriteLine(json);
@@ -150,7 +151,7 @@ namespace UltrakillAIBridge.Net
             }
         }
 
-        public void Send(JObject obj) => Send(obj.ToString(Newtonsoft.Json.Formatting.None));
+        public void Send(JObject obj, int toClientId) => Send(obj.ToString(Newtonsoft.Json.Formatting.None), toClientId);
 
         public void DropClient()
         {

@@ -1,6 +1,6 @@
 """Launches and stops several ULTRAKILL instances for parallel training.
 
-    python scripts/games.py launch --count 4     # ports 47800..47803, small windows tiled on monitor 3
+    python scripts/games.py launch --count 5     # ports 47800..47804, small windows tiled on monitor 3
     python scripts/games.py tile --monitor 3     # move running instances to a monitor
     python scripts/games.py status
     python scripts/games.py stop                 # closes them and restores your display settings
@@ -235,18 +235,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_launch = sub.add_parser("launch")
-    p_launch.add_argument("--count", type=int, default=4)
+    p_launch.add_argument("--count", type=int, default=5, help="at most 5: BepInEx stops loading after 5 log files")
     p_launch.add_argument("--base-port", type=int, default=47800)
-    p_launch.add_argument("--width", type=int, default=640)
-    p_launch.add_argument("--height", type=int, default=360)
+    p_launch.add_argument("--width", type=int, default=480)
+    p_launch.add_argument("--height", type=int, default=270)
     p_launch.add_argument("--stagger", type=float, default=4.0, help="seconds between launches")
     p_launch.add_argument("--timeout", type=float, default=180.0)
     p_launch.add_argument("--monitor", type=int, default=3, help="Windows display number to put the games on")
     p_launch.add_argument("--job-workers", type=int, default=3, help="Unity job worker threads per game")
     p_tile = sub.add_parser("tile")
     p_tile.add_argument("--monitor", type=int, default=3)
-    p_tile.add_argument("--width", type=int, default=640)
-    p_tile.add_argument("--height", type=int, default=360)
+    p_tile.add_argument("--width", type=int, default=480)
+    p_tile.add_argument("--height", type=int, default=270)
     p_status = sub.add_parser("status")
     p_status.add_argument("--base-port", type=int, default=47800)
     sub.add_parser("stop")

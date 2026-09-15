@@ -52,8 +52,10 @@ class BridgeClient:
         if self._sock is None:
             return
         try:
-            self.send({"type": "release"})
-        except OSError:
+            # Wait for the reply so control is released before the socket closes.
+            self._sock.settimeout(5.0)
+            self.request({"type": "release"})
+        except (OSError, BridgeError, ValueError):
             pass
         try:
             self._reader.close()
