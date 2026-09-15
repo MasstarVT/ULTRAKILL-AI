@@ -48,6 +48,9 @@ namespace UltrakillAIBridge.Env
         private float resetTimeoutSeconds = 120f;
         private int resetSettleFrames = 30;
         private int commandTimeoutMs = 300_000;
+        private bool windowed = true;
+        private int windowWidth = 640;
+        private int windowHeight = 360;
 
         // Reset bookkeeping
         private string resetScene;
@@ -58,6 +61,9 @@ namespace UltrakillAIBridge.Env
         // Settings restored on release
         private int savedVSync, savedTargetFps;
         private float savedVolume;
+        private int savedWidth, savedHeight;
+        private FullScreenMode savedScreenMode;
+        private bool displayChanged;
 
         public EpisodeController(BridgeServer server)
         {
@@ -66,10 +72,24 @@ namespace UltrakillAIBridge.Env
 
         private bool HasControl => state != State.Idle;
 
+        /// <summary>True while the AI has control. Read by the Harmony patches.</summary>
+        internal static bool InControl { get; private set; }
+        private static bool muteInControl = true;
+
+        /// <summary>Keeps the cursor free and the game silent while the AI plays in the background.</summary>
+        internal static void ApplyCursorAndAudio()
+        {
+            if (Cursor.lockState != CursorLockMode.None) Cursor.lockState = CursorLockMode.None;
+            Cursor.visible = true;
+            if (muteInControl) AudioListener.volume = 0f;
+        }
+
         public void EndOfFrame()
         {
             try
             {
+                if (HasControl) ApplyCursorAndAudio();
+
                 if (HasControl && server.CurrentClientId != activeClient)
                 {
                     // Controlling client disconnected mid-step or mid-reset; never answer a newer client with its obs.
@@ -225,6 +245,9 @@ namespace UltrakillAIBridge.Env
             resetTimeoutSeconds = msg["reset_timeout_s"]?.Value<float>() ?? resetTimeoutSeconds;
             resetSettleFrames = msg["reset_settle_frames"]?.Value<int>() ?? resetSettleFrames;
             if (msg["command_timeout_s"] != null) commandTimeoutMs = Mathf.Max(1, msg["command_timeout_s"].Value<int>()) * 1000;
+            windowed = msg["windowed"]?.Value<bool>() ?? windowed;
+            windowWidth = Mathf.Max(160, msg["window_width"]?.Value<int>() ?? windowWidth);
+            windowHeight = Mathf.Max(90, msg["window_height"]?.Value<int>() ?? windowHeight);
             observer.Configure(msg);
 
             if (HasControl) ApplyTimeSettings();
@@ -238,10 +261,15 @@ namespace UltrakillAIBridge.Env
             savedVSync = QualitySettings.vSyncCount;
             savedTargetFps = Application.targetFrameRate;
             savedVolume = AudioListener.volume;
+            savedWidth = Screen.width;
+            savedHeight = Screen.height;
+            savedScreenMode = Screen.fullScreenMode;
+            displayChanged = false;
 
             injector.Attach(blockHumanInput);
-            ApplyTimeSettings();
             state = State.AwaitCommand;
+            InControl = true;
+            ApplyTimeSettings();
             Plugin.Log.LogInfo("AI took control");
         }
 
@@ -253,7 +281,16 @@ namespace UltrakillAIBridge.Env
                 QualitySettings.vSyncCount = 0;
                 Application.targetFrameRate = -1;
             }
+            muteInControl = mute;
             AudioListener.volume = mute ? 0f : savedVolume;
+
+            if (HasControl && windowed && (Screen.fullScreenMode != FullScreenMode.Windowed || Screen.width != windowWidth || Screen.height != windowHeight))
+            {
+                // A small window renders faster and doesn't hold the mouse or the screen.
+                Screen.SetResolution(windowWidth, windowHeight, FullScreenMode.Windowed);
+                displayChanged = true;
+            }
+            if (HasControl) ApplyCursorAndAudio();
         }
 
         public void ReleaseControl()
@@ -265,6 +302,12 @@ namespace UltrakillAIBridge.Env
             QualitySettings.vSyncCount = savedVSync;
             Application.targetFrameRate = savedTargetFps;
             AudioListener.volume = savedVolume;
+            if (displayChanged)
+            {
+                Screen.SetResolution(savedWidth, savedHeight, savedScreenMode);
+                displayChanged = false;
+            }
+            InControl = false;
             state = State.Idle;
             activeClient = -1;
             Plugin.Log.LogInfo("AI released control");

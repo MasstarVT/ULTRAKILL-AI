@@ -31,6 +31,7 @@ def main() -> None:
     if args.realtime:
         cfg.unlimited_fps = False
         cfg.mute = False
+        cfg.windowed = False
 
     if args.algo == "rppo":
         from sb3_contrib import RecurrentPPO as cls

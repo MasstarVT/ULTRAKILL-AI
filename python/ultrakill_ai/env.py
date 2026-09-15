@@ -30,6 +30,9 @@ class EnvConfig:
     unlimited_fps: bool = True  # render as fast as possible so training runs faster than real time
     mute: bool = True
     block_human_input: bool = True
+    windowed: bool = True  # run in a small window while training so it doesn't hold your mouse or screen
+    window_width: int = 640
+    window_height: int = 360
 
     # Episodes
     max_steps: int = 4500  # 5 minutes of game time at 15 decisions/s
@@ -100,6 +103,9 @@ class UltrakillEnv(gym.Env):
             unlimited_fps=self.cfg.unlimited_fps,
             mute=self.cfg.mute,
             block_human_input=self.cfg.block_human_input,
+            windowed=self.cfg.windowed,
+            window_width=self.cfg.window_width,
+            window_height=self.cfg.window_height,
             **mod_layout,
         )
         self._connected = True

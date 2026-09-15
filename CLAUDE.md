@@ -17,6 +17,8 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `Act/ActionInjector.cs`: virtual Input System keyboard and mouse; camera look via `CameraController.rotationX/Y`.
   - `Obs/ObservationBuilder.cs`: raw game-state snapshot.
   - `Env/SafetyPatches.cs`: blocks leaderboard submissions.
+  - `Env/TimePatches.cs`: frame-based hitstop during lockstep.
+  - `Env/BackgroundPatches.cs`: keeps the cursor free and audio muted while the AI has control.
 - `mod/GamePaths.props`: local game path (gitignored; copy from `.example`). Build copies the DLL into `<game>/BepInEx/plugins/UltrakillAIBridge/`.
 - `python/ultrakill_ai/`:
   - `protocol.py`: socket client.
@@ -53,13 +55,14 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Hitstop:** the game waits with `WaitForSecondsRealtime`; `TimePatches` makes it frame-based during lockstep.
 - **Stuck buttons:** virtual devices need `InputSystem.ResetDevice` before removal, or actions stay stuck pressed.
 - **Cyber Grind start:** the player spawns on a ledge (≈ z -47, y 100.5). Waves start only after dropping onto the grid: walk forward ~40 steps, jump, keep moving forward ~30 steps.
+- **Background play:** while in control the game switches to a 640x360 window (`windowed`, `window_width/height`), unlocks the cursor every frame and after `GameStateManager.EvaluateState`, and re-mutes after every scene load, because `GameStateManager.IntroCheck` restores the volume. The original resolution and volume are restored on release and on quit.
 - **Speed:** about 600 fps / 150 steps/s in an empty scene and about 100 steps/s with enemies (frameskip 4, RTX 5070).
 
 ## Status
-- **Mod:** v0.2.0. Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
+- **Mod:** v0.2.0 plus background play. Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
 - **Python:** env, training, eval and route tracking verified against a mock and partly in game.
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.
-- **Training:** first Cyber Grind PPO run started 2026-09-15 (`configs/cybergrind.yaml`, `max_wave` 3, 5M steps).
+- **Training:** first Cyber Grind PPO run started 2026-09-15, resumed after the background-play update (`--resume models/cybergrind_ppo/latest.zip`) (`configs/cybergrind.yaml`, `max_wave` 3, 5M steps).
   - Output: `python/runs/cybergrind_ppo_1` (TensorBoard), log `python/runs/cybergrind_ppo_train.log`, checkpoints in `python/models/cybergrind_ppo/`.
   - Throughput is about 36 steps/s including resets, so 5M steps is roughly 38 h.
 - **Next steps:**

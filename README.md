@@ -116,7 +116,8 @@ More detail: [docs/protocol.md](docs/protocol.md) covers the socket protocol, an
 
 ## Notes
 
-- **Speed:** while the AI has control the game renders uncapped and muted, and each frame is a fixed 1/60 s of game time. Training speed depends on how fast your PC renders, so lowering resolution and graphics settings helps.
+- **Background play:** while the AI has control, the game shrinks to a 640x360 window, stays muted and leaves your mouse free, so you can keep using your PC. Your display settings and volume come back when control is released.
+- **Speed:** while the AI has control the game renders uncapped, and each frame is a fixed 1/60 s of game time. Training speed depends on how fast your PC renders, so lowering resolution and graphics settings helps.
 - **Waiting during training:** the game window stops responding while Python runs a PPO update. That's expected; it resumes on the next step.
 - **Leaderboards:** submissions are always blocked while the mod is installed.
 - **Game code:** this repo contains no game code or assemblies. The mod references them from your local install at build time.

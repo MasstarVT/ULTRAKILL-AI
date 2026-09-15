@@ -37,6 +37,7 @@ Errors come back as `{"type":"error","message":..}`.
 | `unlimited_fps` | true | disable vsync and the frame cap while in control |
 | `mute` | true | mute audio while in control |
 | `block_human_input` | true | disable real input devices while in control |
+| `windowed`, `window_width`, `window_height` | true, 640, 360 | run in a small window while in control (restored on release) |
 | `max_enemies` | 16 | enemies included in obs (nearest first) |
 | `horizontal_rays`, `ray_length` | 16, 50 | wall distance ring |
 | `ground_rays`, `ground_ray_radius`, `ground_ray_length` | 8, 4, 30 | pit detection ring |

@@ -65,7 +65,13 @@ def main() -> None:
         if not args.drive:
             return
 
-        client.configure(frameskip=4, unlimited_fps=not args.realtime, mute=not args.realtime, block_human_input=True)
+        client.configure(
+            frameskip=4,
+            unlimited_fps=not args.realtime,
+            mute=not args.realtime,
+            windowed=not args.realtime,
+            block_human_input=True,
+        )
         for label, steps, action in SEQUENCE:
             if label:
                 print(f"-- {label}")

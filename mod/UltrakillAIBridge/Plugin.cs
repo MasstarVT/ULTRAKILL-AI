@@ -38,6 +38,7 @@ namespace UltrakillAIBridge
             harmony = new Harmony(Guid);
             harmony.PatchAll(typeof(SafetyPatches));
             harmony.PatchAll(typeof(TimePatches));
+            harmony.PatchAll(typeof(BackgroundPatches));
 
             // ULTRAKILL destroys BepInEx's manager GameObject during startup, which would take this
             // component with it. The bridge runs on its own hidden, persistent object instead.
@@ -85,6 +86,12 @@ namespace UltrakillAIBridge
                 yield return EndOfFrame;
                 controller.EndOfFrame();
             }
+        }
+
+        private void OnApplicationQuit()
+        {
+            // Restore the player's display settings before Unity saves them on exit.
+            controller?.ReleaseControl();
         }
 
         private void OnDestroy()
