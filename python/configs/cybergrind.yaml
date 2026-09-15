@@ -14,7 +14,10 @@ env:
   max_steps: 4500
   max_wave: 3
   rewards:
-    aim: 0.02
+    # At 820k steps the aim reward was only 0.04 per episode: the agent almost never had an enemy near
+    # the crosshair. Stronger, wider aim shaping to teach it to face enemies before fighting them.
+    aim: 0.06
+    aim_cone_deg: 25.0
     # Rebalanced at 329k steps: with kill 2 / death 10 the agent learned to avoid fights
     # (episode length 124 -> 772 steps, kills per game-minute ~22 -> ~3). One kill now offsets a death.
     damage_dealt: 2.0
@@ -30,3 +33,5 @@ train:
   run_name: cybergrind_ppo
   timesteps: 5000000
   save_every: 50000
+  hyperparams:
+    ent_coef: 0.005  # 0.01 kept actions too noisy for precise aiming

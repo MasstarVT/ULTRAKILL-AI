@@ -85,6 +85,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - Now kill 5 / death 5 / damage_dealt 2.
   - One-shot kills credit the vanished enemy's remaining health as damage dealt.
   - The dashboard shows kills/min (`info["kills_per_min"]`).
+- **Aim shaping at 820k steps:** kills/min only recovered 2.5 → 4.2 and the aim reward was 0.04 per episode, i.e. the agent rarely faced an enemy. Raised `aim` 0.02 → 0.06 with a 25° cone and lowered `ent_coef` 0.01 → 0.005. Config hyperparameters now override the saved ones when resuming.
 - **Mod:** v0.4.0 (background play, training instances, teleport, soft death, rendering off). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
 - **Python:** env, training, eval and route tracking verified against a mock and partly in game.
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.

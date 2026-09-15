@@ -119,8 +119,9 @@ def main() -> None:
         cls, policy = PPO, "MlpPolicy"
 
     if args.resume:
-        # The rollout buffer is rebuilt for the current number of environments.
-        model = cls.load(args.resume, env=venv, device=args.device, tensorboard_log="runs", n_steps=hyper["n_steps"])
+        # The rollout buffer is rebuilt for the current number of environments, and the config's
+        # hyperparameters override the saved ones so tuning applies when resuming.
+        model = cls.load(args.resume, env=venv, device=args.device, tensorboard_log="runs", **hyper)
     else:
         model = cls(policy, venv, policy_kwargs=policy_kwargs, tensorboard_log="runs", device=args.device, verbose=1, **hyper)
 
