@@ -16,8 +16,12 @@ class RewardConfig:
     style: float = 0.002  # per style point gained
     step_penalty: float = 0.0  # small per-step cost to discourage idling
 
-    # Early-training shaping: bonus for keeping the nearest visible enemy near the crosshair.
+    # Early-training shaping for aiming at the nearest visible enemy.
+    # `aim` is paid on a slope from facing away (0) to facing straight at it (full), so turning the right
+    # way always pays a little more. A cone-only reward gives no gradient when the agent is never on
+    # target, which is exactly what happened at 1.9M steps (on-target 0.8% of steps).
     aim: float = 0.0
+    aim_locked: float = 0.0  # extra, inside the cone
     aim_cone_deg: float = 15.0
 
     # Cyber Grind
@@ -85,13 +89,16 @@ def compute_reward(
 
     r.add("step", -cfg.step_penalty)
 
-    if cfg.aim:
+    if cfg.aim or cfg.aim_locked:
         visible = [e for e in cur.get("enemies", []) if e["visible"]]
         if visible:
             x, y, z = visible[0]["rel"]  # camera space, nearest first
-            if z > 0:
-                angle = math.degrees(math.atan2(math.hypot(x, y), z))
-                r.add("aim", cfg.aim * max(0.0, 1.0 - angle / cfg.aim_cone_deg))
+            length = math.sqrt(x * x + y * y + z * z)
+            if length > 1e-6:
+                angle = math.degrees(math.acos(max(-1.0, min(1.0, z / length))))
+                r.add("aim", cfg.aim * (1.0 - angle / 180.0))
+                if angle <= cfg.aim_cone_deg:
+                    r.add("aim_locked", cfg.aim_locked * (1.0 - angle / cfg.aim_cone_deg))
 
     pcg, ccg = prev.get("cybergrind"), cur.get("cybergrind")
     if pcg and ccg:
