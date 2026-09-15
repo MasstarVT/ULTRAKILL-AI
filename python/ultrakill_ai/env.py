@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -37,7 +38,8 @@ class EnvConfig:
     # Episodes
     max_steps: int = 4500  # 5 minutes of game time at 15 decisions/s
     max_wave: int = 0  # Cyber Grind curriculum: end the episode once this many waves are cleared (0 = off)
-    auto_enter_arena: bool = True  # Cyber Grind: script the walk from the spawn ledge onto the grid on reset
+    auto_enter_arena: bool = True  # Cyber Grind: put the player into the arena on reset so wave 1 starts
+    reset_settle_frames: int = 10  # frames the player must be spawned before a reset completes
     checkpoint_resets: bool = False  # campaign: after a death, respawn at the checkpoint instead of reloading
     stuck_steps: int = 450  # campaign: end the episode after this many steps without route progress
     route_dir: str = "routes"
@@ -85,6 +87,7 @@ class UltrakillEnv(gym.Env):
         self._steps = 0
         self._steps_since_progress = 0
         self._last_end_reason = ""
+        self._reset_seconds = 0.0
 
     @property
     def scene(self) -> str:
@@ -103,6 +106,7 @@ class UltrakillEnv(gym.Env):
             unlimited_fps=self.cfg.unlimited_fps,
             mute=self.cfg.mute,
             block_human_input=self.cfg.block_human_input,
+            reset_settle_frames=self.cfg.reset_settle_frames,
             windowed=self.cfg.windowed,
             window_width=self.cfg.window_width,
             window_height=self.cfg.window_height,
@@ -117,9 +121,11 @@ class UltrakillEnv(gym.Env):
         checkpoint = (
             self.cfg.mode == "campaign" and self.cfg.checkpoint_resets and self._last_end_reason == "death"
         )
+        start = time.perf_counter()
         self._raw = self.client.reset(self.scene, checkpoint=checkpoint)
         if self.cfg.mode == "cybergrind" and self.cfg.auto_enter_arena:
             self._raw = self._enter_arena(self._raw)
+        self._reset_seconds = time.perf_counter() - start
         self._enemy_max_health = {}
         self._track_enemies(self._raw)
         self._steps = 0
@@ -167,6 +173,7 @@ class UltrakillEnv(gym.Env):
         info["reward_parts"] = reward.parts
         if reason:
             info["end_reason"] = reason
+            info["reset_seconds"] = self._reset_seconds
         return self._pack(cur), float(reward.total), terminated, truncated, info
 
     def close(self) -> None:
@@ -177,12 +184,20 @@ class UltrakillEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _enter_arena(self, raw: dict[str, Any]) -> dict[str, Any]:
-        """The Cyber Grind spawn is a ledge above the arena; waves only start once the player lands on the grid.
+        """The Cyber Grind spawn is a ledge above the arena; waves only start once the player enters the grid's trigger.
 
-        Walks to the ledge, jumps off and keeps moving forward until wave 1 starts. Times are in game
-        seconds so this doesn't depend on frameskip.
+        Teleports straight into the trigger when the mod reports it (fast, so parallel games aren't held
+        up by resets), otherwise walks off the ledge. Times are in game seconds so this doesn't depend on
+        frameskip.
         """
         steps_per_second = self.cfg.fixed_fps / self.cfg.frameskip
+        trigger = (raw.get("cybergrind") or {}).get("start_trigger")
+        if trigger:
+            raw = self.client.teleport(trigger["center"])
+            for _ in range(int(2 * steps_per_second)):
+                raw = self.client.step({})
+                if (raw.get("cybergrind") or {}).get("wave", 0) >= 1:
+                    return raw
         forward = {"move": [0, 1]}
         for _ in range(int(2.7 * steps_per_second)):
             raw = self.client.step(forward)

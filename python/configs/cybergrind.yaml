@@ -17,6 +17,7 @@ env:
 
 train:
   algo: ppo
+  num_envs: 4  # start the games first: python scripts/games.py launch --count 4
   run_name: cybergrind_ppo
   timesteps: 5000000
   save_every: 50000

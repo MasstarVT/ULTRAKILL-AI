@@ -19,6 +19,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `Env/SafetyPatches.cs`: blocks leaderboard submissions.
   - `Env/TimePatches.cs`: frame-based hitstop during lockstep.
   - `Env/BackgroundPatches.cs`: keeps the cursor free and audio muted while the AI has control.
+  - `Env/InstancePatches.cs`: training instances (`-aibridge-port N`) open prefs read-only and skip prefs and save writes; save writes are also skipped whenever the AI has control.
 - `mod/GamePaths.props`: local game path (gitignored; copy from `.example`). Build copies the DLL into `<game>/BepInEx/plugins/UltrakillAIBridge/`.
 - `python/ultrakill_ai/`:
   - `protocol.py`: socket client.
@@ -26,7 +27,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `spaces.py`: 448-dim obs packing, `MultiDiscrete` actions.
   - `rewards.py`: reward weights and computation.
   - `routes.py`: campaign route tracking.
-- `python/scripts/`: `bridge_test.py`, `random_agent.py`, `record_route.py`, `train.py` (PPO / RecurrentPPO), `eval.py`.
+- `python/scripts/`: `bridge_test.py`, `random_agent.py`, `record_route.py`, `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop training instances).
 - `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml`.
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
@@ -35,7 +36,11 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - Build and install the mod: `cd mod/UltrakillAIBridge && dotnet build -c Release`. The game must be closed, or the DLL is locked.
 - Python env: `cd python && .venv\Scripts\activate` (created with `pip install torch` + `pip install -e .`).
 - Bridge check (game open, in a level): `python scripts/bridge_test.py --drive`.
-- Train: `python scripts/train.py --config configs/cybergrind.yaml`; TensorBoard: `tensorboard --logdir runs`.
+- Parallel training:
+  1. `python scripts/games.py launch --count 4` (monitor 3 by default)
+  2. `python scripts/train.py --config configs/cybergrind.yaml --num-envs 4`
+  3. `python scripts/games.py stop`
+- TensorBoard: `tensorboard --logdir runs`.
 
 ## Key design decisions
 - **Lockstep:** the mod blocks Unity's main thread between steps. `Time.captureDeltaTime = 1/60` fixes game time per frame, and uncapped FPS makes training faster than real time. Game speed is not controlled through `Time.timeScale`, which `TimeController` owns for hitstop.
@@ -54,17 +59,27 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Lockstep timing:** runs at end of frame (`WaitForEndOfFrame`), so obs reflect the finished frame and queued input lands next frame.
 - **Hitstop:** the game waits with `WaitForSecondsRealtime`; `TimePatches` makes it frame-based during lockstep.
 - **Stuck buttons:** virtual devices need `InputSystem.ResetDevice` before removal, or actions stay stuck pressed.
-- **Cyber Grind start:** the player spawns on a ledge (≈ z -47, y 100.5). Waves start only after dropping onto the grid: walk forward ~40 steps, jump, keep moving forward ~30 steps.
+- **Cyber Grind start:** the player spawns on a ledge (≈ z -47, y 100.5), and waves start only on entering the `EndlessGrid` trigger collider. The mod reports it as `cybergrind.start_trigger`, and the env teleports into its center (lands ≈ (2.5, 26.5, 65)). Walking off the ledge remains as a fallback.
 - **Background play:** while in control the game switches to a 640x360 window (`windowed`, `window_width/height`), unlocks the cursor every frame and after `GameStateManager.EvaluateState`, and re-mutes after every scene load, because `GameStateManager.IntroCheck` restores the volume. The original resolution and volume are restored on release and on quit.
+- **Multiple instances:**
+  - The game holds `Preferences/Prefs.json` open with exclusive write access, so a second copy crashes unless `InstancePatches` opens it read-only.
+  - Launching the exe directly works (Facepunch `SteamClient.Init`; the launcher sets `SteamAppId`).
+  - The game re-applies resolution from `LocalPrefs.json` in `InitGame` at startup, so Unity's registry `Screenmanager*` values barely matter.
+  - BepInEx writes `LogOutput.log.1..3` for extra instances.
+- **Lockstep stalls:** vectorized envs step together, so a reset in one game stalls all of them. Keep resets short (teleport entry, `reset_settle_frames` 10).
 - **Speed:** about 600 fps / 150 steps/s in an empty scene and about 100 steps/s with enemies (frameskip 4, RTX 5070).
 
 ## Status
-- **Mod:** v0.2.0 plus background play. Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
+- **Mod:** v0.3.0 (background play, training instances, teleport). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
 - **Python:** env, training, eval and route tracking verified against a mock and partly in game.
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.
 - **Training:** first Cyber Grind PPO run started 2026-09-15, resumed after the background-play update (`--resume models/cybergrind_ppo/latest.zip`) (`configs/cybergrind.yaml`, `max_wave` 3, 5M steps).
   - Output: `python/runs/cybergrind_ppo_1` (TensorBoard), log `python/runs/cybergrind_ppo_train.log`, checkpoints in `python/models/cybergrind_ppo/`.
-  - Throughput is about 36 steps/s including resets, so 5M steps is roughly 38 h.
+  - Throughput:
+    - 1 game: about 36 steps/s
+    - 4 games with walk-in resets: about 80 steps/s
+    - 4 games with teleport resets: about 120 steps/s, CPU ~90%, resets ~0.6 s
+  - Games run on monitor 3 (`\.\DISPLAY3`, x 1920–3840).
 - **Next steps:**
   - Watch the early learning curves and tune rewards (kills often happen without a `damage_dealt` signal, because one-shot enemies vanish before a health drop is observed).
   - Raise `max_wave` as the agent improves.

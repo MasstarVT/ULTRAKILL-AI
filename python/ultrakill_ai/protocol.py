@@ -99,6 +99,9 @@ class BridgeClient:
     def step(self, action: dict[str, Any]) -> dict[str, Any]:
         return self.request({"type": "step", "action": action})
 
+    def teleport(self, pos) -> dict[str, Any]:
+        return self.request({"type": "teleport", "pos": [float(v) for v in pos]})
+
     def release(self) -> None:
         self.request({"type": "release"})
 

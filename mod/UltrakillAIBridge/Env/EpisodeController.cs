@@ -46,7 +46,7 @@ namespace UltrakillAIBridge.Env
         private bool mute = true;
         private bool blockHumanInput = true;
         private float resetTimeoutSeconds = 120f;
-        private int resetSettleFrames = 30;
+        private int resetSettleFrames = 10;
         private int commandTimeoutMs = 300_000;
         private bool windowed = true;
         private int windowWidth = 640;
@@ -197,6 +197,8 @@ namespace UltrakillAIBridge.Env
                         ["type"] = "hello",
                         ["protocol"] = Plugin.ProtocolVersion,
                         ["mod_version"] = Plugin.Version,
+                        ["port"] = Plugin.ListenPort,
+                        ["training_instance"] = Plugin.IsTrainingInstance,
                         ["scene"] = SceneHelper.CurrentScene,
                     });
                     break;
@@ -222,6 +224,12 @@ namespace UltrakillAIBridge.Env
                     injector.ApplyFrame();
                     framesRemaining = frameskip;
                     state = State.Stepping;
+                    break;
+
+                case "teleport":
+                    TakeControl(incoming.ClientId);
+                    Teleport(msg["pos"] as JArray);
+                    Send(observer.Build(step, "teleport"));
                     break;
 
                 case "release":
@@ -375,6 +383,21 @@ namespace UltrakillAIBridge.Env
                 Send(Error($"reset to '{resetScene}' timed out"));
                 state = State.AwaitCommand;
             }
+        }
+
+        /// <summary>Moves the player to a world position and stops them (used to skip walking into the Cyber Grind arena).</summary>
+        private static void Teleport(JArray pos)
+        {
+            var nm = MonoSingleton<NewMovement>.Instance;
+            if (nm == null || pos == null || pos.Count < 3) throw new ArgumentException("teleport needs a player and pos [x,y,z]");
+            var target = new Vector3((float)pos[0], (float)pos[1], (float)pos[2]);
+            nm.transform.position = target;
+            if (nm.rb != null)
+            {
+                nm.rb.position = target;
+                nm.rb.velocity = Vector3.zero;
+            }
+            Physics.SyncTransforms();
         }
 
         private static void UnpauseIfNeeded()

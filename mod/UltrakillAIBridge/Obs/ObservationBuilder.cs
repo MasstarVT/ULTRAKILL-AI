@@ -96,11 +96,22 @@ namespace UltrakillAIBridge.Obs
             if (grid != null)
             {
                 var anw = GetAnw(grid);
-                obs["cybergrind"] = new JObject
+                var cg = new JObject
                 {
                     ["wave"] = grid.currentWave,
                     ["enemies_left"] = anw != null ? Mathf.Max(0, grid.tempEnemyAmount - anw.deadEnemies) : -1,
                 };
+                // The trigger that starts wave 1 when the player enters it (disabled once waves start).
+                var trigger = grid.GetComponent<Collider>();
+                if (trigger != null && trigger.enabled)
+                {
+                    cg["start_trigger"] = new JObject
+                    {
+                        ["center"] = Vec(trigger.bounds.center),
+                        ["size"] = Vec(trigger.bounds.size),
+                    };
+                }
+                obs["cybergrind"] = cg;
             }
 
             return obs;

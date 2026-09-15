@@ -78,6 +78,13 @@ python scripts/train.py --config configs/cybergrind.yaml
 tensorboard --logdir runs
 ```
 
+**Train faster with several games at once.** `games.py` starts training copies of the game on ports 47800+, in small windows on monitor 3 (`--monitor`), at below-normal CPU priority. They never write your settings or saves.
+```bash
+python scripts/games.py launch --count 4
+python scripts/train.py --config configs/cybergrind.yaml --num-envs 4
+python scripts/games.py stop
+```
+
 **Train on a campaign level.** Record a route by playing the level yourself first.
 ```bash
 python scripts/record_route.py --level "Level 0-1"

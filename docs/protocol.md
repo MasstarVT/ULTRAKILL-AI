@@ -1,6 +1,7 @@
 # Bridge protocol (v1)
 
 The mod listens on `127.0.0.1:47800` (configurable in `BepInEx/config/masstarvt.ultrakill.aibridge.cfg`).
+Launching the game with `-aibridge-port N` makes it a **training instance** on port N: it opens preferences read-only and never writes preferences or save data. A normally launched game moves to the next free port if 47800 is taken.
 Messages are single-line JSON objects terminated by `\n`, in both directions. Every request gets exactly one reply.
 
 ## Control model
@@ -19,11 +20,12 @@ Because of the fixed frame time, how long Python takes to decide never changes w
 
 | type | fields | reply |
 |---|---|---|
-| `hello` | `protocol` | `{"type":"hello","protocol":1,"mod_version":..,"scene":..}` |
+| `hello` | `protocol` | `{"type":"hello","protocol":1,"mod_version":..,"port":..,"training_instance":..,"scene":..}` |
 | `config` | any of the settings below | `{"type":"ok"}` |
 | `get_obs` | | an `obs` message (doesn't take control) |
 | `reset` | `scene` (e.g. `"Endless"`, `"Level 0-1"`; omit = current), `checkpoint` (bool) | an `obs` with `"event":"reset"` once the player is spawned and has been ready for `reset_settle_frames` frames |
 | `step` | `action` | an `obs` after `frameskip` frames |
+| `teleport` | `pos` `[x,y,z]` | an `obs` with `"event":"teleport"` (takes control; moves the player and zeroes velocity) |
 | `release` | | `{"type":"ok"}` |
 
 Errors come back as `{"type":"error","message":..}`.
@@ -42,7 +44,7 @@ Errors come back as `{"type":"error","message":..}`.
 | `horizontal_rays`, `ray_length` | 16, 50 | wall distance ring |
 | `ground_rays`, `ground_ray_radius`, `ground_ray_length` | 8, 4, 30 | pit detection ring |
 | `reset_timeout_s` | 120 | give up on a reset after this many seconds (wall clock) |
-| `reset_settle_frames` | 30 | frames the player must be ready before a reset completes |
+| `reset_settle_frames` | 10 | frames the player must be ready before a reset completes |
 | `command_timeout_s` | 300 | drop the client if no command arrives for this long |
 
 ### action
@@ -72,7 +74,7 @@ Keys are resolved from the player's own bindings, so rebinding in game options i
                "rel": [x,y,z], "dist": 12.3, "visible": true}],
   "rays": [..], "ground_rays": [..],
   "stats": {"kills": 3, "style": 450, "seconds": 57.6, "restarts": 0, "level_complete": false},
-  "cybergrind": {"wave": 2, "enemies_left": 4}
+  "cybergrind": {"wave": 2, "enemies_left": 4, "start_trigger": {"center": [..], "size": [..]}}
 }
 ```
 
@@ -80,5 +82,5 @@ Keys are resolved from the player's own bindings, so rebinding in game options i
 - **`stamina`:** 100 per dash charge (300 = 3 dashes).
 - **`rays`:** start straight ahead and go around the player.
 - **`ground_rays`:** distance from the player's height down to the ground at points on a ring. A large value means a pit.
-- **`cybergrind`:** only present in the Cyber Grind scene.
+- **`cybergrind`:** only present in the Cyber Grind scene. `start_trigger` is the volume that starts wave 1 when entered, and is only present before waves start.
 - **`player`:** `null` when no player exists (e.g. the main menu).

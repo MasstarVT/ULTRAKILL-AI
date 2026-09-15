@@ -4,6 +4,10 @@
     python scripts/train.py --config configs/campaign_0-1.yaml --algo rppo
     python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind/latest.zip
 
+Parallel training with several game instances (see scripts/games.py):
+    python scripts/games.py launch --count 4
+    python scripts/train.py --config configs/cybergrind.yaml --num-envs 4
+
 Watch progress with:  tensorboard --logdir runs
 """
 
@@ -12,13 +16,14 @@ from __future__ import annotations
 import argparse
 import sys
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 
 import yaml
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -30,19 +35,29 @@ class EpisodeStatsCallback(BaseCallback):
 
     def __init__(self):
         super().__init__()
-        self.parts = defaultdict(float)
+        self.parts: dict[int, defaultdict[str, float]] = defaultdict(lambda: defaultdict(float))
 
     def _on_step(self) -> bool:
-        for info, done in zip(self.locals["infos"], self.locals["dones"]):
+        for i, (info, done) in enumerate(zip(self.locals["infos"], self.locals["dones"])):
+            parts = self.parts[i]
             for name, value in info.get("reward_parts", {}).items():
-                self.parts[name] += value
+                parts[name] += value
             if done:
-                for name, value in self.parts.items():
+                for name, value in parts.items():
                     self.logger.record_mean(f"reward_parts/{name}", value)
                 if "end_reason" in info:
                     self.logger.record_mean(f"end_reason/{info['end_reason']}", 1.0)
-                self.parts.clear()
+                if "reset_seconds" in info:
+                    self.logger.record_mean("time/reset_seconds", info["reset_seconds"])
+                parts.clear()
         return True
+
+
+def make_env(cfg: EnvConfig, info_keywords: tuple[str, ...]):
+    def _init():
+        return Monitor(UltrakillEnv(cfg), info_keywords=info_keywords)
+
+    return _init
 
 
 def load_config(path: str | None) -> tuple[dict, dict]:
@@ -60,6 +75,8 @@ def main() -> None:
     parser.add_argument("--run-name")
     parser.add_argument("--resume", help="path to a saved model .zip to continue training")
     parser.add_argument("--device", default="cpu", help="cpu is usually fastest for MLP policies")
+    parser.add_argument("--num-envs", type=int, help="game instances to train on in parallel (ports base-port..)")
+    parser.add_argument("--base-port", type=int, help="port of the first game instance (default: env.port)")
     args = parser.parse_args()
 
     env_cfg_dict, train_cfg = load_config(args.config)
@@ -73,7 +90,10 @@ def main() -> None:
     (model_dir / "env_config.yaml").write_text(yaml.safe_dump(env_cfg.to_dict()), encoding="utf-8")
 
     info_keywords = ("kills", "wave", "style") if env_cfg.mode == "cybergrind" else ("kills", "style", "route_progress")
-    venv = DummyVecEnv([lambda: Monitor(UltrakillEnv(env_cfg), info_keywords=info_keywords)])
+    num_envs = args.num_envs or train_cfg.get("num_envs", 1)
+    base_port = args.base_port or env_cfg.port
+    env_fns = [make_env(replace(env_cfg, port=base_port + i), info_keywords) for i in range(num_envs)]
+    venv = SubprocVecEnv(env_fns) if num_envs > 1 else DummyVecEnv(env_fns)
 
     hyper = {
         "learning_rate": 3e-4,
@@ -86,6 +106,8 @@ def main() -> None:
         "ent_coef": 0.01,
         **train_cfg.get("hyperparams", {}),
     }
+    # n_steps in the config is the total rollout size; SB3 counts it per environment.
+    hyper["n_steps"] = max(64, hyper["n_steps"] // num_envs)
     policy_kwargs = train_cfg.get("policy_kwargs", {"net_arch": [512, 512]})
 
     if algo == "rppo":
@@ -96,12 +118,13 @@ def main() -> None:
         cls, policy = PPO, "MlpPolicy"
 
     if args.resume:
-        model = cls.load(args.resume, env=venv, device=args.device, tensorboard_log="runs")
+        # The rollout buffer is rebuilt for the current number of environments.
+        model = cls.load(args.resume, env=venv, device=args.device, tensorboard_log="runs", n_steps=hyper["n_steps"])
     else:
         model = cls(policy, venv, policy_kwargs=policy_kwargs, tensorboard_log="runs", device=args.device, verbose=1, **hyper)
 
     callbacks = CallbackList([
-        CheckpointCallback(save_freq=train_cfg.get("save_every", 50_000), save_path=str(model_dir), name_prefix="ckpt"),
+        CheckpointCallback(save_freq=max(1, train_cfg.get("save_every", 50_000) // num_envs), save_path=str(model_dir), name_prefix="ckpt"),
         EpisodeStatsCallback(),
     ])
 
@@ -111,8 +134,11 @@ def main() -> None:
         print("Interrupted, saving.")
     finally:
         model.save(model_dir / "latest")
-        venv.close()
         print(f"Saved {model_dir / 'latest.zip'}")
+        try:
+            venv.close()
+        except (EOFError, BrokenPipeError, ConnectionError):
+            pass  # A worker already died with its game.
 
 
 if __name__ == "__main__":
