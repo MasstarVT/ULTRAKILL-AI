@@ -34,6 +34,7 @@ class EnvConfig:
     # Episodes
     max_steps: int = 4500  # 5 minutes of game time at 15 decisions/s
     max_wave: int = 0  # Cyber Grind curriculum: end the episode once this many waves are cleared (0 = off)
+    auto_enter_arena: bool = True  # Cyber Grind: script the walk from the spawn ledge onto the grid on reset
     checkpoint_resets: bool = False  # campaign: after a death, respawn at the checkpoint instead of reloading
     stuck_steps: int = 450  # campaign: end the episode after this many steps without route progress
     route_dir: str = "routes"
@@ -111,6 +112,8 @@ class UltrakillEnv(gym.Env):
             self.cfg.mode == "campaign" and self.cfg.checkpoint_resets and self._last_end_reason == "death"
         )
         self._raw = self.client.reset(self.scene, checkpoint=checkpoint)
+        if self.cfg.mode == "cybergrind" and self.cfg.auto_enter_arena:
+            self._raw = self._enter_arena(self._raw)
         self._enemy_max_health = {}
         self._track_enemies(self._raw)
         self._steps = 0
@@ -166,6 +169,23 @@ class UltrakillEnv(gym.Env):
             self._connected = False
 
     # ------------------------------------------------------------------
+
+    def _enter_arena(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """The Cyber Grind spawn is a ledge above the arena; waves only start once the player lands on the grid.
+
+        Walks to the ledge, jumps off and keeps moving forward until wave 1 starts. Times are in game
+        seconds so this doesn't depend on frameskip.
+        """
+        steps_per_second = self.cfg.fixed_fps / self.cfg.frameskip
+        forward = {"move": [0, 1]}
+        for _ in range(int(2.7 * steps_per_second)):
+            raw = self.client.step(forward)
+        raw = self.client.step({"move": [0, 1], "buttons": ["jump"]})
+        for _ in range(int(10 * steps_per_second)):
+            if (raw.get("cybergrind") or {}).get("wave", 0) >= 1:
+                return raw
+            raw = self.client.step(forward)
+        raise RuntimeError("Failed to enter the Cyber Grind arena after reset")
 
     def _track_enemies(self, raw: dict[str, Any]) -> None:
         for e in raw.get("enemies", []):

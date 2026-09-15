@@ -58,7 +58,5 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 ## Status
 - **Mod:** v0.2.0. Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
 - **Python:** env, training, eval and route tracking verified against a mock and partly in game.
-- **Next steps:**
-  - Auto-enter the arena on Cyber Grind reset.
-  - Random-agent smoke test in game.
-  - First training run.
+- **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.
+- **Next steps:** first Cyber Grind PPO training run (`configs/cybergrind.yaml`).
