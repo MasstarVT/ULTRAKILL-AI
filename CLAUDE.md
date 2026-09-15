@@ -59,4 +59,11 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Mod:** v0.2.0. Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
 - **Python:** env, training, eval and route tracking verified against a mock and partly in game.
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.
-- **Next steps:** first Cyber Grind PPO training run (`configs/cybergrind.yaml`).
+- **Training:** first Cyber Grind PPO run started 2026-09-15 (`configs/cybergrind.yaml`, `max_wave` 3, 5M steps).
+  - Output: `python/runs/cybergrind_ppo_1` (TensorBoard), log `python/runs/cybergrind_ppo_train.log`, checkpoints in `python/models/cybergrind_ppo/`.
+  - Throughput is about 36 steps/s including resets, so 5M steps is roughly 38 h.
+- **Next steps:**
+  - Watch the early learning curves and tune rewards (kills often happen without a `damage_dealt` signal, because one-shot enemies vanish before a health drop is observed).
+  - Raise `max_wave` as the agent improves.
+  - Consider lowering render resolution during control to speed training.
+  - Record the 0-1 route and start campaign training.
