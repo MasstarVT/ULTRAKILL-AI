@@ -1,16 +1,24 @@
+using System;
+using System.Diagnostics;
 using Newtonsoft.Json.Linq;
 using UltrakillAIBridge.Act;
 using UltrakillAIBridge.Net;
 using UltrakillAIBridge.Obs;
 using UnityEngine;
+using UnityEngine.AddressableAssets;
 
 namespace UltrakillAIBridge.Env
 {
     /// <summary>
-    /// Runs the lockstep protocol. While the AI has control, the game advances exactly
-    /// <see cref="frameskip"/> frames per step and then blocks the main thread until Python sends the
-    /// next command. Time.captureDeltaTime fixes how much game time each frame covers, so a slow
-    /// policy never costs reaction time and a fast machine trains faster than real time.
+    /// Runs the lockstep protocol at the end of each frame. While the AI has control, the game advances
+    /// exactly <see cref="frameskip"/> frames per step, then sends an observation and blocks the main
+    /// thread until Python sends the next command. Time.captureDeltaTime fixes how much game time each
+    /// frame covers, so a slow policy never costs reaction time and a fast machine trains faster than
+    /// real time.
+    ///
+    /// Frame timeline for a step received at the end of frame N: input for frame N+1 is queued and its
+    /// look applied immediately; frames N+1..N+frameskip run with the action; the observation is built at
+    /// the end of frame N+frameskip.
     ///
     /// Commands (newline-delimited JSON, see docs/protocol.md):
     ///   hello, config, get_obs  - answered immediately, never take control
@@ -37,13 +45,13 @@ namespace UltrakillAIBridge.Env
         private bool unlimitedFps = true;
         private bool mute = true;
         private bool blockHumanInput = true;
-        private int resetTimeoutFrames = 60 * 60;
+        private float resetTimeoutSeconds = 120f;
         private int resetSettleFrames = 30;
         private int commandTimeoutMs = 300_000;
 
         // Reset bookkeeping
         private string resetScene;
-        private int resetFrames;
+        private readonly Stopwatch resetTimer = new Stopwatch();
         private int readyFrames;
         private bool sceneRequested;
 
@@ -58,31 +66,52 @@ namespace UltrakillAIBridge.Env
 
         private bool HasControl => state != State.Idle;
 
-        public void Tick()
+        public void EndOfFrame()
         {
-            switch (state)
+            try
             {
-                case State.Idle:
-                    DrainNonBlocking();
-                    return;
+                if (HasControl && server.CurrentClientId != activeClient)
+                {
+                    // Controlling client disconnected mid-step or mid-reset; never answer a newer client with its obs.
+                    ReleaseControl();
+                }
 
-                case State.Stepping:
-                    injector.ApplyFrame();
-                    if (--framesRemaining > 0) return;
-                    Send(observer.Build(++step));
+                switch (state)
+                {
+                    case State.Idle:
+                        DrainNonBlocking();
+                        break;
+
+                    case State.Stepping:
+                        if (--framesRemaining > 0)
+                        {
+                            injector.ApplyFrame();
+                            break;
+                        }
+                        Send(observer.Build(++step));
+                        state = State.AwaitCommand;
+                        BlockForCommand();
+                        break;
+
+                    case State.Resetting:
+                        injector.ApplyFrame();
+                        TickReset();
+                        if (state == State.AwaitCommand) BlockForCommand();
+                        break;
+
+                    case State.AwaitCommand:
+                        BlockForCommand();
+                        break;
+                }
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogError($"Bridge error: {e}");
+                if (HasControl)
+                {
+                    Send(Error(e.Message));
                     state = State.AwaitCommand;
-                    BlockForCommand();
-                    return;
-
-                case State.Resetting:
-                    injector.ApplyFrame();
-                    TickReset();
-                    if (state == State.AwaitCommand) BlockForCommand();
-                    return;
-
-                case State.AwaitCommand:
-                    BlockForCommand();
-                    return;
+                }
             }
         }
 
@@ -90,7 +119,7 @@ namespace UltrakillAIBridge.Env
         {
             while (state == State.Idle && server.TryReceive(out var msg))
             {
-                Handle(msg);
+                HandleSafely(msg);
             }
         }
 
@@ -108,21 +137,34 @@ namespace UltrakillAIBridge.Env
                     ReleaseControl();
                     return;
                 }
+                HandleSafely(incoming);
+            }
+        }
+
+        private void HandleSafely(BridgeServer.Incoming incoming)
+        {
+            try
+            {
                 Handle(incoming);
+            }
+            catch (Exception e)
+            {
+                Plugin.Log.LogError($"Error handling {(string)incoming.Message?["type"]}: {e}");
+                Send(Error(e.Message));
+                if (HasControl) state = State.AwaitCommand;
             }
         }
 
         private void Handle(BridgeServer.Incoming incoming)
         {
-            if (incoming.ClientId != server.CurrentClientId && !incoming.Disconnected)
-            {
-                return; // Stale message from a previous connection.
-            }
-
             if (incoming.Disconnected)
             {
                 if (incoming.ClientId == activeClient || !server.Connected) ReleaseControl();
                 return;
+            }
+            if (incoming.ClientId != server.CurrentClientId)
+            {
+                return; // Stale message from a previous connection.
             }
 
             var msg = incoming.Message;
@@ -155,7 +197,9 @@ namespace UltrakillAIBridge.Env
 
                 case "step":
                     TakeControl(incoming.ClientId);
+                    ApplyTimeSettings(); // Scene loads and menus can re-enable vsync or a frame cap.
                     injector.SetAction(msg["action"] as JObject, frameskip);
+                    injector.ApplyFrame();
                     framesRemaining = frameskip;
                     state = State.Stepping;
                     break;
@@ -178,7 +222,7 @@ namespace UltrakillAIBridge.Env
             unlimitedFps = msg["unlimited_fps"]?.Value<bool>() ?? unlimitedFps;
             mute = msg["mute"]?.Value<bool>() ?? mute;
             blockHumanInput = msg["block_human_input"]?.Value<bool>() ?? blockHumanInput;
-            resetTimeoutFrames = msg["reset_timeout_frames"]?.Value<int>() ?? resetTimeoutFrames;
+            resetTimeoutSeconds = msg["reset_timeout_s"]?.Value<float>() ?? resetTimeoutSeconds;
             resetSettleFrames = msg["reset_settle_frames"]?.Value<int>() ?? resetSettleFrames;
             if (msg["command_timeout_s"] != null) commandTimeoutMs = Mathf.Max(1, msg["command_timeout_s"].Value<int>()) * 1000;
             observer.Configure(msg);
@@ -238,14 +282,22 @@ namespace UltrakillAIBridge.Env
             bool checkpoint = msg["checkpoint"]?.Value<bool>() ?? false;
 
             resetScene = string.IsNullOrEmpty(scene) ? SceneHelper.CurrentScene : scene;
-            resetFrames = 0;
+            if (!SceneExists(resetScene))
+            {
+                // Loading an unknown scene would leave SceneHelper stuck with a pending load until restart.
+                Send(Error($"unknown scene '{resetScene}'"));
+                return;
+            }
+
+            resetTimer.Restart();
             readyFrames = 0;
             sceneRequested = false;
+            ApplyTimeSettings();
 
             var sm = MonoSingleton<StatsManager>.Instance;
             if (checkpoint && resetScene == SceneHelper.CurrentScene && sm != null && !sm.infoSent)
             {
-                MonoSingleton<OptionsManager>.Instance?.UnPause();
+                UnpauseIfNeeded();
                 sm.Restart();
                 sceneRequested = true;
             }
@@ -255,11 +307,10 @@ namespace UltrakillAIBridge.Env
 
         private void TickReset()
         {
-            resetFrames++;
-
             if (!sceneRequested)
             {
-                MonoSingleton<OptionsManager>.Instance?.UnPause();
+                if (!string.IsNullOrEmpty(SceneHelper.PendingScene)) return; // Wait for an in-progress load.
+                UnpauseIfNeeded();
                 SceneHelper.LoadScene(resetScene);
                 sceneRequested = true;
                 return;
@@ -272,14 +323,34 @@ namespace UltrakillAIBridge.Env
             {
                 step = 0;
                 injector.ResolveBindings();
+                ApplyTimeSettings();
                 Send(observer.Build(step, "reset"));
                 state = State.AwaitCommand;
             }
-            else if (resetFrames > resetTimeoutFrames)
+            else if (resetTimer.Elapsed.TotalSeconds > resetTimeoutSeconds)
             {
                 Send(Error($"reset to '{resetScene}' timed out"));
                 state = State.AwaitCommand;
             }
+        }
+
+        private static void UnpauseIfNeeded()
+        {
+            var om = MonoSingleton<OptionsManager>.Instance;
+            if (om != null && om.paused && !om.mainMenu && MonoSingleton<NewMovement>.Instance != null)
+            {
+                om.UnPause();
+            }
+        }
+
+        private static bool SceneExists(string scene)
+        {
+            if (scene == SceneHelper.CurrentScene) return true;
+            foreach (var locator in Addressables.ResourceLocators)
+            {
+                if (locator.Locate(scene, null, out var locations) && locations.Count > 0) return true;
+            }
+            return false;
         }
 
         private void Send(JObject obj) => server.Send(obj);

@@ -74,6 +74,8 @@ namespace UltrakillAIBridge.Net
                 }
 
                 incoming.NoDelay = true;
+                // Sends happen on the main thread; never let a client that stopped reading freeze the game.
+                incoming.Client.SendTimeout = 5000;
                 int id;
                 lock (clientLock)
                 {

@@ -10,6 +10,7 @@ Messages are single-line JSON objects terminated by `\n`, in both directions. Ev
   - Human keyboard, mouse and gamepad are disabled (unless `block_human_input` is false).
   - Each frame covers a fixed amount of game time (`Time.captureDeltaTime = 1/fixed_fps`).
   - After each step the game **blocks** until the next command arrives.
+- **Timing:** the lockstep runs at the end of each frame. A step received at the end of frame N applies from frame N+1, and its obs is built at the end of frame N+frameskip. Hitstop and parry freezes count frames instead of wall-clock time while in control.
 - **Leaving AI control:** control goes back to the human on `release`, on disconnect, on the panic key (F8), or when no command arrives for `command_timeout_s`.
 
 Because of the fixed frame time, how long Python takes to decide never changes what happens in the game. With `unlimited_fps`, training runs faster than real time.
@@ -39,7 +40,7 @@ Errors come back as `{"type":"error","message":..}`.
 | `max_enemies` | 16 | enemies included in obs (nearest first) |
 | `horizontal_rays`, `ray_length` | 16, 50 | wall distance ring |
 | `ground_rays`, `ground_ray_radius`, `ground_ray_length` | 8, 4, 30 | pit detection ring |
-| `reset_timeout_frames` | 3600 | give up on a reset after this many frames |
+| `reset_timeout_s` | 120 | give up on a reset after this many seconds (wall clock) |
 | `reset_settle_frames` | 30 | frames the player must be ready before a reset completes |
 | `command_timeout_s` | 300 | drop the client if no command arrives for this long |
 

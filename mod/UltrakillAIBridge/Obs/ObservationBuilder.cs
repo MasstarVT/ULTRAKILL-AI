@@ -19,8 +19,26 @@ namespace UltrakillAIBridge.Obs
         public float GroundRayRadius = 4f;
         public float GroundRayLength = 30f;
 
-        private static readonly AccessTools.FieldRef<EndlessGrid, ActivateNextWave> AnwRef =
-            AccessTools.FieldRefAccess<EndlessGrid, ActivateNextWave>("anw");
+        // Resolved lazily so a game update renaming the private field only loses enemies_left.
+        private static AccessTools.FieldRef<EndlessGrid, ActivateNextWave> anwRef;
+        private static bool anwResolved;
+
+        private static ActivateNextWave GetAnw(EndlessGrid grid)
+        {
+            if (!anwResolved)
+            {
+                anwResolved = true;
+                try
+                {
+                    anwRef = AccessTools.FieldRefAccess<EndlessGrid, ActivateNextWave>("anw");
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"EndlessGrid.anw not found, enemies_left unavailable: {e.Message}");
+                }
+            }
+            return anwRef?.Invoke(grid);
+        }
 
         private readonly List<(EnemyIdentifier eid, float dist)> sorted = new List<(EnemyIdentifier, float)>();
 
@@ -77,7 +95,7 @@ namespace UltrakillAIBridge.Obs
             var grid = MonoSingleton<EndlessGrid>.Instance;
             if (grid != null)
             {
-                var anw = AnwRef(grid);
+                var anw = GetAnw(grid);
                 obs["cybergrind"] = new JObject
                 {
                     ["wave"] = grid.currentWave,

@@ -45,13 +45,20 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Mods:** BepInEx 5.4.23.5 installed 2026-09-15; UltrakillAIBridge plugin installed.
 - **Save backup:** `C:\Users\tyler\Documents\ULTRAKILL-Saves-Backup-2026-09-15`.
 
-## Status
-- **Mod:** builds.
-- **Python:** env, training, eval and route tracking verified against a mock of the mod protocol.
-- **Not yet verified in the real game:**
-  - Plugin load
-  - Input injection
-  - Resets
-  - Timing
+## Gotchas found in the live game
+- **Manager object destroyed:** ULTRAKILL destroys BepInEx's manager GameObject. The bridge runs on its own `HideAndDontSave` + `DontDestroyOnLoad` object (`BridgeRunner` in `Plugin.cs`).
+- **Background running:** the game ships with `runInBackground` off. The plugin turns it on so the bridge answers while the window is unfocused.
+- **Frame cap returns:** scene loads re-enable vsync or a frame cap, so time settings are re-applied on every step and reset.
+- **Lockstep timing:** runs at end of frame (`WaitForEndOfFrame`), so obs reflect the finished frame and queued input lands next frame.
+- **Hitstop:** the game waits with `WaitForSecondsRealtime`; `TimePatches` makes it frame-based during lockstep.
+- **Stuck buttons:** virtual devices need `InputSystem.ResetDevice` before removal, or actions stay stuck pressed.
+- **Cyber Grind start:** the player spawns on a ledge (≈ z -47, y 100.5). Waves start only after dropping onto the grid: walk forward ~40 steps, jump, keep moving forward ~30 steps.
+- **Speed:** about 600 fps / 150 steps/s in an empty scene and about 100 steps/s with enemies (frameskip 4, RTX 5070).
 
-  Next step: launch the game, check `BepInEx/LogOutput.log`, then run `bridge_test.py --drive`.
+## Status
+- **Mod:** v0.2.0. Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
+- **Python:** env, training, eval and route tracking verified against a mock and partly in game.
+- **Next steps:**
+  - Auto-enter the arena on Cyber Grind reset.
+  - Random-agent smoke test in game.
+  - First training run.

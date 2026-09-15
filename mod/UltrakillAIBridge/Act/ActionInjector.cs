@@ -69,7 +69,10 @@ namespace UltrakillAIBridge.Act
             if (!Attached) return;
 
             Clear();
-            Queue();
+            // ResetDevice fires the cancel callbacks the game's InputActionState relies on. Removing a
+            // device with keys still down would leave actions like Fire1 stuck pressed.
+            InputSystem.ResetDevice(keyboard);
+            InputSystem.ResetDevice(mouse);
             InputSystem.RemoveDevice(keyboard);
             InputSystem.RemoveDevice(mouse);
             keyboard = null;
@@ -185,7 +188,7 @@ namespace UltrakillAIBridge.Act
                 }
             }
 
-            slot = action["slot"]?.Value<int>() ?? 0;
+            slot = action["slot"]?.Type == JTokenType.Integer ? action["slot"].Value<int>() : 0;
             firstFrame = true;
         }
 
@@ -198,19 +201,30 @@ namespace UltrakillAIBridge.Act
             firstFrame = false;
         }
 
-        /// <summary>Call once per frame while the step is running.</summary>
+        /// <summary>
+        /// Queues input for the next frame and applies that frame's look. Call at the end of each frame
+        /// of a step, starting with the frame on which the step command arrives.
+        /// </summary>
         public void ApplyFrame()
         {
             if (!Attached) return;
-            Queue();
+            if (firstFrame && tapsDownLastQueue)
+            {
+                // The same tap on consecutive steps needs a release first, or it never re-triggers.
+                // Both events are processed in the same input update, in order.
+                Queue(includeTaps: false);
+            }
+            Queue(includeTaps: firstFrame);
             ApplyLook();
             firstFrame = false;
         }
 
-        private void Queue()
+        private bool tapsDownLastQueue;
+
+        private void Queue(bool includeTaps)
         {
             var keyboardState = new KeyboardState();
-            var mouseState = new MouseState();
+            var mouseState = new MouseState { position = new Vector2(Screen.width * 0.5f, Screen.height * 0.5f) };
 
             void Press(List<ButtonControl> controls)
             {
@@ -223,11 +237,13 @@ namespace UltrakillAIBridge.Act
             }
 
             foreach (var name in held) if (buttons.TryGetValue(name, out var c)) Press(c);
-            if (firstFrame)
+            bool taps = includeTaps && (tapped.Count > 0 || (slot >= 1 && slot < slots.Length));
+            if (taps)
             {
                 foreach (var name in tapped) if (buttons.TryGetValue(name, out var c)) Press(c);
                 if (slot >= 1 && slot < slots.Length) Press(slots[slot]);
             }
+            tapsDownLastQueue = taps;
 
             const float deadzone = 0.33f;
             if (moveY > deadzone) Press(Part("up"));
