@@ -3,10 +3,13 @@
 Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: github.com/MasstarVT/ULTRAKILL-AI.
 
 ## Workflow rules
-- After every change: update this file to reflect the current state, then commit and push to `origin main`.
+- **Always push to GitHub** after completing a change: commit, then `git push origin main` (remote: https://github.com/MasstarVT/ULTRAKILL-AI).
+- **Always update this CLAUDE.md** as part of every change so it reflects the current state of the project (structure, setup, commands, conventions, decisions).
 - Never commit game assemblies or decompiled game code (`.gitignore` covers `*.dll`, `decompiled/`).
+- Update `times.md` whenever a training generation finishes (instructions are in an HTML comment at the bottom of that file).
 
 ## Layout
+- `times.md`: the AI's level-time leaderboard (best time per level plus per-generation history). No entries yet.
 - `mod/UltrakillAIBridge/`: BepInEx 5 plugin (C#, netstandard2.1).
   - `Plugin.cs`: entry point and config (port 47800, panic key F8).
   - `Net/BridgeServer.cs`: TCP server, newline JSON.
