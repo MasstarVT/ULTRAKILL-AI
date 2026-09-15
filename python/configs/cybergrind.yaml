@@ -15,10 +15,12 @@ env:
   max_wave: 3
   rewards:
     aim: 0.02
-    damage_dealt: 1.0
-    kill: 2.0
+    # Rebalanced at 329k steps: with kill 2 / death 10 the agent learned to avoid fights
+    # (episode length 124 -> 772 steps, kills per game-minute ~22 -> ~3). One kill now offsets a death.
+    damage_dealt: 2.0
+    kill: 5.0
     damage_taken: 0.02
-    death: 10.0
+    death: 5.0
     style: 0.002
     wave: 5.0
 

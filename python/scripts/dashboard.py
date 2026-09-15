@@ -258,7 +258,7 @@ class Dashboard:
         self.tiles: dict[str, tk.Label] = {}
         for i, (key, title) in enumerate((
             ("episodes", "Episodes"), ("mean_reward", "Mean reward"), ("best_reward", "Best reward"),
-            ("mean_kills", "Mean kills"), ("mean_wave", "Mean wave"), ("best_wave", "Best wave"), ("mean_length", "Mean length"),
+            ("mean_kills", "Mean kills"), ("kills_per_min", "Kills/min"), ("mean_wave", "Mean wave"), ("best_wave", "Best wave"), ("mean_length", "Mean length"),
         )):
             tiles.columnconfigure(i, weight=1, uniform="tile")
             t = panel(tiles, row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
@@ -278,7 +278,7 @@ class Dashboard:
         middle.rowconfigure(1, weight=1, uniform="midrow")
         self.chart_reward = LineChart(middle, "Mean reward (100 ep)")
         self.chart_reward.grid(row=0, column=0, sticky="nsew", padx=(0, 3), pady=(0, 3))
-        self.chart_kw = LineChart(middle, "Kills & wave (100 ep)")
+        self.chart_kw = LineChart(middle, "Kills/min & wave (100 ep)")
         self.chart_kw.grid(row=0, column=1, sticky="nsew", padx=(3, 0), pady=(0, 3))
         self.chart_speed = LineChart(middle, "Steps/s", x_label="elapsed")
         self.chart_speed.grid(row=1, column=0, sticky="nsew", padx=(0, 3), pady=(3, 0))
@@ -373,6 +373,7 @@ class Dashboard:
         self.tiles["mean_reward"].config(text=fmt_float(mean.get("reward")))
         self.tiles["best_reward"].config(text=fmt_float(get("best_reward")))
         self.tiles["mean_kills"].config(text=fmt_float(mean.get("kills")))
+        self.tiles["kills_per_min"].config(text=fmt_float(mean.get("kills_per_min")))
         self.tiles["mean_wave"].config(text=fmt_float(mean.get("wave")))
         self.tiles["best_wave"].config(text=fmt_int(get("best_wave")))
         self.tiles["mean_length"].config(text=fmt_int(mean.get("length")))
@@ -389,7 +390,7 @@ class Dashboard:
             return out
 
         self.chart_reward.set_series([("reward", GREEN, series("mean_reward_100"))])
-        self.chart_kw.set_series([("kills", RED, series("mean_kills_100")), ("wave", YELLOW, series("mean_wave_100"))])
+        self.chart_kw.set_series([("kills/min", RED, series("mean_kills_per_min_100")), ("wave", YELLOW, series("mean_wave_100"))])
         started = num(get("started_at"))
         if started is None and history:
             started = num(history[0].get("wall_time")) or 0.0

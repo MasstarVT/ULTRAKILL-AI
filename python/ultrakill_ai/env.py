@@ -191,6 +191,9 @@ class UltrakillEnv(gym.Env):
         if reason:
             info["end_reason"] = reason
             info["reset_seconds"] = self._reset_seconds
+            seconds = self._steps * self.cfg.frameskip / self.cfg.fixed_fps
+            info["episode_seconds"] = seconds
+            info["kills_per_min"] = info["kills"] / seconds * 60.0 if seconds > 0 else 0.0
         return self._pack(cur), float(reward.total), terminated, truncated, info
 
     def close(self) -> None:

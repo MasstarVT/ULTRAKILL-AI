@@ -80,6 +80,11 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Speed:** about 600 fps / 150 steps/s in an empty scene and about 100 steps/s with enemies (frameskip 4, RTX 5070).
 
 ## Status
+- **Reward rebalance at 329k steps:**
+  - Problem: with kill 2 / death 10 the agent learned to avoid fights. Reward went -9.7 → -1.8 and episode length 124 → 772 steps, but kills per game-minute fell from ~22 to ~3.
+  - Now kill 5 / death 5 / damage_dealt 2.
+  - One-shot kills credit the vanished enemy's remaining health as damage dealt.
+  - The dashboard shows kills/min (`info["kills_per_min"]`).
 - **Mod:** v0.4.0 (background play, training instances, teleport, soft death, rendering off). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
 - **Python:** env, training, eval and route tracking verified against a mock and partly in game.
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.
@@ -92,6 +97,6 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     - 5 games, 30 fps / frameskip 2, soft death, no rendering, 480x270 windows: ~255+ steps/s in real training
   - Games run on monitor 3 (`\.\DISPLAY3`, x 1920–3840).
 - **Next steps:**
-  - Watch the early learning curves and tune rewards (kills often happen without a `damage_dealt` signal, because one-shot enemies vanish before a health drop is observed).
+  - Check that the reward rebalance restores aggression: kills/min on the dashboard should rise back above the random-play level of ~20.
   - Raise `max_wave` as the agent improves.
   - Record the 0-1 route and start campaign training.

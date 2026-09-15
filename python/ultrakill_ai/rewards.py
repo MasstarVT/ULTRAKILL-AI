@@ -56,15 +56,23 @@ def compute_reward(
 
     # Damage dealt, normalised per enemy so a Filth and a Maurice are worth the same when killed.
     prev_hp = {e["id"]: e["health"] for e in prev.get("enemies", [])}
+    cur_ids = {e["id"] for e in cur.get("enemies", [])}
     dealt = 0.0
     for e in cur.get("enemies", []):
         before = prev_hp.get(e["id"])
         if before is not None and before > e["health"]:
             dealt += (before - e["health"]) / max(enemy_max_health.get(e["id"], before), 1e-3)
-    r.add("damage_dealt", cfg.damage_dealt * dealt)
 
     ps, cs = prev.get("stats", {}), cur.get("stats", {})
-    r.add("kill", cfg.kill * max(0, cs.get("kills", 0) - ps.get("kills", 0)))
+    new_kills = max(0, cs.get("kills", 0) - ps.get("kills", 0))
+    if new_kills:
+        # Enemies killed in one hit vanish before a health drop is ever observed. Credit the health they
+        # had left, nearest first, for as many enemies as the kill counter went up.
+        vanished = [e for e in prev.get("enemies", []) if e["id"] not in cur_ids]
+        for e in vanished[:new_kills]:
+            dealt += e["health"] / max(enemy_max_health.get(e["id"], e["health"]), 1e-3)
+    r.add("damage_dealt", cfg.damage_dealt * dealt)
+    r.add("kill", cfg.kill * new_kills)
     r.add("style", cfg.style * max(0, cs.get("style", 0) - ps.get("style", 0)))
 
     if died is None:

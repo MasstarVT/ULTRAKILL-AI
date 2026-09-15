@@ -161,6 +161,7 @@ class ProgressCallback(BaseCallback):
             "reward": _num(ep.get("r")),
             "length": _num(ep.get("l")),
             "kills": field("kills"),
+            "kills_per_min": field("kills_per_min"),
             "wave": field("wave"),
             "style": field("style"),
             "route_progress": field("route_progress"),
@@ -208,7 +209,7 @@ class ProgressCallback(BaseCallback):
         remaining = max(0, self.target_timesteps - self.num_timesteps)
         eta = remaining / steps_per_s if steps_per_s and self.state == "running" else None
 
-        recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "wave", "style", "route_progress", "reset_seconds")}
+        recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "kills_per_min", "wave", "style", "route_progress", "reset_seconds")}
         part_names = sorted({name for ep in self.episodes_recent for name in ep["reward_parts"]})
         n = len(self.episodes_recent)
         parts_mean = {name: sum(ep["reward_parts"].get(name, 0.0) for ep in self.episodes_recent) / n for name in part_names} if n else {}
@@ -221,6 +222,7 @@ class ProgressCallback(BaseCallback):
                 "wall_time": now,
                 "mean_reward_100": recent["reward"],
                 "mean_kills_100": recent["kills"],
+                "mean_kills_per_min_100": recent["kills_per_min"],
                 "mean_wave_100": recent["wave"],
                 "steps_per_s": steps_per_s,
             })
