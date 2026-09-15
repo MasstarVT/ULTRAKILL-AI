@@ -78,6 +78,12 @@ python scripts/train.py --config configs/cybergrind.yaml
 tensorboard --logdir runs
 ```
 
+**Watch training.** A small desktop window shows live progress: steps and ETA, recent reward, kills and waves, charts, and which games have stalled. It only reads `runs/<run_name>/status.json`, which `train.py` writes, so you can open and close it at any time.
+```bash
+python scripts/dashboard.py                        # most recently updated run
+python scripts/dashboard.py --run cybergrind_ppo
+```
+
 **Train faster with several games at once.** `games.py` starts training copies of the game on ports 47800+, in small windows on monitor 3 (`--monitor`), at below-normal CPU priority. They never write your settings or saves.
 ```bash
 python scripts/games.py launch --count 4

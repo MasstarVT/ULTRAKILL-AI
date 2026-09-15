@@ -19,6 +19,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `Env/SafetyPatches.cs`: blocks leaderboard submissions.
   - `Env/TimePatches.cs`: frame-based hitstop during lockstep.
   - `Env/BackgroundPatches.cs`: keeps the cursor free and audio muted while the AI has control.
+  - `Env/TrainingSpeed.cs`: soft death (Harmony prefix on `NewMovement.GetHurt` heals instead of a lethal hit, counted in obs `player.soft_deaths`), camera disabling, and enemy Animators set to `AlwaysAnimate`.
   - `Env/InstancePatches.cs`: training instances (`-aibridge-port N`) open prefs read-only and skip prefs and save writes; save writes are also skipped whenever the AI has control.
 - `mod/GamePaths.props`: local game path (gitignored; copy from `.example`). Build copies the DLL into `<game>/BepInEx/plugins/UltrakillAIBridge/`.
 - `python/ultrakill_ai/`:
@@ -27,7 +28,9 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `spaces.py`: 448-dim obs packing, `MultiDiscrete` actions.
   - `rewards.py`: reward weights and computation.
   - `routes.py`: campaign route tracking.
-- `python/scripts/`: `bridge_test.py`, `random_agent.py`, `record_route.py`, `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop training instances).
+  - `progress.py`: `ProgressCallback`, which writes live training stats to `runs/<run_name>/status.json` (atomic, every 2 s; `state` running/finished/stopped).
+- `python/scripts/`: `bridge_test.py`, `random_agent.py`, `record_route.py`, `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop training instances), `dashboard.py` (Tkinter live view of `status.json`).
+- `python/tests/test_progress.py`: `ProgressCallback` and dashboard smoke tests against a fake env (no game needed).
 - `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml`.
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
@@ -37,10 +40,12 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - Python env: `cd python && .venv\Scripts\activate` (created with `pip install torch` + `pip install -e .`).
 - Bridge check (game open, in a level): `python scripts/bridge_test.py --drive`.
 - Parallel training:
-  1. `python scripts/games.py launch --count 4` (monitor 3 by default)
-  2. `python scripts/train.py --config configs/cybergrind.yaml --num-envs 4`
+  1. `python scripts/games.py launch --count 5` (monitor 3 by default; BepInEx supports at most 5 copies)
+  2. `python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo/latest.zip` (`num_envs` 5 in config; `timesteps` is the run total, so resuming trains only the rest)
   3. `python scripts/games.py stop`
 - TensorBoard: `tensorboard --logdir runs`.
+- Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo`; `--smoke-test` renders once and exits.
+- Tests (no game): `python tests/test_progress.py` (pytest is not installed; the file also works under pytest).
 
 ## Key design decisions
 - **Lockstep:** the mod blocks Unity's main thread between steps. `Time.captureDeltaTime = 1/60` fixes game time per frame, and uncapped FPS makes training faster than real time. Game speed is not controlled through `Time.timeScale`, which `TimeController` owns for hitstop.
@@ -66,11 +71,16 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - Launching the exe directly works (Facepunch `SteamClient.Init`; the launcher sets `SteamAppId`).
   - The game re-applies resolution from `LocalPrefs.json` in `InitGame` at startup, so Unity's registry `Screenmanager*` values barely matter.
   - BepInEx writes `LogOutput.log.1..3` for extra instances.
+- **Training speed findings** (random actions, 4–5 games):
+  - The PPO update is only ~0.2 s per 2048 samples on CPU, so the GPU wouldn't help. The time is in the games and resets.
+  - 60 fps / frameskip 4: 138 steps/s. 30 fps / frameskip 2 (same 15 decisions per game second; game logic is deltaTime-based): 199.
+  - Rendering off: 217. Soft death: 297. Both: 328. With 5 games: 380.
+  - A 6th copy fails because BepInEx opens at most `LogOutput.log` plus `.1`–`.4`.
 - **Lockstep stalls:** vectorized envs step together, so a reset in one game stalls all of them. Keep resets short (teleport entry, `reset_settle_frames` 10).
 - **Speed:** about 600 fps / 150 steps/s in an empty scene and about 100 steps/s with enemies (frameskip 4, RTX 5070).
 
 ## Status
-- **Mod:** v0.3.0 (background play, training instances, teleport). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
+- **Mod:** v0.4.0 (background play, training instances, teleport, soft death, rendering off). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
 - **Python:** env, training, eval and route tracking verified against a mock and partly in game.
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.
 - **Training:** first Cyber Grind PPO run started 2026-09-15, resumed after the background-play update (`--resume models/cybergrind_ppo/latest.zip`) (`configs/cybergrind.yaml`, `max_wave` 3, 5M steps).
@@ -79,9 +89,9 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     - 1 game: about 36 steps/s
     - 4 games with walk-in resets: about 80 steps/s
     - 4 games with teleport resets: about 120 steps/s, CPU ~90%, resets ~0.6 s
+    - 5 games, 30 fps / frameskip 2, soft death, no rendering, 480x270 windows: ~255+ steps/s in real training
   - Games run on monitor 3 (`\.\DISPLAY3`, x 1920–3840).
 - **Next steps:**
   - Watch the early learning curves and tune rewards (kills often happen without a `damage_dealt` signal, because one-shot enemies vanish before a health drop is observed).
   - Raise `max_wave` as the agent improves.
-  - Consider lowering render resolution during control to speed training.
   - Record the 0-1 route and start campaign training.

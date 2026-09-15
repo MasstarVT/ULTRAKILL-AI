@@ -5,10 +5,10 @@
     python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind/latest.zip
 
 Parallel training with several game instances (see scripts/games.py):
-    python scripts/games.py launch --count 4
-    python scripts/train.py --config configs/cybergrind.yaml --num-envs 4
+    python scripts/games.py launch --count 5
+    python scripts/train.py --config configs/cybergrind.yaml --num-envs 5
 
-Watch progress with:  tensorboard --logdir runs
+Watch progress with:  python scripts/dashboard.py   (or: tensorboard --logdir runs)
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
+from ultrakill_ai.progress import ProgressCallback  # noqa: E402
 
 
 class EpisodeStatsCallback(BaseCallback):
@@ -71,7 +72,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", help="YAML file with env and train sections")
     parser.add_argument("--algo", choices=["ppo", "rppo"], help="ppo = MLP, rppo = LSTM (sb3-contrib RecurrentPPO)")
-    parser.add_argument("--timesteps", type=int)
+    parser.add_argument("--timesteps", type=int, help="total training steps for the run (resuming trains only the rest)")
     parser.add_argument("--run-name")
     parser.add_argument("--resume", help="path to a saved model .zip to continue training")
     parser.add_argument("--device", default="cpu", help="cpu is usually fastest for MLP policies")
@@ -123,16 +124,22 @@ def main() -> None:
     else:
         model = cls(policy, venv, policy_kwargs=policy_kwargs, tensorboard_log="runs", device=args.device, verbose=1, **hyper)
 
+    # timesteps is the total for the run. learn() adds its argument to the loaded step count when
+    # resuming, so only the remaining steps are requested.
+    remaining = max(0, timesteps - model.num_timesteps) if args.resume else timesteps
+    progress = ProgressCallback(Path("runs") / run_name / "status.json", timesteps, run_name, num_envs)
     callbacks = CallbackList([
         CheckpointCallback(save_freq=max(1, train_cfg.get("save_every", 50_000) // num_envs), save_path=str(model_dir), name_prefix="ckpt"),
         EpisodeStatsCallback(),
+        progress,
     ])
 
     try:
-        model.learn(total_timesteps=timesteps, callback=callbacks, tb_log_name=run_name, reset_num_timesteps=not args.resume)
+        model.learn(total_timesteps=remaining, callback=callbacks, tb_log_name=run_name, reset_num_timesteps=not args.resume)
     except KeyboardInterrupt:
         print("Interrupted, saving.")
     finally:
+        progress.mark_stopped()  # no-op if training finished normally
         model.save(model_dir / "latest")
         print(f"Saved {model_dir / 'latest.zip'}")
         try:
