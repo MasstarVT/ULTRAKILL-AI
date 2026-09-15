@@ -18,6 +18,8 @@ import tkinter as tk
 import traceback
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 RUNS_DIR = Path(__file__).resolve().parents[1] / "runs"
 REFRESH_MS = 2000
 STALE_AFTER_S = 60
@@ -451,11 +453,28 @@ class Dashboard:
                 lbl.config(text=text, fg=(ORANGE if stalled else FG) if c in (0, 4) else FG)
 
 
+def place_window(root: tk.Tk, monitor: int | None, reserve_top: int) -> None:
+    """Fills the chosen monitor below the game windows; falls back to the default size on any failure."""
+    if monitor is None:
+        return
+    try:
+        from ultrakill_ai.windows import monitor_work_area
+
+        left, top, right, bottom = monitor_work_area(monitor, quiet=True)
+    except Exception:
+        return
+    width = max(760, right - left)
+    height = max(640, bottom - top - reserve_top)
+    root.geometry(f"{width}x{height}+{left}+{top + reserve_top}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live training dashboard")
     parser.add_argument("--run", help="run name under runs/ (default: most recently updated)")
     parser.add_argument("--file", type=Path, help="explicit path to a status.json")
     parser.add_argument("--runs-dir", type=Path, default=RUNS_DIR)
+    parser.add_argument("--monitor", type=int, default=3, help="Windows display to open on (default 3, where the games run)")
+    parser.add_argument("--reserve-top", type=int, default=250, help="pixels left free at the top for the game windows")
     parser.add_argument("--smoke-test", action="store_true", help="render once, then exit (exit code 1 on errors)")
     args = parser.parse_args()
 
@@ -470,6 +489,7 @@ def main() -> None:
 
     root.report_callback_exception = report
     dash = Dashboard(root, args.runs_dir, args.run, args.file)
+    place_window(root, args.monitor, args.reserve_top)
 
     if args.smoke_test:
         root.update_idletasks()

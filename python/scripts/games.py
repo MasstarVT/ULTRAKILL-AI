@@ -25,6 +25,10 @@ import winreg
 from ctypes import wintypes
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from ultrakill_ai.windows import monitor_work_area  # noqa: E402
+
 REPO = Path(__file__).resolve().parents[2]
 BACKUP = REPO / "python" / "runs" / "display_backup.json"
 REG_PATH = r"Software\Hakita\ULTRAKILL"
@@ -91,41 +95,8 @@ def windows_for_pid(pid: int) -> list[int]:
     return found
 
 
-class MONITORINFOEXW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("rcMonitor", wintypes.RECT),
-        ("rcWork", wintypes.RECT),
-        ("dwFlags", wintypes.DWORD),
-        ("szDevice", wintypes.WCHAR * 32),
-    ]
-
-
-def monitor_work_area(number: int | None) -> tuple[int, int, int, int]:
-    """Work area (left, top, right, bottom) of Windows display N (DISPLAYN); primary if not found."""
-    user32 = ctypes.windll.user32
-    monitors: dict[str, tuple[tuple[int, int, int, int], bool]] = {}
-
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
-    def callback(hmon, _hdc, _rect, _):
-        info = MONITORINFOEXW()
-        info.cbSize = ctypes.sizeof(info)
-        user32.GetMonitorInfoW(hmon, ctypes.byref(info))
-        w = info.rcWork
-        monitors[info.szDevice] = ((w.left, w.top, w.right, w.bottom), bool(info.dwFlags & 1))
-        return True
-
-    user32.EnumDisplayMonitors(None, None, callback, 0)
-    wanted = rf"\\.\DISPLAY{number}"
-    if number is not None and wanted in monitors:
-        return monitors[wanted][0]
-    if number is not None:
-        print(f"Monitor {number} not found, using the primary monitor")
-    return next(area for area, primary in monitors.values() if primary)
-
-
 def tile(pids: list[int], width: int, height: int, monitor: int | None) -> None:
-    """Arranges the game windows in a grid on the chosen monitor so they don't overlap."""
+    """Arranges the game windows in a row along the top of the chosen monitor, leaving room below for the dashboard."""
     user32 = ctypes.windll.user32
     left, top, right, bottom = monitor_work_area(monitor)
     # Window borders add a little to the client size.
@@ -237,16 +208,16 @@ def main() -> None:
     p_launch = sub.add_parser("launch")
     p_launch.add_argument("--count", type=int, default=5, help="at most 5: BepInEx stops loading after 5 log files")
     p_launch.add_argument("--base-port", type=int, default=47800)
-    p_launch.add_argument("--width", type=int, default=480)
-    p_launch.add_argument("--height", type=int, default=270)
+    p_launch.add_argument("--width", type=int, default=368)
+    p_launch.add_argument("--height", type=int, default=207)
     p_launch.add_argument("--stagger", type=float, default=4.0, help="seconds between launches")
     p_launch.add_argument("--timeout", type=float, default=180.0)
     p_launch.add_argument("--monitor", type=int, default=3, help="Windows display number to put the games on")
     p_launch.add_argument("--job-workers", type=int, default=3, help="Unity job worker threads per game")
     p_tile = sub.add_parser("tile")
     p_tile.add_argument("--monitor", type=int, default=3)
-    p_tile.add_argument("--width", type=int, default=480)
-    p_tile.add_argument("--height", type=int, default=270)
+    p_tile.add_argument("--width", type=int, default=368)
+    p_tile.add_argument("--height", type=int, default=207)
     p_status = sub.add_parser("status")
     p_status.add_argument("--base-port", type=int, default=47800)
     sub.add_parser("stop")

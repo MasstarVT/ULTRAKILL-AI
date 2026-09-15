@@ -91,6 +91,23 @@ class ProgressCallback(BaseCallback):
         self.per_env: dict[int, dict] = {}
         self.history: list[dict] = []
         self.ppo_metrics: dict[str, float] = {}
+        self.previous_elapsed_s = 0.0
+        self._restore()
+
+    def _restore(self) -> None:
+        """Carries totals and charts over from an earlier run, so restarting doesn't wipe the dashboard."""
+        try:
+            old = json.loads(self.status_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if old.get("run_name") != self.run_name:
+            return
+        self.history = [p for p in old.get("history", []) if isinstance(p, dict)]
+        self.episodes = int(old.get("episodes") or 0)
+        self.best_reward = _num(old.get("best_reward"))
+        self.best_wave = _num(old.get("best_wave"))
+        self.previous_elapsed_s = _num(old.get("elapsed_s")) or 0.0
+        self.ppo_metrics = {k: v for k, v in (old.get("ppo") or {}).items() if isinstance(v, (int, float))}
 
     # -- SB3 hooks ---------------------------------------------------------------------------
 
@@ -241,7 +258,8 @@ class ProgressCallback(BaseCallback):
             "state": self.state,
             "updated_at": now,
             "started_at": self.start_time,
-            "elapsed_s": now - self.start_time,
+            "elapsed_s": self.previous_elapsed_s + (now - self.start_time),
+            "session_elapsed_s": now - self.start_time,
             "num_envs": self.num_envs,
             "timesteps": self.num_timesteps,
             "start_timesteps": self.start_timesteps,

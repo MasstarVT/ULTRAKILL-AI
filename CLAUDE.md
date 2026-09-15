@@ -30,6 +30,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `routes.py`: campaign route tracking.
   - `progress.py`: `ProgressCallback`, which writes live training stats to `runs/<run_name>/status.json` (atomic, every 2 s; `state` running/finished/stopped).
 - `python/scripts/`: `bridge_test.py`, `random_agent.py`, `record_route.py`, `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop training instances), `dashboard.py` (Tkinter live view of `status.json`).
+- `python/ultrakill_ai/windows.py`: monitor work-area lookup shared by `games.py` and `dashboard.py`.
 - `python/tests/test_progress.py`: `ProgressCallback` and dashboard smoke tests against a fake env (no game needed).
 - `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml`.
 - `docs/protocol.md`: the socket protocol.
@@ -44,7 +45,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   2. `python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo/latest.zip` (`num_envs` 5 in config; `timesteps` is the run total, so resuming trains only the rest)
   3. `python scripts/games.py stop`
 - TensorBoard: `tensorboard --logdir runs`.
-- Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo`; `--smoke-test` renders once and exits.
+- Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits.
 - Tests (no game): `python tests/test_progress.py` (pytest is not installed; the file also works under pytest).
 
 ## Key design decisions
@@ -86,6 +87,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - One-shot kills credit the vanished enemy's remaining health as damage dealt.
   - The dashboard shows kills/min (`info["kills_per_min"]`).
 - **Aim shaping at 820k steps:** kills/min only recovered 2.5 → 4.2 and the aim reward was 0.04 per episode, i.e. the agent rarely faced an enemy. Raised `aim` 0.02 → 0.06 with a 25° cone and lowered `ent_coef` 0.01 → 0.005. Config hyperparameters now override the saved ones when resuming.
+- **Dashboard layout:** games tile in one row (368x207) along the top of monitor 3; the dashboard fills the space below. `ProgressCallback` reloads the existing `status.json`, so restarting training keeps episodes, charts, bests and elapsed time.
 - **Mod:** v0.4.0 (background play, training instances, teleport, soft death, rendering off). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
 - **Python:** env, training, eval and route tracking verified against a mock and partly in game.
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.

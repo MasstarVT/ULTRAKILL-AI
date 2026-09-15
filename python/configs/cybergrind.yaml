@@ -9,8 +9,8 @@ env:
   frameskip: 2
   render: false      # the agent never sees pixels
   soft_death: true   # deaths end the episode with the full penalty but don't reload the scene
-  window_width: 480  # 5 windows fit on one 1080p monitor
-  window_height: 270
+  window_width: 368  # 5 windows fit in one row, leaving the rest of the monitor for the dashboard
+  window_height: 207
   max_steps: 4500
   max_wave: 3
   rewards:
