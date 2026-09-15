@@ -260,7 +260,7 @@ class Dashboard:
         self.tiles: dict[str, tk.Label] = {}
         for i, (key, title) in enumerate((
             ("episodes", "Episodes"), ("mean_reward", "Mean reward"), ("best_reward", "Best reward"),
-            ("mean_kills", "Mean kills"), ("kills_per_min", "Kills/min"), ("mean_wave", "Mean wave"), ("best_wave", "Best wave"), ("mean_length", "Mean length"),
+            ("mean_kills", "Mean kills"), ("kills_per_min", "Kills/min"), ("mean_deaths", "Deaths/ep"), ("mean_wave", "Mean wave"), ("best_wave", "Best wave"),
         )):
             tiles.columnconfigure(i, weight=1, uniform="tile")
             t = panel(tiles, row=0, column=i, sticky="ew", padx=(0 if i == 0 else 6, 0))
@@ -378,7 +378,7 @@ class Dashboard:
         self.tiles["kills_per_min"].config(text=fmt_float(mean.get("kills_per_min")))
         self.tiles["mean_wave"].config(text=fmt_float(mean.get("wave")))
         self.tiles["best_wave"].config(text=fmt_int(get("best_wave")))
-        self.tiles["mean_length"].config(text=fmt_int(mean.get("length")))
+        self.tiles["mean_deaths"].config(text=fmt_float(mean.get("deaths")))
 
         # Charts
         history = [p for p in (get("history") or []) if isinstance(p, dict)]

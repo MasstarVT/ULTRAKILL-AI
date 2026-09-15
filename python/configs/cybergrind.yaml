@@ -11,8 +11,12 @@ env:
   soft_death: true   # deaths end the episode with the full penalty but don't reload the scene
   window_width: 368  # 5 windows fit in one row, leaving the rest of the monitor for the dashboard
   window_height: 207
-  max_steps: 4500
-  max_wave: 3
+  # Episodes are a fixed two minutes of game time and continue through deaths, so the return measures
+  # kills per minute. Ending episodes on death made hiding optimal: reward rose while kills/min stayed ~3.5.
+  max_steps: 1800
+  max_wave: 0
+  end_episode_on_death: false
+  hard_reset_above_wave: 5  # reload to wave 1 past this, so the agent keeps practising early waves
   rewards:
     # At 820k steps the aim reward was only 0.04 per episode: the agent almost never had an enemy near
     # the crosshair. Stronger, wider aim shaping to teach it to face enemies before fighting them.
@@ -23,7 +27,7 @@ env:
     damage_dealt: 2.0
     kill: 5.0
     damage_taken: 0.02
-    death: 5.0
+    death: 8.0  # a cost inside the episode now, not an escape from it
     style: 0.002
     wave: 5.0
 

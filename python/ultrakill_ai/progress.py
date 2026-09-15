@@ -179,6 +179,7 @@ class ProgressCallback(BaseCallback):
             "length": _num(ep.get("l")),
             "kills": field("kills"),
             "kills_per_min": field("kills_per_min"),
+            "deaths": field("deaths"),
             "wave": field("wave"),
             "style": field("style"),
             "route_progress": field("route_progress"),
@@ -226,7 +227,7 @@ class ProgressCallback(BaseCallback):
         remaining = max(0, self.target_timesteps - self.num_timesteps)
         eta = remaining / steps_per_s if steps_per_s and self.state == "running" else None
 
-        recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "kills_per_min", "wave", "style", "route_progress", "reset_seconds")}
+        recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "kills_per_min", "deaths", "wave", "style", "route_progress", "reset_seconds")}
         part_names = sorted({name for ep in self.episodes_recent for name in ep["reward_parts"]})
         n = len(self.episodes_recent)
         parts_mean = {name: sum(ep["reward_parts"].get(name, 0.0) for ep in self.episodes_recent) / n for name in part_names} if n else {}

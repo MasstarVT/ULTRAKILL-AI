@@ -38,8 +38,11 @@ class EnvConfig:
     # Episodes
     max_steps: int = 4500  # 5 minutes of game time at 15 decisions/s
     max_wave: int = 0  # Cyber Grind curriculum: end the episode once this many waves are cleared (0 = off)
+    hard_reset_above_wave: int = 5  # reload the arena once waves get this far, so training keeps seeing early waves
     auto_enter_arena: bool = True  # Cyber Grind: put the player into the arena on reset so wave 1 starts
     reset_settle_frames: int = 10  # frames the player must be spawned before a reset completes
+    end_episode_on_death: bool = True  # False (with soft_death) keeps the run going after a death, so episodes are a
+    # fixed slice of time: total reward then measures kills per minute instead of rewarding hiding
     soft_death: bool = True  # Cyber Grind: lethal hits heal instead of killing; the episode still ends with the death
     # penalty, but the next one continues in the same arena without a scene reload
     render: bool = False  # the agent never sees pixels; turning cameras off saves CPU/GPU
@@ -91,6 +94,7 @@ class UltrakillEnv(gym.Env):
         self._steps_since_progress = 0
         self._last_end_reason = ""
         self._reset_seconds = 0.0
+        self._deaths = 0
         self._arena_spawn: list[float] | None = None
         self._episode_start_stats: dict[str, Any] = {}
 
@@ -143,6 +147,7 @@ class UltrakillEnv(gym.Env):
         self._track_enemies(self._raw)
         self._steps = 0
         self._steps_since_progress = 0
+        self._deaths = 0
         self._last_end_reason = ""
 
         if self.route_tracker is not None and self._raw.get("player"):
@@ -169,6 +174,17 @@ class UltrakillEnv(gym.Env):
             player.get("soft_deaths", 0) > prev_player.get("soft_deaths", player.get("soft_deaths", 0))
         )
         reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, route_gain, stuck, died)
+
+        if died and not self.cfg.end_episode_on_death and player is not None and not player["dead"]:
+            # Soft death inside a timed episode: stay in the run, but get out of the pit that killed us.
+            if player.get("soft_death_instakill") and self._arena_spawn is not None:
+                x, y, z = self._arena_spawn
+                cur = self.client.teleport([x, y + 10.0, z])
+                self._raw = cur
+                player = cur.get("player")
+                self._track_enemies(cur)
+            self._deaths += 1
+            died = False
 
         terminated, truncated, reason = False, False, ""
         stats = cur.get("stats", {})
@@ -213,7 +229,7 @@ class UltrakillEnv(gym.Env):
             and self._raw.get("scene") == self.scene
             and player is not None
             and not player["dead"]
-            and (self._raw.get("cybergrind") or {}).get("wave", 0) >= 1
+            and 1 <= (self._raw.get("cybergrind") or {}).get("wave", 0) <= (self.cfg.hard_reset_above_wave or 10 ** 9)
         )
 
     def _soft_reset(self) -> dict[str, Any]:
@@ -268,6 +284,7 @@ class UltrakillEnv(gym.Env):
             "style": stats.get("style", 0) - start.get("style", 0),
             "hp": player.get("hp", 0),
             "wave": (raw.get("cybergrind") or {}).get("wave", 0),
+            "deaths": self._deaths,
         }
         if self.route_tracker is not None:
             info["route_progress"] = self.route_tracker.progress
