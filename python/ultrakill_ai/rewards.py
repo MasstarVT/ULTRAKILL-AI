@@ -33,10 +33,25 @@ class RewardConfig:
     # Cyber Grind
     wave: float = 5.0
 
-    # Campaign
-    route_point: float = 0.1  # per route point reached (~1 m of progress)
-    level_complete: float = 50.0
-    stuck: float = 1.0
+    # Campaign. The new terms default to 0, so Cyber Grind runs are unchanged; campaign configs set them.
+    level_complete: float = 100.0  # once, on the step the level ends (both modes)
+    time: float = 0.0  # charged per decision, so finishing sooner always pays
+    checkpoint: float = 0.0  # per checkpoint first reached in a level load
+    arena_clear: float = 0.0  # per arena whose last wave died, once per level load
+    door_unlock: float = 0.0  # per door unlocked by play, once per level load (respawn unlocks never pay)
+    novelty: float = 0.0  # times CampaignStep.novelty, the summed 1/sqrt(N+1) of cells new this episode
+    path: float = 0.0  # per metre of new best NavMesh distance to the exit
+
+
+@dataclass
+class CampaignStep:
+    """What the level did this step, measured by the env (see campaign.py)."""
+
+    checkpoints: int = 0
+    arenas: int = 0
+    doors: int = 0
+    novelty: float = 0.0  # sum of 1/sqrt(N+1) over cells entered for the first time this episode
+    path_gain: float = 0.0  # metres of new best NavMesh distance to the exit
 
 
 @dataclass
@@ -110,11 +125,20 @@ def compute_reward(
     prev: dict[str, Any],
     cur: dict[str, Any],
     enemy_max_health: dict[int, float],
-    route_gain: int = 0,
-    stuck: bool = False,
     died: bool | None = None,
+    campaign: CampaignStep | None = None,
 ) -> RewardResult:
     r = RewardResult()
+    if campaign is not None:
+        # Paid before the player check: the env has already marked these milestones paid, so a step that
+        # arrives without a player (a level load) must not drop them.
+        r.add("time", -cfg.time)
+        r.add("checkpoint", cfg.checkpoint * campaign.checkpoints)
+        r.add("arena_clear", cfg.arena_clear * campaign.arenas)
+        r.add("door_unlock", cfg.door_unlock * campaign.doors)
+        r.add("novelty", cfg.novelty * campaign.novelty)
+        r.add("path", cfg.path * campaign.path_gain)
+
     pp, cp = prev.get("player"), cur.get("player")
     if not pp or not cp:
         return r
@@ -166,10 +190,7 @@ def compute_reward(
     if pcg and ccg:
         r.add("wave", cfg.wave * max(0, ccg["wave"] - pcg["wave"]))
 
-    r.add("route", cfg.route_point * route_gain)
     if cs.get("level_complete") and not ps.get("level_complete"):
         r.add("level_complete", cfg.level_complete)
-    if stuck:
-        r.add("stuck", -cfg.stuck)
 
     return r

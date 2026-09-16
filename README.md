@@ -118,7 +118,7 @@ python scripts/eval.py models/cybergrind_ppo/latest.zip --realtime
 - **Rewards** (`python/ultrakill_ai/rewards.py`):
   - Positive: damage dealt (normalised per enemy), kills, style, waves cleared.
   - Negative: damage taken, death.
-  - Campaign: progress along the recorded route, level completion, a penalty for getting stuck.
+  - Campaign: a small cost per decision, level completion, each checkpoint's first activation, arena clears and door unlocks, entering cells not yet visited this episode, and new best NavMesh distance to the exit.
   - Early training can also use an optional aim-assist shaping bonus.
 - **Curriculum:**
   1. Cyber Grind with `max_wave: 3`. Raise it as the agent improves, then set 0 for full runs.

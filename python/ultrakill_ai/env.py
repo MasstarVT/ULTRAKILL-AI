@@ -194,7 +194,7 @@ class UltrakillEnv(gym.Env):
         died = player is None or player["dead"] or (
             player.get("soft_deaths", 0) > prev_player.get("soft_deaths", player.get("soft_deaths", 0))
         )
-        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, route_gain, stuck, died)
+        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, died=died)
 
         if died and not self.cfg.end_episode_on_death and player is not None and not player["dead"]:
             # Soft death inside a timed episode: stay in the run, but get out of the pit that killed us.
