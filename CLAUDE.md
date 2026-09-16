@@ -149,7 +149,53 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   1800 steps, so the gradient that would cancel the constant offset is far smaller than the kill term's own
   variance -- the same "noise-dominated updates" as the v1 audit, with the cause now identified. The one
   genuinely contingent term, `aim_locked` (paid only inside the 20 deg cone), is worth just 5.3.
+- **Reward rebalance at 1.70M steps (2026-09-15), the change now running.** Baseline over 100 episodes at
+  1,697,290 steps: reward 138.8, kills/min 2.64, deaths 1.91, `on_target_frac` 3.9%, `yaw_track` 0.149,
+  `pitch_track` 0.065, `enemy_visible_frac` 0.748, entropy 9.66, `approx_kl` 0.031 (over `target_kl` 0.02).
+  Parts: `aim_pitch` 57.2, `aim_yaw` 53.1, `kill` 26.4, `death` -15.3, `damage_dealt` 11.0, `aim_locked` 6.1,
+  `damage_taken` -5.2, `wave` 3.0, `style` 2.4 -- aim shaping 84% of the return. Four independent analyses
+  and four adversarial checks produced three findings that changed the plan:
+  - **`visible` is line-of-sight only.** `ObservationBuilder.cs:165` is `!Physics.Linecast(cam.position,
+    center, envMask, ...)` with no frustum test, and the list is distance-sorted, so `visible[0]` in
+    `rewards.py` is the nearest unoccluded enemy whether or not it is on screen -- an enemy behind the player
+    counts. The slope terms therefore paid ~100 points an episode for standing where an enemy can see you.
+    That is an exposure subsidy, and exposure is what drives `damage_taken`; deaths rising 1.60 -> 2.38 was
+    this term working as specified, not a mispriced `death`.
+  - **A linear slope on a uniformly-swept error is gradient-free**, which is the real mechanism (the earlier
+    "unconditional floor" framing was wrong: a constant per-step reward is absorbed by the value baseline,
+    and `explained_variance` is 0.96). With the probed bias c = +19 deg/step and tracking gain
+    k = (19-15)/90 = 0.044, the closed loop az <- (1-k)az - c has its fixed point at -c/k = -430 deg, outside
+    [-180,180]. No lock-on exists, so the camera sweeps, yaw error goes uniform on [0,180], and the mean
+    reward is identical for every c in (8, 19]. Lock-on only begins below c = k*180 = 8, so no value of
+    `aim_yaw` can move the policy off the sweep -- the slopes had to be demoted, not retuned.
+  - **`wave` was the most underpriced term.** Cyber Grind spawns nothing until the wave is cleared, so fewer
+    kills -> no wave advance -> fewer enemies -> less line of sight -> less reward and fewer targets. That
+    self-reinforcing spiral is what drove `enemy_visible_frac` 0.857 -> 0.669. Waves cannot be farmed without
+    killing, so the term is purely contingent.
+  Applied: `aim_yaw` 0.06 -> 0.02, `aim_pitch` 0.06 -> 0.01 (half of yaw, so the per-degree gradients match
+  at 1.11e-4), `damage_dealt` 2 -> 4, `kill` 5 -> 8, `death` 8 -> 6, `wave` 5 -> 20. `aim_locked` stays 0.15,
+  `aim_cone_deg` 20 and `pitch_limit_deg` 45 unchanged. **All four proposals wanted `aim_locked` raised (to
+  0.25-0.8) and all four adversarial checks rejected that**: above w = 0.18 a tracker that holds an enemy in
+  the cone and never kills it out-earns a policy that fights, because the cone subtends a fixed angle and
+  close combat is the worst case for holding a target inside it. Cutting the slopes raises `aim_locked`'s
+  share without touching its ceiling. Freezing the cone also keeps every predicted part an exact rescaling
+  of a measured one. Predicted composition with behaviour unchanged: total 138.8 -> 95.4, aim share
+  84% -> 35%, combat (`kill` + `damage_dealt` + `wave`) 80% of the return; a good combat policy scores ~719
+  an episode against the best non-killing tracker's ~194.
+  Resumed from `ckpt_1679085_steps.zip` (not `latest.zip`, which was left stale at 1.179M by the hard stop),
+  `timesteps` raised 5M -> 8M so an overnight run does not idle.
+  - **Falsifiers.** Do NOT judge this by total reward: it falls to ~95 by construction and its composition
+    changed. Primary: `on_target_frac` must reach >= 0.09 by 2.18M steps and >= 0.15 by 2.68M; if it is
+    still <= 0.06 at 2.18M the floor:signal hypothesis is not the binding constraint and the next suspect is
+    the look-head parameterisation itself (the offset lives in the bias, so that needs a head reset like
+    v1's `pitch_reset`, not another weight pass). Early tripwire at 1.83M: `yaw_track` >= 0.30, up from
+    0.149 -- it moves before `on_target_frac` does. Guardrails: deaths/ep > 5.0 means the `death` cut was
+    too deep; `enemy_dist_mean` > 32 with `on_target_frac` rising means `aim_locked` is paying for easy
+    long-range tracking; and kills/min must not sit below 1.95 at 2.68M, since aim improving while kills
+    fall is the signature of a tracking policy that stopped engaging.
 - **Next steps:**
-  - Watch v2: `pitch_abs_mean` should sit under 15° and `on_target_frac` climb past the ~8% chance level; then kills/min should climb above the random-play level of ~20 (v1 ended at 5.0).
+  - Watch the 1.70M rebalance against the falsifiers above; `yaw_track` then `on_target_frac` lead, kills/min follows.
+  - If `on_target_frac` is still <= 0.06 at 2.18M, reset the look-head output bias (as `pitch_reset_2447005.zip` did for v1) rather than tuning weights again: a constant offset in the bias is not reachable from a reward slope that is flat across the whole sweep range.
+  - `approx_kl` runs 0.029-0.031 against `target_kl` 0.02, so every update is being truncated. Worth a pass once the reward change has been judged, but not at the same time as it.
   - Raise `max_wave` as the agent improves.
   - Record the 0-1 route and start campaign training.

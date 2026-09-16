@@ -26,24 +26,49 @@ env:
   # reward now gives a gradient back toward the enemy elevation at any pitch, unlike the 3-D angle in v1.
   pitch_limit_deg: 45
   rewards:
-    # Aim shaping, one slope per look axis so each gets its own gradient: `aim_yaw` pays for the heading
-    # (ground-plane angle to the nearest visible enemy, ignoring pitch) and `aim_pitch` for the enemy
-    # elevation being on the horizon (ignoring yaw). The single 3-D slope (`aim`) gave pitch no gradient
-    # while yaw was random, which is how the sky-staring habit survived. A cone-only reward gave no
-    # gradient at all (on-target 0.8% at 1.9M). `aim_locked` still pays extra inside the 3-D cone.
+    # Rebalanced at 1.70M steps after a four-lens review with adversarial verification.
+    #
+    # The defect: aim shaping was 84% of the return (aim_pitch 57.2, aim_yaw 53.1, aim_locked 6.1 of 138.8)
+    # while kills/min fell 3.10 -> 1.95 and deaths rose 1.60 -> 2.38. Three findings drove the new numbers.
+    #
+    # 1. `visible` is line-of-sight ONLY (ObservationBuilder.cs:165 `!Physics.Linecast`, no frustum test), so
+    #    an enemy behind the player counts. The slope terms therefore pay ~100 points an episode for standing
+    #    where an enemy can see you -- an exposure subsidy, and exposure is what drives damage_taken and
+    #    deaths. The rising death rate was this term working exactly as written.
+    # 2. A linear slope on a uniformly-swept error is gradient-free. With the measured look bias c = +19
+    #    deg/step and tracking gain k = 0.044, the closed loop az <- (1-k)az - c has its fixed point at
+    #    -c/k = -430 deg, outside [-180,180]: no lock-on exists, the camera sweeps, yaw error goes uniform,
+    #    and mean reward is IDENTICAL for every c in (8, 19]. Lock-on only starts below c = k*180 = 8, so no
+    #    value of aim_yaw moves the policy off the sweep. Demote the slopes to a tiebreaker instead.
+    # 3. aim_pitch was over-weighted: it divides by 90 where aim_yaw divides by 180, so equal weights give
+    #    pitch twice the per-degree gradient. 0.02/0.01 equalises them (0.02/180 = 0.01/90 = 1.11e-4).
+    #    Measured, the pitch loop is worth about nothing: a camera welded level would score pitch_err 26.0
+    #    against the real camera's 27.0 while burning 28.7 deg of travel (pitch_track 0.065).
+    #
+    # aim_locked STAYS at 0.15 on purpose. It is the only zero-floor aim term, so cutting the slopes raises
+    # its share without touching its ceiling. Every one of the four independent proposals wanted it raised
+    # (to 0.25-0.8) and all four adversarial checks rejected that: above w = 0.18 a tracker that holds an
+    # enemy in the cone and never kills it out-earns a policy that fights, because the cone subtends a fixed
+    # angle and close combat is the worst case for holding a target inside it. At 0.15 a good combat policy
+    # scores ~719 an episode against the best non-killing tracker's ~194.
     aim: 0.0
-    aim_yaw: 0.06
-    aim_pitch: 0.06
-    aim_locked: 0.15
-    aim_cone_deg: 20.0
-    # Rebalanced at 329k steps: with kill 2 / death 10 the agent learned to avoid fights
-    # (episode length 124 -> 772 steps, kills per game-minute ~22 -> ~3). One kill now offsets a death.
-    damage_dealt: 2.0
-    kill: 5.0
+    aim_yaw: 0.02      # was 0.06
+    aim_pitch: 0.01    # was 0.06; half of aim_yaw so the per-degree gradients match
+    aim_locked: 0.15   # unchanged, and deliberately so: 0.18 is where camping beats fighting
+    aim_cone_deg: 20.0 # unchanged, so every aim part stays an exact rescaling of a measured number
+    damage_dealt: 4.0  # was 2.0; zero-floor and contingent on actually landing hits
+    kill: 8.0          # was 5.0
     damage_taken: 0.02
-    death: 8.0  # a cost inside the episode now, not an escape from it
+    # A death already costs `death` plus the damage_taken credit for the HP it had left (rewards.py:146),
+    # so at 8.0 a death outpriced a kill -- the same shape as the kill 2 / death 10 failure at 329k steps
+    # that taught the agent to avoid fights. At death 6 / kill 8, one kill just beats one death.
+    death: 6.0         # was 8.0
     style: 0.002
-    wave: 5.0
+    # The most underpriced term in the config. Cyber Grind spawns nothing until the wave is cleared, so
+    # fewer kills -> no wave advance -> fewer enemies alive -> less line of sight -> less reward AND fewer
+    # targets. That spiral is what drove enemy_visible_frac 0.857 -> 0.669. Waves cannot be farmed without
+    # killing, so this is purely contingent.
+    wave: 20.0         # was 5.0
 
 train:
   algo: ppo
@@ -51,7 +76,7 @@ train:
   # v2: a fresh start after the 2.45M-step weight audit. The first run had learned reflexes (fire always, dash,
   # walk backwards, look up) through noise-dominated updates, so it was not worth carrying over.
   run_name: cybergrind_ppo_v2
-  timesteps: 5000000
+  timesteps: 8000000  # raised from 5M so an overnight run does not idle after finishing
   save_every: 50000
   hyperparams:
     ent_coef: 0.01  # keep exploring early; the old 0.005 was chosen for "precise aiming" when the real problem was pitch
