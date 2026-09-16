@@ -23,6 +23,8 @@ namespace UltrakillAIBridge.Obs
         private static AccessTools.FieldRef<EndlessGrid, ActivateNextWave> anwRef;
         private static bool anwResolved;
 
+        private static readonly List<EnemyIdentifier> EmptyEnemies = new List<EnemyIdentifier>();
+
         private static ActivateNextWave GetAnw(EndlessGrid grid)
         {
             if (!anwResolved)
@@ -42,6 +44,14 @@ namespace UltrakillAIBridge.Obs
 
         private readonly List<(EnemyIdentifier eid, float dist)> sorted = new List<(EnemyIdentifier, float)>();
         private readonly CampaignObserver campaign = new CampaignObserver();
+
+        // The enemies BuildEnemies already fetched from EnemyTracker this step, reused for the campaign
+        // block's arena_enemies_alive so CampaignObserver doesn't re-walk and re-allocate the same list.
+        private List<EnemyIdentifier> currentEnemies = new List<EnemyIdentifier>();
+
+        // Set once a campaign-block failure has been logged, so a persistent failure at 150-250 steps/s
+        // across five instances can't flood the log for hours; the failure itself repeats every step.
+        private bool campaignBuildFailWarned;
 
         public void Configure(JObject cfg)
         {
@@ -94,7 +104,25 @@ namespace UltrakillAIBridge.Obs
             obs["stats"] = BuildStats(nm);
 
             var sm = MonoSingleton<StatsManager>.Instance;
-            if (CampaignObserver.IsCampaignScene(sm)) obs["campaign"] = campaign.Build(nm, sm);
+            if (CampaignObserver.IsCampaignScene(sm))
+            {
+                // A campaign-block bug must not become an obs-build exception: EpisodeController.EndOfFrame's
+                // outer catch would turn the whole reply into a "type":"error", which the Python client raises
+                // as BridgeError, killing that SubprocVecEnv worker and the whole training run. Degrade instead:
+                // omit the block for this step, same as GetAnw degrades a missing field.
+                try
+                {
+                    obs["campaign"] = campaign.Build(nm, sm, currentEnemies);
+                }
+                catch (System.Exception e)
+                {
+                    if (!campaignBuildFailWarned)
+                    {
+                        campaignBuildFailWarned = true;
+                        Plugin.Log.LogWarning($"CampaignObserver.Build failed, omitting campaign block: {e}");
+                    }
+                }
+            }
 
             var grid = MonoSingleton<EndlessGrid>.Instance;
             if (grid != null)
@@ -165,10 +193,13 @@ namespace UltrakillAIBridge.Obs
         {
             var arr = new JArray();
             var tracker = MonoSingleton<EnemyTracker>.Instance;
+            // Fetched once here and kept in currentEnemies for CampaignObserver to reuse for
+            // arena_enemies_alive, since GetCurrentEnemies() allocates and refills a list every call.
+            currentEnemies = tracker != null ? tracker.GetCurrentEnemies() : EmptyEnemies;
             if (tracker == null) return arr;
 
             sorted.Clear();
-            foreach (var eid in tracker.GetCurrentEnemies())
+            foreach (var eid in currentEnemies)
             {
                 if (eid == null || eid.dead || eid.blessed) continue;
                 sorted.Add((eid, Vector3.Distance(cam.position, Center(eid))));

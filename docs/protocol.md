@@ -92,7 +92,7 @@ Keys are resolved from the player's own bindings, so rebinding in game options i
 
 ## campaign
 
-Present only in the 35 main levels (`StatsManager.levelNumber` 1 to 35, in a scene whose name starts with `Level`) when a player exists:
+Present only in the 35 main levels (`StatsManager.levelNumber` 1 to 35, in a scene whose name starts with `Level`) when a player exists, and only when the block itself built successfully: an exception building it is caught, logged once (not every step, to stay readable at 150-250 steps/s), and the block is simply omitted from that step's obs rather than failing the whole reply.
 
 ```json
 "campaign": {

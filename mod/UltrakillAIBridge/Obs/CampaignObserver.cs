@@ -33,6 +33,10 @@ namespace UltrakillAIBridge.Obs
 
         private readonly List<FinalPit> pits = new List<FinalPit>();
         private readonly List<CheckPoint> checkpoints = new List<CheckPoint>();
+        // Id strings for checkpoints, same index as checkpoints. Computed once per Scan() rather than
+        // once per Build(): checkpoint positions don't move between scans, so re-formatting the same
+        // "x,y,z" string every step (up to 250/s across five instances) is a pure waste.
+        private readonly List<string> checkpointIds = new List<string>();
         private readonly List<Door> doors = new List<Door>();
         private readonly HashSet<Transform> templates = new HashSet<Transform>();
         private readonly List<(Door door, float dist)> lockedDoors = new List<(Door, float)>();
@@ -57,7 +61,11 @@ namespace UltrakillAIBridge.Obs
                    && scene != null && scene.StartsWith("Level ", StringComparison.Ordinal);
         }
 
-        public JObject Build(NewMovement nm, StatsManager sm)
+        /// <param name="enemies">
+        /// The enemies ObservationBuilder.BuildEnemies already fetched from EnemyTracker this step, reused for
+        /// arena_enemies_alive instead of querying the tracker again (it allocates and refills a list per call).
+        /// </param>
+        public JObject Build(NewMovement nm, StatsManager sm, List<EnemyIdentifier> enemies)
         {
             int handle = SceneManager.GetActiveScene().handle;
             if (!scanned || handle != sceneHandle || sm.restarts != lastRestarts)
@@ -70,7 +78,10 @@ namespace UltrakillAIBridge.Obs
             else if (CheckpointSignature(sm) != checkpointSignature)
             {
                 // A checkpoint activated, took over rooms or became current: live rooms may now be templates.
+                // The path itself didn't necessarily move, but treat it the same as the scan invalidation
+                // above so both branches leave the cache in the same state.
                 builds = 0;
+                pathCached = false;
             }
             if (builds % RescanEvery == 0) Scan(sm);
 
@@ -97,7 +108,7 @@ namespace UltrakillAIBridge.Obs
                 ["checkpoints"] = BuildCheckpoints(sm),
                 ["path"] = BuildPath(),
                 ["locked_doors"] = BuildLockedDoors(playerPos),
-                ["arena_enemies_alive"] = ArenaEnemiesAlive(),
+                ["arena_enemies_alive"] = ArenaEnemiesAlive(enemies),
                 ["cleared_arenas"] = Strings(CampaignPatches.ClearedArenas),
                 ["unlocked_doors"] = Strings(CampaignPatches.UnlockedDoors),
                 ["ranks"] = new JObject
@@ -126,9 +137,12 @@ namespace UltrakillAIBridge.Obs
             }
 
             checkpoints.Clear();
+            checkpointIds.Clear();
             foreach (var cp in allCheckpoints)
             {
-                if (cp != null && !IsTemplate(cp.transform)) checkpoints.Add(cp);
+                if (cp == null || IsTemplate(cp.transform)) continue;
+                checkpoints.Add(cp);
+                checkpointIds.Add(CampaignPatches.Key(cp.transform.position));
             }
             pits.Clear();
             foreach (var pit in Object.FindObjectsOfType<FinalPit>(true))
@@ -240,14 +254,14 @@ namespace UltrakillAIBridge.Obs
         private JArray BuildCheckpoints(StatsManager sm)
         {
             var arr = new JArray();
-            foreach (var cp in checkpoints)
+            for (int i = 0; i < checkpoints.Count; i++)
             {
+                var cp = checkpoints[i];
                 if (cp == null) continue;
-                var pos = cp.transform.position;
                 arr.Add(new JObject
                 {
-                    ["id"] = CampaignPatches.Key(pos),
-                    ["pos"] = ObservationBuilder.Vec(pos),
+                    ["id"] = checkpointIds[i],
+                    ["pos"] = ObservationBuilder.Vec(cp.transform.position),
                     ["activated"] = cp.activated,
                     ["current"] = sm.currentCheckPoint == cp,
                 });
@@ -278,13 +292,16 @@ namespace UltrakillAIBridge.Obs
             return arr;
         }
 
-        /// <summary>Live enemies belonging to an arena wave that hasn't been cleared yet.</summary>
-        private static int ArenaEnemiesAlive()
+        /// <summary>
+        /// Live enemies belonging to an arena wave that hasn't been cleared yet. Takes the enemies
+        /// ObservationBuilder.BuildEnemies already fetched this step rather than querying EnemyTracker
+        /// again, since GetCurrentEnemies() allocates and refills a list on every call.
+        /// </summary>
+        private static int ArenaEnemiesAlive(List<EnemyIdentifier> enemies)
         {
-            var tracker = MonoSingleton<EnemyTracker>.Instance;
-            if (tracker == null) return 0;
+            if (enemies == null) return 0;
             int alive = 0;
-            foreach (var eid in tracker.GetCurrentEnemies())
+            foreach (var eid in enemies)
             {
                 if (eid == null || eid.dead) continue;
                 var wave = eid.GetComponentInParent<ActivateNextWave>();
