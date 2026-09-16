@@ -18,8 +18,10 @@ env:
   end_episode_on_death: false
   hard_reset_above_wave: 5  # reload to wave 1 past this, so the agent keeps practising early waves
   # The 2.3M-step weight audit found the camera pinned at the +90° clamp (staring at the sky), so every
-  # enemy sat ~90° off the crosshair whatever the yaw did. Keep the camera near level; enemies are on the ground.
-  pitch_limit_deg: 40
+  # enemy sat ~90° off the crosshair whatever the yaw did. Keep the camera near level; enemies are on the
+  # ground. A 40° band was not enough: the policy just leaned on the new edge (pitch 35° after 150k steps),
+  # which still put eye-level enemies outside the aim cone and the hitbox. Within 15° a correct yaw hits.
+  pitch_limit_deg: 15
   rewards:
     # Aim shaping, one slope per look axis so each gets its own gradient: `aim_yaw` pays for the heading
     # (ground-plane angle to the nearest visible enemy, ignoring pitch) and `aim_pitch` for the enemy
