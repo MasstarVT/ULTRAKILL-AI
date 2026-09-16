@@ -26,6 +26,7 @@ Because of the fixed frame time, how long Python takes to decide never changes w
 | `reset` | `scene` (e.g. `"Endless"`, `"Level 0-1"`; omit = current), `checkpoint` (bool) | an `obs` with `"event":"reset"` once the player is spawned and has been ready for `reset_settle_frames` frames |
 | `step` | `action` | an `obs` after `frameskip` frames |
 | `teleport` | `pos` `[x,y,z]` | an `obs` with `"event":"teleport"` (takes control; moves the player and zeroes velocity) |
+| `kill` | | an `obs` with `"event":"kill"` (takes control; debug: a lethal `NewMovement.GetHurt(999)` for the in-game death check. With `soft_death` on it is healed like any lethal hit; ignored once the level is over; an error when there is no living player). While in control a dead player stays dead until a `reset`: the game's own restarts (Fire1 or R while dead, the pause menu) are blocked |
 | `release` | | `{"type":"ok"}` |
 
 Errors come back as `{"type":"error","message":..}`.
@@ -46,6 +47,8 @@ Errors come back as `{"type":"error","message":..}`.
 | `reset_timeout_s` | 120 | give up on a reset after this many seconds (wall clock) |
 | `reset_settle_frames` | 10 | frames the player must be ready before a reset completes |
 | `command_timeout_s` | 300 | drop the client if no command arrives for this long |
+| `difficulty` | -1 | difficulty the game reads while in control: 0 Harmless, 1 Lenient, 2 Standard, 3 Violent, 4 Brutal; -1 keeps the game's own setting. In memory only. Send it before the level loads: enemies and the player read it at scene start |
+| `unlock_all_gear` | false | while in control, every weapon, variant and arm reads as owned and switched on (`GameProgressSaver.CheckGear` 0 and `weapon.<name>` prefs of 0 read as 1). In memory only. Send it before the level loads: `GunSetter` builds the arsenal at scene start |
 
 ### action
 
@@ -69,7 +72,8 @@ Keys are resolved from the player's own bindings, so rebinding in game options i
   "type": "obs", "step": 12, "frame": 3456, "time": 57.6, "scene": "Endless", "ready": true,
   "player": {"pos": [x,y,z], "vel": [..], "local_vel": [..], "forward": [..], "yaw": 90.0, "pitch": -5.0,
              "hp": 100, "anti_hp": 0.0, "stamina": 300.0, "grounded": true, "sliding": false, "dead": false,
-             "activated": true, "level_over": false, "weapon_slot": 0, "weapon_variation": 1},
+             "activated": true, "level_over": false, "weapon_slot": 0, "weapon_variation": 1,
+             "slot_counts": [3, 3, 3, 3, 3, 0]},
   "enemies": [{"id": 12345, "type": 3, "type_name": "Filth", "health": 0.5, "pos": [..],
                "rel": [x,y,z], "dist": 12.3, "visible": true}],
   "rays": [..], "ground_rays": [..],
@@ -84,3 +88,38 @@ Keys are resolved from the player's own bindings, so rebinding in game options i
 - **`ground_rays`:** distance from the player's height down to the ground at points on a ring. A large value means a pit.
 - **`cybergrind`:** only present in the Cyber Grind scene. `start_trigger` is the volume that starts wave 1 when entered, and is only present before waves start.
 - **`player`:** `null` when no player exists (e.g. the main menu).
+- **`player.slot_counts`:** weapons in each of the six slots, slot 1 first. Empty until `GunControl` has started; 0-1 has none until the revolver pickup.
+
+## campaign
+
+Present only in the 35 main levels (`StatsManager.levelNumber` 1 to 35, in a scene whose name starts with `Level`) when a player exists:
+
+```json
+"campaign": {
+  "mission": 1, "difficulty": 3, "seconds": 12.3, "timer_running": true, "level_started": true,
+  "level_over": false, "restarts": 0, "input_locked": false,
+  "exit": {"pos": [x, y, z], "active": true},
+  "checkpoints": [{"id": "12,3,-40", "pos": [x, y, z], "activated": false, "current": false}],
+  "path": {"status": "complete", "length": 84.2, "next_corner": [x, y, z]},
+  "locked_doors": [{"pos": [x, y, z], "dist": 9.5}],
+  "arena_enemies_alive": 0,
+  "cleared_arenas": ["30,1,5"],
+  "unlocked_doors": ["22,0,17"],
+  "ranks": {"time": [300, 240, 180, 120], "kills": [10, 20, 30, 40], "style": [1000, 2000, 3000, 4000]}
+}
+```
+
+- **Position keys** (`checkpoints[].id`, `cleared_arenas`, `unlocked_doors`): `"x,y,z"`, each coordinate rounded to whole metres. Objects that round to the same metre share a key (for example two waves' `ActivateNextWave` components on one GameObject, or wave containers placed at the same point), so only the first of them pays.
+- **`mission`:** `StatsManager.levelNumber` (1 = 0-1 through 35 = 9-2).
+- **`difficulty`:** the difficulty the game reads right now, so it shows the `difficulty` config override while in control.
+- **`seconds`, `timer_running`, `level_started`, `restarts`:** from `StatsManager`. The timer keeps running through checkpoint respawns and cutscenes, and stops when the player enters the exit.
+- **`level_over`:** `NewMovement.levelOver`, set on entering the real exit.
+- **`input_locked`:** `GameStateManager.PlayerInputLocked` (any registered game state that locks player input: the pause, cheat and spawn menus, the console, and scene objects with `AutoRegisterState`) or the player not activated (the level-start drop, after entering the exit, and while dead).
+- **`exit`:** the real `FinalPit`, or `null`. Decoys (`fakeEnd`, `secondPit`, `rankless`) and room templates are skipped, and an active pit is preferred; `active` is false while its room has not loaded.
+- **`checkpoints`:** every checkpoint except room templates. `current` marks `StatsManager.currentCheckPoint`.
+- **`path`:** NavMesh path from the player to the exit, each end snapped onto the mesh (within 6 m of the player, 20 m of the exit), recalculated every 4 obs. `length` runs from the player through every corner; `next_corner` is the first corner more than 1.5 m away horizontally, else the last. `partial` is common: the mesh does not link jumps or gaps, and doors carry obstacles. `{"status": "none"}` when there is no exit or no path.
+- **`locked_doors`:** the nearest 4 active doors that are locked.
+- **`arena_enemies_alive`:** live enemies under an `ActivateNextWave` whose wave has not been cleared.
+- **`cleared_arenas`, `unlocked_doors`:** keys of arenas whose last wave was cleared (`ActivateNextWave.EndWaves`) and of doors that went from locked to unlocked (`Door.Unlock`), recorded while in control and emptied on every scene load. A checkpoint respawn re-creates rooms at the same positions, so an arena cleared again after a death gives the same key; a respawn also unlocks the checkpoint's doors, which adds keys. Pay each key once per level load.
+- **`ranks`:** the 4 thresholds per category from `StatsManager`: `time` in seconds (lower is better), `kills` and `style` (higher is better).
+- **Scene objects** are cached and searched again every 30 obs, on a new scene, after a checkpoint respawn, and when a checkpoint activates, becomes current or takes over rooms.

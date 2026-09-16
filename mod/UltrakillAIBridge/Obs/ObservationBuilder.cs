@@ -41,6 +41,7 @@ namespace UltrakillAIBridge.Obs
         }
 
         private readonly List<(EnemyIdentifier eid, float dist)> sorted = new List<(EnemyIdentifier, float)>();
+        private readonly CampaignObserver campaign = new CampaignObserver();
 
         public void Configure(JObject cfg)
         {
@@ -91,6 +92,9 @@ namespace UltrakillAIBridge.Obs
             obs["rays"] = BuildHorizontalRays(nm, playerPos, envMask);
             obs["ground_rays"] = BuildGroundRays(nm, playerPos, envMask);
             obs["stats"] = BuildStats(nm);
+
+            var sm = MonoSingleton<StatsManager>.Instance;
+            if (CampaignObserver.IsCampaignScene(sm)) obs["campaign"] = campaign.Build(nm, sm);
 
             var grid = MonoSingleton<EndlessGrid>.Instance;
             if (grid != null)
@@ -240,6 +244,6 @@ namespace UltrakillAIBridge.Obs
             };
         }
 
-        private static JArray Vec(Vector3 v) => new JArray(v.x, v.y, v.z);
+        internal static JArray Vec(Vector3 v) => new JArray(v.x, v.y, v.z);
     }
 }
