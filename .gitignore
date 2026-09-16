@@ -20,10 +20,11 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# Training output
+# Training output (checkpoints under python/models/ are committed on purpose: they are the
+# transferable state of a run; runs/ holds TensorBoard and dashboard logs and stays local)
 runs/
-models/
-*.zip
+# v1 (abandoned run): only latest.zip and pitch_reset_2447005.zip are kept in git
+python/models/cybergrind_ppo/ckpt_*.zip
 
 # Editors / OS
 .vscode/

@@ -1,0 +1,46 @@
+auto_enter_arena: true
+block_human_input: true
+checkpoint_resets: false
+end_episode_on_death: false
+fixed_fps: 30
+frameskip: 2
+hard_reset_above_wave: 5
+host: 127.0.0.1
+layout:
+  ground_ray_length: 30.0
+  ground_rays: 8
+  horizontal_rays: 16
+  max_enemies: 8
+  ray_length: 50.0
+level: Level 0-1
+max_steps: 1800
+max_wave: 0
+mode: cybergrind
+mute: true
+pitch_limit_deg: 45
+port: 47800
+render: false
+reset_settle_frames: 10
+rewards:
+  aim: 0.0
+  aim_cone_deg: 20.0
+  aim_locked: 0.15
+  aim_pitch: 0.06
+  aim_yaw: 0.06
+  damage_dealt: 2.0
+  damage_taken: 0.02
+  death: 8.0
+  kill: 5.0
+  level_complete: 50.0
+  route_point: 0.1
+  step_penalty: 0.0
+  stuck: 1.0
+  style: 0.002
+  wave: 5.0
+route_dir: routes
+soft_death: true
+stuck_steps: 450
+unlimited_fps: true
+window_height: 207
+window_width: 368
+windowed: true
