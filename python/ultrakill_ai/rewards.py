@@ -125,6 +125,7 @@ def compute_reward(
     prev: dict[str, Any],
     cur: dict[str, Any],
     enemy_max_health: dict[int, float],
+    *,
     died: bool | None = None,
     campaign: CampaignStep | None = None,
 ) -> RewardResult:

@@ -20,6 +20,8 @@ CHECKPOINT_ID = "0,1,20"
 ARENA_KEY = "0,1,30"
 RESPAWN_DOOR_KEY = "0,0,25"
 RANKS = {"time": [120, 90, 60, 30], "kills": [0, 1, 2, 3], "style": [0, 100, 200, 300]}
+ENEMY_ID = 7
+ENEMY_MAX_HP = 50.0
 
 
 class FakeLevel:
@@ -28,13 +30,20 @@ class FakeLevel:
     Walking forward covers 2 m a step. The checkpoint at z 20 activates (and becomes current) on arrival, the
     arena at z 30 clears on arrival, and the exit is at z 60. A checkpoint respawn puts the player back at z 20
     and unlocks a door, the way `StatsManager.Restart` unlocks `doorsToUnlock`: that unlock must never pay.
+
+    The room holds one enemy, alive from the moment the level is entered or re-entered (`reset`, fresh or
+    checkpoint), so a respawn re-creates it exactly like the real game while `kills` (the game's own counter)
+    keeps whatever value it already had -- the pairing `test_kill_reward_can_be_farmed_across_a_checkpoint_respawn`
+    documents.
     """
 
     def __init__(self):
         self.resets: list[bool] = []  # the checkpoint flag of every reset
         self.steps = 0
         self.kill_next = False  # the next step returns a dead player
+        self.kill_enemy_next = False  # the next step removes the room's enemy, if alive, and pays a kill
         self.lock_steps = 0  # the next N steps report input_locked
+        self.drop_campaign_steps = 0  # the next N obs omit "campaign", as the mod does when building it throws
         self._load()
 
     def _load(self) -> None:
@@ -47,6 +56,7 @@ class FakeLevel:
         self.checkpoint = False
         self.arenas: list[str] = []
         self.doors: list[str] = []
+        self.enemy_alive = False  # reset() below turns this on: every level (re-)entry re-creates the room
 
     # The BridgeClient methods UltrakillEnv uses ----------------------------
 
@@ -72,6 +82,7 @@ class FakeLevel:
                 self.doors.append(RESPAWN_DOOR_KEY)
         else:
             self._load()
+        self.enemy_alive = True  # a fresh load or a checkpoint respawn both re-create the room's enemy
         return self._obs("reset")
 
     def step(self, action: dict) -> dict:
@@ -85,6 +96,10 @@ class FakeLevel:
             elif not self.locked and action.get("move", [0, 0])[1] > 0:
                 self.z = min(EXIT_Z, self.z + 2.0)
             self.seconds += 2.0 / 15.0
+        if self.enemy_alive and self.kill_enemy_next:
+            # A one-shot kill: the enemy vanishes without a health drop first, same as the mod reports it.
+            self.enemy_alive, self.kill_enemy_next = False, False
+            self.kills += 1
         if self.z >= 20.0:
             self.checkpoint = True
         if self.z >= 30.0 and ARENA_KEY not in self.arenas:
@@ -93,6 +108,12 @@ class FakeLevel:
 
     def _obs(self, event: str | None = None) -> dict:
         over = self.z >= EXIT_Z
+        enemies = []
+        if self.enemy_alive:
+            enemies = [{
+                "id": ENEMY_ID, "type": 0, "health": ENEMY_MAX_HP, "visible": True,
+                "rel": [0.0, 0.0, 5.0], "dist": 5.0, "pos": [0.0, 1.0, self.z + 5.0],
+            }]
         obs = {
             "type": "obs",
             "step": self.steps,
@@ -105,7 +126,7 @@ class FakeLevel:
                 "activated": True, "level_over": over, "weapon_slot": 0, "weapon_variation": 0,
                 "soft_deaths": 0, "soft_death_instakill": False, "slot_counts": [1, 0, 0, 0, 0],
             },
-            "enemies": [],
+            "enemies": enemies,
             "rays": [50.0] * 16,
             "ground_rays": [0.0] * 8,
             "stats": {"kills": self.kills, "style": 0, "seconds": self.seconds, "restarts": self.restarts, "level_complete": over},
@@ -124,6 +145,10 @@ class FakeLevel:
         }
         if event:
             obs["event"] = event
+        if self.drop_campaign_steps > 0:
+            # docs/protocol.md: the mod logs and omits the whole campaign block for a step if building it throws.
+            self.drop_campaign_steps -= 1
+            del obs["campaign"]
         return obs
 
 
@@ -248,6 +273,78 @@ def test_death_before_any_checkpoint_reloads_the_level_inside_the_episode():
         env.close()
         run = json.loads((Path(tmp) / "Level_0-1.json").read_text(encoding="utf-8"))
         assert len(run["positions"]) == 31 and run["positions"][0] == [0.0, 1.0, 0.0]  # only the attempt that finished
+
+
+def test_kill_reward_can_be_farmed_across_a_checkpoint_respawn():
+    """Documents current, intended-by-omission behaviour -- not an endorsement of it. A checkpoint respawn
+    re-creates the room's enemies (FakeLevel.enemy_alive goes back to True on every reset, matching the mod
+    re-instantiating the room), but the game's own kill counter does not reset with it, so re-killing the same
+    enemy after a death pays `kill` and `damage_dealt` again. This is a known reward-farming risk to watch
+    during training, not something this change fixes.
+    """
+    env, fake = make_env()
+    env.reset(seed=0)
+    for _ in range(11):  # z 22, just past the checkpoint so a death respawns instead of reloading the level
+        env.step(forward())
+
+    fake.kill_enemy_next = True
+    _, _, terminated, truncated, info = env.step(noop_action())
+    assert not terminated and not truncated
+    first_kill, first_damage = info["reward_parts"]["kill"], info["reward_parts"]["damage_dealt"]
+    assert info["kills"] == 1 and first_kill > 0 and first_damage > 0
+
+    fake.kill_next = True  # the player also dies now, which triggers a checkpoint respawn
+    _, _, terminated, truncated, info = env.step(noop_action())
+    assert not terminated and not truncated  # a death inside a campaign episode respawns it, not ends it
+    assert info["deaths"] == 1
+    assert fake.enemy_alive and fake.kills == 1  # the room's enemy is back; the kill counter did not reset
+
+    fake.kill_enemy_next = True
+    _, _, terminated, truncated, info = env.step(noop_action())
+    assert not terminated and not truncated
+    assert info["kills"] == 2 and fake.kills == 2
+    assert info["reward_parts"]["kill"] == first_kill  # paid again for the re-created enemy
+    assert info["reward_parts"]["damage_dealt"] == first_damage
+    env.close()
+
+
+def test_missing_campaign_block_mid_episode_does_not_break_the_episode():
+    """docs/protocol.md: the mod logs and omits the whole `campaign` block for a step if building it throws.
+    The env must survive that -- no exception, the stuck clock keeps ticking instead of freezing or getting
+    confused, milestones are neither re-paid nor lost once the block returns, and combat rewards (which never
+    touch the campaign block) are still paid during the gap.
+    """
+    env, fake = make_env(fresh_start_prob=0.0)
+    env.reset(seed=0)
+    parts: dict[str, float] = {}
+    for _ in range(10):  # z 20: the checkpoint activates, so there is a milestone to protect across the gap
+        _, _, terminated, truncated, info = env.step(forward())
+        add_parts(parts, info)
+    assert parts["checkpoint"] == 10.0 and env._steps_since_progress == 0
+
+    fake.drop_campaign_steps = 2
+    fake.kill_enemy_next = True
+    _, _, terminated, truncated, info = env.step(noop_action())  # campaign block missing, but the kill still lands
+    add_parts(parts, info)
+    assert not terminated and not truncated
+    assert info["kills"] == 1
+    assert info["reward_parts"]["kill"] > 0 and info["reward_parts"]["damage_dealt"] > 0
+    assert env._steps_since_progress == 1  # no checkpoint/arena/door/novelty/path signal while the block is gone
+
+    _, _, terminated, truncated, info = env.step(noop_action())  # still missing (2nd of the 2 dropped steps)
+    add_parts(parts, info)
+    assert not terminated and not truncated
+    assert fake.drop_campaign_steps == 0
+    assert env._steps_since_progress == 2
+
+    for _ in range(40):  # the block is back; finish the level to prove the gap left nothing corrupted
+        _, _, terminated, truncated, info = env.step(forward())
+        add_parts(parts, info)
+        if terminated or truncated:
+            break
+    assert info["end_reason"] == "level_complete"
+    assert parts["checkpoint"] == 10.0  # still paid exactly once: neither re-paid nor lost across the gap
+    env.close()
 
 
 def test_three_stuck_episodes_at_one_checkpoint_force_a_fresh_load():

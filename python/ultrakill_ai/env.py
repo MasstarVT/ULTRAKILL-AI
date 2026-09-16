@@ -130,6 +130,7 @@ class UltrakillEnv(gym.Env):
         self._steps_since_progress = 0
         self._last_end_reason = ""
         self._reset_seconds = 0.0
+        self._episode_start_seconds: float | None = None  # campaign: the mod's own clock at this episode's reset
         self._deaths = 0
         self._behaviour = dict.fromkeys(BEHAVIOUR_KEYS, 0)
         self._arena_spawn: list[float] | None = None
@@ -201,6 +202,8 @@ class UltrakillEnv(gym.Env):
                 self._arena_spawn = list(self._raw["player"]["pos"])
         self._reset_seconds = time.perf_counter() - start
         self._episode_start_stats = dict(self._raw.get("stats", {}))
+        # Campaign: baseline for episode_seconds, the mod's own clock rather than a step count (see step()).
+        self._episode_start_seconds = (self._raw.get("campaign") or {}).get("seconds")
         self._enemy_max_health = {}
         self._track_enemies(self._raw)
         self._steps = 0
@@ -290,6 +293,14 @@ class UltrakillEnv(gym.Env):
             info["end_reason"] = reason
             info["reset_seconds"] = self._reset_seconds
             seconds = self._steps * self.cfg.frameskip / self.cfg.fixed_fps
+            if campaign:
+                # The step count excludes every frame _skip_locked steps through (the opening drop, cutscenes,
+                # each respawn), which can understate elapsed time by minutes across a death-heavy episode. The
+                # mod's own clock counts all of it, so prefer it here; fall back to the step count only when the
+                # campaign block (and so this episode's start reading of it) was missing.
+                camp_seconds = (cur.get("campaign") or {}).get("seconds")
+                if camp_seconds is not None and self._episode_start_seconds is not None:
+                    seconds = camp_seconds - self._episode_start_seconds
             info["episode_seconds"] = seconds
             info["kills_per_min"] = info["kills"] / seconds * 60.0 if seconds > 0 else 0.0
             if campaign:
@@ -541,10 +552,19 @@ class UltrakillEnv(gym.Env):
                 info["level_seconds"] = result["seconds"]
                 info["restarts"] = result["restarts"]
                 info["rank"] = result["rank"]
-                self._save_best_run(raw)
+                # A save failure here (this project has hit Windows PermissionError on these paths) must not
+                # end a training worker mid-run, the same way close() releases the game even when its own
+                # archive write fails, and progress.py warns rather than raises on a status-file write failure.
+                try:
+                    self._save_best_run(raw)
+                except OSError as exc:
+                    print(f"UltrakillEnv: could not save the best run for {self.cfg.level!r}: {exc}")
         self._episodes += 1
         if self._episodes % 20 == 0:
-            self._save_archive()
+            try:
+                self._save_archive()
+            except OSError as exc:
+                print(f"UltrakillEnv: could not save the exploration archive: {exc}")
 
     def _save_best_run(self, raw: dict[str, Any]) -> None:
         if not self.cfg.best_runs_dir:
