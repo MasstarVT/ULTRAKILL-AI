@@ -11,6 +11,7 @@ obj/
 *.dll
 *.pdb
 decompiled/
+.tools/
 
 # Python
 __pycache__/

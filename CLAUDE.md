@@ -37,6 +37,8 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml`.
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
+- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign plan (not built yet).
+- `.tools/` (gitignored): local `ilspycmd` install used to regenerate `decompiled/`.
 
 ## Commands
 - Build and install the mod: `cd mod/UltrakillAIBridge && dotnet build -c Release`. The game must be closed, or the DLL is locked.
@@ -326,4 +328,22 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - If `on_target_frac` is still <= 0.06 at 2.18M, reset the look-head output bias (as `pitch_reset_2447005.zip` did for v1) rather than tuning weights again: a constant offset in the bias is not reachable from a reward slope that is flat across the whole sweep range.
   - `approx_kl` runs 0.029-0.031 against `target_kl` 0.02, so every update is being truncated. Worth a pass once the reward change has been judged, but not at the same time as it.
   - Raise `max_wave` as the agent improves.
-  - Record the 0-1 route and start campaign training.
+- **Campaign: designed 2026-09-16, not built yet.** Goal: finish all 35 main levels (`Level 0-1` to `Level 9-2`)
+  as fast as possible, learning alone. Spec: `docs/superpowers/specs/2026-09-16-campaign-foundation-design.md`.
+  - **Decisions:**
+    - No human demos or recorded routes, so `routes.py` and `record_route.py` are to be retired.
+    - Violent difficulty, all weapons unlocked in memory only.
+    - Deaths respawn at the checkpoint inside the episode.
+  - **Approach:**
+    - The mod reads level structure: the real `FinalPit` exit, checkpoints, locked doors, arena clears, a NavMesh path hint and the official timer.
+    - Rewards: time, milestones, per-cell novelty and path progress.
+    - Episodes mostly respawn at each game's current checkpoint, so training concentrates on the frontier.
+  - **Sub-projects:**
+    1. Foundation + 0-1 pilot. Success bar: 50% fresh-start completion on Violent.
+    2. The rest of the Prelude.
+    3. Skull keys and switches.
+    4. Acts 1-3.
+    5. Speed and movement-tech actions.
+  - **Starting weights:** Cyber Grind `best.zip`, widened to 479 inputs.
+  - Cyber Grind training stays paused while the 5 games run the campaign.
+  - `decompiled/` was regenerated on the second PC for this (ilspycmd 9.1.0.7988 in `.tools/`).
