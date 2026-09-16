@@ -20,9 +20,15 @@ class RewardConfig:
     # `aim` is paid on a slope from facing away (0) to facing straight at it (full), so turning the right
     # way always pays a little more. A cone-only reward gives no gradient when the agent is never on
     # target, which is exactly what happened at 1.9M steps (on-target 0.8% of steps).
-    aim: float = 0.0
+    aim: float = 0.0  # slope on the 3-D angle off the enemy
     aim_locked: float = 0.0  # extra, inside the cone
     aim_cone_deg: float = 15.0
+    # Separate slopes for the two look axes. A single 3-D angle gives pitch no gradient while yaw is still
+    # random (any pitch scores the same on average), and the 2.3M-step weight audit found the camera pinned at
+    # the +90° clamp for that reason. `aim_yaw` pays for the heading being right regardless of pitch, and
+    # `aim_pitch` for the enemy elevation being on the camera horizon regardless of yaw.
+    aim_yaw: float = 0.0
+    aim_pitch: float = 0.0
 
     # Cyber Grind
     wave: float = 5.0
@@ -42,6 +48,37 @@ class RewardResult:
         if value:
             self.parts[name] = self.parts.get(name, 0.0) + value
             self.total += value
+
+
+def aim_errors(player: dict[str, Any], enemy: dict[str, Any]) -> tuple[float, float, float] | None:
+    """Degrees the crosshair is off an enemy: (3-D angle, horizontal/yaw angle, vertical/pitch angle).
+
+    The yaw error compares the camera heading and the enemy direction projected onto the ground plane, so it
+    ignores pitch. The pitch error is the enemy elevation in camera space, so it ignores yaw. Both only use
+    vectors the mod reports (no assumptions about the game rotation sign conventions).
+    """
+    x, y, z = enemy["rel"]  # camera space: x right, y up, z forward
+    length = math.sqrt(x * x + y * y + z * z)
+    if length <= 1e-6:
+        return None
+    angle = math.degrees(math.acos(max(-1.0, min(1.0, z / length))))
+    pitch_err = abs(math.degrees(math.asin(max(-1.0, min(1.0, y / length)))))
+
+    if "pos" in enemy and "pos" in player and "forward" in player:
+        fx, _, fz = player["forward"]
+        if math.hypot(fx, fz) < 1e-3:  # looking straight up or down: take the heading from the yaw angle
+            yaw = math.radians(player["yaw"])
+            fx, fz = math.sin(yaw), math.cos(yaw)
+        ex, ez = enemy["pos"][0] - player["pos"][0], enemy["pos"][2] - player["pos"][2]
+        h = math.hypot(ex, ez)
+        if h <= 1e-6:
+            return angle, 0.0, pitch_err
+        cos = (fx * ex + fz * ez) / (math.hypot(fx, fz) * h)
+    else:  # older snapshots without world positions: horizontal angle in camera space (exact when level)
+        h = math.hypot(x, z)
+        cos = z / h if h > 1e-6 else 1.0
+    yaw_err = math.degrees(math.acos(max(-1.0, min(1.0, cos))))
+    return angle, yaw_err, pitch_err
 
 
 def compute_reward(
@@ -89,14 +126,15 @@ def compute_reward(
 
     r.add("step", -cfg.step_penalty)
 
-    if cfg.aim or cfg.aim_locked:
+    if cfg.aim or cfg.aim_locked or cfg.aim_yaw or cfg.aim_pitch:
         visible = [e for e in cur.get("enemies", []) if e["visible"]]
         if visible:
-            x, y, z = visible[0]["rel"]  # camera space, nearest first
-            length = math.sqrt(x * x + y * y + z * z)
-            if length > 1e-6:
-                angle = math.degrees(math.acos(max(-1.0, min(1.0, z / length))))
+            errors = aim_errors(cp, visible[0])  # nearest first
+            if errors is not None:
+                angle, yaw_err, pitch_err = errors
                 r.add("aim", cfg.aim * (1.0 - angle / 180.0))
+                r.add("aim_yaw", cfg.aim_yaw * (1.0 - yaw_err / 180.0))
+                r.add("aim_pitch", cfg.aim_pitch * (1.0 - pitch_err / 90.0))
                 if angle <= cfg.aim_cone_deg:
                     r.add("aim_locked", cfg.aim_locked * (1.0 - angle / cfg.aim_cone_deg))
 

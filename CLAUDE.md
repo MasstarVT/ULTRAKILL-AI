@@ -24,14 +24,15 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `mod/GamePaths.props`: local game path (gitignored; copy from `.example`). Build copies the DLL into `<game>/BepInEx/plugins/UltrakillAIBridge/`.
 - `python/ultrakill_ai/`:
   - `protocol.py`: socket client.
-  - `env.py`: `UltrakillEnv` / `EnvConfig`.
+  - `env.py`: `UltrakillEnv` / `EnvConfig` (`pitch_limit_deg` keeps the camera near level).
   - `spaces.py`: 448-dim obs packing, `MultiDiscrete` actions.
-  - `rewards.py`: reward weights and computation.
+  - `rewards.py`: reward weights and computation; `aim_errors` gives the 3-D, yaw and pitch angles off an enemy.
   - `routes.py`: campaign route tracking.
   - `progress.py`: `ProgressCallback`, which writes live training stats to `runs/<run_name>/status.json` (atomic, every 2 s; `state` running/finished/stopped).
 - `python/scripts/`: `bridge_test.py`, `random_agent.py`, `record_route.py`, `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop training instances), `dashboard.py` (Tkinter live view of `status.json`).
 - `python/ultrakill_ai/windows.py`: monitor work-area lookup shared by `games.py` and `dashboard.py`.
 - `python/tests/test_progress.py`: `ProgressCallback` and dashboard smoke tests against a fake env (no game needed).
+- `python/tests/test_aim.py`: aim-reward geometry (the yaw/pitch split) and the pitch clamp (no game needed).
 - `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml`.
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
@@ -46,7 +47,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   3. `python scripts/games.py stop`
 - TensorBoard: `tensorboard --logdir runs`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits.
-- Tests (no game): `python tests/test_progress.py` (pytest is not installed; the file also works under pytest).
+- Tests (no game): `python tests/test_progress.py` and `python tests/test_aim.py` (pytest is not installed; the files also work under pytest).
 
 ## Key design decisions
 - **Lockstep:** the mod blocks Unity's main thread between steps. `Time.captureDeltaTime = 1/60` fixes game time per frame, and uncapped FPS makes training faster than real time. Game speed is not controlled through `Time.timeScale`, which `TimeController` owns for hitstop.
@@ -93,6 +94,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Timed episodes helped:** kills/min 2.5 → 3.5, reward 25 → 45, deaths/ep 1.6 → 1.2 between 1.05M and 1.68M steps.
 - **Aim shaping needs a gradient (1.9M steps):** a cone-only aim reward paid zero beyond the cone, and the agent was inside it 0.8% of the time, so raising the weight (0.06 → 0.15) changed nothing (on-target went 1.1% → 0.8%). `aim` is now a slope from facing away (0) to facing straight at the nearest visible enemy, with `aim_locked` extra inside the cone.
 - **Weight audit at 2.3M steps (why it never aims):** probing the policy offline and simulating its look dynamics from the weights alone reproduces the live stats (enemy angle 89°, on-target 0%, aim 0.040 per visible step, vs 88.8°, 0.9%, 0.041 in training). The pitch head has carried a constant +3°/step bias since ~300k steps, independent of weapon, health and enemy position, so within 5 game seconds the camera pins at the +90° clamp (the sky) and every enemy sits ~90° off the crosshair whatever the yaw does. Under random yaw the aim slope pays the same 0.5 level or pinned, so nothing ever corrected the drift. The yaw head only began tracking enemies in the last 300k steps (corr(rel.x, E[yaw]) 0 → 0.39, right sign) and the pin masks it: with pitch forced level the same weights are on target 12% of steps. The rest of the policy is fire always, dash often, lean backwards (entropy 11.7 → 5.9). Updates are noise-dominated: Adam gradient SNR sits at the noise floor and the checkpoint-to-checkpoint weight drift is a random walk (path/net ≈ 6–8 ≈ √40 over 40 checkpoints). Candidate fixes: clamp or auto-level pitch in Cyber Grind, penalise |pitch|, or split the aim reward into yaw and pitch terms.
+- **Pitch fix (resumed at 2.30M steps):** `pitch_limit_deg` 40 clamps the camera to within 40° of level on the Python side (the pitch command is trimmed against the last observed pitch, so no mod change and the camera snaps back into the band in one step), and the aim reward is split per look axis so each head gets its own gradient: `aim_yaw` 0.06 on the ground-plane heading error and `aim_pitch` 0.06 on the enemy elevation in camera space, with `aim` 0 and `aim_locked` unchanged. New per-episode diagnostics `pitch_abs_mean` and `enemy_yaw_angle_mean` flow into status.json and the dashboard Shooting panel. Expected: camera pitch well under 40°, on-target climbing from ~1% (the same weights reach 12% with a level camera), then kills/min.
 - **Mod:** v0.4.0 (background play, training instances, teleport, soft death, rendering off). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block.
 - **Python:** env, training, eval and route tracking verified against a mock and partly in game.
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.
@@ -105,6 +107,6 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     - 5 games, 30 fps / frameskip 2, soft death, no rendering, 480x270 windows: ~255+ steps/s in real training
   - Games run on monitor 3 (`\.\DISPLAY3`, x 1920–3840).
 - **Next steps:**
-  - Fix the pitch pin found in the weight audit, then check kills/min climbs back above the random-play level of ~20 (5.0 at 2.3M steps).
+  - Watch the pitch fix: `pitch_abs_mean` should sit well under 40° and `on_target_frac` climb above 10%; then kills/min should climb back above the random-play level of ~20 (5.0 at 2.3M steps).
   - Raise `max_wave` as the agent improves.
   - Record the 0-1 route and start campaign training.

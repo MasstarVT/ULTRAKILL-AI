@@ -411,7 +411,8 @@ class Dashboard:
             for key, label in (("firing_frac", "firing          "), ("on_target_frac", "enemy in crosshair"), ("enemy_visible_frac", "enemy visible   "), ("enemy_close_frac", "enemy within 5m "))
             if isinstance(mean.get(key), (int, float))
         ]
-        for key, label, unit in (("enemy_angle_mean", "angle off       ", "deg"), ("enemy_dist_mean", "enemy distance  ", "m"), ("yaw_per_step_mean", "turn per step   ", "deg")):
+        for key, label, unit in (("enemy_angle_mean", "angle off       ", "deg"), ("enemy_yaw_angle_mean", "yaw off         ", "deg"), ("pitch_abs_mean", "camera pitch    ", "deg"),
+                                 ("enemy_dist_mean", "enemy distance  ", "m"), ("yaw_per_step_mean", "turn per step   ", "deg")):
             if isinstance(mean.get(key), (int, float)):
                 shooting.append(f"  {label} {mean[key]:.0f}{unit}")
         self.behaviour.config(text="Shooting (last 100)\n" + "\n".join(shooting) if shooting else "")

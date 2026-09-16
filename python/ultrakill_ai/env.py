@@ -12,7 +12,7 @@ import gymnasium as gym
 import numpy as np
 
 from ultrakill_ai.protocol import DEFAULT_PORT, BridgeClient
-from ultrakill_ai.rewards import RewardConfig, compute_reward
+from ultrakill_ai.rewards import RewardConfig, aim_errors, compute_reward
 from ultrakill_ai.routes import Route, RouteTracker, route_path
 from ultrakill_ai.spaces import ObsLayout, action_space, decode_action, pack_observation
 
@@ -47,6 +47,8 @@ class EnvConfig:
     soft_death: bool = True  # Cyber Grind: lethal hits heal instead of killing; the episode still ends with the death
     # penalty, but the next one continues in the same arena without a scene reload
     render: bool = False  # the agent never sees pixels; turning cameras off saves CPU/GPU
+    pitch_limit_deg: float = 0.0  # keep the camera within ±this many degrees of level (0 = off). Without it the
+    # policy drifted to the +90° clamp and stared at the sky, so no yaw ever put an enemy near the crosshair
     checkpoint_resets: bool = False  # campaign: after a death, respawn at the checkpoint instead of reloading
     stuck_steps: int = 450  # campaign: end the episode after this many steps without route progress
     route_dir: str = "routes"
@@ -63,6 +65,15 @@ class EnvConfig:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "yaw_err_sum", "dist_sum", "yaw_sum", "pitch_steps", "pitch_sum")
+
+
+def clamp_pitch_command(current_pitch: float, pitch_cmd: float, limit: float) -> float:
+    """Trims a pitch command so the camera ends within ±limit degrees of level (snapping back if it is outside)."""
+    target = max(-limit, min(limit, current_pitch + pitch_cmd))
+    return target - current_pitch
 
 
 class UltrakillEnv(gym.Env):
@@ -96,7 +107,7 @@ class UltrakillEnv(gym.Env):
         self._last_end_reason = ""
         self._reset_seconds = 0.0
         self._deaths = 0
-        self._behaviour = dict.fromkeys(("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "dist_sum", "yaw_sum"), 0)
+        self._behaviour = dict.fromkeys(BEHAVIOUR_KEYS, 0)
         self._arena_spawn: list[float] | None = None
         self._episode_start_stats: dict[str, Any] = {}
 
@@ -150,7 +161,7 @@ class UltrakillEnv(gym.Env):
         self._steps = 0
         self._steps_since_progress = 0
         self._deaths = 0
-        self._behaviour = dict.fromkeys(("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "dist_sum", "yaw_sum"), 0)
+        self._behaviour = dict.fromkeys(BEHAVIOUR_KEYS, 0)
         self._last_end_reason = ""
 
         if self.route_tracker is not None and self._raw.get("player"):
@@ -161,6 +172,8 @@ class UltrakillEnv(gym.Env):
     def step(self, action):
         prev = self._raw
         command = decode_action(action)
+        if self.cfg.pitch_limit_deg and prev.get("player"):
+            command["look"][1] = clamp_pitch_command(prev["player"]["pitch"], command["look"][1], self.cfg.pitch_limit_deg)
         self._note_behaviour(prev, command)
         cur = self.client.step(command)
         self._raw = cur
@@ -279,16 +292,18 @@ class UltrakillEnv(gym.Env):
         player = raw.get("player")
         if not player:
             return
+        self._behaviour["pitch_steps"] += 1
+        self._behaviour["pitch_sum"] += abs(player["pitch"])
         visible = [e for e in raw.get("enemies", []) if e["visible"]]
         if not visible:
             return
         self._behaviour["enemy_visible"] += 1
-        x, y, z = visible[0]["rel"]
-        length = math.sqrt(x * x + y * y + z * z)
-        if length <= 1e-6:
+        errors = aim_errors(player, visible[0])
+        if errors is None:
             return
-        angle = math.degrees(math.acos(max(-1.0, min(1.0, z / length))))
+        angle, yaw_err, _ = errors
         self._behaviour["angle_sum"] += angle
+        self._behaviour["yaw_err_sum"] += yaw_err
         self._behaviour["dist_sum"] += visible[0]["dist"]
         self._behaviour["close"] += visible[0]["dist"] <= 5.0
         on_target = angle <= 15.0
@@ -324,6 +339,8 @@ class UltrakillEnv(gym.Env):
         info["firing_on_target_frac"] = b["firing_on_target"] / steps
         info["enemy_visible_frac"] = b["enemy_visible"] / steps
         info["enemy_angle_mean"] = b["angle_sum"] / seen  # degrees off the crosshair
+        info["enemy_yaw_angle_mean"] = b["yaw_err_sum"] / seen  # heading error only, ignoring pitch
+        info["pitch_abs_mean"] = b["pitch_sum"] / max(1, b["pitch_steps"])  # camera pitch away from level
         info["enemy_dist_mean"] = b["dist_sum"] / seen
         info["enemy_close_frac"] = b["close"] / steps  # nearest visible enemy within 5 m
         info["yaw_per_step_mean"] = b["yaw_sum"] / steps  # degrees turned per decision

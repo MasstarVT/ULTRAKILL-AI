@@ -17,13 +17,18 @@ env:
   max_wave: 0
   end_episode_on_death: false
   hard_reset_above_wave: 5  # reload to wave 1 past this, so the agent keeps practising early waves
+  # The 2.3M-step weight audit found the camera pinned at the +90° clamp (staring at the sky), so every
+  # enemy sat ~90° off the crosshair whatever the yaw did. Keep the camera near level; enemies are on the ground.
+  pitch_limit_deg: 40
   rewards:
-    # At 820k steps the aim reward was only 0.04 per episode: the agent almost never had an enemy near
-    # the crosshair. Stronger, wider aim shaping to teach it to face enemies before fighting them.
-    # Aim shaping. `aim` is a slope from facing away to facing straight at the nearest visible enemy,
-    # so turning toward it always pays; `aim_locked` adds a bonus inside the cone. A cone-only reward
-    # gave no gradient (on-target 0.8% of steps at 1.9M), which is why aiming never improved.
-    aim: 0.08
+    # Aim shaping, one slope per look axis so each gets its own gradient: `aim_yaw` pays for the heading
+    # (ground-plane angle to the nearest visible enemy, ignoring pitch) and `aim_pitch` for the enemy
+    # elevation being on the horizon (ignoring yaw). The single 3-D slope (`aim`) gave pitch no gradient
+    # while yaw was random, which is how the sky-staring habit survived. A cone-only reward gave no
+    # gradient at all (on-target 0.8% at 1.9M). `aim_locked` still pays extra inside the 3-D cone.
+    aim: 0.0
+    aim_yaw: 0.06
+    aim_pitch: 0.06
     aim_locked: 0.15
     aim_cone_deg: 20.0
     # Rebalanced at 329k steps: with kill 2 / death 10 the agent learned to avoid fights
