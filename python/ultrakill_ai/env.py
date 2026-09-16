@@ -350,9 +350,7 @@ class UltrakillEnv(gym.Env):
                 self._enemy_max_health[e["id"]] = e["health"]
 
     def _pack(self, raw: dict[str, Any]) -> np.ndarray:
-        waypoint = self.route_tracker.waypoint if self.route_tracker else None
-        progress = self.route_tracker.progress if self.route_tracker else 0.0
-        return pack_observation(raw, self.cfg.layout, self._enemy_max_health, waypoint, progress)
+        return pack_observation(raw, self.cfg.layout, self._enemy_max_health)
 
     def _info(self, raw: dict[str, Any]) -> dict[str, Any]:
         stats = raw.get("stats", {})

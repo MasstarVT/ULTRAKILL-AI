@@ -58,6 +58,7 @@ def noop_action() -> np.ndarray:
 
 NUM_ENEMY_TYPES = 43  # EnemyType enum values 0..42 in the current game build
 NUM_WEAPON_SLOTS = 6
+CAMPAIGN_BLOCK = 36  # campaign values packed after the Cyber Grind two (see campaign_block)
 
 
 @dataclass
@@ -67,6 +68,7 @@ class ObsLayout:
     ground_rays: int = 8
     ray_length: float = 50.0
     ground_ray_length: float = 30.0
+    campaign: bool = False  # campaign levels: the level block replaces the 5 retired route values (448 -> 479)
 
     @property
     def player_size(self) -> int:
@@ -79,7 +81,9 @@ class ObsLayout:
 
     @property
     def mode_size(self) -> int:
-        return 2 + 5  # cybergrind (wave, enemies_left) + campaign (waypoint rel xyz, dist, progress)
+        # Cyber Grind (wave, enemies_left), then the campaign block, or 5 zeros where the retired route waypoint
+        # used to be, so 448-input Cyber Grind checkpoints still load.
+        return 2 + (CAMPAIGN_BLOCK if self.campaign else 5)
 
     @property
     def size(self) -> int:
@@ -112,12 +116,66 @@ def yaw_frame(vec_world: tuple[float, float, float], yaw_deg: float) -> tuple[fl
     return (dx * math.cos(y) - dz * math.sin(y), dy, dx * math.sin(y) + dz * math.cos(y))
 
 
+def campaign_block(obs: dict[str, Any], explore: list[float] | None = None) -> list[float]:
+    """The 36 campaign values, all zero without a `campaign` block or a player.
+
+    Targets are relative to the player in its yaw frame (x right, y up, z forward), so "ahead" is +z whichever way
+    the player faces.
+
+        0-4    exit: rel xyz / 100, distance / 200, mask
+        5-9    path next corner: rel xyz / 50, distance / 50, path length / 300 (complete or partial path only)
+        10-12  path status one-hot: complete, partial, none
+        13-17  nearest checkpoint neither activated nor current: rel xyz / 100, distance / 200, mask
+        18-22  first locked door (the mod sends them nearest first): rel xyz / 50, distance / 100, mask
+        23-26  arena enemies alive / 20, timer running, input locked, level seconds / 600
+        27-35  exploration map (ExplorationArchive.features: current cell, then 8 neighbours from straight ahead)
+    """
+    out = [0.0] * CAMPAIGN_BLOCK
+    c, p = obs.get("campaign"), obs.get("player")
+    if not c or not p:
+        return out
+    pos, yaw = p["pos"], p["yaw"]
+
+    def relative(point, rel_scale: float, dist_scale: float) -> list[float]:
+        x, y, z = yaw_frame((point[0] - pos[0], point[1] - pos[1], point[2] - pos[2]), yaw)
+        return [x / rel_scale, y / rel_scale, z / rel_scale, math.sqrt(x * x + y * y + z * z) / dist_scale]
+
+    exit_ = c.get("exit")
+    if exit_:
+        out[0:5] = relative(exit_["pos"], 100.0, 200.0) + [1.0]
+
+    path = c.get("path") or {}
+    status = path.get("status", "none")
+    if status in ("complete", "partial") and path.get("next_corner"):
+        out[5:10] = relative(path["next_corner"], 50.0, 50.0) + [path.get("length", 0.0) / 300.0]
+    out[10:13] = [float(status == "complete"), float(status == "partial"), float(status not in ("complete", "partial"))]
+
+    pending = [cp for cp in (c.get("checkpoints") or []) if not cp["activated"] and not cp["current"]]
+    if pending:
+        nearest = min(pending, key=lambda cp: math.dist(cp["pos"], pos))
+        out[13:18] = relative(nearest["pos"], 100.0, 200.0) + [1.0]
+
+    doors = c.get("locked_doors") or []
+    if doors:
+        out[18:23] = relative(doors[0]["pos"], 50.0, 100.0) + [1.0]
+
+    out[23:27] = [
+        c.get("arena_enemies_alive", 0) / 20.0,
+        float(bool(c.get("timer_running"))),
+        float(bool(c.get("input_locked"))),
+        c.get("seconds", 0.0) / 600.0,
+    ]
+    if explore is not None:
+        values = [float(v) for v in explore[:9]]
+        out[27 : 27 + len(values)] = values
+    return out
+
+
 def pack_observation(
     obs: dict[str, Any],
     layout: ObsLayout,
     enemy_max_health: dict[int, float],
-    waypoint: tuple[float, float, float] | None = None,
-    route_progress: float = 0.0,
+    explore: list[float] | None = None,
 ) -> np.ndarray:
     out = np.zeros(layout.size, dtype=np.float32)
     p = obs.get("player")
@@ -167,14 +225,8 @@ def pack_observation(
     cg = obs.get("cybergrind")
     put([cg["wave"] / 30.0, max(cg["enemies_left"], 0) / 30.0] if cg else [0.0, 0.0])
 
-    if waypoint is not None:
-        pos = p["pos"]
-        delta = (waypoint[0] - pos[0], waypoint[1] - pos[1], waypoint[2] - pos[2])
-        lx, ly, lz = yaw_frame(delta, p["yaw"])
-        dist = math.sqrt(delta[0] ** 2 + delta[1] ** 2 + delta[2] ** 2)
-        put([lx / 50.0, ly / 50.0, lz / 50.0, dist / 100.0, route_progress])
-    else:
-        put([0.0] * 5)
+    # Cyber Grind keeps 5 zeros where the route waypoint used to be, so its 448-input checkpoints still load.
+    put(campaign_block(obs, explore) if layout.campaign else [0.0] * 5)
 
     assert i == layout.size, f"packed {i} values, layout expects {layout.size}"
     return out

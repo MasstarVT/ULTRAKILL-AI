@@ -106,12 +106,12 @@ python scripts/eval.py models/cybergrind_ppo/latest.zip --realtime
 
 ## How it works
 
-- **Observations:** the policy gets a fixed 448-float vector.
+- **Observations:** the policy gets a fixed float vector: 448 values in Cyber Grind, 479 in campaign levels.
   - Player: velocity, HP, stamina, grounded/sliding, look angles, weapon slot.
   - The 8 nearest enemies: camera-space position, distance, health fraction, visibility, type.
   - 16 wall-distance rays and 8 pit-detection rays.
   - Cyber Grind wave info.
-  - Campaign only: direction to the next route waypoint.
+  - Campaign only (36 values): the exit, the next NavMesh path corner and path status, the nearest checkpoint not yet reached, the nearest locked door, arena enemies, timer and input lock, and a 9-cell exploration map. Cyber Grind keeps 5 zeros in their place.
 - **Actions:** a `MultiDiscrete` space.
   - Move forward/back and strafe; jump, dash, slide, fire1, fire2, punch; weapon slot.
   - Yaw and pitch in nonlinear degree bins, for both fine aim and fast turns.
