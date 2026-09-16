@@ -139,9 +139,22 @@ namespace UltrakillAIBridge.Obs
                 ["level_over"] = nm.levelOver,
                 ["weapon_slot"] = gun != null ? gun.currentSlotIndex : -1,
                 ["weapon_variation"] = gun != null ? gun.currentVariationIndex : -1,
+                ["slot_counts"] = SlotCounts(gun),
                 ["soft_deaths"] = Env.TrainingSpeed.SoftDeaths,
                 ["soft_death_instakill"] = Env.TrainingSpeed.LastSoftDeathInstakill,
             };
+        }
+
+        /// <summary>Weapons in each slot, slot 1 first (empty until GunControl has started).</summary>
+        private static JArray SlotCounts(GunControl gun)
+        {
+            var arr = new JArray();
+            if (gun == null || gun.slots == null) return arr;
+            foreach (var slot in gun.slots)
+            {
+                arr.Add(slot != null ? slot.Count : 0);
+            }
+            return arr;
         }
 
         private JArray BuildEnemies(Transform cam, int envMask)

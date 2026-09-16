@@ -6,6 +6,7 @@ using HarmonyLib;
 using UltrakillAIBridge.Env;
 using UltrakillAIBridge.Net;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace UltrakillAIBridge
 {
@@ -58,7 +59,15 @@ namespace UltrakillAIBridge
             harmony.PatchAll(typeof(BackgroundPatches));
             harmony.PatchAll(typeof(InstancePatches));
             harmony.PatchAll(typeof(TrainingSpeed));
+            harmony.PatchAll(typeof(CampaignPatches));
             EnemyTracker.onEnemyAdded += TrainingSpeed.OnEnemyAdded;
+
+            // Arena and door keys belong to one level load. Checkpoint respawns don't load a scene, so the
+            // keys survive them, which is what lets Python ignore an arena cleared again after a death.
+            SceneManager.sceneLoaded += (scene, mode) =>
+            {
+                if (mode == LoadSceneMode.Single) CampaignPatches.OnSceneLoaded();
+            };
 
             // ULTRAKILL destroys BepInEx's manager GameObject during startup, which would take this
             // component with it. The bridge runs on its own hidden, persistent object instead.

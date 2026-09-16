@@ -24,6 +24,7 @@ namespace UltrakillAIBridge.Env
     ///   hello, config, get_obs  - answered immediately, never take control
     ///   reset                   - takes control, loads/restarts, replies with an obs once ready
     ///   step                    - takes control, runs one step, replies with an obs
+    ///   teleport, kill          - take control, reply with an obs straight away (kill is a debug command)
     ///   release                 - gives control back to the human
     /// </summary>
     public sealed class EpisodeController
@@ -236,6 +237,12 @@ namespace UltrakillAIBridge.Env
                     Send(observer.Build(step, "teleport"));
                     break;
 
+                case "kill":
+                    TakeControl(incoming.ClientId);
+                    Kill();
+                    Send(observer.Build(step, "kill"));
+                    break;
+
                 case "release":
                     ReleaseControl();
                     Send(new JObject { ["type"] = "ok" });
@@ -259,6 +266,8 @@ namespace UltrakillAIBridge.Env
             if (msg["command_timeout_s"] != null) commandTimeoutMs = Mathf.Max(1, msg["command_timeout_s"].Value<int>()) * 1000;
             windowed = msg["windowed"]?.Value<bool>() ?? windowed;
             TrainingSpeed.SoftDeathEnabled = msg["soft_death"]?.Value<bool>() ?? TrainingSpeed.SoftDeathEnabled;
+            CampaignPatches.DifficultyOverride = msg["difficulty"]?.Value<int>() ?? CampaignPatches.DifficultyOverride;
+            CampaignPatches.UnlockAllGear = msg["unlock_all_gear"]?.Value<bool>() ?? CampaignPatches.UnlockAllGear;
             if (msg["render"] != null)
             {
                 TrainingSpeed.RenderingDisabled = !msg["render"].Value<bool>();
@@ -364,7 +373,15 @@ namespace UltrakillAIBridge.Env
             if (checkpoint && resetScene == SceneHelper.CurrentScene && sm != null && !sm.infoSent)
             {
                 UnpauseIfNeeded();
-                sm.Restart();
+                CampaignPatches.BridgeRestart = true; // CampaignPatches blocks every other Restart while in control
+                try
+                {
+                    sm.Restart();
+                }
+                finally
+                {
+                    CampaignPatches.BridgeRestart = false;
+                }
                 sceneRequested = true;
             }
 
@@ -413,6 +430,18 @@ namespace UltrakillAIBridge.Env
                 nm.rb.velocity = Vector3.zero;
             }
             Physics.SyncTransforms();
+        }
+
+        /// <summary>
+        /// Debug command for the in-game death check: a lethal hit through the normal damage path. With
+        /// soft_death on, TrainingSpeed heals it instead and counts a soft death. GetHurt ignores it once the
+        /// level is over.
+        /// </summary>
+        private static void Kill()
+        {
+            var nm = MonoSingleton<NewMovement>.Instance;
+            if (nm == null || nm.dead) throw new InvalidOperationException("kill needs a living player");
+            nm.GetHurt(999, invincible: false, ignoreInvincibility: true);
         }
 
         private static void UnpauseIfNeeded()
