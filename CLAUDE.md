@@ -238,8 +238,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     observed `enemy_visible_frac` 0.669-0.748 reproduces yaw_track 0.121-0.150 and pitch_track 0.031 --
     i.e. the whole live value -- from a true score of about 0.24. Fixed in `env.py`: the two tracking scores
     now only count steps where the nearest enemy IS the visible one, and the deadzone is angular (5 deg)
-    rather than `abs(x) > 0.5` metres, which silently meant 1.4 deg at 20 m but 4.8 deg at 6 m. The gate gua
-rds
+    rather than `abs(x) > 0.5` metres, which silently meant 1.4 deg at 20 m but 4.8 deg at 6 m. The gate guards
     only those two counters, never `on_target_frac`/`dist`/`elev`. Scores before and after this fix are not
     comparable.
   - **The "enemies behind" hypothesis was wrong.** Enemies behind score better, not worse (`rel.x` is large
