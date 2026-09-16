@@ -85,4 +85,13 @@ train:
     # one change, not two.
     learning_rate: 0.0002
     target_kl: 0.03
-    ent_coef: 0.01  # keep exploring early; the old 0.005 was chosen for "precise aiming" when the real problem was pitch
+    # Lowered at 2.07M once the margin was actually measured. Entropy sat at 9.47 of 12.49 nats (76% of
+    # maximum) after 2M steps, so even when the head's MEAN action pointed at the enemy the SAMPLED action
+    # often did not: mean-action agreement was 86% but the sampled tracking score only ~0.24. Aiming is a
+    # precision task and that noise is the thing capping on_target_frac at ~3%.
+    # Measured per-head, entropy pull = ent_coef * ln(bins) against the normalised advantage over the GAE
+    # horizon: yaw 0.0240 vs 0.0512 (2.1x) and pitch 0.0195 vs 0.0246 (only 1.26x). A 3x margin needs
+    # ent_coef <= 0.0071 (yaw) and <= 0.0042 (pitch), so 0.004 gives both heads room to sharpen.
+    # This is not v1's mistake of lowering it "for precise aiming": there the reward itself was broken, so
+    # sharpening only locked in the wrong behaviour. The reward has since been rebalanced onto combat.
+    ent_coef: 0.004

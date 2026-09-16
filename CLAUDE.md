@@ -225,6 +225,53 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   line-of-sight only, so the nearest visible enemy is often BEHIND the player, where turning either way is
   equally correct and the sign comparison becomes a coin flip -- which would drag the live metric toward 0
   for a policy that is actually fine.
+- **The `yaw_track` gap explained, and the probe's exact lie (2.07M).** Two independent audits closed both
+  open questions from the reverted pitch experiment.
+  - **Trust the live number.** The offline probe scored `sign(E[yaw])`, the mean action; the live metric
+    scores the sign of the SAMPLED action (`env.py` reads `command["look"][0]` from `decode_action`). With
+    entropy at 9.47 of 12.49 nats the head is soft, so the two differ enormously: at azimuth -10 deg the
+    policy puts P(left) 0.748, so the mean is right but sampled agreement is only 0.502. Reproducing the
+    probe's own states gives mean-action 0.85 and sampled 0.566 -- half the gap is sampling alone.
+  - **The metric graded the wrong enemy.** It scored against `visible[0]`, but `pack_observation` feeds the
+    policy the nearest 8 by distance REGARDLESS of visibility, so whenever the nearest enemy was occluded
+    the score compared the look command against a farther enemy at an unrelated azimuth. Monte-Carlo at the
+    observed `enemy_visible_frac` 0.669-0.748 reproduces yaw_track 0.121-0.150 and pitch_track 0.031 --
+    i.e. the whole live value -- from a true score of about 0.24. Fixed in `env.py`: the two tracking scores
+    now only count steps where the nearest enemy IS the visible one, and the deadzone is angular (5 deg)
+    rather than `abs(x) > 0.5` metres, which silently meant 1.4 deg at 20 m but 4.8 deg at 6 m. The gate gua
+rds
+    only those two counters, never `on_target_frac`/`dist`/`elev`. Scores before and after this fix are not
+    comparable.
+  - **The "enemies behind" hypothesis was wrong.** Enemies behind score better, not worse (`rel.x` is large
+    there). Dragging 0.85 to 0.15 by coin flips would need 82% of steps behind; `enemy_yaw_angle_mean` 62.6
+    implies about 26%. The aim reward IS paid on unshootable enemies behind the player, but it is only
+    about 4 of 131 reward (3%).
+  - **Why the synthetic probe invented a pitch bias.** All 8 ground rays were set to 1.0 while `grounded`
+    was also 1.0 -- and the mod documents a near-max ground ray as "a pit", so every probe sample described
+    a player standing on nothing over a 30 m drop, a state that never occurs. All 16 wall rays were 1.0 (no
+    geometry within 50 m), velocity was zero, health full. Camera pitch and enemy camera-space elevation
+    were also swept INDEPENDENTLY, though live they are rigidly coupled (camera-space elevation is roughly
+    world elevation minus camera pitch), so the grid contained impossible joint states like an implied world
+    elevation of +85 deg. Each marginal looked plausible; the joint was fiction. **The free falsification:**
+    -5.7 deg/step against a +/-45 clamp pins the camera within 8 steps, so `pitch_abs_mean` would read ~45;
+    it read 27.2. The probe was refuted by data already on disk before any weight was touched.
+- **Pitch is not the binding constraint; yaw is.** `enemy_yaw_angle_mean` is 62.8 deg. Zeroing the pitch
+  error entirely would move the 3-D angle only 64.7 -> 62.8, so the 15 deg cone still fails on yaw alone.
+  The pitch loop scores 0.6 deg WORSE than a camera welded level (`enemy_pitch_err_mean` 26.97 vs
+  `enemy_elev_abs_mean` 26.34) while burning 27.2 deg of travel, and `pitch_abs_mean` 27.2 exceeds the 22.5
+  of a uniform sweep over the band -- that is a random walk piling up on the clamp, not a biased head. Mean
+  elevation is +0.8 deg but mean-absolute is 26.3: the residual is zero-mean and conditional, so no constant
+  could ever capture it and the bias tilt was structurally incapable of helping.
+- **`ent_coef` 0.01 -> 0.004 at 2.08M.** Measured per head as entropy pull (`ent_coef * ln bins`) against the
+  normalised advantage over the GAE horizon: yaw 0.0240 vs 0.0512 (2.1x) and pitch 0.0195 vs 0.0246 (1.26x).
+  The signal wins, but far too narrowly for a precision task, which is why the mean action is right 86% of
+  the time while the sampled one is right ~24%. A 3x margin needs `ent_coef` <= 0.0071 for yaw and <= 0.0042
+  for pitch. Unlike v1's cut to 0.005, this is not being used to paper over a broken reward: the reward was
+  rebalanced onto combat first.
+- **`scripts/poll_status.py`** appends `status.json` to `runs/<run>/metrics_log.csv` every 30 s. `mean_100`
+  is a deque that does NOT survive a restart and `history[]` keeps only reward/kills/wave, so every aiming
+  diagnostic was being thrown away on each resume -- which is how a 5-episode window got mistaken for a
+  trend. Gate every comparison on `window >= 50`.
 - **Next steps:**
   - Watch the 1.70M rebalance against the falsifiers above; `yaw_track` then `on_target_frac` lead, kills/min follows.
   - If `on_target_frac` is still <= 0.06 at 2.18M, reset the look-head output bias (as `pitch_reset_2447005.zip` did for v1) rather than tuning weights again: a constant offset in the bias is not reachable from a reward slope that is flat across the whole sweep range.

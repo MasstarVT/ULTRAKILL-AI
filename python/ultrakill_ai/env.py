@@ -312,14 +312,26 @@ class UltrakillEnv(gym.Env):
         self._behaviour["pitch_err_sum"] += pitch_err
         # Tracking scores: +1 when the look command turns toward the nearest visible enemy, -1 when away
         # (random play scores 0). Uses the unclamped pitch command so the band does not bias it.
-        x, y, _ = visible[0]["rel"]
+        #
+        # Two corrections after the 2.07M-step audit, which found the raw score reproduced almost entirely
+        # by measurement artefacts rather than by policy behaviour:
+        #  - Grade only when the nearest enemy overall is the visible one. `pack_observation` feeds the
+        #    policy the nearest 8 by distance REGARDLESS of visibility, so when the nearest is occluded the
+        #    old score graded the look command against a farther enemy at an unrelated azimuth. Simulating
+        #    that alone reproduced the live 0.121-0.150 at the observed visibility, from a true ~0.24.
+        #  - Use an ANGULAR deadzone. `abs(x) > 0.5` was 0.5 metres, i.e. 1.4 degrees off at 20 m but
+        #    4.8 degrees at 6 m, so the threshold silently tightened with range.
+        # Note these scores are still computed on the SAMPLED action, so with a soft policy they sit well
+        # below the mean-action agreement (86% at 2.0M): the gap between them is the exploration noise.
+        x, y, z = visible[0]["rel"]
         yaw_cmd = command["look"][0]
-        if yaw_cmd and abs(x) > 0.5:
-            self._behaviour["yaw_track_n"] += 1
-            self._behaviour["yaw_track"] += 1 if (yaw_cmd > 0) == (x > 0) else -1
-        if raw_pitch_cmd and abs(y) > 0.5:
-            self._behaviour["pitch_track_n"] += 1
-            self._behaviour["pitch_track"] += 1 if (raw_pitch_cmd > 0) == (y > 0) else -1
+        if visible[0] is raw["enemies"][0]:  # gates only the two tracking scores, not the metrics below
+            if yaw_cmd and abs(math.degrees(math.atan2(x, z))) > 5.0:
+                self._behaviour["yaw_track_n"] += 1
+                self._behaviour["yaw_track"] += 1 if (yaw_cmd > 0) == (x > 0) else -1
+            if raw_pitch_cmd and abs(math.degrees(math.atan2(y, math.hypot(x, z)))) > 5.0:
+                self._behaviour["pitch_track_n"] += 1
+                self._behaviour["pitch_track"] += 1 if (raw_pitch_cmd > 0) == (y > 0) else -1
         elev = horizon_elevation(player, visible[0])
         if elev is not None:
             self._behaviour["elev_steps"] += 1
