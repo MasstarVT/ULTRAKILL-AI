@@ -25,18 +25,18 @@ rewards:
   aim: 0.0
   aim_cone_deg: 20.0
   aim_locked: 0.15
-  aim_pitch: 0.06
-  aim_yaw: 0.06
-  damage_dealt: 2.0
+  aim_pitch: 0.01
+  aim_yaw: 0.02
+  damage_dealt: 4.0
   damage_taken: 0.02
-  death: 8.0
-  kill: 5.0
+  death: 6.0
+  kill: 8.0
   level_complete: 50.0
   route_point: 0.1
   step_penalty: 0.0
   stuck: 1.0
   style: 0.002
-  wave: 5.0
+  wave: 20.0
 route_dir: routes
 soft_death: true
 stuck_steps: 450

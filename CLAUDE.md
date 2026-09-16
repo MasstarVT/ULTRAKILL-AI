@@ -40,11 +40,16 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 
 ## Commands
 - Build and install the mod: `cd mod/UltrakillAIBridge && dotnet build -c Release`. The game must be closed, or the DLL is locked.
+- **Which checkpoint to resume from:** `best.zip` (see `best.json` for its score and source). `latest.zip` only
+  updates on a GRACEFUL stop (Ctrl+C); every hard kill leaves it stale, and it sat at 1.18M steps for a whole
+  night while the run reached 6.5M. Helpers to keep running alongside training, both read-only and safe:
+  `python scripts/poll_status.py` (metrics to `runs/<run>/metrics_log.csv`) and `python scripts/keep_best.py`
+  (maintains `best.zip`, warns when the current policy falls more than 15% below it).
 - Python env: `cd python && .venv\Scripts\activate` (created with `pip install torch` + `pip install -e .`).
 - Bridge check (game open, in a level): `python scripts/bridge_test.py --drive`.
 - Parallel training:
   1. `python scripts/games.py launch --count 5` (monitor 3 by default; BepInEx supports at most 5 copies)
-  2. `python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo_v2/latest.zip` (`num_envs` 5 in config; `timesteps` is the run total, so resuming trains only the rest; drop `--resume` for a fresh run, and give it a new `run_name` so `status.json` does not inherit the old episodes)
+  2. `python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo_v2/best.zip` (`num_envs` 5 in config; `timesteps` is the run total, so resuming trains only the rest; drop `--resume` for a fresh run, and give it a new `run_name` so `status.json` does not inherit the old episodes)
   3. `python scripts/games.py stop`
   - `python scripts/games.py status` is safe during training (it reads netstat, it does not connect).
 - TensorBoard: `tensorboard --logdir runs`.
@@ -58,7 +63,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 
 ## Moving the project to another machine
 - Checkpoints come with the repo (`python/models/`). `runs/` is gitignored, so copy `python/runs/cybergrind_ppo_v2/status.json` (dashboard history) and `python/runs/cybergrind_ppo_v2_1/` (TensorBoard curves) by hand if you want them.
-- On the new machine: install BepInEx 5 into the game, copy `mod/GamePaths.props.example` to `mod/GamePaths.props` with the game path, build the mod (Commands above), create the venv (`pip install torch` then `pip install -e .`), run the no-game tests, then `games.py launch --count 5` and `train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo_v2/latest.zip`.
+- On the new machine: install BepInEx 5 into the game, copy `mod/GamePaths.props.example` to `mod/GamePaths.props` with the game path, build the mod (Commands above), create the venv (`pip install torch` then `pip install -e .`), run the no-game tests, then `games.py launch --count 5` and `train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo_v2/best.zip`.
 - Re-check the monitor layout: `games.py` tiles on monitor 3 by default (`--monitor`), and the dashboard follows it.
 
 ## Local machine state (the original PC, 2026-09-15)
@@ -298,6 +303,19 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   watching it, so the post-peak degradation ran unchecked for ~500k steps. Cron jobs here are session-only
   and only fire while the session is idle; do not rely on them for unattended work. The durable substitute
   is the pair of always-on helper processes (`poll_status.py`, `keep_best.py`), which need no scheduler.
+- **Second peak and second collapse (4.42M -> 6.53M), then PAUSED 2026-09-16.** After the rollback the run set
+  a new best: **7.16 kills/min at 4.70M steps** (reward 231, deaths 1.55; `ckpt_4679085_steps.zip`), caught by
+  `keep_best.py`. It then degraded exactly as before, to **3.79 kills/min, reward 125.7, entropy 2.94** by
+  6.53M. So raising `ent_coef` 0.004 -> 0.006 did NOT stop the collapse; it only moved the peak. The pattern is
+  now twice-observed and should be treated as the defining problem of this run: the policy improves to a
+  peak around entropy ~3.5, then keeps sharpening past it and gets worse, while `on_target_frac` never moves
+  off ~3%. Paused by request at 6,532,470 steps with games stopped and display settings restored.
+  **Resume from `best.zip` (4,679,085 steps, 7.16 kills/min), not from the final weights**, which are roughly
+  half as good. `latest.zip` has been refreshed to the same file so the old command is not a trap.
+  Suggested order on resume: (1) confirm `best.zip` reproduces ~7 kills/min before changing anything;
+  (2) stop the collapse -- either hold entropy with a higher `ent_coef` (0.008-0.01) or anneal the learning
+  rate toward zero after the peak so the policy stops moving once it is good; (3) only then attack yaw, the
+  binding constraint, with a zero-floor yaw shaping term.
 - **Next steps:**
   - **Yaw is the one thing to fix.** `enemy_yaw_angle_mean` 51 deg is what keeps `on_target_frac` at 3%;
     pitch changes have been tried at 15 and 45 deg and moved nothing. Consider a yaw-only shaping term with

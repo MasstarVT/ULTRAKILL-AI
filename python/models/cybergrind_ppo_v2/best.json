@@ -1,0 +1,9 @@
+{
+  "score_metric": "kills_per_min, smoothed over 9 samples",
+  "score": 7.1567,
+  "deaths": 1.5478,
+  "reward": 231.472,
+  "at_timesteps": 4697515.0,
+  "checkpoint": "ckpt_4679085_steps.zip",
+  "saved_at": "2026-09-16 04:22:09"
+}

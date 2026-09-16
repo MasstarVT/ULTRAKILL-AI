@@ -25,6 +25,15 @@ venv/
 runs/
 # v1 (abandoned run): only latest.zip and pitch_reset_2447005.zip are kept in git
 python/models/cybergrind_ppo/ckpt_*.zip
+# v2: the numbered checkpoints are ~12 MB each (107 of them, 1.2 GB, from the 2026-09-16 run alone).
+# best.zip + best.json (written by scripts/keep_best.py) and latest.zip are the transferable state.
+# The 23 numbered ones committed before this rule stay tracked; gitignore does not untrack them.
+python/models/cybergrind_ppo_v2/ckpt_*.zip
+python/models/cybergrind_ppo_v2/best_*kpm_*.zip
+python/models/cybergrind_ppo_v2/*.bad
+
+# Claude Code local session state
+.claude/
 
 # Editors / OS
 .vscode/
