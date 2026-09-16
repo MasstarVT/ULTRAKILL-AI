@@ -3,20 +3,38 @@
 from __future__ import annotations
 
 import math
+import random
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
 import numpy as np
 
+from ultrakill_ai.campaign import (
+    ExplorationArchive,
+    MilestoneTracker,
+    PathProgress,
+    choose_fresh_start,
+    compute_rank,
+    safe_name,
+    save_best_run,
+)
 from ultrakill_ai.protocol import DEFAULT_PORT, BridgeClient
-from ultrakill_ai.rewards import RewardConfig, aim_errors, compute_reward, horizon_elevation
-from ultrakill_ai.routes import Route, RouteTracker, route_path
+from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
 from ultrakill_ai.spaces import ObsLayout, action_space, decode_action, pack_observation
 
 CYBERGRIND_SCENE = "Endless"
+# Per-episode info the campaign Monitor records (scripts/train.py); every key is in every campaign info.
+CAMPAIGN_INFO_KEYS = ("kills", "style", "deaths", "completed", "fresh_start", "level_seconds",
+                      "checkpoints_level", "cells_new", "exit_dist_min")
+
+
+def _known_fields(cls, d: dict[str, Any]) -> dict[str, Any]:
+    """Keeps the keys that are fields of dataclass `cls`, so configs saved with retired settings still load."""
+    names = {f.name for f in fields(cls)}
+    return {k: v for k, v in d.items() if k in names}
 
 
 @dataclass
@@ -49,9 +67,17 @@ class EnvConfig:
     render: bool = False  # the agent never sees pixels; turning cameras off saves CPU/GPU
     pitch_limit_deg: float = 0.0  # keep the camera within ±this many degrees of level (0 = off). Without it the
     # policy drifted to the +90° clamp and stared at the sky, so no yaw ever put an enemy near the crosshair
-    checkpoint_resets: bool = False  # campaign: after a death, respawn at the checkpoint instead of reloading
-    stuck_steps: int = 450  # campaign: end the episode after this many steps without route progress
-    route_dir: str = "routes"
+
+    # Campaign (docs/superpowers/specs/2026-09-16-campaign-foundation-design.md)
+    difficulty: int = -1  # difficulty the game reads while the AI has control (3 = Violent, -1 = leave the game's own)
+    unlock_all_gear: bool = False  # every weapon and variant while the AI has control, in memory only
+    fresh_start_prob: float = 0.2  # chance of a fresh level load when a checkpoint respawn would also do
+    stuck_seconds: float = 45.0  # game seconds without progress (milestone, new cell, shorter path) before truncating
+    stuck_repeats: int = 3  # episodes in a row stuck at the same checkpoint before a fresh load is forced
+    cell_size: float = 4.0  # metres per exploration cell
+    max_locked_skip_s: float = 120.0  # longest input lock (landing, cutscene) stepped through without the policy
+    explore_dir: str = ""  # folder for the exploration archive, so a resumed run keeps its visit counts ("" = memory only)
+    best_runs_dir: str = ""  # folder for the fastest fresh-start completion of each level ("" = off)
 
     layout: ObsLayout = field(default_factory=ObsLayout)
     rewards: RewardConfig = field(default_factory=RewardConfig)
@@ -59,9 +85,9 @@ class EnvConfig:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "EnvConfig":
         d = dict(d)
-        layout = ObsLayout(**d.pop("layout", {}))
-        rewards = RewardConfig(**d.pop("rewards", {}))
-        return cls(**d, layout=layout, rewards=rewards)
+        layout = ObsLayout(**_known_fields(ObsLayout, d.pop("layout", None) or {}))
+        rewards = RewardConfig(**_known_fields(RewardConfig, d.pop("rewards", None) or {}))
+        return cls(**_known_fields(cls, d), layout=layout, rewards=rewards)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -86,21 +112,17 @@ class UltrakillEnv(gym.Env):
         self.cfg = config or EnvConfig()
         if self.cfg.mode not in ("cybergrind", "campaign"):
             raise ValueError(f"Unknown mode {self.cfg.mode!r}")
+        campaign = self.cfg.mode == "campaign"
+        if self.cfg.layout.campaign != campaign:
+            # The layout follows the mode (Cyber Grind 448 inputs, campaign 479). Replaced, not edited in place:
+            # train.py builds each game's config with dataclasses.replace, so they all share one layout object.
+            self.cfg = replace(self.cfg, layout=replace(self.cfg.layout, campaign=campaign))
 
         self.observation_space = self.cfg.layout.space()
         self.action_space = action_space()
 
         self.client = BridgeClient(self.cfg.host, self.cfg.port)
         self._connected = False
-
-        self.route_tracker: RouteTracker | None = None
-        if self.cfg.mode == "campaign":
-            path = route_path(self.cfg.route_dir, self.cfg.level)
-            if not Path(path).exists():
-                raise FileNotFoundError(
-                    f"No route for {self.cfg.level} at {path}. Record one with scripts/record_route.py first."
-                )
-            self.route_tracker = RouteTracker(Route.load(path))
 
         self._raw: dict[str, Any] = {}
         self._enemy_max_health: dict[int, float] = {}
@@ -112,6 +134,23 @@ class UltrakillEnv(gym.Env):
         self._behaviour = dict.fromkeys(BEHAVIOUR_KEYS, 0)
         self._arena_spawn: list[float] | None = None
         self._episode_start_stats: dict[str, Any] = {}
+
+        # Campaign state. The exploration archive counts, per game and per level, how many earlier episodes
+        # entered each cell, so the novelty reward fades where this game has already been.
+        if campaign and self.cfg.explore_dir:
+            self.archive = ExplorationArchive.load(self._archive_path(), self.cfg.cell_size)
+        else:
+            self.archive = ExplorationArchive(self.cfg.cell_size)
+        self.milestones = MilestoneTracker()
+        self.path_progress = PathProgress()
+        self._rng = random.Random()
+        self._stuck_streak = 0  # episodes in a row that ended stuck at the same current checkpoint
+        self._stuck_checkpoint: str | None = None
+        self._fresh_start = False  # this episode began with a fresh level load
+        self._positions: list[list[float]] = []  # fresh-start episodes only, for best runs
+        self._cells_new = 0
+        self._exit_dist_min = math.inf
+        self._episodes = 0
 
     @property
     def scene(self) -> str:
@@ -136,23 +175,27 @@ class UltrakillEnv(gym.Env):
             windowed=self.cfg.windowed,
             window_width=self.cfg.window_width,
             window_height=self.cfg.window_height,
+            # Sent before the first reset: enemies and GunSetter read both when the level loads.
+            difficulty=self.cfg.difficulty,
+            unlock_all_gear=self.cfg.unlock_all_gear,
             **mod_layout,
         )
         self._connected = True
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
+        if seed is not None:
+            self._rng.seed(seed)
         self._ensure_connected()
 
-        checkpoint = (
-            self.cfg.mode == "campaign" and self.cfg.checkpoint_resets and self._last_end_reason == "death"
-        )
         start = time.perf_counter()
-        if self._can_soft_reset():
+        if self.cfg.mode == "campaign":
+            self._raw = self._campaign_reset()
+        elif self._can_soft_reset():
             self._raw = self._soft_reset()
         else:
-            self._raw = self.client.reset(self.scene, checkpoint=checkpoint)
-            if self.cfg.mode == "cybergrind" and self.cfg.auto_enter_arena:
+            self._raw = self.client.reset(self.scene, checkpoint=False)
+            if self.cfg.auto_enter_arena:
                 self._raw = self._enter_arena(self._raw)
             if self._raw.get("player"):
                 self._arena_spawn = list(self._raw["player"]["pos"])
@@ -166,8 +209,17 @@ class UltrakillEnv(gym.Env):
         self._behaviour = dict.fromkeys(BEHAVIOUR_KEYS, 0)
         self._last_end_reason = ""
 
-        if self.route_tracker is not None and self._raw.get("player"):
-            self.route_tracker.start(self._raw["player"]["pos"])
+        if self.cfg.mode == "campaign":
+            self.archive.start_episode()
+            self.path_progress.reset()
+            self._positions = []
+            self._cells_new = 0
+            self._exit_dist_min = math.inf
+            player = self._raw.get("player")
+            if player:
+                self.archive.visit(player["pos"])  # the spawn cell is entered, but pays nothing
+                if self._fresh_start:
+                    self._positions.append(self._rounded(player["pos"]))
 
         return self._pack(self._raw), self._info(self._raw)
 
@@ -178,25 +230,33 @@ class UltrakillEnv(gym.Env):
         if self.cfg.pitch_limit_deg and prev.get("player"):
             command["look"][1] = clamp_pitch_command(prev["player"]["pitch"], command["look"][1], self.cfg.pitch_limit_deg)
         self._note_behaviour(prev, command, raw_pitch_cmd)
+        campaign = self.cfg.mode == "campaign"
         cur = self.client.step(command)
+        if campaign:
+            cur = self._skip_locked(cur)
         self._raw = cur
         self._steps += 1
         self._track_enemies(cur)
 
-        route_gain = 0
         player = cur.get("player")
-        if self.route_tracker is not None and player:
-            route_gain = self.route_tracker.update(player["pos"])
-            self._steps_since_progress = 0 if route_gain else self._steps_since_progress + 1
-
-        stuck = self.cfg.mode == "campaign" and self._steps_since_progress >= self.cfg.stuck_steps
         prev_player = prev.get("player") or {}
         died = player is None or player["dead"] or (
             player.get("soft_deaths", 0) > prev_player.get("soft_deaths", player.get("soft_deaths", 0))
         )
-        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, died=died)
+        # Milestones, novelty and path progress are measured before the reward, from the frame the policy caused.
+        campaign_step = self._campaign_progress(cur) if campaign else None
+        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, died=died, campaign=campaign_step)
 
-        if died and not self.cfg.end_episode_on_death and player is not None and not player["dead"]:
+        if campaign:
+            if died and player is not None and not (cur.get("campaign") or {}).get("level_over"):
+                # A death does not end a campaign episode: the penalty is paid above, then the player respawns at
+                # the checkpoint and the level clock keeps running, as in real play.
+                cur = self._respawn()
+                self._raw = cur
+                player = cur.get("player")
+                self._deaths += 1
+                died = False
+        elif died and not self.cfg.end_episode_on_death and player is not None and not player["dead"]:
             # Soft death inside a timed episode: stay in the run, but get out of the pit that killed us.
             if player.get("soft_death_instakill") and self._arena_spawn is not None:
                 x, y, z = self._arena_spawn
@@ -207,6 +267,7 @@ class UltrakillEnv(gym.Env):
             self._deaths += 1
             died = False
 
+        stuck = campaign and self._steps_since_progress >= int(self.cfg.stuck_seconds * self.cfg.fixed_fps / self.cfg.frameskip)
         terminated, truncated, reason = False, False, ""
         stats = cur.get("stats", {})
         if died:
@@ -231,12 +292,18 @@ class UltrakillEnv(gym.Env):
             seconds = self._steps * self.cfg.frameskip / self.cfg.fixed_fps
             info["episode_seconds"] = seconds
             info["kills_per_min"] = info["kills"] / seconds * 60.0 if seconds > 0 else 0.0
+            if campaign:
+                self._end_campaign_episode(cur, reason, info)
         return self._pack(cur), float(reward.total), terminated, truncated, info
 
     def close(self) -> None:
-        if self._connected:
-            self.client.close()
-            self._connected = False
+        try:
+            self._save_archive()
+        finally:
+            # Release the game even if the archive could not be written, so it never stays in lockstep.
+            if self._connected:
+                self.client.close()
+                self._connected = False
 
     # ------------------------------------------------------------------
 
@@ -349,8 +416,160 @@ class UltrakillEnv(gym.Env):
             if e["health"] > self._enemy_max_health.get(e["id"], 0.0):
                 self._enemy_max_health[e["id"]] = e["health"]
 
+    # Campaign ----------------------------------------------------------
+
+    def _archive_path(self) -> Path:
+        return Path(self.cfg.explore_dir) / f"explore_{safe_name(self.cfg.level)}_{self.cfg.port}.npz"
+
+    def _save_archive(self) -> None:
+        if self.cfg.mode != "campaign" or not self.cfg.explore_dir:
+            return
+        path = self._archive_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.archive.save(path)
+
+    @staticmethod
+    def _current_checkpoint(raw: dict[str, Any]) -> str | None:
+        """Id of the checkpoint a respawn would return to, or None when no checkpoint is active in this level load."""
+        for cp in (raw.get("campaign") or {}).get("checkpoints", []):
+            if cp.get("current"):
+                return cp["id"]
+        return None
+
+    @staticmethod
+    def _rounded(pos) -> list[float]:
+        return [round(float(v), 2) for v in pos]
+
+    def _campaign_reset(self) -> dict[str, Any]:
+        """Fresh level load or checkpoint respawn, so each game drifts toward the part of the level it cannot do yet."""
+        prev = self._raw or {}
+        camp = prev.get("campaign") or {}
+        current = self._current_checkpoint(prev)
+        if self._last_end_reason == "stuck":
+            # A respawn can leave a door locked behind the player; three stuck episodes in a row at the same
+            # checkpoint force a fresh load.
+            self._stuck_streak = self._stuck_streak + 1 if current == self._stuck_checkpoint else 1
+            self._stuck_checkpoint = current
+        else:
+            self._stuck_streak, self._stuck_checkpoint = 0, None
+        fresh = choose_fresh_start(
+            self._rng,
+            in_level=prev.get("scene") == self.cfg.level and prev.get("player") is not None,
+            level_over=bool(camp.get("level_over")),
+            has_checkpoint=current is not None,
+            stuck_streak=self._stuck_streak,
+            stuck_limit=self.cfg.stuck_repeats,
+            fresh_prob=self.cfg.fresh_start_prob,
+        )
+        raw = self._skip_locked(self.client.reset(self.cfg.level, checkpoint=not fresh))
+        if fresh:
+            self.milestones.new_level_load(raw.get("campaign"))
+            self._stuck_streak, self._stuck_checkpoint = 0, None
+        else:
+            # Whatever the respawn itself changes (doors it unlocks, rooms it resets) pays nothing.
+            self.milestones.mark_paid(raw.get("campaign"))
+        self._fresh_start = fresh
+        return raw
+
+    def _respawn(self) -> dict[str, Any]:
+        """Respawns after a death inside the same episode. Milestones the respawn itself changes pay nothing."""
+        before = self._raw.get("stats", {})
+        raw = self._skip_locked(self.client.reset(self.cfg.level, checkpoint=True))
+        self.milestones.mark_paid(raw.get("campaign"))
+        self._track_enemies(raw)
+        player = raw.get("player")
+        if player and self._current_checkpoint(raw) is None:
+            # No checkpoint yet, so StatsManager.Restart reloaded the level and its counters started again. Keep
+            # the kills and style from before the death in this episode's info, and start a best run's positions
+            # again from the spawn: the official time is the reloaded attempt's.
+            after = raw.get("stats", {})
+            for key in ("kills", "style"):
+                self._episode_start_stats[key] = self._episode_start_stats.get(key, 0) - before.get(key, 0) + after.get(key, 0)
+            self._positions = [self._rounded(player["pos"])] if self._fresh_start else []
+        return raw
+
+    def _skip_locked(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Steps with an empty action while input is locked (landing, cutscenes), so the policy never sees those frames."""
+        for _ in range(int(self.cfg.max_locked_skip_s * self.cfg.fixed_fps / self.cfg.frameskip)):
+            camp = raw.get("campaign") or {}
+            player = raw.get("player")
+            if not camp.get("input_locked") or camp.get("level_over") or not player or player["dead"]:
+                break
+            raw = self.client.step({})
+            self._track_enemies(raw)
+        return raw
+
+    def _campaign_progress(self, raw: dict[str, Any]) -> CampaignStep:
+        """What the level did this step. Any progress restarts the stuck clock."""
+        camp = raw.get("campaign") or {}
+        checkpoints, arenas, doors = self.milestones.update(raw.get("campaign"))
+        novelty = 0.0
+        player = raw.get("player")
+        if player:
+            pos = player["pos"]
+            novelty = self.archive.visit(pos)
+            if novelty > 0:
+                self._cells_new += 1
+            if self._fresh_start:
+                self._positions.append(self._rounded(pos))
+            if camp.get("exit"):
+                self._exit_dist_min = min(self._exit_dist_min, math.dist(pos, camp["exit"]["pos"]))
+        path_gain = self.path_progress.update(camp.get("path"))
+        if checkpoints or arenas or doors or novelty > 0 or path_gain > 0:
+            self._steps_since_progress = 0
+        else:
+            self._steps_since_progress += 1
+        return CampaignStep(checkpoints=checkpoints, arenas=arenas, doors=doors, novelty=novelty, path_gain=path_gain)
+
+    def _level_result(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Official time, kills, style, restarts and rank as the game's results screen would count them."""
+        camp = raw.get("campaign") or {}
+        stats = raw.get("stats", {})
+        seconds = camp.get("seconds", stats.get("seconds", 0.0))
+        restarts = camp.get("restarts", stats.get("restarts", 0))
+        kills, style = stats.get("kills", 0), stats.get("style", 0)
+        ranks = camp.get("ranks")
+        rank = compute_rank(seconds, kills, style, restarts, ranks) if ranks else None
+        return {"seconds": seconds, "kills": kills, "style": style, "restarts": restarts, "rank": rank}
+
+    def _end_campaign_episode(self, raw: dict[str, Any], reason: str, info: dict[str, Any]) -> None:
+        if reason == "level_complete":
+            info["completed"] = 1
+            if self._fresh_start:
+                # Only a fresh load has a meaningful official time: the timer carries across respawn episodes.
+                result = self._level_result(raw)
+                info["level_seconds"] = result["seconds"]
+                info["restarts"] = result["restarts"]
+                info["rank"] = result["rank"]
+                self._save_best_run(raw)
+        self._episodes += 1
+        if self._episodes % 20 == 0:
+            self._save_archive()
+
+    def _save_best_run(self, raw: dict[str, Any]) -> None:
+        if not self.cfg.best_runs_dir:
+            return
+        result = self._level_result(raw)
+        run = {
+            "level": self.cfg.level,
+            "seconds": result["seconds"],
+            "kills": result["kills"],
+            "style": result["style"],
+            "restarts": result["restarts"],
+            "deaths": self._deaths,
+            "rank": result["rank"],
+            "difficulty": (raw.get("campaign") or {}).get("difficulty"),
+            "positions": self._positions,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        path = Path(self.cfg.best_runs_dir) / f"{safe_name(self.cfg.level)}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_best_run(path, run)
+
     def _pack(self, raw: dict[str, Any]) -> np.ndarray:
-        return pack_observation(raw, self.cfg.layout, self._enemy_max_health)
+        player = raw.get("player")
+        explore = self.archive.features(player["pos"], player["yaw"]) if self.cfg.mode == "campaign" and player else None
+        return pack_observation(raw, self.cfg.layout, self._enemy_max_health, explore)
 
     def _info(self, raw: dict[str, Any]) -> dict[str, Any]:
         stats = raw.get("stats", {})
@@ -385,6 +604,11 @@ class UltrakillEnv(gym.Env):
         info["enemy_dist_mean"] = b["dist_sum"] / seen
         info["enemy_close_frac"] = b["close"] / steps  # nearest visible enemy within 5 m
         info["yaw_per_step_mean"] = b["yaw_sum"] / steps  # degrees turned per decision
-        if self.route_tracker is not None:
-            info["route_progress"] = self.route_tracker.progress
+        if self.cfg.mode == "campaign":
+            info["fresh_start"] = int(self._fresh_start)
+            info["checkpoints_level"] = self.milestones.checkpoints_reached  # distinct checkpoints this level load
+            info["cells_new"] = self._cells_new  # cells entered for the first time this episode
+            info["exit_dist_min"] = None if math.isinf(self._exit_dist_min) else self._exit_dist_min
+            info["completed"] = 0  # set to 1 on the step that ends with level_complete
+            info["level_seconds"] = None  # official time, only for a fresh-start completion
         return info
