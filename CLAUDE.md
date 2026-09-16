@@ -66,6 +66,18 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Mods:** BepInEx 5.4.23.5 installed 2026-09-15; UltrakillAIBridge plugin installed.
 - **Save backup:** `C:\Users\tyler\Documents\ULTRAKILL-Saves-Backup-2026-09-15`.
 
+## Local machine state (the second PC, 2026-09-15)
+- **Game:** `C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL`, Unity 2022.3.29 Mono (same build).
+- **Hardware:** Ryzen 9 3900X (12C/24T), 32 GB, RTX 2080 SUPER. One display only, so launch with
+  `games.py launch --count 5 --monitor 1` and `dashboard.py --monitor 1` (the default `--monitor 3` falls
+  back to the primary with a printed note, but pass it explicitly).
+- **Toolchain installed 2026-09-15:** Python 3.12.10 and .NET SDK 8.0.425 (winget), BepInEx 5.4.23.5,
+  venv with torch 2.14.0+cpu / sb3 2.9.0 / gymnasium 1.3.0 / numpy 2.5.3. `GamePaths.props` is a
+  straight copy of the example: the example's path already matches this machine.
+- **Save backup:** `C:\Users\tyler\Documents\ULTRAKILL-Saves-Backup-2026-09-15-newpc`.
+- **Migration gap:** `runs/` is gitignored and was not carried over, so the v2 dashboard history and the
+  TensorBoard curves before 1.179M steps are gone. `models/` is committed now, so the weights survived.
+
 ## Gotchas found in the live game
 - **Manager object destroyed:** ULTRAKILL destroys BepInEx's manager GameObject. The bridge runs on its own `HideAndDontSave` + `DontDestroyOnLoad` object (`BridgeRunner` in `Plugin.cs`).
 - **Background running:** the game ships with `runInBackground` off. The plugin turns it on so the bridge answers while the window is unfocused.
@@ -120,6 +132,23 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     - 4 games with teleport resets: about 120 steps/s, CPU ~90%, resets ~0.6 s
     - 5 games, 30 fps / frameskip 2, soft death, no rendering, 480x270 windows: ~255+ steps/s in real training
   - Games run on monitor 3 (`\.\DISPLAY3`, x 1920–3840).
+- **Resumed on the second PC at 1.179M steps (2026-09-15).** Throughput ~190 steps/s with 5 games
+  (vs ~255 on the original PC). An offline probe of `latest.zip` (`probe_policy.py`: synthetic observations
+  with one visible enemy, reading the yaw/pitch bin distributions) shows v2 has drifted into v1's failure
+  mode: both look heads have the right slope (corr(rel.x, E[yaw]) +0.74, corr(rel.y, E[pitch]) +0.68) but
+  carry a large constant offset, so `E[yaw]` is positive at every azimuth (+19 deg/step at azimuth 0, still
+  +15 at -90 deg) and `E[pitch]` is positive at every elevation (+3 deg/step, v1's exact bias). Sign
+  agreement is 50% on both axes, i.e. random: the camera spins right at ~285 deg/s and pitch pins against
+  the 45 deg band. Live metrics agree: `yaw_track` 0.13, `pitch_track` 0.02, `on_target_frac` 3.2%,
+  `pitch_abs_mean` 27 deg, `firing_frac` 86%.
+- **Why the bias survives: the aim reward is mostly an unconditional floor.** Per-episode reward parts at
+  1.19M steps: `aim_pitch` 65.0, `aim_yaw` 58.3, `kill` 31.0, `death` -12.8, `damage_dealt` 12.7,
+  `aim_locked` 5.3, `damage_taken` -4.4, `style` 2.6 (total ~158). Aim shaping is 78% of the return, but the
+  slope `w * (1 - err/180)` pays `w/2` per step at a uniformly random heading: about 54 points an episode
+  per axis that no behaviour can avoid. Only ~15 of the ~123 aim points vary with aim quality, spread over
+  1800 steps, so the gradient that would cancel the constant offset is far smaller than the kill term's own
+  variance -- the same "noise-dominated updates" as the v1 audit, with the cause now identified. The one
+  genuinely contingent term, `aim_locked` (paid only inside the 20 deg cone), is worth just 5.3.
 - **Next steps:**
   - Watch v2: `pitch_abs_mean` should sit under 15° and `on_target_frac` climb past the ~8% chance level; then kills/min should climb above the random-play level of ~20 (v1 ended at 5.0).
   - Raise `max_wave` as the agent improves.
