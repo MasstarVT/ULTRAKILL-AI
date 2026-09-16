@@ -1542,13 +1542,13 @@ In `CLAUDE.md` (Layout, the specs line):
 Replace:
 
 ```markdown
-- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign plan (not built yet).
+- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign design (not built yet).
 ```
 
 With:
 
 ```markdown
-- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign plan (being built: the mod side is done in v0.5.0).
+- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign design (being built: the mod side is done in v0.5.0).
 ```
 
 In `CLAUDE.md` (Status, the Campaign bullet's first line):
