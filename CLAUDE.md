@@ -42,6 +42,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/ultrakill_ai/windows.py`: monitor work-area lookup shared by `games.py` and `dashboard.py`.
 - `python/tests/test_progress.py`: `ProgressCallback`, dashboard and `poll_status.py` tests against fake Cyber Grind and campaign envs (no game needed).
 - `python/tests/test_aim.py`: aim-reward geometry (the yaw/pitch split) and the pitch clamp (no game needed).
+- `python/tests/test_keep_best.py`: `keep_best.py` scoring for both metrics on synthetic `metrics_log.csv` rows, and old `best.json` files (no game needed; `python tests/test_keep_best.py`).
 - `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load (no game needed).
 - `python/tests/test_campaign.py`: campaign helpers: level list, rank maths, exploration archive, milestones, path progress, the fresh-start rule and best runs (no game needed).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
@@ -60,6 +61,11 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   night while the run reached 6.5M. Helpers to keep running alongside training, both read-only and safe:
   `python scripts/poll_status.py` (metrics to `runs/<run>/metrics_log.csv`) and `python scripts/keep_best.py`
   (maintains `best.zip`, warns when the current policy falls more than 15% below it).
+  For the campaign run use `python scripts/keep_best.py --run campaign_ppo --metric campaign`: it scores the
+  completion rate over the last 50 fresh-start episodes (samples need `fresh_window >= 20`), breaks ties on the
+  lower best official time, and `best.json` records the tie-break as `penalty` / `penalty_name` (older files
+  that only have `deaths` still load). It refuses to start when `best.json` was written by the other metric, so
+  forgetting `--metric campaign` cannot overwrite the campaign `best.zip`.
 - Python env: `cd python && .venv\Scripts\activate` (created with `pip install torch` + `pip install -e .`).
 - Bridge check (game open, in a level): `python scripts/bridge_test.py --drive`. In a campaign level, `python scripts/bridge_test.py --campaign` prints the `campaign` block (exit, checkpoints, path, locked doors, arena state, ranks, weapons per slot) without taking control, so its `difficulty` is the game's own setting: the override applies only while the AI has control. Never run it against a game a trainer is using.
 - Parallel training:
@@ -69,7 +75,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `python scripts/games.py status` is safe during training (it reads netstat, it does not connect).
 - TensorBoard: `tensorboard --logdir runs`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, checkpoints per load, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and checkpoints per load instead of kills/min and wave, and lists checkpoints instead of waves per game.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py` and `python tests/test_campaign_env.py` (pytest is not installed; the files also work under pytest).
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py` and `python tests/test_keep_best.py` (pytest is not installed; the files also work under pytest).
 
 ## Key design decisions
 - **Lockstep:** the mod blocks Unity's main thread between steps. `Time.captureDeltaTime = 1/60` fixes game time per frame, and uncapped FPS makes training faster than real time. Game speed is not controlled through `Time.timeScale`, which `TimeController` owns for hitstop.

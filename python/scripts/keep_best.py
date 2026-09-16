@@ -9,11 +9,15 @@ This copies the checkpoint nearest each new best to `best.zip` and records how i
 `best.json`. It only reads `metrics_log.csv` (written by poll_status.py) and copies files, so it is
 safe to leave running alongside training and never touches the bridge ports.
 
-Scoring: kills per game-minute, smoothed over several consecutive samples, and only from samples
-backed by a full 100-episode window. Ties break on lower deaths.
+Scoring, smoothed over several consecutive samples in both modes:
+- `--metric kills_per_min` (default, Cyber Grind): kills per game-minute, only from samples backed by a
+  full 100-episode window. Ties break on lower deaths.
+- `--metric campaign`: the completion rate over the last 50 fresh-start episodes, only from samples
+  backed by at least 20 of them. Ties break on the lower best official time.
 
     python scripts/keep_best.py --run cybergrind_ppo_v2            # watch until stopped
     python scripts/keep_best.py --run cybergrind_ppo_v2 --once     # report and exit
+    python scripts/keep_best.py --run campaign_ppo --metric campaign
 """
 
 from __future__ import annotations
@@ -21,14 +25,33 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import re
 import shutil
 import statistics
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 SMOOTH = 9          # samples per smoothing window (~4.5 min at a 30 s poll)
-MIN_WINDOW = 100    # require a full episode window behind every mean
+MIN_WINDOW = 100    # kills_per_min: require a full episode window behind every mean
+MIN_FRESH_WINDOW = 20  # campaign: fresh-start episodes behind the completion rate (its window holds 50)
+
+
+class Metric(NamedTuple):
+    window: str     # CSV column counting the episodes behind the means
+    min_window: int
+    score: str      # CSV column, higher is better
+    penalty: str    # CSV column that breaks ties, lower is better; also `penalty_name` in best.json
+    missing: float  # penalty when no sample in a smoothing window has one
+    unit: str
+
+
+METRICS = {
+    "kills_per_min": Metric("window", MIN_WINDOW, "kills_per_min", "deaths", 0.0, "kills/min"),
+    # No completed run means no best time: an infinite penalty, so the first finite time wins the tie.
+    "campaign": Metric("fresh_window", MIN_FRESH_WINDOW, "fresh_completion_rate", "best_time", math.inf, "fresh completion rate"),
+}
 
 
 def num(row: dict, key: str) -> float | None:
@@ -41,29 +64,70 @@ def num(row: dict, key: str) -> float | None:
         return None
 
 
-def scored(csv_path: Path) -> list[tuple[float, float, float, float]]:
-    """(score, deaths, reward, timesteps), smoothed, newest last."""
+def scored(csv_path: Path, metric: str = "kills_per_min") -> list[tuple[float, float, float, float]]:
+    """(score, penalty, reward, timesteps), smoothed, newest last."""
+    m = METRICS[metric]
     try:
-        rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
+        with csv_path.open(encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
     except OSError:
         return []
-    rows = [r for r in rows if (num(r, "window") or 0) >= MIN_WINDOW and num(r, "kills_per_min") is not None]
+    rows = [r for r in rows if (num(r, m.window) or 0) >= m.min_window and num(r, m.score) is not None]
     out = []
     half = SMOOTH // 2
     for i in range(half, len(rows) - half):
         w = rows[i - half:i + half + 1]
-        kpm = [num(r, "kills_per_min") for r in w]
-        dth = [num(r, "deaths") for r in w]
+        score = [num(r, m.score) for r in w]
+        pen = [num(r, m.penalty) for r in w]
         rew = [num(r, "reward") for r in w]
-        if any(v is None for v in kpm):
+        if any(v is None for v in score):
             continue
         out.append((
-            statistics.mean(kpm),
-            statistics.mean([d for d in dth if d is not None] or [0.0]),
+            statistics.mean(score),
+            statistics.mean([p for p in pen if p is not None] or [m.missing]),
             statistics.mean([v for v in rew if v is not None] or [0.0]),
             num(rows[i], "timesteps") or 0.0,
         ))
     return out
+
+
+def rank_key(score: float, penalty: float) -> tuple[float, float]:
+    """Higher is better: the score, then the negated penalty, both at the 4 decimals best.json keeps.
+
+    best_of and is_better share it, so the sample picked as best is always the one compared with the stored best,
+    and a restart does not re-save the best it already holds (a raw score against its own rounded copy).
+    """
+    return round(score, 4), -round(penalty, 4)
+
+
+def best_of(series: list[tuple[float, float, float, float]]) -> tuple[float, float, float, float]:
+    """The sample with the highest score, ties broken on the lowest penalty."""
+    return max(series, key=lambda s: rank_key(s[0], s[1]))
+
+
+def is_better(candidate: tuple[float, float], stored: tuple[float, float] | None) -> bool:
+    """True when (score, penalty) strictly beats the stored best: a higher score, or the same score and a lower penalty."""
+    if stored is None:
+        return True
+    return rank_key(*candidate) > rank_key(*stored)
+
+
+def stored_best(best_json: Path) -> tuple[float, float] | None:
+    """(score, penalty) of the saved best, or None. best.json files written before --metric keep the penalty as `deaths`."""
+    try:
+        data = json.loads(best_json.read_text(encoding="utf-8"))
+        penalty = data.get("penalty", data.get("deaths"))
+        return float(data["score"]), (math.inf if penalty is None else float(penalty))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def stored_penalty_name(best_json: Path) -> str | None:
+    """The tie-break the saved best was chosen with (`deaths` for files written before --metric), or None without one."""
+    try:
+        return str(json.loads(best_json.read_text(encoding="utf-8")).get("penalty_name", "deaths"))
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def nearest_checkpoint(model_dir: Path, timesteps: float) -> Path | None:
@@ -78,51 +142,63 @@ def nearest_checkpoint(model_dir: Path, timesteps: float) -> Path | None:
     return at_or_before[-1] if at_or_before else None
 
 
+def save_if_better(series: list[tuple[float, float, float, float]], model_dir: Path, metric: str,
+                   best: tuple[float, float] | None) -> tuple[float, float] | None:
+    """Copies the checkpoint behind the series' best sample to best.zip when it beats `best`. Returns the best now held."""
+    m = METRICS[metric]
+    score, penalty, reward, ts = best_of(series)
+    if not is_better((score, penalty), best):
+        return best
+    src = nearest_checkpoint(model_dir, ts)
+    if not (src and src.exists()):
+        return best
+    shutil.copy2(src, model_dir / "best.zip")
+    (model_dir / "best.json").write_text(json.dumps({
+        "score_metric": "%s, smoothed over %d samples" % (m.score, SMOOTH),
+        "score": round(score, 4),
+        "penalty": round(penalty, 4) if math.isfinite(penalty) else None,  # null: no completed run yet
+        "penalty_name": m.penalty,
+        "reward": round(reward, 3),
+        "at_timesteps": ts,
+        "checkpoint": src.name,
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }, indent=2), encoding="utf-8")
+    print(f"[keep_best] new best {score:.2f} {m.unit} ({m.penalty} {penalty:.2f}) at {ts:,.0f} -> {src.name}", flush=True)
+    return score, penalty
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="cybergrind_ppo_v2")
     ap.add_argument("--runs-dir", default="runs")
     ap.add_argument("--models-dir", default="models")
+    ap.add_argument("--metric", choices=sorted(METRICS), default="kills_per_min",
+                    help="kills_per_min (Cyber Grind) or campaign (fresh-start completion rate, then best time)")
     ap.add_argument("--interval", type=float, default=60.0)
     ap.add_argument("--once", action="store_true")
     a = ap.parse_args()
 
+    metric = METRICS[a.metric]
     csv_path = Path(a.runs_dir) / a.run / "metrics_log.csv"
     model_dir = Path(a.models_dir) / a.run
-    best_zip = model_dir / "best.zip"
     best_json = model_dir / "best.json"
-
-    best_score = -1.0
-    if best_json.exists():
-        try:
-            best_score = float(json.loads(best_json.read_text(encoding="utf-8")).get("score", -1.0))
-        except (OSError, ValueError, json.JSONDecodeError):
-            best_score = -1.0
+    # A best chosen by the other metric is not comparable (7.16 kills/min would outrank any completion rate), and
+    # overwriting it would silently replace that run's best.zip, so refuse instead.
+    held = stored_penalty_name(best_json)
+    if held is not None and held != metric.penalty:
+        ap.error(f"{best_json} holds a best chosen with the {held!r} tie-break, not {metric.penalty!r}: "
+                 f"pass the --metric that run was scored with")
+    best = stored_best(best_json)
 
     while True:
-        series = scored(csv_path)
+        series = scored(csv_path, a.metric)
         if series:
-            score, deaths, reward, ts = max(series, key=lambda s: (s[0], -s[1]))
+            best = save_if_better(series, model_dir, a.metric, best)
             newest = series[-1]
-            if score > best_score + 1e-9:
-                src = nearest_checkpoint(model_dir, ts)
-                if src and src.exists():
-                    shutil.copy2(src, best_zip)
-                    best_json.write_text(json.dumps({
-                        "score_metric": "kills_per_min, smoothed over %d samples" % SMOOTH,
-                        "score": round(score, 4),
-                        "deaths": round(deaths, 4),
-                        "reward": round(reward, 3),
-                        "at_timesteps": ts,
-                        "checkpoint": src.name,
-                        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    }, indent=2), encoding="utf-8")
-                    best_score = score
-                    print(f"[keep_best] new best {score:.2f} kills/min at {ts:,.0f} -> {src.name}", flush=True)
             # Warn when the current policy has fallen well below the best: that is the signal to roll back.
-            if best_score > 0 and newest[0] < best_score * 0.85:
-                print(f"[keep_best] WARNING current {newest[0]:.2f} kills/min is "
-                      f"{(1 - newest[0]/best_score)*100:.0f}% below best {best_score:.2f} "
+            if best is not None and best[0] > 0 and newest[0] < best[0] * 0.85:
+                print(f"[keep_best] WARNING current {newest[0]:.2f} {metric.unit} is "
+                      f"{(1 - newest[0]/best[0])*100:.0f}% below best {best[0]:.2f} "
                       f"(best.zip holds the good weights)", flush=True)
         if a.once:
             if best_json.exists():
