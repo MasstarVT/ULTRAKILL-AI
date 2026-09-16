@@ -1,12 +1,19 @@
 """Runs a trained model so you can watch it or measure it.
 
     python scripts/eval.py models/cybergrind_ppo/latest.zip --episodes 3 --realtime
+    python scripts/eval.py models/campaign_ppo/best.zip --level "Level 0-1" --episodes 10 --record-times
+
+Campaign evaluation always starts from a fresh level load with real deaths. It reads the first training game's
+exploration counts (the policy was trained with them as inputs) but never writes them back, and never writes the
+training runs' best-run files. `--record-times` adds the fastest completion to the repo-root times.md
+(generation history, plus the leaderboard when it is a record).
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +21,40 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ultrakill_ai.campaign import CAMPAIGN_LEVELS, ExplorationArchive, safe_name  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
+from ultrakill_ai.times import TimeEntry, format_time, record_file  # noqa: E402
+
+TIMES_MD = Path(__file__).resolve().parents[2] / "times.md"
+
+
+def report_campaign(args: argparse.Namespace, cfg: EnvConfig, model, results: list[tuple[float, dict]]) -> None:
+    """Completion summary for a campaign eval, and the times.md entry for its fastest completion."""
+    completions = sum(1 for _, info in results if info.get("completed"))
+    print(f"completed {completions}/{len(results)} fresh runs of {cfg.level}")
+    timed = [info for _, info in results if info.get("completed") and info.get("level_seconds") is not None]
+    if not timed:
+        if args.record_times:
+            print("no completed run, times.md unchanged")
+        return
+    best = min(timed, key=lambda info: info["level_seconds"])
+    print(f"fastest {format_time(best['level_seconds'])} rank={best.get('rank') or '-'} kills={best['kills']}"
+          f" style={best.get('style', 0)} restarts={best.get('restarts', '-')} deaths={best['deaths']}")
+    if not args.record_times:
+        return
+    entry = TimeEntry(
+        level=cfg.level,
+        seconds=best["level_seconds"],
+        rank=best.get("rank") or "",
+        generation=f"{Path(args.model).parent.name}@{model.num_timesteps / 1e6:.2f}M",
+        difficulty=best["difficulty"],
+        date=time.strftime("%Y-%m-%d"),
+        kills=best["kills"],
+        deaths=best["deaths"],
+        notes=f"{completions}/{len(results)} eval runs completed",
+    )
+    record_file(TIMES_MD, entry)
+    print(f"recorded {format_time(entry.seconds)} ({entry.generation}) in {TIMES_MD}")
 
 
 def main() -> None:
@@ -24,16 +64,30 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--realtime", action="store_true", help="normal speed with sound")
     parser.add_argument("--stochastic", action="store_true", help="sample actions instead of taking the most likely")
+    parser.add_argument("--level", help='campaign scene, e.g. "Level 0-1" (default: the level in env_config.yaml next to the model)')
+    parser.add_argument("--record-times", action="store_true", help="campaign: add the fastest completion to times.md")
     args = parser.parse_args()
 
     cfg_path = Path(args.model).parent / "env_config.yaml"
     cfg = EnvConfig.from_dict(yaml.safe_load(cfg_path.read_text(encoding="utf-8"))) if cfg_path.exists() else EnvConfig()
+    if (args.level or args.record_times) and cfg.mode != "campaign":
+        parser.error(f"--level and --record-times need a campaign model; the env config next to it gives mode {cfg.mode!r}")
+    if args.level and args.level not in CAMPAIGN_LEVELS:
+        parser.error(f"--level {args.level!r} is not a campaign scene name (Level 0-1 .. Level 9-2)")
+    if args.level:
+        cfg.level = args.level
     if args.realtime:
         cfg.unlimited_fps = False
         cfg.mute = False
         cfg.windowed = False
         cfg.render = True
     cfg.soft_death = False  # evaluate with real deaths
+    if cfg.mode == "campaign":
+        # Every episode is a fresh level load, so each one is a whole run with an official time. The exploration
+        # archive and best-run files belong to the training games, so eval never saves either of them.
+        cfg.fresh_start_prob = 1.0
+        cfg.explore_dir = ""
+        cfg.best_runs_dir = ""
 
     if args.algo == "rppo":
         from sb3_contrib import RecurrentPPO as cls
@@ -42,6 +96,14 @@ def main() -> None:
     model = cls.load(args.model, device="cpu")
 
     env = UltrakillEnv(cfg)
+    if cfg.mode == "campaign":
+        # The last 9 campaign inputs are the game's visit counts, which in training come from thousands of earlier
+        # episodes. A fresh archive would show the policy an all-unexplored map it never trained on, so eval reads the
+        # counts the first training game (the config's base port) saved next to the model. explore_dir stays empty,
+        # so the env never writes them back. A missing file gives an empty archive, and the count below shows it.
+        archive_path = Path(args.model).parent / f"explore_{safe_name(cfg.level)}_{cfg.port}.npz"
+        env.archive = ExplorationArchive.load(archive_path, cfg.cell_size)
+        print(f"exploration counts: {len(env.archive.counts)} cells from {archive_path}")
     results = []
     try:
         for ep in range(args.episodes):
@@ -56,13 +118,23 @@ def main() -> None:
                 steps += 1
                 if terminated or truncated:
                     break
+            if cfg.mode == "campaign":
+                # The difficulty the game actually read this run: the campaign block reports the override, if any.
+                info = dict(info, difficulty=(env._raw.get("campaign") or {}).get("difficulty", cfg.difficulty))
+                seconds = info.get("level_seconds")
+                extra = (f" completed={info.get('completed', 0)} time={format_time(seconds) if seconds is not None else '-'}"
+                         f" rank={info.get('rank') or '-'} style={info.get('style', 0)}"
+                         f" restarts={info.get('restarts', '-')} deaths={info['deaths']}")
+            else:
+                extra = f" wave={info['wave']}"
             results.append((total, info))
-            extra = f" route={info['route_progress']:.0%}" if "route_progress" in info else f" wave={info['wave']}"
             print(f"episode {ep}: reward={total:.1f} steps={steps} kills={info['kills']}{extra} end={info.get('end_reason')}")
     finally:
         env.close()
 
     print(f"mean reward {np.mean([r for r, _ in results]):.1f} over {len(results)} episodes")
+    if cfg.mode == "campaign":
+        report_campaign(args, cfg, model, results)
 
 
 if __name__ == "__main__":
