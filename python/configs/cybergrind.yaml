@@ -45,8 +45,12 @@ env:
 train:
   algo: ppo
   num_envs: 5  # start the games first: python scripts/games.py launch --count 5 (BepInEx supports at most 5 copies)
-  run_name: cybergrind_ppo
+  # v2: a fresh start after the 2.45M-step weight audit. The first run had learned reflexes (fire always, dash,
+  # walk backwards, look up) through noise-dominated updates, so it was not worth carrying over.
+  run_name: cybergrind_ppo_v2
   timesteps: 5000000
   save_every: 50000
   hyperparams:
-    ent_coef: 0.005  # 0.01 kept actions too noisy for precise aiming
+    ent_coef: 0.01  # keep exploring early; the old 0.005 was chosen for "precise aiming" when the real problem was pitch
+    target_kl: 0.02  # stop an update early once the policy has moved this far: the v1 updates hit 0.03-0.05 per
+    # iteration with a 25-30% clip fraction and wandered randomly instead of following the gradient
