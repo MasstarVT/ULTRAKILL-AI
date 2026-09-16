@@ -12,7 +12,7 @@ import gymnasium as gym
 import numpy as np
 
 from ultrakill_ai.protocol import DEFAULT_PORT, BridgeClient
-from ultrakill_ai.rewards import RewardConfig, aim_errors, compute_reward
+from ultrakill_ai.rewards import RewardConfig, aim_errors, compute_reward, horizon_elevation
 from ultrakill_ai.routes import Route, RouteTracker, route_path
 from ultrakill_ai.spaces import ObsLayout, action_space, decode_action, pack_observation
 
@@ -67,7 +67,8 @@ class EnvConfig:
         return asdict(self)
 
 
-BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "yaw_err_sum", "dist_sum", "yaw_sum", "pitch_steps", "pitch_sum")
+BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "yaw_err_sum", "dist_sum", "yaw_sum",
+                  "pitch_steps", "pitch_sum", "pitch_signed_sum", "look_up_sum", "elev_steps", "elev_sum", "elev_abs_sum", "elev_over15")
 
 
 def clamp_pitch_command(current_pitch: float, pitch_cmd: float, limit: float) -> float:
@@ -294,6 +295,8 @@ class UltrakillEnv(gym.Env):
             return
         self._behaviour["pitch_steps"] += 1
         self._behaviour["pitch_sum"] += abs(player["pitch"])
+        self._behaviour["pitch_signed_sum"] += player["pitch"]
+        self._behaviour["look_up_sum"] += player.get("forward", (0.0, 0.0, 0.0))[1]
         visible = [e for e in raw.get("enemies", []) if e["visible"]]
         if not visible:
             return
@@ -304,6 +307,12 @@ class UltrakillEnv(gym.Env):
         angle, yaw_err, _ = errors
         self._behaviour["angle_sum"] += angle
         self._behaviour["yaw_err_sum"] += yaw_err
+        elev = horizon_elevation(player, visible[0])
+        if elev is not None:
+            self._behaviour["elev_steps"] += 1
+            self._behaviour["elev_sum"] += elev
+            self._behaviour["elev_abs_sum"] += abs(elev)
+            self._behaviour["elev_over15"] += abs(elev) > 15.0
         self._behaviour["dist_sum"] += visible[0]["dist"]
         self._behaviour["close"] += visible[0]["dist"] <= 5.0
         on_target = angle <= 15.0
@@ -341,6 +350,12 @@ class UltrakillEnv(gym.Env):
         info["enemy_angle_mean"] = b["angle_sum"] / seen  # degrees off the crosshair
         info["enemy_yaw_angle_mean"] = b["yaw_err_sum"] / seen  # heading error only, ignoring pitch
         info["pitch_abs_mean"] = b["pitch_sum"] / max(1, b["pitch_steps"])  # camera pitch away from level
+        info["pitch_mean"] = b["pitch_signed_sum"] / max(1, b["pitch_steps"])  # signed rotationX
+        info["look_up_mean"] = b["look_up_sum"] / max(1, b["pitch_steps"])  # mean camera forward.y (>0 = looking up)
+        elev_steps = max(1, b["elev_steps"])
+        info["enemy_elev_mean"] = b["elev_sum"] / elev_steps  # nearest visible enemy, degrees above the horizon
+        info["enemy_elev_abs_mean"] = b["elev_abs_sum"] / elev_steps
+        info["enemy_elev_over15_frac"] = b["elev_over15"] / elev_steps  # share of steps the pitch band cannot reach
         info["enemy_dist_mean"] = b["dist_sum"] / seen
         info["enemy_close_frac"] = b["close"] / steps  # nearest visible enemy within 5 m
         info["yaw_per_step_mean"] = b["yaw_sum"] / steps  # degrees turned per decision

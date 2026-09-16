@@ -81,6 +81,30 @@ def aim_errors(player: dict[str, Any], enemy: dict[str, Any]) -> tuple[float, fl
     return angle, yaw_err, pitch_err
 
 
+def horizon_elevation(player: dict[str, Any], enemy: dict[str, Any]) -> float | None:
+    """Degrees the enemy sits above the horizontal through the camera, independent of where the camera points.
+
+    Rebuilds the camera basis from the reported world `forward` (no roll) and lifts the camera-space `rel` back
+    into world space, so it needs no assumption about the sign of the pitch angle. Diagnostics only.
+    """
+    fwd = player.get("forward")
+    if not fwd:
+        return None
+    fx, fy, fz = fwd
+    rx, rz = fz, -fx  # right = cross(world up, forward)
+    n = math.hypot(rx, rz)
+    if n < 1e-6:  # looking straight up or down: no horizontal heading to build the basis from
+        return None
+    rx, rz = rx / n, rz / n
+    uy = fz * rx - fx * rz  # y of up = cross(forward, right)
+    x, y, z = enemy["rel"]
+    length = math.sqrt(x * x + y * y + z * z)
+    if length <= 1e-6:
+        return None
+    world_y = y * uy + z * fy
+    return math.degrees(math.asin(max(-1.0, min(1.0, world_y / length))))
+
+
 def compute_reward(
     cfg: RewardConfig,
     prev: dict[str, Any],

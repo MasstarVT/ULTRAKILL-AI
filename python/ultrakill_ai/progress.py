@@ -190,6 +190,11 @@ class ProgressCallback(BaseCallback):
             "yaw_per_step_mean": field("yaw_per_step_mean"),
             "enemy_yaw_angle_mean": field("enemy_yaw_angle_mean"),
             "pitch_abs_mean": field("pitch_abs_mean"),
+            "pitch_mean": field("pitch_mean"),
+            "look_up_mean": field("look_up_mean"),
+            "enemy_elev_mean": field("enemy_elev_mean"),
+            "enemy_elev_abs_mean": field("enemy_elev_abs_mean"),
+            "enemy_elev_over15_frac": field("enemy_elev_over15_frac"),
             "wave": field("wave"),
             "style": field("style"),
             "route_progress": field("route_progress"),
@@ -240,7 +245,8 @@ class ProgressCallback(BaseCallback):
         recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "kills_per_min", "deaths", "wave", "style", "route_progress", "reset_seconds",
                                                  "firing_frac", "on_target_frac", "firing_on_target_frac",
                                                  "enemy_visible_frac", "enemy_angle_mean", "enemy_dist_mean",
-                                                 "enemy_close_frac", "yaw_per_step_mean", "enemy_yaw_angle_mean", "pitch_abs_mean")}
+                                                 "enemy_close_frac", "yaw_per_step_mean", "enemy_yaw_angle_mean", "pitch_abs_mean",
+                                                 "pitch_mean", "look_up_mean", "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac")}
         part_names = sorted({name for ep in self.episodes_recent for name in ep["reward_parts"]})
         n = len(self.episodes_recent)
         parts_mean = {name: sum(ep["reward_parts"].get(name, 0.0) for ep in self.episodes_recent) / n for name in part_names} if n else {}

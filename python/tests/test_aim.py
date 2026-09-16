@@ -9,7 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ultrakill_ai.env import clamp_pitch_command  # noqa: E402
-from ultrakill_ai.rewards import RewardConfig, aim_errors, compute_reward  # noqa: E402
+from ultrakill_ai.rewards import RewardConfig, aim_errors, compute_reward, horizon_elevation  # noqa: E402
 
 
 def camera(yaw_deg: float, pitch_up_deg: float):
@@ -89,6 +89,16 @@ def test_reward_parts_split_by_axis():
     locked = parts(0.0, 0.0, ground_enemy(5.0))
     assert abs(locked["aim_locked"] - 0.75) < 1e-6
     assert "aim" not in locked  # weight 0 adds nothing
+
+
+def test_horizon_elevation_ignores_camera_pitch_and_yaw():
+    for yaw, pitch in ((0.0, 0.0), (70.0, 30.0), (-120.0, -12.0), (33.0, 60.0)):
+        assert abs(horizon_elevation(*snapshot(yaw, pitch, ground_enemy(20.0)))) < 1e-6
+        above = ground_enemy(-50.0, dist=10.0 * math.cos(math.radians(25)), height=10.0 * math.sin(math.radians(25)))
+        assert abs(horizon_elevation(*snapshot(yaw, pitch, above)) - 25.0) < 1e-6
+        below = ground_enemy(10.0, dist=8.0, height=-8.0 * math.tan(math.radians(15)))
+        assert abs(horizon_elevation(*snapshot(yaw, pitch, below)) + 15.0) < 1e-6
+    assert horizon_elevation(*snapshot(0.0, 90.0, ground_enemy(0.0))) is None
 
 
 def test_pitch_clamp():
