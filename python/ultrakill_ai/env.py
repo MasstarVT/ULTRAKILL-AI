@@ -68,7 +68,7 @@ class EnvConfig:
 
 
 BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "yaw_err_sum", "dist_sum", "yaw_sum",
-                  "pitch_steps", "pitch_sum", "pitch_signed_sum", "look_up_sum", "elev_steps", "elev_sum", "elev_abs_sum", "elev_over15")
+                  "pitch_steps", "pitch_sum", "pitch_signed_sum", "look_up_sum", "elev_steps", "elev_sum", "elev_abs_sum", "elev_over15", "pitch_err_sum")
 
 
 def clamp_pitch_command(current_pitch: float, pitch_cmd: float, limit: float) -> float:
@@ -304,9 +304,10 @@ class UltrakillEnv(gym.Env):
         errors = aim_errors(player, visible[0])
         if errors is None:
             return
-        angle, yaw_err, _ = errors
+        angle, yaw_err, pitch_err = errors
         self._behaviour["angle_sum"] += angle
         self._behaviour["yaw_err_sum"] += yaw_err
+        self._behaviour["pitch_err_sum"] += pitch_err
         elev = horizon_elevation(player, visible[0])
         if elev is not None:
             self._behaviour["elev_steps"] += 1
@@ -349,6 +350,7 @@ class UltrakillEnv(gym.Env):
         info["enemy_visible_frac"] = b["enemy_visible"] / steps
         info["enemy_angle_mean"] = b["angle_sum"] / seen  # degrees off the crosshair
         info["enemy_yaw_angle_mean"] = b["yaw_err_sum"] / seen  # heading error only, ignoring pitch
+        info["enemy_pitch_err_mean"] = b["pitch_err_sum"] / seen  # vertical miss: enemy elevation in camera space
         info["pitch_abs_mean"] = b["pitch_sum"] / max(1, b["pitch_steps"])  # camera pitch away from level
         info["pitch_mean"] = b["pitch_signed_sum"] / max(1, b["pitch_steps"])  # signed rotationX
         info["look_up_mean"] = b["look_up_sum"] / max(1, b["pitch_steps"])  # mean camera forward.y (>0 = looking up)
