@@ -27,7 +27,14 @@ namespace UltrakillAIBridge.Obs
         private const int RescanEvery = 30;
         private const int PathEvery = 4;
         private const int MaxLockedDoors = 4;
-        private const float PlayerSnapDistance = 6f;
+        // The player end is snapped too, and ULTRAKILL is played in the air: jumping, dashing and falling are
+        // most of a run. At 6 m an airborne player can miss the mesh, and a missed sample reports the whole
+        // path as "none", withholding the path reward and the policy's next-corner input until they land.
+        // 25 m covers a jump or a drop between floors while still snapping to ground the player is above.
+        // (This is not why Level 0-1 reads "none" at spawn: measured there, the player is grounded and snaps
+        // fine, but the mesh island holding the exit is not connected to the start area, so CalculatePath
+        // finds nothing at all. The path hint only appears once the agent is far enough through the level.)
+        private const float PlayerSnapDistance = 25f;
         private const float ExitSnapDistance = 20f;
         private const float CornerReachedDistance = 1.5f;
 
