@@ -8,6 +8,8 @@ import os
 import random
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -188,6 +190,44 @@ def test_archive_load_missing_or_unreadable_is_empty():
             bad.write_bytes(data)
             loaded = ExplorationArchive.load(bad, cell_size=4.0)
             assert loaded.counts == {} and loaded.cell_size == 4.0, data
+
+
+def test_archive_cell_is_none_for_a_non_finite_position():
+    archive = ExplorationArchive(cell_size=4.0)
+    assert archive.cell((float("nan"), 0.0, 0.0)) is None
+    assert archive.cell((0.0, float("inf"), 0.0)) is None
+    assert archive.cell((0.0, 0.0, float("-inf"))) is None
+    assert archive.cell((1.0, 2.0, 3.0)) == (0, 0, 0)  # unaffected coordinates still work
+
+
+def test_archive_visit_ignores_a_non_finite_position():
+    # math.floor raises ValueError on NaN and OverflowError on infinity; one glitched physics frame must not
+    # crash the training worker, so a non-finite position simply pays no novelty.
+    archive = ExplorationArchive(cell_size=4.0)
+    archive.start_episode()
+    assert archive.visit((float("nan"), 0.0, 0.0)) == 0.0
+    assert archive.visit((0.0, float("inf"), 0.0)) == 0.0
+    assert archive.visit((0.0, 0.0, float("-inf"))) == 0.0
+    assert archive.episode_cells == 0  # nothing was recorded as visited
+    assert archive.counts == {}  # and nothing polluted the saved counts
+    # a later finite visit still works normally
+    assert archive.visit((1.0, 1.0, 1.0)) == 1.0
+
+
+def test_archive_features_ignores_a_non_finite_position_or_yaw():
+    archive = ExplorationArchive(cell_size=4.0)
+    archive.counts[(0, 0, 0)] = 5  # would otherwise show up as nonzero at the player's own cell
+
+    nan_pos = archive.features((float("nan"), 0.0, 0.0), 0.0)
+    assert nan_pos == [0.0] * 9
+
+    inf_pos = archive.features((0.0, 0.0, float("inf")), 0.0)
+    assert inf_pos == [0.0] * 9
+
+    # a non-finite yaw only breaks the neighbours (which depend on yaw); the player's own cell is unaffected
+    nan_yaw = archive.features((0.0, 0.0, 0.0), float("nan"))
+    assert nan_yaw[0] == min(1.0, math.log1p(5) / math.log(1001.0))
+    assert nan_yaw[1:] == [0.0] * 8
 
 
 def test_archive_load_cell_size_mismatch_is_empty():
@@ -398,6 +438,68 @@ def test_save_best_run_overwrites_an_unreadable_file():
         path.write_text('{"level": "Level 0-1"}', encoding="utf-8")  # readable JSON without a time
         assert save_best_run(path, best_run(310.0)) is True
         assert json.loads(path.read_text(encoding="utf-8"))["seconds"] == 310.0
+
+
+def test_save_best_run_serialises_two_racing_writers():
+    """Two processes finishing at nearly the same time must not let the slower one win the write.
+
+    Without locking the whole read-compare-write, both could read the same stale stored value, both decide
+    independently that they are faster, and whichever writes last wins regardless of which run is actually
+    faster. This uses real threads (so the actual O_CREAT | O_EXCL lock file is exercised, not a mock standing
+    in for it) with a sleep forced into the middle of each writer's critical section -- in the style of
+    test_archive_save_retries_a_briefly_locked_file's monkeypatching, but timed rather than counted, since the
+    two writers must genuinely overlap for the race to be worth testing. A shared counter proves the lock kept
+    them from ever being inside their critical section at the same time, and the stored file must end up with
+    the faster of the two runs no matter which thread's write lands last.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "Level_0-1.json"
+        assert save_best_run(path, best_run(200.0)) is True  # a slow baseline already on disk
+
+        real_read_text = Path.read_text
+        active = {"n": 0, "max": 0}
+        guard = threading.Lock()
+
+        def slow_read_text(self, *a, **kw):
+            with guard:
+                active["n"] += 1
+                active["max"] = max(active["max"], active["n"])
+            try:
+                time.sleep(0.05)  # hold the critical section open long enough for the other thread to try it
+                return real_read_text(self, *a, **kw)
+            finally:
+                with guard:
+                    active["n"] -= 1
+
+        results: dict[str, bool] = {}
+
+        def writer(name: str, seconds: float) -> None:
+            results[name] = save_best_run(path, best_run(seconds), lock_timeout=5.0, lock_poll=0.01)
+
+        with mock.patch("pathlib.Path.read_text", slow_read_text):
+            slow_thread = threading.Thread(target=writer, args=("slow", 150.0))
+            fast_thread = threading.Thread(target=writer, args=("fast", 90.0))
+            slow_thread.start()
+            fast_thread.start()
+            slow_thread.join()
+            fast_thread.join()
+
+        assert active["max"] == 1  # the lock never let both writers' critical sections overlap
+        assert json.loads(path.read_text(encoding="utf-8"))["seconds"] == 90.0  # the faster run survived
+        assert not (path.parent / f"{path.name}.lock").exists()  # the lock file is always cleaned up
+
+
+def test_save_best_run_gives_up_on_a_stale_lock_instead_of_blocking_forever():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "Level_0-1.json"
+        stale_lock = path.with_name(f"{path.name}.lock")
+        stale_lock.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(stale_lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))  # a lock never removed by a killed process
+        started = time.monotonic()
+        assert save_best_run(path, best_run(80.0), lock_timeout=0.2, lock_poll=0.02) is False
+        assert time.monotonic() - started < 2.0  # gave up quickly instead of blocking forever
+        assert not path.exists()  # nothing was written
+        assert stale_lock.exists()  # a stale lock is left for whoever created it to clean up, not deleted by a waiter
 
 
 if __name__ == "__main__":

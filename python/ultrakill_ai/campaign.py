@@ -34,6 +34,25 @@ def _replace_file(tmp: Path, path: Path) -> None:
             time.sleep(0.05)
 
 
+def _acquire_lock(lock_path: Path, timeout: float, poll: float) -> bool:
+    """Creates `lock_path` exclusively as a mutex; returns whether it was acquired within `timeout` seconds.
+
+    `os.open` with O_CREAT | O_EXCL is atomic across processes (unlike a read-then-write), so only one caller can
+    hold the lock at a time; the rest retry until the holder removes it. A stale lock (left behind by a process
+    that was killed mid-write) must never wedge every future save for a level, so the wait is bounded: giving up
+    just means this one call skips its write, same as losing the race it exists to prevent.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.close(os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            return True
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll)
+
+
 # ---------------------------------------------------------------------------
 # Levels and ranks
 # ---------------------------------------------------------------------------
@@ -113,16 +132,32 @@ class ExplorationArchive:
         self.counts: dict[tuple[int, int, int], int] = {}
         self._episode: set[tuple[int, int, int]] = set()
 
-    def cell(self, pos) -> tuple[int, int, int]:
+    def cell(self, pos) -> tuple[int, int, int] | None:
+        """The integer cell containing `pos`, or None when a coordinate is NaN or infinite.
+
+        `math.floor` raises ValueError on NaN and OverflowError on infinity. This runs every step on the live
+        player position (via visit and features), so a single glitched physics frame (a NaN from a bad raycast, an
+        infinite velocity spike) must read as "no cell" instead of crashing the whole training run.
+        """
         s = self.cell_size
-        return (math.floor(pos[0] / s), math.floor(pos[1] / s), math.floor(pos[2] / s))
+        x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            return None
+        return (math.floor(x / s), math.floor(y / s), math.floor(z / s))
 
     def start_episode(self) -> None:
         self._episode.clear()
 
     def visit(self, pos) -> float:
-        """Novelty for being at `pos`: 1/sqrt(N + 1) on the first entry of its cell this episode, else 0."""
+        """Novelty for being at `pos`: 1/sqrt(N + 1) on the first entry of its cell this episode, else 0.
+
+        A non-finite `pos` has no cell (see `cell`) and pays no novelty. It must not be recorded either: letting a
+        `None` cell into `_episode`/`counts` would mark every future non-finite step as "already visited" and, on
+        the next save(), a `None` key would break the array reshape that expects 3-tuples.
+        """
         cell = self.cell(pos)
+        if cell is None:
+            return 0.0
         if cell in self._episode:
             return 0.0
         self._episode.add(cell)
@@ -140,6 +175,10 @@ class ExplorationArchive:
 
         Neighbour k sits at yaw + 45k degrees (k = 0 straight ahead, then clockwise to the right), the same yaw
         convention as spaces.yaw_frame, so the map turns with the player. Each value is min(1, log1p(N) / log(1001)).
+
+        A non-finite `pos` or `yaw_deg` reads as 0 for every point it touches instead of raising: `cell()` returns
+        None for a non-finite point, and `counts.get(None, 0)` is just a dict miss, so no special-casing is needed
+        here beyond `cell()`'s own guard.
         """
         x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
         points = [(x, y, z)]
@@ -281,22 +320,38 @@ def choose_fresh_start(
     return rng.random() < fresh_prob
 
 
-def save_best_run(path, run: dict) -> bool:
+def save_best_run(path, run: dict, lock_timeout: float = 2.0, lock_poll: float = 0.02) -> bool:
     """Stores `run` as the level's best run if it is faster than the stored one. Returns whether it wrote.
 
-    A missing or unreadable file, or one without a time, counts as no stored run. The file is replaced
-    atomically (retrying briefly while another training game has it open), so a crash mid-write never leaves a
-    broken best run behind.
+    Guaranteed: a missing or unreadable file, or one without a time, counts as no stored run; only a run
+    strictly faster than the stored one is written; the file is replaced atomically (retrying briefly while
+    another training game has it open), so a crash mid-write never leaves a broken best run behind; and the
+    read-compare-write is serialised across processes by an exclusive lock file, so two of the five training
+    games finishing at nearly the same time cannot both read the same stale "stored" value and have the slower
+    one win the write race (the atomic replace alone only protects against a torn file, not this race). If the
+    lock is still held after `lock_timeout` seconds (a stale lock left by a killed process), this gives up and
+    returns False rather than blocking the run forever.
     """
     path = Path(path)
-    try:
-        stored = float(json.loads(path.read_text(encoding="utf-8"))["seconds"])
-    except (OSError, ValueError, KeyError, TypeError):
-        stored = math.inf
-    if not float(run["seconds"]) < stored:
+    path.parent.mkdir(parents=True, exist_ok=True)  # the lock file needs the directory to exist too
+    lock_path = path.with_name(f"{path.name}.lock")
+    if not _acquire_lock(lock_path, lock_timeout, lock_poll):
         return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(run, separators=(",", ":")), encoding="utf-8")
-    _replace_file(tmp, path)
-    return True
+    try:
+        try:
+            stored = float(json.loads(path.read_text(encoding="utf-8"))["seconds"])
+        except (OSError, ValueError, KeyError, TypeError):
+            stored = math.inf
+        # `not (a < b)` (rather than `a >= b`) also refuses a NaN `run["seconds"]`, since every comparison with
+        # NaN is False either way -- do not "simplify" this into `>=`, which would let a NaN time through.
+        if not float(run["seconds"]) < stored:
+            return False
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(run, separators=(",", ":")), encoding="utf-8")
+        _replace_file(tmp, path)
+        return True
+    finally:
+        try:
+            os.remove(lock_path)
+        except OSError:
+            pass
