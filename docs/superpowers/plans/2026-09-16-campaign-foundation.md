@@ -9285,7 +9285,17 @@ $s = Get-Content runs\campaign_ppo\status.json -Raw | ConvertFrom-Json
 "best_checkpoints_level {0}  checkpoints/load {1:N2}  new cells/ep {2:N1}  deaths/ep {3:N2}  closest to exit {4:N1} m" -f $s.best_checkpoints_level, $s.mean_100.checkpoints_level, $s.mean_100.cells_new, $s.mean_100.deaths, $s.mean_100.exit_dist_min
 "fresh completion {0:P0} over {1} fresh episodes  best time {2}  median time {3}" -f $s.campaign.fresh_completion_rate, $s.campaign.fresh_window, $s.campaign.best_time, $s.campaign.median_time_50
 $s.end_reasons_100 | Format-List
+"kills/ep {0:N1}  kills per death {1:N1}" -f $s.mean_100.kills, ($s.mean_100.kills / [Math]::Max(0.1, $s.mean_100.deaths))
 ```
+
+**Watch for death farming at every check below.** A checkpoint respawn re-creates that room's enemies while the
+game's kill counter keeps counting up, so re-killing them pays `kill` and `damage_dealt` again. A policy that
+discovers this dies on purpose, and the signature is deaths per episode above 3 with `checkpoints_level` flat and
+kills per death roughly constant across checks: lots of fighting and dying, no progress through the level. This
+project has form here (the Cyber Grind agent learned to avoid fights when `death` was mispriced), so if that
+pattern appears, stop and cut `kill` and `damage_dealt` to 0.2 each (arena clears, worth 10, are what should pay
+for fighting) rather than raising `death`, which would teach it to avoid combat altogether. Record the change and
+the numbers that prompted it in `CLAUDE.md`, and give it 400k steps before judging, per the project's tuning rules.
 
 If `state` reads `stopped` without a Ctrl+C, or the log shows a `Traceback` (typically `BridgeError: Connection closed by the game` after a game crashed), the trainer's `finally` block has already saved `latest.zip`. Close its console, relaunch the games and resume:
 
