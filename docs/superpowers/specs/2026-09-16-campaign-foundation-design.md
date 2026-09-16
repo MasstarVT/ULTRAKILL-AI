@@ -1,6 +1,7 @@
 # Campaign foundation, piloted on 0-1: design
 
-Date: 2026-09-16. Status: approved in brainstorming, awaiting spec review.
+Date: 2026-09-16. Status: approved. Amended the same day with the refinements decided while writing the
+implementation plan (listed at the end, and already applied to the sections below).
 
 ## Goal
 
@@ -45,14 +46,18 @@ All from the decompiled `Assembly-CSharp.dll` (Unity 2022.3.29 build). Checked 2
   `StatsManager.StopTimer()`, then sends results 5 s later. Decoys carry `fakeEnd`, `secondPit` or `rankless`.
   The pit may sit in a room that starts inactive, so search with `FindObjectsOfType<FinalPit>(true)`.
 - **Room templates.** `CheckPoint.Start()` clones each room in `rooms` and moves the disabled original +10000 on
-  X. Searches that include inactive objects must filter those copies out.
+  X, relative to wherever the room was, so no X threshold separates templates from live rooms. Searches that
+  include inactive objects filter by ancestry instead: an object is a template when it or any ancestor is an
+  entry of some checkpoint's `defaultRooms`. A respawn (`ResetRoom`) re-instantiates each template at the live
+  room's position.
 - **Timer.** `StatsManager.seconds += Time.deltaTime * GameStateManager.Instance.TimerModifier` while `timer`.
   Checkpoint respawns do not reset it. Cutscenes do not stop it.
 - **Checkpoints.** `CheckPoint.activated`, `ActivateCheckPoint()`, `StatsManager.currentCheckPoint`.
   `StatsManager.Restart()` respawns at the current checkpoint (and reloads the scene if there is none). That
   resets the rooms the checkpoint owns, unlocks `doorsToUnlock` and increments `restarts`.
 - **Arenas and doors.** `ActivateNextWave.EndWaves()` runs when an arena's last wave dies. It unlocks its doors
-  and opens `doorForward`. `Door.locked`, `Door.open`, `Door.Unlock()`.
+  and opens `doorForward`. It is invoked repeatedly (once per door, then a final call that destroys the
+  component), so it cannot be counted. `Door.locked`, `Door.open`, `Door.Unlock()`.
 - **NavMesh.** Enemies use `NavMeshAgent`, so campaign scenes have a baked NavMesh. It is a ground mesh: jumps
   and gaps are not connected, and doors carry `NavMeshObstacle`s.
 - **Level start.** The player drops in with the `"pit-falling"` game state (camera locked).
@@ -77,23 +82,34 @@ Present only in campaign scenes (mission numbers 1 to 35, from `StatsManager.lev
 | `mission`, `difficulty` | `StatsManager.levelNumber`, and the difficulty the game actually reads |
 | `seconds`, `timer_running`, `level_started`, `level_over`, `restarts` | from `StatsManager` / `NewMovement` |
 | `input_locked` | `PlayerInputLocked` or `!NewMovement.activated` |
-| `exit` | `{pos}` of the real `FinalPit`, or `null`. Skips `fakeEnd`, `secondPit`, `rankless` and +10000 X templates. |
-| `checkpoints` | list of `{id, pos, activated, current}`, template copies excluded |
+| `exit` | `{pos, active}` of the real `FinalPit` (an active one preferred), or `null`. Skips `fakeEnd`, `secondPit`, `rankless` and room templates. |
+| `checkpoints` | list of `{id, pos, activated, current}`, room templates excluded. `id` is the position key (see `cleared_arenas`). |
 | `path` | `{status: "complete" \| "partial" \| "none", length, next_corner}`: `NavMesh.CalculatePath` from the player to the exit, each end snapped with `NavMesh.SamplePosition`. Recalculated every 4 steps and cached in between. |
 | `locked_doors` | nearest 4 `{pos, dist}` with `Door.locked` |
-| `arena_enemies_alive` | live enemies whose parent `ActivateNextWave` is activated and not finished |
-| `arenas_cleared`, `doors_unlocked` | counters incremented by Harmony postfixes on `ActivateNextWave.EndWaves` and `Door.Unlock`. They reset to 0 on scene load. |
+| `arena_enemies_alive` | live enemies under an `ActivateNextWave` whose wave is not cleared yet (component present, `activated` false) |
+| `cleared_arenas`, `unlocked_doors` | lists of position keys (`"x,y,z"`, whole metres) recorded by Harmony prefixes on `ActivateNextWave.EndWaves` and `Door.Unlock` (doors that were locked). Cleared on scene load. A checkpoint respawn re-creates rooms at the same positions, so an arena cleared again after a death gives the same key and cannot pay twice. |
 | `ranks` | `{time: [4], kills: [4], style: [4]}` from `StatsManager` |
 
 ### Config settings
 
 | Key | Default | Meaning |
 |---|---|---|
-| `difficulty` | unset | if set, a Harmony prefix on `PrefsManager.GetInt` returns it for `"difficulty"` while the AI has control |
-| `unlock_all_gear` | false | `GameProgressSaver.CheckGear` returns 1, and `weapon.*` prefs read as 1, while the AI has control |
+| `difficulty` | -1 (keep the game's setting) | if 0 or more, a Harmony postfix on `PrefsManager.GetInt` returns it for `"difficulty"` while the AI has control |
+| `unlock_all_gear` | false | a `GameProgressSaver.CheckGear` result of 0, and a `weapon.<name>` pref of 0, read as 1 while the AI has control (2, the alternate version, is kept) |
 
 Both must be sent before the level loads, because enemies and `GunSetter` read them at scene start. Save and
 prefs writes are already skipped while the AI has control (`InstancePatches`).
+
+### Debug additions
+
+- `player.slot_counts`: the number of weapons in each of `GunControl.slots`, slot 1 first. The in-game gear
+  check reads it instead of cycling weapons.
+- `kill` request: a lethal `NewMovement.GetHurt(999)` through the normal damage path, for the in-game death
+  check. With `soft_death` on it heals instead, like any other lethal hit.
+
+While the AI has control the mod also blocks every `StatsManager.Restart` call the bridge did not make. Outside
+Cyber Grind the game restarts by itself when a dead player presses Fire1 (or R). That would respawn the player, or
+reload the level when there is no checkpoint, in the middle of a step before Python has seen the death.
 
 ### Resets
 
@@ -104,7 +120,8 @@ trusted.
 
 ### Docs
 
-Update `docs/protocol.md` (new block and config keys) and `docs/game-internals.md` (the facts above).
+Update `docs/protocol.md` (new block, config keys, the `kill` request and `player.slot_counts`) and
+`docs/game-internals.md` (the facts above).
 
 ## Python changes
 
@@ -144,7 +161,8 @@ Update `docs/protocol.md` (new block and config keys) and `docs/game-internals.m
   - `stuck_seconds` (45 s) with no progress means truncated. Progress is a checkpoint, arena clear, door unlock,
     new best path distance, or entering a cell not yet visited this episode.
 - **Speed settings.** Same as Cyber Grind: `fixed_fps` 30, `frameskip` 2, `render` false, and 368x207
-  windows. `soft_death` is off (real deaths drive respawns).
+  windows. `soft_death` is off (real deaths drive respawns). `pitch_limit_deg` is 0 (off): levels need the
+  camera to look up and down.
 
 ### Rewards (`RewardConfig`, campaign terms)
 
@@ -153,20 +171,23 @@ Update `docs/protocol.md` (new block and config keys) and `docs/game-internals.m
 | `time` | -0.01 per decision | constant, so -9 per game minute |
 | `level_complete` | +100 | once. Finishing within the 10 min cap always beats not finishing. |
 | `checkpoint` | +10 | each checkpoint's first activation per level load |
-| `arena_clear` | +10 | per increment of `arenas_cleared` |
-| `door_unlock` | +3 | per increment of `doors_unlocked`. Counter changes across a reset or respawn are ignored. |
+| `arena_clear` | +10 | per new key in `cleared_arenas`, once per level load |
+| `door_unlock` | +3 | per new key in `unlocked_doors`, once per level load. Keys that appear during a reset or respawn are marked paid without paying. |
 | `novelty` | +0.5 / sqrt(N + 1) | on first entry to a 4 m cell this episode. N = earlier episodes of this game that entered the cell (per level). |
 | `path` | +0.1 per metre | when the complete-path length to the exit reaches a new minimum this episode |
 | `kill`, `damage_dealt` | +0.5, +0.5 | existing computation |
 | `damage_taken`, `death` | -0.01 per HP, -5 | existing computation |
+| `style` | 0 | off: the campaign is judged on time, not style |
 
 The exploration archive (cell visit counts) is kept in memory per environment and per level, and saved next
-to the checkpoints (`models/<run>/explore_<env>.npz`) so resuming keeps it.
+to the checkpoints (`models/<run>/explore_<level>_<port>.npz`) so resuming keeps it.
 
 ### Episode info (dashboard, Monitor, `status.json`)
 
-- `completed` (0/1), `fresh_start` (0/1), `level_seconds` (official time, set on completion).
-- `checkpoints_reached`, `furthest_checkpoint` (checkpoint index in hierarchy order).
+- `completed` (0/1), `fresh_start` (0/1), `level_seconds` (official time, set only when a fresh-start episode
+  completes: the timer carries across respawn episodes, so a respawn episode's time is not an official run).
+- `checkpoints_level`: distinct checkpoints activated in the current level load. The mod has no reliable
+  checkpoint order, so there is no "furthest checkpoint".
 - `cells_new`, `deaths`, `exit_dist_min`, `end_reason`.
 
 ### Best runs
@@ -178,7 +199,8 @@ kills, style, restarts and the computed rank to `runs/<run>/best_runs/<scene>.js
 
 `python/ultrakill_ai/routes.py`, `python/scripts/record_route.py` and the `route_point` / `stuck` reward terms
 existed only for human-recorded routes. Delete them (git history keeps them). `configs/campaign_0-1.yaml` is
-rewritten.
+rewritten. `EnvConfig.from_dict` ignores unknown keys, so an old `env_config.yaml` that still carries retired
+settings (`checkpoint_resets`, `stuck_steps`, `route_dir`, `route_point`, `stuck`) keeps loading.
 
 ## Training
 
@@ -195,8 +217,8 @@ rewritten.
 - Save to `models/campaign_ppo/transfer_init.zip`.
 - If the first live rollout's entropy is outside 6-10 nats, adjust the scale once and restart.
 
-**Falsifier.** If no game has activated a second checkpoint in 0-1 by 1M steps, run 1M steps from fresh weights
-and compare `furthest_checkpoint` and `cells_new`.
+**Falsifier.** If no game has activated a second checkpoint in 0-1 by 1M steps (`best_checkpoints_level` < 2),
+run 1M steps from fresh weights and compare `checkpoints_level` and `cells_new`.
 
 ### `configs/campaign_0-1.yaml`
 
@@ -209,11 +231,14 @@ and compare `furthest_checkpoint` and `cells_new`.
 - **`progress.py` / dashboard.** Add a campaign panel:
   - completion rate over the last 50 fresh-start episodes and over all episodes;
   - best and median official time;
-  - furthest checkpoint per game;
+  - checkpoints activated in the current level load per game (`checkpoints_level`), and the best over all
+    episodes (`best_checkpoints_level`);
   - cells explored per episode, deaths per episode, reward parts.
 
   The Cyber Grind panels stay as they are.
-- **`poll_status.py`** logs the new keys to `metrics_log.csv`.
+- **`poll_status.py`** logs the new keys to `metrics_log.csv`. An existing CSV keeps its header
+  (`DictWriter(..., extrasaction="ignore")`), so new columns never misalign an old `metrics_log.csv`; they
+  appear once a run starts a new file.
 - **`keep_best.py`** gets a `--metric campaign` mode: fresh-start completion rate first, then best official time.
   Kills/min stays the default.
 - **`eval.py --level "Level 0-1"`:**
@@ -221,7 +246,8 @@ and compare `furthest_checkpoint` and `cells_new`.
   - prints official time, kills, style, restarts and rank computed from `ranks`;
   - `--record-times` adds the best run to `times.md` (generation history, and the leaderboard if it is a record).
 - **`bridge_test.py --campaign`** prints the `campaign` block.
-- **`.gitignore`** adds `.tools/` (local ILSpy install).
+- **`.gitignore`** already ignores `.tools/` (local ILSpy install). It adds the campaign run's numbered checkpoints
+  (`python/models/campaign_ppo/ckpt_*.zip`) and `python/models/campaign_smoke/`.
 
 ## Testing
 
@@ -233,24 +259,24 @@ Runs with plain `python` and under pytest, like the existing tests.
   - a checkpoint pays once per level load;
   - novelty pays only on first entry per episode and falls as 1/sqrt(N + 1);
   - path pays only on a new minimum, and nothing for a partial or missing path;
-  - counter changes across a respawn pay nothing;
+  - keys that appear during a respawn pay nothing, and an arena cleared again after a death pays nothing;
   - finishing within the cap nets more than timing out.
 - **Observations:** the campaign layout is 479 and Cyber Grind stays 448; masks are 0 when exit, checkpoint or
   door are missing; yaw-frame vectors match `yaw_frame`.
 - **Episode start:** each fresh-load rule, with a seeded random source.
 - **Rank:** thresholds to rank, including restarts and the P case.
-- **Weight transfer:** on a random 448-dim input padded with 36 zeros, the transferred policy's latent features
-  equal the source's, checked before the action head is scaled.
+- **Weight transfer** (`tests/test_transfer.py`): random values in the 443 shared inputs, followed by 5 zeros for
+  the 448-input source and 36 zeros for the 479-input transferred policy, give the same latent features in both.
 
 ### In game, before any training (0-1, one game)
 
 1. After the mod builds, `bridge_test.py --campaign` shows an exit (or a documented `null` until its room loads),
    checkpoints, and a path status. `difficulty` reads 3.
-2. After the revolver pickup, stepping with `slot` 1 to 5 moves `weapon_slot` to each of those slots, so the full
-   arsenal is present.
-3. Teleporting to the exit sets `level_over`, stops the timer, and ends the episode with `level_complete` and the
-   expected `level_seconds`.
-4. A death mid-episode respawns at the checkpoint and the episode continues.
+2. `player.slot_counts` shows at least one weapon in each of slots 1 to 5, so the full arsenal is present. 0-1
+   has no weapons until the revolver pickup, so this is read on `Level 1-1`.
+3. Teleporting to the exit sets `level_over`, stops the timer, and ends a fresh-start episode with
+   `level_complete` and `level_seconds` equal to the block's `seconds`.
+4. A death mid-episode (the `kill` request) respawns at the checkpoint and the episode continues.
 5. A 2-minute random-agent run finishes without errors and gives a steps/s figure for 5 games.
 6. Check that checkpoint and exit triggers still fire at 30 fps / frameskip 2 with rendering off. If not, fall
    back to 60/4 or turn rendering on, and record which.
@@ -267,6 +293,33 @@ Runs with plain `python` and under pytest, like the existing tests.
   check 6 covers the main triggers. If a later level stalls at one spot, retry that level with rendering on.
 - **Cyber Grind habits.** Always firing and walking backwards may slow early navigation. The softened action head
   and the falsifier above cover this.
+
+## Refinements decided during planning
+
+Decided on 2026-09-16 while writing the implementation plan, and applied to the sections above.
+
+1. Arena clears and door unlocks are reported as lists of rounded-position keys (`cleared_arenas`,
+   `unlocked_doors`), not counters. A checkpoint respawn re-instantiates rooms at the same position, so the same
+   arena re-cleared after a death yields the same key and cannot pay twice. Python pays each key once per level
+   load, and anything that appears during a reset or respawn is marked paid without paying.
+2. `furthest_checkpoint` is replaced by `checkpoints_level`: distinct checkpoints activated in the current level
+   load (the mod has no reliable checkpoint order).
+3. Room templates are filtered by ancestry (an object under any `CheckPoint.defaultRooms` entry), not by an X
+   threshold: `CheckPoint.Start` moves templates +10000 relative to their original X, which can be anywhere.
+4. The mod adds `player.slot_counts` (weapons in each slot, for the gear check) and a `kill` debug command (for
+   the in-game death check).
+5. `level_seconds` is only reported for fresh-start completions: the timer carries across respawn episodes.
+6. `poll_status.py` keeps an existing CSV's header (`extrasaction="ignore"`), so new columns never misalign an
+   old `metrics_log.csv`.
+7. `EnvConfig.from_dict` ignores unknown keys, so old `env_config.yaml` files with retired settings still load.
+8. Campaign style reward is 0 (speed matters, not style), `pitch_limit_deg` 0 (off) for the campaign.
+
+Also aligned with the plan while applying these: `arena_enemies_alive` counts enemies of waves not yet cleared,
+the `difficulty` config default is -1 and both config patches are Harmony postfixes, the exploration archive file
+is named per level and port, in-game checks 2 to 4 name the observation and request they use, the `.gitignore`
+bullet lists the campaign entries (`.tools/` was already ignored), and the weight-transfer test uses the real
+input sizes (443 shared inputs, then 5 or 36 zeros). Plan review added one mod behaviour: game-initiated
+`StatsManager.Restart` calls are blocked while the AI has control (see Debug additions).
 
 ## Housekeeping
 

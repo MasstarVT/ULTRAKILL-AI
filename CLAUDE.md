@@ -348,3 +348,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - **Starting weights:** Cyber Grind `best.zip`, widened to 479 inputs.
   - Cyber Grind training stays paused while the 5 games run the campaign.
   - `decompiled/` was regenerated on the second PC for this (ilspycmd 9.1.0.7988 in `.tools/`).
+  - Spec amended during planning (2026-09-16): arena clears and door unlocks are position keys paid once per level
+    load, `checkpoints_level` replaces `furthest_checkpoint`, room templates are filtered by `defaultRooms`
+    ancestry, `level_seconds` is only reported for fresh starts, the campaign style reward is 0, and the mod blocks
+    game-initiated restarts while the AI has control.
