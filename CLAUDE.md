@@ -148,6 +148,9 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - A 6th copy fails because BepInEx opens at most `LogOutput.log` plus `.1`–`.4`.
 - **Lockstep stalls:** vectorized envs step together, so a reset in one game stalls all of them. Keep resets short (teleport entry, `reset_settle_frames` 10).
 - **Speed:** about 600 fps / 150 steps/s in an empty scene and about 100 steps/s with enemies (frameskip 4, RTX 5070).
+- **Campaign checkpoint triggers fire at training speed; the exit was never a trigger-timing test:** checkpoint triggers activate correctly at 30 fps / frameskip 2 with rendering off (`campaign_check.py` check 3 PASS on 0-1 and 1-1, 2026-09-16), so no speed-setting change was needed. Check 5 (exit) FAILed on both levels, but not from timing: see the exit-room gotcha below.
+- **Campaign throughput:** 177 steps/s with 5 games on 0-1 at 30 fps / frameskip 2 with rendering off (20k-step smoke run from fresh weights; SB3's `fps` over the whole run, level loads included). At that rate 1M steps take 1.6 h and the 20M-step pilot 31 h.
+- **Exit room switched off at load; checkpoint activation does not bring it up (0-1 and 1-1, 2026-09-16):** a fresh load reports the exit `active: false` on both levels, so `campaign_check.py` check 5 fails there, and `campaign.path.status` reads `none` from spawn (no path can be computed into a room that is not active). Automated stand-in for playing through, since `CheckPoint.ActivateCheckPoint` calls `SetActive(true)` on its own room (`decompiled/CheckPoint.cs`): teleported onto and activated every checkpoint in spawn-distance order. 0-1 activated 5 of 6 (the nearest did not activate within 30 decisions on this attempt); 1-1 activated 4 of 4. The exit stayed `active: false` on both afterward, and `path.status` stayed `none` through the entire walk on both levels -- never `partial` or `complete`. So checkpoint activation does not switch on the exit's own room; it sits well past the last checkpoint (293 m on 0-1, 469 m on 1-1 from the last checkpoint tried). Not verified by hand (no human play in this session). Treated as a known open item, not a blocker: check 5's code path is covered by `test_campaign_env.py` against the fake bridge, and the first real level completion during training exercises it live.
 
 ## Status
 - **Reward rebalance at 329k steps:**
@@ -400,3 +403,11 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     `poll_status.py` logs these as columns (`part_time`, `part_checkpoint`, ... for the reward parts), and now
     keeps an existing `metrics_log.csv` header, dropping columns that header lacks: move an old log aside to get
     the new columns. `route_progress` is gone from `status.json`.
+- **Campaign verified in game (2026-09-16), mod v0.5.0, one game at 30 fps / frameskip 2 with rendering off:**
+  - Level 0-1: 1 level load PASS | 2 arsenal SKIP | 3 checkpoint PASS | 4 death respawn PASS | 5 exit FAIL (exit
+    room switched off at load; see the gotcha above).
+  - Level 1-1: 1 level load PASS | 2 arsenal PASS | 3 checkpoint PASS | 4 death respawn PASS | 5 exit FAIL (exit
+    room switched off at load; see the gotcha above).
+  - Throughput smoke run with 5 games (`train.py --config configs/campaign_0-1.yaml --timesteps 20000
+    --run-name campaign_smoke`, outputs deleted): finished cleanly at 177 steps/s; 13 episodes ended (stuck 13).
+  - Next: the 0-1 pilot run (`campaign_ppo`).
