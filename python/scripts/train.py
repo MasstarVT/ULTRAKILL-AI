@@ -1,7 +1,7 @@
 """Trains a PPO agent.
 
     python scripts/train.py --config configs/cybergrind.yaml
-    python scripts/train.py --config configs/campaign_0-1.yaml --algo rppo
+    python scripts/train.py --config configs/campaign_0-1.yaml --resume models/campaign_ppo/transfer_init.zip
     python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind/latest.zip
 
 Parallel training with several game instances (see scripts/games.py):
@@ -27,7 +27,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
+from ultrakill_ai.env import CAMPAIGN_INFO_KEYS, EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.progress import ProgressCallback  # noqa: E402
 
 
@@ -68,6 +68,20 @@ def load_config(path: str | None) -> tuple[dict, dict]:
     return data.get("env", {}), data.get("train", {})
 
 
+def fill_campaign_dirs(cfg: EnvConfig, model_dir: Path, run_dir: Path) -> EnvConfig:
+    """Campaign runs keep their exploration archives beside the checkpoints and their best runs beside the logs.
+
+    Only empty settings are filled, so a config can still point either one elsewhere. Cyber Grind is returned as is.
+    """
+    if cfg.mode != "campaign":
+        return cfg
+    return replace(
+        cfg,
+        explore_dir=cfg.explore_dir or model_dir.as_posix(),
+        best_runs_dir=cfg.best_runs_dir or (run_dir / "best_runs").as_posix(),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", help="YAML file with env and train sections")
@@ -88,9 +102,12 @@ def main() -> None:
     run_name = args.run_name or train_cfg.get("run_name") or f"{env_cfg.mode}_{algo}"
     model_dir = Path("models") / run_name
     model_dir.mkdir(parents=True, exist_ok=True)
+    env_cfg = fill_campaign_dirs(env_cfg, model_dir, Path("runs") / run_name)
+    if env_cfg.best_runs_dir:
+        Path(env_cfg.best_runs_dir).mkdir(parents=True, exist_ok=True)
     (model_dir / "env_config.yaml").write_text(yaml.safe_dump(env_cfg.to_dict()), encoding="utf-8")
 
-    info_keywords = ("kills", "wave", "style", "deaths", "firing_frac", "on_target_frac") if env_cfg.mode == "cybergrind" else ("kills", "style", "route_progress")
+    info_keywords = ("kills", "wave", "style", "deaths", "firing_frac", "on_target_frac") if env_cfg.mode == "cybergrind" else CAMPAIGN_INFO_KEYS
     num_envs = args.num_envs or train_cfg.get("num_envs", 1)
     base_port = args.base_port or env_cfg.port
     env_fns = [make_env(replace(env_cfg, port=base_port + i), info_keywords) for i in range(num_envs)]

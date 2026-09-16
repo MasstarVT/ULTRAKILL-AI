@@ -32,6 +32,11 @@ python/models/cybergrind_ppo/ckpt_*.zip
 python/models/cybergrind_ppo_v2/ckpt_*.zip
 python/models/cybergrind_ppo_v2/best_*kpm_*.zip
 python/models/cybergrind_ppo_v2/*.bad
+# Campaign: numbered checkpoints stay local, as for v2. transfer_init.zip (the widened Cyber Grind weights),
+# best.zip + best.json, latest.zip, env_config.yaml and the explore_*.npz exploration archives are committed.
+python/models/campaign_ppo/ckpt_*.zip
+# Throwaway in-game smoke runs
+python/models/campaign_smoke/
 
 # Claude Code local session state
 .claude/

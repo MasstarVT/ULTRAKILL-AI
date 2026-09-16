@@ -45,13 +45,14 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/tests/test_progress.py`: `ProgressCallback`, dashboard and `poll_status.py` tests against fake Cyber Grind and campaign envs (no game needed).
 - `python/tests/test_aim.py`: aim-reward geometry (the yaw/pitch split) and the pitch clamp (no game needed).
 - `python/tests/test_transfer.py`: weight transfer on small PPO models: hidden features unchanged on Cyber Grind inputs, logits scaled, value head kept fresh, the saved model loads with 479 inputs (no game needed).
+- `python/tests/test_campaign_config.py`: `configs/campaign_0-1.yaml` builds a 479-input env with its reward weights, every key is a real config field, and `train.fill_campaign_dirs` (no game needed).
 - `python/tests/test_keep_best.py`: `keep_best.py` scoring for both metrics on synthetic `metrics_log.csv` rows, and old `best.json` files (no game needed; `python tests/test_keep_best.py`).
 - `python/tests/test_times.py`: `times.md` updates against the committed file's exact text: placeholders, records, deltas, level order (no game needed; `python tests/test_times.py`).
 - `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load (no game needed).
 - `python/tests/test_campaign.py`: campaign helpers: level list, rank maths, exploration archive, milestones, path progress, the fresh-start rule and best runs (no game needed).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
 - `python/tests/test_spaces.py`: layout sizes (448 / 479) and every index range of the campaign block, including the yaw-frame signs (no game needed).
-- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml`.
+- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign pilot: Violent, all gear unlocked in memory, run `campaign_ppo`; its header lists the run commands).
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
 - `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign design (being built: the mod side is done in v0.5.0).
@@ -77,6 +78,15 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   2. `python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo_v2/best.zip` (`num_envs` 5 in config; `timesteps` is the run total, so resuming trains only the rest; drop `--resume` for a fresh run, and give it a new `run_name` so `status.json` does not inherit the old episodes)
   3. `python scripts/games.py stop`
   - `python scripts/games.py status` is safe during training (it reads netstat, it does not connect).
+- Campaign training (0-1, `configs/campaign_0-1.yaml`; it uses the same five games, so Cyber Grind stays paused):
+  1. `python scripts/transfer_weights.py models/cybergrind_ppo_v2/best.zip models/campaign_ppo/transfer_init.zip` (done once and committed; rerun only to change `--action-scale`)
+  2. `python scripts/games.py launch --count 5` (add `--monitor 1` on the one-display PC)
+  3. `python scripts/train.py --config configs/campaign_0-1.yaml --resume models/campaign_ppo/transfer_init.zip` (a new run: the file is at 0 steps). To continue a stopped run, resume from `models/campaign_ppo/best.zip` once `keep_best.py` has written it, else from the newest `ckpt_*_steps.zip`.
+  4. Alongside it: `python scripts/poll_status.py --run campaign_ppo`, `python scripts/keep_best.py --run campaign_ppo --metric campaign` and `python scripts/dashboard.py --run campaign_ppo` (`--monitor 1` on the one-display PC).
+  5. `python scripts/games.py stop`
+  - `train.py` fills `explore_dir` (the per-game exploration archives, `models/campaign_ppo/explore_*.npz`) and `best_runs_dir` (`runs/campaign_ppo/best_runs/`) when the config leaves them empty, before writing `env_config.yaml`.
+  - Commit `transfer_init.zip`, `best.zip` + `best.json`, `latest.zip`, `env_config.yaml` and the `explore_*.npz` archives; the numbered `ckpt_*` files and `models/campaign_smoke/` are gitignored.
+  - If the first update's entropy (the dashboard's PPO panel shows it negated, as `entropy`) is outside 6-10 nats: stop, rerun step 1 once with another `--action-scale` and commit the new `transfer_init.zip`, delete `runs/campaign_ppo/` (dashboard history), the `runs/campaign_ppo_*` TensorBoard folders (a `--resume` run keeps writing into the newest one) and the run's `ckpt_*` and `explore_*.npz` files so the restart does not inherit them, then start step 3 again.
 - TensorBoard: `tensorboard --logdir runs`.
 - Campaign eval (one game on port 47800, e.g. `python scripts/games.py launch --count 1 --monitor 1`):
   `python scripts/eval.py models/campaign_ppo/best.zip --level "Level 0-1" --episodes 10`. Fresh level loads,
@@ -85,7 +95,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, checkpoints per load, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and checkpoints per load instead of kills/min and wave, and lists checkpoints instead of waves per game.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` (campaign weight transfer). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }`.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` (campaign weight transfer) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }`.
 
 ## Key design decisions
 - **Lockstep:** the mod blocks Unity's main thread between steps. `Time.captureDeltaTime = 1/60` fixes game time per frame, and uncapped FPS makes training faster than real time. Game speed is not controlled through `Time.timeScale`, which `TimeController` owns for hitstop.
