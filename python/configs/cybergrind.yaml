@@ -94,4 +94,9 @@ train:
     # ent_coef <= 0.0071 (yaw) and <= 0.0042 (pitch), so 0.004 gives both heads room to sharpen.
     # This is not v1's mistake of lowering it "for precise aiming": there the reward itself was broken, so
     # sharpening only locked in the wrong behaviour. The reward has since been rebalanced onto combat.
-    ent_coef: 0.004
+    # 0.004 overshot. Entropy fell 9.47 -> 2.51 and was still falling at 4.93M, and the run PEAKED at
+    # 4.40M (kills/min 6.62, reward 217, deaths 1.33, entropy 3.60) then degraded: by 4.93M kills/min was
+    # 5.36, reward 166, deaths 2.15, and the camera had drifted from pitch_mean -6.9 to -24.6 with
+    # pitch_track dead at 0.003. That is a policy going deterministic and getting stuck, not improving.
+    # Raised to hold entropy near the 3.6 the peak ran at, rather than letting it collapse to zero.
+    ent_coef: 0.006

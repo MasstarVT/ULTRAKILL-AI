@@ -271,7 +271,39 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   is a deque that does NOT survive a restart and `history[]` keeps only reward/kills/wave, so every aiming
   diagnostic was being thrown away on each resume -- which is how a 5-episode window got mistaken for a
   trend. Gate every comparison on `window >= 50`.
+- **Overnight run 2.12M -> 4.93M (2026-09-16), and the first clear win.** Ran 5.8 h unattended at ~175
+  steps/s with no crashes. **kills/min 2.64 (1.70M baseline) -> 6.62 at the 4.40M peak**, which beats v1's
+  all-time best of 5.0; reward 136 -> 217, deaths 1.91 -> 1.33, `wave` 3.7 -> 4.2, aim share 84% -> 16%.
+  The reward rebalance worked: combat is now ~78% of the return and the agent is actually fighting.
+- **But the aim hypothesis is FALSIFIED.** The stated falsifier was `on_target_frac` >= 0.09 by 2.48M. It
+  ran 0.038 -> 0.031 across the whole night and sat at 0.029 by 4.93M, with `firing_on_target_frac` equally
+  flat at ~0.028. The agent got much better at killing WITHOUT aiming better -- `enemy_dist_mean` fell
+  25.3 -> 14.5, so it is winning by closing distance and spraying, not by pointing at things. Some yaw
+  progress is real (`enemy_yaw_angle_mean` 63.8 -> 51.3, `yaw_track` 0.154 -> 0.214) but nowhere near the
+  ~15 deg the cone needs. Neither pitch band setting has ever moved this number (15 deg capped it at 4%,
+  45 deg leaves it at 3%), which matches the audit finding that **yaw, not pitch, is the binding
+  constraint**: at 51 deg mean heading error the 3-D angle cannot reach the cone whatever pitch does.
+- **`ent_coef` 0.004 overshot, and the run peaked then degraded.** Entropy fell 9.47 -> 2.51 and was still
+  falling. After the 4.40M peak the policy went deterministic and got worse for half a million steps:
+  by 4.93M kills/min 6.62 -> 5.36, reward 217 -> 166, deaths 1.33 -> 2.15, and the camera drifted
+  `pitch_mean` -6.9 -> -24.6 with `pitch_abs_mean` 28 -> 34 and `pitch_track` dead at 0.003. Rolled back to
+  `ckpt_4379085_steps.zip` (kept as `best_6.6kpm_4379085.zip`) and raised `ent_coef` to 0.006 to hold
+  entropy near the 3.60 the peak ran at. On resume entropy came back to exactly 3.60 and kills/min to 6.00.
+- **`scripts/keep_best.py`** now preserves the best checkpoint automatically (`best.zip` + `best.json`),
+  scored on smoothed kills/min from `metrics_log.csv` with a full 100-episode window, and warns when the
+  current policy falls more than 15% below it. PPO does not improve monotonically and `latest.zip` tracks
+  the LAST policy, not the best one, so without this a peak is lost at the next checkpoint rotation --
+  which is exactly what nearly happened overnight.
+- **The 15-minute monitor did not fire overnight.** Training survived on its own, but nothing was tuning or
+  watching it, so the post-peak degradation ran unchecked for ~500k steps. Cron jobs here are session-only
+  and only fire while the session is idle; do not rely on them for unattended work. The durable substitute
+  is the pair of always-on helper processes (`poll_status.py`, `keep_best.py`), which need no scheduler.
 - **Next steps:**
+  - **Yaw is the one thing to fix.** `enemy_yaw_angle_mean` 51 deg is what keeps `on_target_frac` at 3%;
+    pitch changes have been tried at 15 and 45 deg and moved nothing. Consider a yaw-only shaping term with
+    a zero floor (`w * max(0, 1 - yaw_err/T)` with T near the current mean so improvement always pays),
+    rather than another pitch pass.
+  - Hold `ent_coef` so entropy stays near 3.5-4.0; below ~3 the policy went deterministic and regressed.
   - Watch the 1.70M rebalance against the falsifiers above; `yaw_track` then `on_target_frac` lead, kills/min follows.
   - If `on_target_frac` is still <= 0.06 at 2.18M, reset the look-head output bias (as `pitch_reset_2447005.zip` did for v1) rather than tuning weights again: a constant offset in the bias is not reachable from a reward slope that is flat across the whole sweep range.
   - `approx_kl` runs 0.029-0.031 against `target_kl` 0.02, so every update is being truncated. Worth a pass once the reward change has been judged, but not at the same time as it.
