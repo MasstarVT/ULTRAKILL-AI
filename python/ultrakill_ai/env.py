@@ -96,7 +96,7 @@ class UltrakillEnv(gym.Env):
         self._last_end_reason = ""
         self._reset_seconds = 0.0
         self._deaths = 0
-        self._behaviour = dict.fromkeys(("steps", "firing", "on_target", "firing_on_target"), 0)
+        self._behaviour = dict.fromkeys(("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "dist_sum", "yaw_sum"), 0)
         self._arena_spawn: list[float] | None = None
         self._episode_start_stats: dict[str, Any] = {}
 
@@ -150,7 +150,7 @@ class UltrakillEnv(gym.Env):
         self._steps = 0
         self._steps_since_progress = 0
         self._deaths = 0
-        self._behaviour = dict.fromkeys(("steps", "firing", "on_target", "firing_on_target"), 0)
+        self._behaviour = dict.fromkeys(("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "dist_sum", "yaw_sum"), 0)
         self._last_end_reason = ""
 
         if self.route_tracker is not None and self._raw.get("player"):
@@ -275,16 +275,22 @@ class UltrakillEnv(gym.Env):
         self._behaviour["steps"] += 1
         firing = "fire1" in command["buttons"] or "fire2" in command["buttons"]
         self._behaviour["firing"] += firing
+        self._behaviour["yaw_sum"] += abs(command["look"][0])
         player = raw.get("player")
         if not player:
             return
         visible = [e for e in raw.get("enemies", []) if e["visible"]]
         if not visible:
             return
+        self._behaviour["enemy_visible"] += 1
         x, y, z = visible[0]["rel"]
-        if z <= 0:
+        length = math.sqrt(x * x + y * y + z * z)
+        if length <= 1e-6:
             return
-        angle = math.degrees(math.atan2(math.hypot(x, y), z))
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, z / length))))
+        self._behaviour["angle_sum"] += angle
+        self._behaviour["dist_sum"] += visible[0]["dist"]
+        self._behaviour["close"] += visible[0]["dist"] <= 5.0
         on_target = angle <= 15.0
         self._behaviour["on_target"] += on_target
         self._behaviour["firing_on_target"] += on_target and firing
@@ -310,10 +316,17 @@ class UltrakillEnv(gym.Env):
             "wave": (raw.get("cybergrind") or {}).get("wave", 0),
             "deaths": self._deaths,
         }
-        steps = max(1, self._behaviour["steps"])
-        info["firing_frac"] = self._behaviour["firing"] / steps
-        info["on_target_frac"] = self._behaviour["on_target"] / steps
-        info["firing_on_target_frac"] = self._behaviour["firing_on_target"] / steps
+        b = self._behaviour
+        steps = max(1, b["steps"])
+        seen = max(1, b["enemy_visible"])
+        info["firing_frac"] = b["firing"] / steps
+        info["on_target_frac"] = b["on_target"] / steps
+        info["firing_on_target_frac"] = b["firing_on_target"] / steps
+        info["enemy_visible_frac"] = b["enemy_visible"] / steps
+        info["enemy_angle_mean"] = b["angle_sum"] / seen  # degrees off the crosshair
+        info["enemy_dist_mean"] = b["dist_sum"] / seen
+        info["enemy_close_frac"] = b["close"] / steps  # nearest visible enemy within 5 m
+        info["yaw_per_step_mean"] = b["yaw_sum"] / steps  # degrees turned per decision
         if self.route_tracker is not None:
             info["route_progress"] = self.route_tracker.progress
         return info

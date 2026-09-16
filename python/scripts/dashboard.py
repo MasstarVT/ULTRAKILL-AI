@@ -408,9 +408,12 @@ class Dashboard:
         # End reasons + PPO
         shooting = [
             f"  {label} {mean[key] * 100:.0f}%"
-            for key, label in (("firing_frac", "firing        "), ("on_target_frac", "enemy in sight"), ("firing_on_target_frac", "firing at it  "))
+            for key, label in (("firing_frac", "firing          "), ("on_target_frac", "enemy in crosshair"), ("enemy_visible_frac", "enemy visible   "), ("enemy_close_frac", "enemy within 5m "))
             if isinstance(mean.get(key), (int, float))
         ]
+        for key, label, unit in (("enemy_angle_mean", "angle off       ", "deg"), ("enemy_dist_mean", "enemy distance  ", "m"), ("yaw_per_step_mean", "turn per step   ", "deg")):
+            if isinstance(mean.get(key), (int, float)):
+                shooting.append(f"  {label} {mean[key]:.0f}{unit}")
         self.behaviour.config(text="Shooting (last 100)\n" + "\n".join(shooting) if shooting else "")
         reasons = get("end_reasons_100") if isinstance(get("end_reasons_100"), dict) else {}
         total = sum(v for v in (num(x) for x in reasons.values()) if v) or 0
