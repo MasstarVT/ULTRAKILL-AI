@@ -150,7 +150,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Speed:** about 600 fps / 150 steps/s in an empty scene and about 100 steps/s with enemies (frameskip 4, RTX 5070).
 - **Campaign checkpoint triggers fire at training speed; the exit was never a trigger-timing test:** checkpoint triggers activate correctly at 30 fps / frameskip 2 with rendering off (`campaign_check.py` check 3 PASS on 0-1 and 1-1, 2026-09-16), so no speed-setting change was needed. Check 5 (exit) FAILed on both levels, but not from timing: see the exit-room gotcha below.
 - **Campaign throughput:** 177 steps/s with 5 games on 0-1 at 30 fps / frameskip 2 with rendering off (20k-step smoke run from fresh weights; SB3's `fps` over the whole run, level loads included). At that rate 1M steps take 1.6 h and the 20M-step pilot 31 h.
-- **Exit room switched off at load; checkpoint activation does not bring it up (0-1 and 1-1, 2026-09-16):** a fresh load reports the exit `active: false` on both levels, so `campaign_check.py` check 5 fails there, and `campaign.path.status` reads `none` from spawn (no path can be computed into a room that is not active). Automated stand-in for playing through, since `CheckPoint.ActivateCheckPoint` calls `SetActive(true)` on its own room (`decompiled/CheckPoint.cs`): teleported onto and activated every checkpoint in spawn-distance order. 0-1 activated 5 of 6 (the nearest did not activate within 30 decisions on this attempt); 1-1 activated 4 of 4. The exit stayed `active: false` on both afterward, and `path.status` stayed `none` through the entire walk on both levels -- never `partial` or `complete`. So checkpoint activation does not switch on the exit's own room; it sits well past the last checkpoint (293 m on 0-1, 469 m on 1-1 from the last checkpoint tried). Not verified by hand (no human play in this session). Treated as a known open item, not a blocker: check 5's code path is covered by `test_campaign_env.py` against the fake bridge, and the first real level completion during training exercises it live.
+- **Exit room switched off at load; checkpoint activation does not bring it up (0-1 and 1-1, 2026-09-16):** a fresh load reports the exit `active: false` on both levels, so `campaign_check.py` check 5 fails there. Automated stand-in for playing through, since `CheckPoint.ActivateCheckPoint` calls `SetActive(true)` on its own room (`decompiled/CheckPoint.cs`): teleported onto and activated every checkpoint in spawn-distance order. 0-1 activated 5 of 6 (the nearest did not activate within 30 decisions on this attempt); 1-1 activated 4 of 4. The exit stayed `active: false` on both afterward -- so checkpoint activation does not switch on the exit's own room; it sits well past the last checkpoint (293 m on 0-1, 469 m on 1-1 from the last checkpoint tried). Not verified by hand (no human play in this session). Treated as a known open item, not a blocker: check 5's code path is covered by `test_campaign_env.py` against the fake bridge, and the first real level completion during training exercises it live. (The `path.status` staying `none` the whole walk turned out to be a separate NavMesh-sampling bug, not caused by the room being inactive -- see the exit-sample fix below; `FinalPit` is findable and its `transform.position` valid via `FindObjectsOfType(true)` regardless of active state.)
 
 ## Status
 - **Reward rebalance at 329k steps:**
@@ -411,3 +411,27 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - Throughput smoke run with 5 games (`train.py --config configs/campaign_0-1.yaml --timesteps 20000
     --run-name campaign_smoke`, outputs deleted): finished cleanly at 177 steps/s; 13 episodes ended (stuck 13).
   - Next: the 0-1 pilot run (`campaign_ppo`).
+- **`campaign.path` exit-sample fix, verified in game (2026-09-16).** `CampaignObserver.UpdatePath` sampled
+  the NavMesh at `exit.transform.position` with a 20 m radius, but a `FinalPit`'s transform sits inside the
+  drop it triggers, not on walkable ground, so that sample always missed and `path.status` read `none`
+  everywhere on both 0-1 and 1-1 (matching the read above). Logging every `NavMesh.SamplePosition` candidate
+  in game showed the raw depth figures (17.1 m below the floor on 0-1, 76.1 m on 1-1) do not tell you where
+  to look: the true nearest NavMesh point was 47.5 m away **straight down** from the pit on 0-1, and 84.6 m
+  away **up and 46.8 m to the side** on 1-1 -- not "a few metres directly above" as first assumed, so an
+  initial fix that only probed upward (heights 18/30/50/80 at a tight 6 m radius) found nothing on either
+  level. Replaced with `CampaignObserver.SampleExit`: keep the unchanged 20 m try at the pit's own position,
+  then escalate the search radius itself (55 m, then 95 m) at that same position, letting NavMesh's own
+  nearest-point search find whichever direction actually holds mesh. Both measured points connect back to the
+  player's side only as `NavMeshPathStatus.PathPartial`, which `BuildPath` already reports as `"partial"` --
+  expected, since a `FinalPit` deliberately sits off the walkable graph. `length`/`next_corner` are still
+  measured to the snapped point (distance left to walk to standable ground near the exit), never a straight
+  line into the pit. Verified live with one game (`games.py launch --count 1 --monitor 1`,
+  `campaign_check.py`'s teleport-to-checkpoint approach against the level's farthest pending checkpoint):
+  - Level 0-1: spawn `path.status` stays `none` (unrelated, pre-existing: the player-side 6 m sample already
+    fails on the player's own spawn position, left untouched per scope). After teleporting to and activating
+    the farthest checkpoint (`157,28,640`, 319.9 m from spawn): `partial`, length 72.4 m, a real `next_corner`.
+  - Level 1-1: `partial` from spawn already (length 16.6 m) and after activating the farthest checkpoint
+    (`46,12,550`, 300.7 m from spawn): `partial`, length 16.8 m, `next_corner` updated toward it. Before the
+    fix both levels read `none` in both cases (confirmed by rebuilding and re-running against the pre-fix code
+    first).
+  - Noted, not changed (out of scope): the player-side NavMesh sample failing at 0-1's own spawn point.

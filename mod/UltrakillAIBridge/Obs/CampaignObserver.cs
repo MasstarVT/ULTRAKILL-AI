@@ -31,6 +31,21 @@ namespace UltrakillAIBridge.Obs
         private const float ExitSnapDistance = 20f;
         private const float CornerReachedDistance = 1.5f;
 
+        /// <summary>
+        /// Escalating search radii tried when <see cref="ExitSnapDistance"/> finds nothing at a
+        /// <see cref="FinalPit"/>'s own position. A FinalPit's transform sits inside the drop it triggers,
+        /// not on walkable ground, so the nearest NavMesh isn't at a fixed offset from it: logging every
+        /// NavMesh.SamplePosition candidate in game (Level 0-1, Level 1-1) showed the nearest point is 47.5 m
+        /// away straight down in one level and 84.6 m away up and 46.8 m to the side in the other -- not "a
+        /// few metres above" as first assumed from the pit's raw depth (17.1 m / 76.1 m below the floor).
+        /// A wider search radius at the unchanged pit position finds the same nearest point regardless of
+        /// its direction, so this replaces directional probing. Both measured points connect back to the
+        /// player's side of the mesh only as NavMeshPathStatus.PathPartial (BuildPath already reports that
+        /// as a valid "partial" status), which matches a FinalPit deliberately sitting off the walkable graph.
+        /// 55/95 clears both measured cases with a few metres of slack.
+        /// </summary>
+        private static readonly float[] ExitSnapRadii = { 55f, 95f };
+
         private readonly List<FinalPit> pits = new List<FinalPit>();
         private readonly List<CheckPoint> checkpoints = new List<CheckPoint>();
         // Id strings for checkpoints, same index as checkpoints. Computed once per Scan() rather than
@@ -206,6 +221,11 @@ namespace UltrakillAIBridge.Obs
         /// <summary>
         /// NavMesh path from the player to the exit, both ends snapped onto the mesh. The mesh only covers
         /// walkable ground (jumps and gaps are not linked, doors carry obstacles), so a partial path is normal.
+        /// The exit end is snapped by <see cref="SampleExit"/>, which may land far from the pit's own
+        /// position (see <see cref="ExitSnapRadii"/>); <c>pathLength</c> is measured through
+        /// <c>NavMeshPath.corners</c> to that snapped point, i.e. it always stays "distance the player still
+        /// has to walk" to reach the nearest standable point back on the mesh, never a straight line into the
+        /// pit itself.
         /// </summary>
         private void UpdatePath(Vector3 playerPos, FinalPit exit)
         {
@@ -213,7 +233,7 @@ namespace UltrakillAIBridge.Obs
             pathStatus = "none";
             if (exit == null) return;
             if (!NavMesh.SamplePosition(playerPos, out var from, PlayerSnapDistance, NavMesh.AllAreas)) return;
-            if (!NavMesh.SamplePosition(exit.transform.position, out var to, ExitSnapDistance, NavMesh.AllAreas)) return;
+            if (!SampleExit(exit.transform.position, out var to)) return;
 
             if (navPath == null) navPath = new NavMeshPath();
             if (!NavMesh.CalculatePath(from.position, to.position, NavMesh.AllAreas, navPath)) return;
@@ -238,6 +258,25 @@ namespace UltrakillAIBridge.Obs
                 }
             }
             pathStatus = navPath.status == NavMeshPathStatus.PathComplete ? "complete" : "partial";
+        }
+
+        /// <summary>
+        /// Samples the NavMesh point nearest a <see cref="FinalPit"/>, escalating the search radius instead
+        /// of guessing a direction: see <see cref="ExitSnapRadii"/> for why (the nearest point measured in
+        /// game was straight down for one pit and diagonally up and sideways for another). Tries
+        /// <see cref="ExitSnapDistance"/> at the raw position first, so a pit that already sits on/near the
+        /// mesh keeps working exactly as before, then each wider radius in turn, stopping at the first
+        /// NavMesh hit. Bounded to at most 1 + <c>ExitSnapRadii.Length</c> SamplePosition calls, cheap enough
+        /// for the 150-250 steps/s this runs at across five games.
+        /// </summary>
+        private static bool SampleExit(Vector3 exitPos, out NavMeshHit hit)
+        {
+            if (NavMesh.SamplePosition(exitPos, out hit, ExitSnapDistance, NavMesh.AllAreas)) return true;
+            foreach (var radius in ExitSnapRadii)
+            {
+                if (NavMesh.SamplePosition(exitPos, out hit, radius, NavMesh.AllAreas)) return true;
+            }
+            return false;
         }
 
         private JObject BuildPath()
