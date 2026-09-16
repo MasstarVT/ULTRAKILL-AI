@@ -266,7 +266,10 @@ namespace UltrakillAIBridge.Env
             if (msg["command_timeout_s"] != null) commandTimeoutMs = Mathf.Max(1, msg["command_timeout_s"].Value<int>()) * 1000;
             windowed = msg["windowed"]?.Value<bool>() ?? windowed;
             TrainingSpeed.SoftDeathEnabled = msg["soft_death"]?.Value<bool>() ?? TrainingSpeed.SoftDeathEnabled;
-            CampaignPatches.DifficultyOverride = msg["difficulty"]?.Value<int>() ?? CampaignPatches.DifficultyOverride;
+            // PrefsManager's own validator clamps a stored difficulty above 4 down to 4, but the Harmony
+            // postfix overwrites __result AFTER that validator runs, so an out-of-range override would
+            // reach call sites that index arrays directly by the value. Clamp here instead; -1 stays -1.
+            CampaignPatches.DifficultyOverride = Mathf.Clamp(msg["difficulty"]?.Value<int>() ?? CampaignPatches.DifficultyOverride, -1, 4);
             CampaignPatches.UnlockAllGear = msg["unlock_all_gear"]?.Value<bool>() ?? CampaignPatches.UnlockAllGear;
             if (msg["render"] != null)
             {

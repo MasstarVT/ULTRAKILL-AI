@@ -59,7 +59,17 @@ namespace UltrakillAIBridge
             harmony.PatchAll(typeof(BackgroundPatches));
             harmony.PatchAll(typeof(InstancePatches));
             harmony.PatchAll(typeof(TrainingSpeed));
-            harmony.PatchAll(typeof(CampaignPatches));
+            try
+            {
+                // CampaignPatches binds a private method (ActivateNextWave.EndWaves) among its five targets;
+                // a game update renaming or restructuring any of them would throw here. Isolate that failure
+                // so campaign support degrades instead of taking the whole bridge down with it.
+                harmony.PatchAll(typeof(CampaignPatches));
+            }
+            catch (System.Exception e)
+            {
+                Log.LogError($"Campaign patches failed to apply, campaign support is disabled: {e}");
+            }
             EnemyTracker.onEnemyAdded += TrainingSpeed.OnEnemyAdded;
 
             // Arena and door keys belong to one level load. Checkpoint respawns don't load a scene, so the
