@@ -73,10 +73,21 @@ def stop_all(timeout: float = 30.0) -> None:
         time.sleep(2)
 
 
+def listening_ports() -> set[int]:
+    """TCP ports something is listening on, read from netstat. Never probe the bridge by connecting: it is a
+    single-client server that drops its current client when a new one connects, so a probe connection kicks a
+    running trainer off the game (this killed a training run once)."""
+    out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True).stdout
+    ports = set()
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0] == "TCP" and parts[3] == "LISTENING":
+            ports.add(int(parts[1].rsplit(":", 1)[1]))
+    return ports
+
+
 def port_open(port: int) -> bool:
-    with socket.socket() as s:
-        s.settimeout(0.5)
-        return s.connect_ex(("127.0.0.1", port)) == 0
+    return port in listening_ports()
 
 
 def windows_for_pid(pid: int) -> list[int]:
