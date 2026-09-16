@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import random
 import sys
 import tempfile
 from pathlib import Path
@@ -15,9 +17,13 @@ from ultrakill_ai.campaign import (  # noqa: E402
     CAMPAIGN_LEVELS,
     RANK_LETTERS,
     ExplorationArchive,
+    MilestoneTracker,
+    PathProgress,
+    choose_fresh_start,
     compute_rank,
     grade,
     safe_name,
+    save_best_run,
 )
 
 RANKS = {"time": [300, 240, 180, 120], "kills": [10, 20, 30, 40], "style": [1000, 2000, 3000, 4000]}
@@ -193,6 +199,205 @@ def test_archive_load_cell_size_mismatch_is_empty():
         assert ExplorationArchive.load(path, cell_size=4.0).counts == {(0, 0, 0): 1}
         loaded = ExplorationArchive.load(path, cell_size=2.0)
     assert loaded.counts == {} and loaded.cell_size == 2.0
+
+
+def milestones_block(checkpoints=(), arenas=(), doors=()):
+    """A campaign block holding only the milestone keys. `checkpoints` holds (id, activated, current) tuples."""
+    return {
+        "checkpoints": [{"id": cid, "pos": [0.0, 0.0, 0.0], "activated": act, "current": cur} for cid, act, cur in checkpoints],
+        "cleared_arenas": list(arenas),
+        "unlocked_doors": list(doors),
+    }
+
+
+def test_milestones_pay_a_checkpoint_once_per_level_load():
+    m = MilestoneTracker()
+    m.new_level_load(milestones_block(checkpoints=[("0,1,20", False, False)]))
+    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)])) == (1, 0, 0)
+    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)])) == (0, 0, 0)
+    assert m.checkpoints_reached == 1
+    further = milestones_block(checkpoints=[("0,1,20", True, False), ("0,1,80", True, True)], arenas=["0,1,30"], doors=["5,0,40"])
+    assert m.update(further) == (1, 1, 1)
+    assert m.update(further) == (0, 0, 0)
+    assert m.checkpoints_reached == 2
+    assert m.update(None) == (0, 0, 0)  # a step without the block pays nothing and forgets nothing
+    assert m.update(further) == (0, 0, 0)
+
+
+def test_milestones_level_load_baseline_pays_nothing():
+    m = MilestoneTracker()
+    loaded = milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"], doors=["0,0,25"])
+    m.new_level_load(loaded)
+    assert m.update(loaded) == (0, 0, 0)
+    assert m.checkpoints_reached == 1
+    m.new_level_load(None)
+    assert m.checkpoints_reached == 0
+
+
+def test_milestones_mark_paid_absorbs_a_respawn_unlock():
+    m = MilestoneTracker()
+    m.new_level_load(milestones_block())
+    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"])) == (1, 1, 0)
+    # Restart() at the checkpoint unlocked a door: absorbed, never paid
+    respawned = milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"], doors=["0,0,25"])
+    m.mark_paid(respawned)
+    assert m.update(respawned) == (0, 0, 0)
+    later = milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"], doors=["0,0,25", "9,0,50"])
+    assert m.update(later) == (0, 0, 1)
+    assert m.checkpoints_reached == 1
+
+
+def test_milestones_current_counts_as_activated():
+    m = MilestoneTracker()
+    m.new_level_load(milestones_block(checkpoints=[("0,1,20", False, False), ("0,1,80", False, False)]))
+    assert m.update(milestones_block(checkpoints=[("0,1,20", False, True), ("0,1,80", False, False)])) == (1, 0, 0)
+    assert m.update(milestones_block(checkpoints=[("0,1,20", True, False), ("0,1,80", False, False)])) == (0, 0, 0)
+    assert m.checkpoints_reached == 1
+
+
+def test_milestones_new_level_load_pays_again():
+    m = MilestoneTracker()
+    m.new_level_load(milestones_block())
+    reached = milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"], doors=["5,0,40"])
+    assert m.update(reached) == (1, 1, 1)
+    m.new_level_load(milestones_block(checkpoints=[("0,1,20", False, False)]))
+    assert m.checkpoints_reached == 0
+    assert m.update(reached) == (1, 1, 1)
+
+
+def nav_path(length, status="complete"):
+    return {"status": status, "length": length, "next_corner": [0.0, 0.0, 0.0]}
+
+
+def test_path_progress_baseline_pays_nothing():
+    p = PathProgress()
+    p.reset()
+    assert p.update(nav_path(60.0)) == 0.0
+    assert p.update(nav_path(60.0)) == 0.0
+    assert p.update(nav_path(70.0)) == 0.0  # a longer path is not progress and does not move the best
+    assert p.update(nav_path(58.5)) == 1.5  # still measured from 60
+
+
+def test_path_progress_pays_a_gain_over_min_gain():
+    assert PathProgress.MIN_GAIN == 1.0
+    p = PathProgress()
+    p.reset()
+    p.update(nav_path(60.0))
+    assert p.update(nav_path(52.0)) == 8.0
+    assert p.update(nav_path(52.0)) == 0.0
+    assert p.update(nav_path(51.0)) == 0.0  # exactly MIN_GAIN is not enough
+    p.reset()
+    assert p.update(nav_path(40.0)) == 0.0  # a new episode starts from a new baseline
+    assert p.update(nav_path(30.0)) == 10.0
+
+
+def test_path_progress_partial_or_missing_path_pays_nothing():
+    p = PathProgress()
+    p.reset()
+    assert p.update(None) == 0.0
+    assert p.update({"status": "none"}) == 0.0
+    assert p.update(nav_path(10.0, status="partial")) == 0.0  # does not set the baseline either
+    assert p.update(nav_path(60.0)) == 0.0
+    assert p.update(nav_path(20.0, status="partial")) == 0.0
+    assert p.update({"status": "none"}) == 0.0
+    assert p.update(nav_path(55.0)) == 5.0
+
+
+def test_path_progress_sub_metre_gains_accumulate():
+    p = PathProgress()
+    p.reset()
+    p.update(nav_path(60.0))
+    assert p.update(nav_path(59.6)) == 0.0
+    assert p.update(nav_path(59.2)) == 0.0
+    assert abs(p.update(nav_path(58.8)) - 1.2) < 1e-9  # measured from 60, not from 59.2
+    assert p.update(nav_path(58.8)) == 0.0
+
+
+def fresh(rng, fresh_prob, **overrides):
+    """choose_fresh_start for a game mid-level with an active checkpoint, with some conditions overridden."""
+    kwargs = {"in_level": True, "level_over": False, "has_checkpoint": True, "stuck_streak": 0, "stuck_limit": 3}
+    kwargs.update(overrides)
+    return choose_fresh_start(rng, fresh_prob=fresh_prob, **kwargs)
+
+
+def test_fresh_start_when_not_in_the_level():
+    for prob in (0.0, 1.0):
+        assert fresh(random.Random(0), prob, in_level=False) is True
+
+
+def test_fresh_start_after_the_level_is_over():
+    for prob in (0.0, 1.0):
+        assert fresh(random.Random(0), prob, level_over=True) is True
+
+
+def test_fresh_start_without_a_checkpoint():
+    for prob in (0.0, 1.0):
+        assert fresh(random.Random(0), prob, has_checkpoint=False) is True
+
+
+def test_fresh_start_after_repeated_stuck_episodes():
+    assert fresh(random.Random(0), 0.0, stuck_streak=2) is False
+    assert fresh(random.Random(0), 0.0, stuck_streak=3) is True
+    assert fresh(random.Random(0), 0.0, stuck_streak=4) is True
+    assert fresh(random.Random(0), 1.0, stuck_streak=3) is True
+
+
+def test_fresh_start_otherwise_by_probability():
+    assert fresh(random.Random(0), 0.0) is False
+    assert fresh(random.Random(0), 1.0) is True
+    rng, twin = random.Random(123), random.Random(123)
+    picks = [fresh(rng, 0.2) for _ in range(2000)]
+    assert picks == [twin.random() < 0.2 for _ in range(2000)]  # one draw per decision from the seeded source
+    assert 300 < sum(picks) < 500
+    forced, untouched = random.Random(7), random.Random(7)
+    assert fresh(forced, 0.2, in_level=False) is True
+    assert forced.random() == untouched.random()  # a forced reload does not draw
+
+
+def best_run(seconds, **extra):
+    run = {
+        "level": "Level 0-1", "seconds": seconds, "kills": 5, "style": 300, "restarts": 0, "deaths": 0, "rank": "A",
+        "difficulty": 3, "positions": [[0, 1, 2], [0, 1, 4]], "saved_at": "2026-09-16T12:00:00",
+    }
+    run.update(extra)
+    return run
+
+
+def test_save_best_run_writes_the_first_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "best_runs" / "Level_0-1.json"
+        assert save_best_run(path, best_run(95.5)) is True
+        assert json.loads(path.read_text(encoding="utf-8")) == best_run(95.5)
+        assert [p.name for p in path.parent.iterdir()] == ["Level_0-1.json"]  # no temp file left behind
+
+
+def test_save_best_run_refuses_a_slower_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "Level_0-1.json"
+        assert save_best_run(path, best_run(95.5)) is True
+        assert save_best_run(path, best_run(120.0, kills=9)) is False
+        assert save_best_run(path, best_run(95.5, kills=9)) is False  # a tie keeps the stored run
+        assert json.loads(path.read_text(encoding="utf-8")) == best_run(95.5)
+
+
+def test_save_best_run_overwrites_with_a_faster_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "Level_0-1.json"
+        save_best_run(path, best_run(95.5))
+        assert save_best_run(path, best_run(80.25, rank="S")) is True
+        assert json.loads(path.read_text(encoding="utf-8")) == best_run(80.25, rank="S")
+        assert [p.name for p in path.parent.iterdir()] == ["Level_0-1.json"]
+
+
+def test_save_best_run_overwrites_an_unreadable_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "Level_0-1.json"
+        path.write_text("{truncated", encoding="utf-8")
+        assert save_best_run(path, best_run(300.0)) is True
+        assert json.loads(path.read_text(encoding="utf-8"))["seconds"] == 300.0
+        path.write_text('{"level": "Level 0-1"}', encoding="utf-8")  # readable JSON without a time
+        assert save_best_run(path, best_run(310.0)) is True
+        assert json.loads(path.read_text(encoding="utf-8"))["seconds"] == 310.0
 
 
 if __name__ == "__main__":

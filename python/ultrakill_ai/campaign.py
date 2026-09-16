@@ -6,8 +6,10 @@ tests/test_campaign.py. The inputs come from the mod's `campaign` observation bl
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import random
 import re
 import time
 import zipfile
@@ -171,3 +173,130 @@ class ExplorationArchive:
             return archive
         archive.counts = loaded
         return archive
+
+
+# ---------------------------------------------------------------------------
+# Milestones, path progress and episode starts
+# ---------------------------------------------------------------------------
+
+
+class MilestoneTracker:
+    """Pays each checkpoint, arena clear and door unlock once per level load.
+
+    The mod reports arenas and doors as rounded-position keys. A checkpoint respawn re-instantiates rooms at the
+    same position, so an arena cleared again after a death gives the same key and cannot pay twice. Keys that
+    show up during a reset or respawn (Restart() unlocks the checkpoint's doors) are absorbed with `mark_paid`
+    instead of paid. A checkpoint counts once it is activated or current.
+    """
+
+    def __init__(self):
+        self._checkpoints: set[str] = set()
+        self._arenas: set[str] = set()
+        self._doors: set[str] = set()
+
+    @staticmethod
+    def _keys(campaign: dict | None) -> tuple[set[str], set[str], set[str]]:
+        if not campaign:
+            return set(), set(), set()
+        checkpoints = {str(cp["id"]) for cp in campaign.get("checkpoints") or () if cp.get("activated") or cp.get("current")}
+        return checkpoints, set(campaign.get("cleared_arenas") or ()), set(campaign.get("unlocked_doors") or ())
+
+    def new_level_load(self, campaign: dict | None) -> None:
+        """Starts a level load: forgets what was paid, then absorbs whatever the fresh level already reports."""
+        self._checkpoints.clear()
+        self._arenas.clear()
+        self._doors.clear()
+        self.mark_paid(campaign)
+
+    def mark_paid(self, campaign: dict | None) -> None:
+        """Absorbs the block's current keys without paying for them."""
+        self.update(campaign)
+
+    def update(self, campaign: dict | None) -> tuple[int, int, int]:
+        """(new checkpoints, new arena clears, new door unlocks): keys not yet paid or absorbed this level load."""
+        checkpoints, arenas, doors = self._keys(campaign)
+        new = (len(checkpoints - self._checkpoints), len(arenas - self._arenas), len(doors - self._doors))
+        self._checkpoints |= checkpoints
+        self._arenas |= arenas
+        self._doors |= doors
+        return new
+
+    @property
+    def checkpoints_reached(self) -> int:
+        """Distinct checkpoints activated in this level load (paid or absorbed)."""
+        return len(self._checkpoints)
+
+
+class PathProgress:
+    """Pays metres of new best NavMesh path length to the exit within an episode.
+
+    Only complete paths count: a partial path stops wherever the NavMesh does, so its length says nothing about
+    the distance left. The first complete path of an episode is the baseline and pays nothing. A new best must
+    beat the old one by more than MIN_GAIN, and smaller improvements leave the best where it was, so they add up
+    instead of paying jitter from the snapped path ends.
+    """
+
+    MIN_GAIN = 1.0
+
+    def __init__(self):
+        self.best = math.inf
+
+    def reset(self) -> None:
+        self.best = math.inf
+
+    def update(self, path: dict | None) -> float:
+        if not path or path.get("status") != "complete" or path.get("length") is None:
+            return 0.0
+        length = float(path["length"])
+        if math.isinf(self.best):
+            self.best = length
+            return 0.0
+        if length < self.best - self.MIN_GAIN:
+            gain = self.best - length
+            self.best = length
+            return gain
+        return 0.0
+
+
+def choose_fresh_start(
+    rng: random.Random,
+    *,
+    in_level: bool,
+    level_over: bool,
+    has_checkpoint: bool,
+    stuck_streak: int,
+    stuck_limit: int,
+    fresh_prob: float,
+) -> bool:
+    """Whether the next campaign episode reloads the level (True) or respawns at the current checkpoint.
+
+    A reload is forced when the game is not in the level with a player, the level is over, there is no current
+    checkpoint to respawn at, or `stuck_limit` episodes in a row ended stuck at the same checkpoint (a respawn can
+    leave a door locked behind the player). Otherwise it reloads with probability `fresh_prob`, so fresh-start
+    completions keep being measured while most episodes land on each game's frontier. A forced reload does not
+    draw from `rng`.
+    """
+    if not in_level or level_over or not has_checkpoint or stuck_streak >= stuck_limit:
+        return True
+    return rng.random() < fresh_prob
+
+
+def save_best_run(path, run: dict) -> bool:
+    """Stores `run` as the level's best run if it is faster than the stored one. Returns whether it wrote.
+
+    A missing or unreadable file, or one without a time, counts as no stored run. The file is replaced
+    atomically (retrying briefly while another training game has it open), so a crash mid-write never leaves a
+    broken best run behind.
+    """
+    path = Path(path)
+    try:
+        stored = float(json.loads(path.read_text(encoding="utf-8"))["seconds"])
+    except (OSError, ValueError, KeyError, TypeError):
+        stored = math.inf
+    if not float(run["seconds"]) < stored:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(run, separators=(",", ":")), encoding="utf-8")
+    _replace_file(tmp, path)
+    return True
