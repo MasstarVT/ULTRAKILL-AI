@@ -79,6 +79,10 @@ train:
   timesteps: 8000000  # raised from 5M so an overnight run does not idle after finishing
   save_every: 50000
   hyperparams:
+    # approx_kl ran 0.029-0.034 against target_kl 0.02 every iteration, so SB3 was breaking out of the
+    # epoch loop early and only 1-2 of the 5 epochs ever ran. Smaller steps let the whole update through:
+    # lr 3e-4 -> 2e-4 with a slightly looser KL budget. Together these control update size, so they are
+    # one change, not two.
+    learning_rate: 0.0002
+    target_kl: 0.03
     ent_coef: 0.01  # keep exploring early; the old 0.005 was chosen for "precise aiming" when the real problem was pitch
-    target_kl: 0.02  # stop an update early once the policy has moved this far: the v1 updates hit 0.03-0.05 per
-    # iteration with a 25-30% clip fraction and wandered randomly instead of following the gradient

@@ -193,6 +193,38 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     too deep; `enemy_dist_mean` > 32 with `on_target_frac` rising means `aim_locked` is paying for easy
     long-range tracking; and kills/min must not sit below 1.95 at 2.68M, since aim improving while kills
     fall is the signature of a tracking policy that stopped engaging.
+- **Failed experiment at 1.98M: a pitch-head bias tilt, applied and reverted the same night.** Worth keeping
+  because the failure mode is a trap this project can fall into again. An offline probe of
+  `ckpt_1979085_steps.zip` reported the pitch head commanding -5.7 deg/step at *every* camera pitch from
+  -40 to +40 and sign agreement 44-46% (below chance), i.e. an open loop driving the camera into the floor
+  of the band. Note the bias itself was NOT the culprit: decomposing the logits showed `b` contributed only
+  +0.06 of that -3.75 deg/step and `W @ h` the rest, so v1's `pitch_reset` approach (zeroing the head) would
+  have been a no-op here and would also have destroyed a genuinely good slope (corr +0.95). Instead a single
+  scalar tilt was added to the pitch bias (`logit_i += lam * PITCH_BINS[i]`, lam 0.0469, Adam moments for
+  those rows cleared), chosen so the command at elevation 0 was exactly zero. Offline this looked right:
+  the loop gained a fixed point near -8 deg, inside the band, and sign agreement went 45% -> 55%.
+  **Live it was clearly worse**: `look_up_mean` -0.010 -> +0.447, `pitch_mean` -0.62 -> +27.9,
+  `on_target_frac` 0.039 -> 0.016, `pitch_track` 0.065 -> -0.134. Reverted to `ckpt_1979085_steps.zip`
+  within ~10k steps; the bad checkpoint is kept as `REVERTED_pitch_centred_1979085.zip.bad`.
+  **Why it was wrong:** the live camera was ALREADY level on average (`pitch_mean` -0.62) and enemies sit
+  essentially ON the horizon on average (`enemy_elev_mean` +0.80), so the live mean pitch command was already
+  ~0. The probe's synthetic states (one enemy, seven empty enemy slots, no walls, zero velocity, camera pitch
+  0, full health) are not the live distribution, and the "systematic downward command" was an artifact of
+  them. `enemy_pitch_err_mean` 26.97 versus `enemy_elev_abs_mean` 26.34 says the same thing from the other
+  side: a camera welded level would score what the real one scores, so the pitch loop is useless but it was
+  not biased, and there was nothing for a constant correction to fix.
+  **Rules adopted:** never judge a policy edit from an offline probe alone -- confirm against live
+  `status.json` metrics; after any change, revert if `on_target_frac` or `kills_per_min` is worse at the next
+  two checks; prefer reward-weight changes to editing weights directly; change one thing at a time and give
+  it at least 400k steps.
+- **Update size at 1.98M.** `approx_kl` had been running 0.029-0.034 against `target_kl` 0.02 every iteration,
+  so SB3 was breaking out of the epoch loop early and only 1-2 of the 5 epochs ever ran. Set
+  `learning_rate` 3e-4 -> 2e-4 and `target_kl` 0.02 -> 0.03 (one change: both control update size).
+- **Open question: `yaw_track` is 0.149 live but +0.846 in the offline probe** on the same checkpoint. Until
+  that gap is explained, neither number should drive a decision. The leading suspect is that `visible` is
+  line-of-sight only, so the nearest visible enemy is often BEHIND the player, where turning either way is
+  equally correct and the sign comparison becomes a coin flip -- which would drag the live metric toward 0
+  for a policy that is actually fine.
 - **Next steps:**
   - Watch the 1.70M rebalance against the falsifiers above; `yaw_track` then `on_target_frac` lead, kills/min follows.
   - If `on_target_frac` is still <= 0.06 at 2.18M, reset the look-head output bias (as `pitch_reset_2447005.zip` did for v1) rather than tuning weights again: a constant offset in the bias is not reachable from a reward slope that is flat across the whole sweep range.
