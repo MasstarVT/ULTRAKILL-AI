@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ultrakill_ai.env import CAMPAIGN_INFO_KEYS, EnvConfig, UltrakillEnv  # noqa: E402
+from ultrakill_ai.protocol import BridgeClient  # noqa: E402
 from ultrakill_ai.rewards import RewardConfig  # noqa: E402
 from ultrakill_ai.spaces import noop_action  # noqa: E402
 
@@ -329,6 +330,20 @@ def test_exploration_archive_is_saved_on_close_and_loaded_again():
         assert (Path(tmp) / f"explore_Level_0-1_{env.cfg.port}.npz").exists()
         again = UltrakillEnv(env.cfg)
         assert again.archive.counts == counts
+
+
+def test_bridge_client_kill_sends_the_kill_command():
+    client = BridgeClient()
+    sent = []
+    client.request = lambda msg: sent.append(msg) or {"type": "obs", "event": "kill"}
+    assert client.kill() == {"type": "obs", "event": "kill"}
+    assert sent == [{"type": "kill"}]
+
+
+def test_human_routes_are_retired():
+    root = Path(__file__).resolve().parents[1]
+    assert not (root / "ultrakill_ai" / "routes.py").exists()
+    assert not (root / "scripts" / "record_route.py").exists()
 
 
 if __name__ == "__main__":

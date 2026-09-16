@@ -1,6 +1,7 @@
 """Smoke test: random actions with automatic resets.
 
     python scripts/random_agent.py --mode cybergrind --episodes 5
+    python scripts/random_agent.py --mode campaign --level "Level 0-1" --episodes 2
 """
 
 from __future__ import annotations
@@ -37,8 +38,12 @@ def main() -> None:
                 if terminated or truncated:
                     break
             elapsed = time.perf_counter() - start
+            if env.cfg.mode == "campaign":
+                progress = f"completed={info['completed']} checkpoints_level={info['checkpoints_level']} cells_new={info['cells_new']}"
+            else:
+                progress = f"wave={info['wave']}"
             print(
-                f"episode {ep}: steps={steps} reward={total:.2f} kills={info['kills']} wave={info['wave']} "
+                f"episode {ep}: steps={steps} reward={total:.2f} kills={info['kills']} {progress} "
                 f"end={info.get('end_reason')} ({steps / elapsed:.0f} steps/s)"
             )
     finally:

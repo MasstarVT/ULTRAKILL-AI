@@ -91,9 +91,8 @@ python scripts/train.py --config configs/cybergrind.yaml --num-envs 4
 python scripts/games.py stop
 ```
 
-**Train on a campaign level.** Record a route by playing the level yourself first.
+**Train on a campaign level.** No recorded route is needed: the agent learns from the level itself (checkpoints, arena clears, door unlocks, ground it has not covered yet, and the NavMesh distance to the exit). To see what the mod reports in a campaign level without taking control, run `python scripts/bridge_test.py --campaign` while playing it.
 ```bash
-python scripts/record_route.py --level "Level 0-1"
 python scripts/train.py --config configs/campaign_0-1.yaml
 ```
 

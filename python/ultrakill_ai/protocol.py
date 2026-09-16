@@ -104,6 +104,10 @@ class BridgeClient:
     def teleport(self, pos) -> dict[str, Any]:
         return self.request({"type": "teleport", "pos": [float(v) for v in pos]})
 
+    def kill(self) -> dict[str, Any]:
+        """Kills the player (debug command for the in-game death check). With soft_death on, the mod heals instead."""
+        return self.request({"type": "kill"})
+
     def release(self) -> None:
         self.request({"type": "release"})
 
