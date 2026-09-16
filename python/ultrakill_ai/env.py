@@ -68,7 +68,8 @@ class EnvConfig:
 
 
 BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "yaw_err_sum", "dist_sum", "yaw_sum",
-                  "pitch_steps", "pitch_sum", "pitch_signed_sum", "look_up_sum", "elev_steps", "elev_sum", "elev_abs_sum", "elev_over15", "pitch_err_sum")
+                  "pitch_steps", "pitch_sum", "pitch_signed_sum", "look_up_sum", "elev_steps", "elev_sum", "elev_abs_sum", "elev_over15", "pitch_err_sum",
+                  "yaw_track", "yaw_track_n", "pitch_track", "pitch_track_n")
 
 
 def clamp_pitch_command(current_pitch: float, pitch_cmd: float, limit: float) -> float:
@@ -173,9 +174,10 @@ class UltrakillEnv(gym.Env):
     def step(self, action):
         prev = self._raw
         command = decode_action(action)
+        raw_pitch_cmd = command["look"][1]
         if self.cfg.pitch_limit_deg and prev.get("player"):
             command["look"][1] = clamp_pitch_command(prev["player"]["pitch"], command["look"][1], self.cfg.pitch_limit_deg)
-        self._note_behaviour(prev, command)
+        self._note_behaviour(prev, command, raw_pitch_cmd)
         cur = self.client.step(command)
         self._raw = cur
         self._steps += 1
@@ -284,8 +286,8 @@ class UltrakillEnv(gym.Env):
             raw = self.client.step(forward)
         raise RuntimeError("Failed to enter the Cyber Grind arena after reset")
 
-    def _note_behaviour(self, raw: dict[str, Any], command: dict[str, Any]) -> None:
-        """Per-episode diagnostics: is the agent shooting, and is it shooting at anything?"""
+    def _note_behaviour(self, raw: dict[str, Any], command: dict[str, Any], raw_pitch_cmd: float) -> None:
+        """Per-episode diagnostics: is the agent shooting, is it shooting at anything, and does it turn toward enemies?"""
         self._behaviour["steps"] += 1
         firing = "fire1" in command["buttons"] or "fire2" in command["buttons"]
         self._behaviour["firing"] += firing
@@ -308,6 +310,16 @@ class UltrakillEnv(gym.Env):
         self._behaviour["angle_sum"] += angle
         self._behaviour["yaw_err_sum"] += yaw_err
         self._behaviour["pitch_err_sum"] += pitch_err
+        # Tracking scores: +1 when the look command turns toward the nearest visible enemy, -1 when away
+        # (random play scores 0). Uses the unclamped pitch command so the band does not bias it.
+        x, y, _ = visible[0]["rel"]
+        yaw_cmd = command["look"][0]
+        if yaw_cmd and abs(x) > 0.5:
+            self._behaviour["yaw_track_n"] += 1
+            self._behaviour["yaw_track"] += 1 if (yaw_cmd > 0) == (x > 0) else -1
+        if raw_pitch_cmd and abs(y) > 0.5:
+            self._behaviour["pitch_track_n"] += 1
+            self._behaviour["pitch_track"] += 1 if (raw_pitch_cmd > 0) == (y > 0) else -1
         elev = horizon_elevation(player, visible[0])
         if elev is not None:
             self._behaviour["elev_steps"] += 1
@@ -351,6 +363,8 @@ class UltrakillEnv(gym.Env):
         info["enemy_angle_mean"] = b["angle_sum"] / seen  # degrees off the crosshair
         info["enemy_yaw_angle_mean"] = b["yaw_err_sum"] / seen  # heading error only, ignoring pitch
         info["enemy_pitch_err_mean"] = b["pitch_err_sum"] / seen  # vertical miss: enemy elevation in camera space
+        info["yaw_track"] = b["yaw_track"] / max(1, b["yaw_track_n"])  # -1..1, turns toward the enemy horizontally
+        info["pitch_track"] = b["pitch_track"] / max(1, b["pitch_track_n"])  # -1..1, vertically
         info["pitch_abs_mean"] = b["pitch_sum"] / max(1, b["pitch_steps"])  # camera pitch away from level
         info["pitch_mean"] = b["pitch_signed_sum"] / max(1, b["pitch_steps"])  # signed rotationX
         info["look_up_mean"] = b["look_up_sum"] / max(1, b["pitch_steps"])  # mean camera forward.y (>0 = looking up)

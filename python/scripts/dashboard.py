@@ -415,6 +415,9 @@ class Dashboard:
                                  ("enemy_dist_mean", "enemy distance  ", "m"), ("yaw_per_step_mean", "turn per step   ", "deg")):
             if isinstance(mean.get(key), (int, float)):
                 shooting.append(f"  {label} {mean[key]:.0f}{unit}")
+        for key, label in (("yaw_track", "yaw tracking    "), ("pitch_track", "pitch tracking  ")):
+            if isinstance(mean.get(key), (int, float)):
+                shooting.append(f"  {label} {mean[key]:+.2f}")
         self.behaviour.config(text="Shooting (last 100)\n" + "\n".join(shooting) if shooting else "")
         reasons = get("end_reasons_100") if isinstance(get("end_reasons_100"), dict) else {}
         total = sum(v for v in (num(x) for x in reasons.values()) if v) or 0
