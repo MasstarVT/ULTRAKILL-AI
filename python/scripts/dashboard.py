@@ -99,6 +99,46 @@ def fmt_duration(seconds) -> str:
     return f"{d}d {h}h"
 
 
+def fmt_time(seconds) -> str:
+    """Official level time as mm:ss.mmm, the format times.md uses."""
+    s = num(seconds)
+    if s is None:
+        return "—"
+    try:
+        from ultrakill_ai.times import format_time
+    except ImportError:  # a checkout from before times.py: the same whole-millisecond format
+        ms = round(max(0.0, s) * 1000)
+        return f"{ms // 60000:02d}:{ms // 1000 % 60:02d}.{ms % 1000:03d}"
+    return format_time(s)
+
+
+def fmt_pct(value) -> str:
+    v = num(value)
+    return "—" if v is None else f"{v * 100:.0f}%"
+
+
+def campaign_lines(campaign: dict, mean: dict, parts: dict | None = None) -> list[str]:
+    """Campaign panel rows: completion and official times, per-episode means over the last 100, then the largest reward parts."""
+    exit_dist = fmt_float(mean.get("exit_dist_min"), 0)
+    rows = (
+        ("fresh completed ", f"{fmt_pct(campaign.get('fresh_completion_rate'))} of last {fmt_int(campaign.get('fresh_window'))}"),
+        ("all completed   ", fmt_pct(mean.get("completed"))),  # fresh starts and checkpoint respawns alike
+        ("best time       ", fmt_time(campaign.get("best_time"))),
+        ("median time     ", fmt_time(campaign.get("median_time_50"))),
+        ("checkpoints/load", fmt_float(mean.get("checkpoints_level"), 1)),
+        ("new cells/ep    ", fmt_float(mean.get("cells_new"), 0)),
+        ("deaths/ep       ", fmt_float(mean.get("deaths"))),
+        ("closest to exit ", exit_dist if exit_dist == "—" else f"{exit_dist}m"),
+    )
+    lines = [f"  {label} {value}" for label, value in rows]
+    # The four largest reward parts by size, so a term that dominates the return shows up at a glance.
+    values = [(str(name), v) for name, v in ((name, num(value)) for name, value in (parts or {}).items()) if v is not None]
+    if values:
+        lines.append("  reward parts/ep")
+        lines.extend(f"    {name[:14]:<14} {v:+.1f}" for name, v in sorted(values, key=lambda nv: -abs(nv[1]))[:4])
+    return lines
+
+
 # ---------------------------------------------------------------------------------------------
 # Status file
 # ---------------------------------------------------------------------------------------------
@@ -289,9 +329,12 @@ class Dashboard:
         tk.Label(games, text="Games", bg=PANEL, fg=FG, font=FONT_BOLD).pack(anchor="w", padx=10, pady=(6, 2))
         self.games_table = tk.Frame(games, bg=PANEL)
         self.games_table.pack(fill="both", expand=True, padx=10)
+        self.games_heads: list[tk.Label] = []
         for c, head in enumerate(("#", "last reward", "kills", "wave", "last episode")):
             self.games_table.columnconfigure(c, weight=1 if c else 0)
-            tk.Label(self.games_table, text=head, bg=PANEL, fg=MUTED, font=FONT_SMALL, anchor="w").grid(row=0, column=c, sticky="w", padx=(0, 8))
+            head_label = tk.Label(self.games_table, text=head, bg=PANEL, fg=MUTED, font=FONT_SMALL, anchor="w")
+            head_label.grid(row=0, column=c, sticky="w", padx=(0, 8))
+            self.games_heads.append(head_label)
 
         # Bottom text
         bottom = tk.Frame(outer, bg=BG)
@@ -333,6 +376,7 @@ class Dashboard:
         now = time.time()
         get = d.get
         mean = get("mean_100") if isinstance(get("mean_100"), dict) else {}
+        campaign = get("campaign") if isinstance(get("campaign"), dict) else None
 
         # Header
         self.run_label.config(text=str(get("run_name") or (self.path.parent.name if self.path else "—")))
@@ -395,7 +439,13 @@ class Dashboard:
             return out
 
         self.chart_reward.set_series([("reward", GREEN, series("mean_reward_100"))])
-        self.chart_kw.set_series([("kills/min", RED, series("mean_kills_per_min_100")), ("wave", YELLOW, series("mean_wave_100"))])
+        if campaign is not None:
+            self.chart_kw.title = "Fresh completion % & checkpoints"
+            fresh_pct = [(x, y * 100.0) for x, y in series("completion_rate_fresh_50")]
+            self.chart_kw.set_series([("fresh %", PURPLE, fresh_pct), ("checkpoints", YELLOW, series("mean_checkpoints_level_100"))])
+        else:
+            self.chart_kw.title = "Kills/min & wave (100 ep)"
+            self.chart_kw.set_series([("kills/min", RED, series("mean_kills_per_min_100")), ("wave", YELLOW, series("mean_wave_100"))])
         started = num(get("started_at"))
         if started is None and history:
             started = num(history[0].get("wall_time")) or 0.0
@@ -403,6 +453,7 @@ class Dashboard:
         self.chart_speed.x_label = "min"
         self.chart_speed.set_series([("steps/s", BLUE, speed)])
 
+        self.games_heads[3].config(text="checkpoints" if campaign is not None else "wave")
         self._render_games(get("envs") or [], age if state == "running" else None)
 
         # End reasons + PPO
@@ -418,7 +469,11 @@ class Dashboard:
         for key, label in (("yaw_track", "yaw tracking    "), ("pitch_track", "pitch tracking  ")):
             if isinstance(mean.get(key), (int, float)):
                 shooting.append(f"  {label} {mean[key]:+.2f}")
-        self.behaviour.config(text="Shooting (last 100)\n" + "\n".join(shooting) if shooting else "")
+        if campaign is not None:
+            parts = get("reward_parts_mean_100") if isinstance(get("reward_parts_mean_100"), dict) else {}
+            self.behaviour.config(text="Campaign (last 100)\n" + "\n".join(campaign_lines(campaign, mean, parts)))
+        else:
+            self.behaviour.config(text="Shooting (last 100)\n" + "\n".join(shooting) if shooting else "")
         reasons = get("end_reasons_100") if isinstance(get("end_reasons_100"), dict) else {}
         total = sum(v for v in (num(x) for x in reasons.values()) if v) or 0
         items = []
@@ -463,7 +518,9 @@ class Dashboard:
                 last = f"{fmt_duration(age)} ago"
             else:
                 last = f"none yet ({fmt_duration(age)})"
-            values = (fmt_int(e.get("env")), fmt_float(e.get("reward")), fmt_int(e.get("kills")), fmt_int(e.get("wave")),
+            # Campaign games report the checkpoints of the level load instead of a wave (their wave stays 0).
+            progress = e.get("checkpoints_level") if e.get("checkpoints_level") is not None else e.get("wave")
+            values = (fmt_int(e.get("env")), fmt_float(e.get("reward")), fmt_int(e.get("kills")), fmt_int(progress),
                       last + ("  ⚠ stalled?" if stalled else ""))
             for c, (lbl, text) in enumerate(zip(row, values)):
                 lbl.config(text=text, fg=(ORANGE if stalled else FG) if c in (0, 4) else FG)

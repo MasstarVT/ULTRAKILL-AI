@@ -78,7 +78,7 @@ python scripts/train.py --config configs/cybergrind.yaml
 tensorboard --logdir runs
 ```
 
-**Watch training.** A small desktop window shows live progress: steps and ETA, recent reward, kills and waves, charts, and which games have stalled. It only reads `runs/<run_name>/status.json`, which `train.py` writes, so you can open and close it at any time.
+**Watch training.** A small desktop window shows live progress: steps and ETA, recent reward, kills and waves, charts, and which games have stalled. On a campaign run it shows the fresh-start completion rate, best and median official level time, and checkpoints reached instead of the shooting stats and waves. It only reads `runs/<run_name>/status.json`, which `train.py` writes, so you can open and close it at any time.
 ```bash
 python scripts/dashboard.py                        # most recently updated run
 python scripts/dashboard.py --run cybergrind_ppo

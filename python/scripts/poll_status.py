@@ -9,6 +9,10 @@ for a trend on the night of 2026-09-15.
 Read-only: it polls a file and never touches the bridge ports, so it is safe to leave running
 alongside training.
 
+An existing `metrics_log.csv` keeps its header. Rows are written under the columns it already has, and
+values for columns it lacks are dropped, so adding a column here never shifts an old log out of
+alignment. Move the old file aside to start logging the new columns.
+
     python scripts/poll_status.py --run cybergrind_ppo_v2            # every 30 s until stopped
     python scripts/poll_status.py --run cybergrind_ppo_v2 --once
 """
@@ -28,15 +32,20 @@ FIELDS = [
     "enemy_angle_mean", "enemy_yaw_angle_mean", "enemy_pitch_err_mean",
     "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac",
     "enemy_dist_mean", "enemy_close_frac", "reset_seconds",
+    "completed", "fresh_start", "checkpoints_level", "cells_new", "exit_dist_min",
 ]
+# Campaign runs only (status["campaign"]): completion rate and median time over the last 50 fresh starts.
+CAMPAIGN_FIELDS = ["fresh_window", "fresh_completion_rate", "median_time_50", "best_time"]
 PPO_FIELDS = ["entropy_loss", "approx_kl", "clip_fraction", "explained_variance", "value_loss", "learning_rate"]
-PART_FIELDS = ["aim_yaw", "aim_pitch", "aim_locked", "aim", "kill", "damage_dealt", "damage_taken", "death", "wave", "style", "step"]
+PART_FIELDS = ["aim_yaw", "aim_pitch", "aim_locked", "aim", "kill", "damage_dealt", "damage_taken", "death", "wave", "style", "step",
+               "time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path", "level_complete"]
 
 
 def row(status: dict) -> dict:
     m = status.get("mean_100") or {}
     ppo = status.get("ppo") or {}
     parts = status.get("reward_parts_mean_100") or {}
+    campaign = status.get("campaign") or {}
     out = {
         "wall_time": time.strftime("%Y-%m-%d %H:%M:%S"),
         "timesteps": status.get("timesteps"),
@@ -47,6 +56,8 @@ def row(status: dict) -> dict:
         "state": status.get("state"),
     }
     out.update({k: m.get(k) for k in FIELDS})
+    out.update({k: campaign.get(k) for k in CAMPAIGN_FIELDS})
+    out["best_checkpoints_level"] = status.get("best_checkpoints_level")
     out.update({f"ppo_{k}": ppo.get(k) for k in PPO_FIELDS})
     out.update({f"part_{k}": parts.get(k) for k in PART_FIELDS})
     total = sum(v for v in parts.values() if isinstance(v, (int, float)))
@@ -54,6 +65,15 @@ def row(status: dict) -> dict:
     out["part_total"] = total
     out["aim_share"] = (aim / total) if total else None
     return out
+
+
+def existing_header(path: Path) -> list[str] | None:
+    """The header row of an existing CSV, or None when there is no file or it is empty."""
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            return next(csv.reader(f), None) or None
+    except OSError:
+        return None
 
 
 def main() -> None:
@@ -68,8 +88,10 @@ def main() -> None:
     out_path = Path(a.runs_dir) / a.run / "metrics_log.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    header = list(row({}).keys())
-    new = not out_path.exists()
+    header = existing_header(out_path)
+    new = header is None
+    if new:
+        header = list(row({}).keys())
     last_steps = None
     while True:
         try:
@@ -79,7 +101,7 @@ def main() -> None:
         if status and status.get("timesteps") != last_steps:
             last_steps = status.get("timesteps")
             with out_path.open("a", newline="", encoding="utf-8") as f:
-                w = csv.DictWriter(f, fieldnames=header)
+                w = csv.DictWriter(f, fieldnames=header, extrasaction="ignore")
                 if new:
                     w.writeheader()
                     new = False

@@ -3,6 +3,10 @@
 `ProgressCallback` collects episode stats during `model.learn()` and writes a small JSON status file
 (atomically, at most every few seconds). The dashboard only reads that file, so it never touches the
 training process.
+
+Campaign runs also get a `campaign` block. Its completion rate and median time count fresh starts only:
+a checkpoint respawn starts partway through the level, and the official timer carries over from earlier
+episodes, so neither says how the agent does on a whole level.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import statistics
 import time
 from collections import Counter, deque
 from pathlib import Path
@@ -18,6 +23,7 @@ from typing import Any
 from stable_baselines3.common.callbacks import BaseCallback
 
 EPISODE_WINDOW = 100
+FRESH_WINDOW = 50  # campaign completion rate and median time are over this many fresh-start episodes
 RATE_WINDOW_S = 45.0  # steps/s is measured over this much recent wall time
 HISTORY_EVERY_S = 20.0
 HISTORY_MAX = 2000
@@ -88,6 +94,10 @@ class ProgressCallback(BaseCallback):
         self.episodes_recent: deque[dict] = deque(maxlen=EPISODE_WINDOW)
         self.best_reward: float | None = None
         self.best_wave: float | None = None
+        self.best_checkpoints_level: float | None = None
+        self.best_time: float | None = None  # fastest fresh-start completion, official level seconds
+        self.fresh_recent: deque[tuple[float, float | None]] = deque(maxlen=FRESH_WINDOW)  # (completed, level_seconds)
+        self.campaign = False  # set once an episode reports fresh_start
         self.per_env: dict[int, dict] = {}
         self.history: list[dict] = []
         self.ppo_metrics: dict[str, float] = {}
@@ -106,6 +116,10 @@ class ProgressCallback(BaseCallback):
         self.episodes = int(old.get("episodes") or 0)
         self.best_reward = _num(old.get("best_reward"))
         self.best_wave = _num(old.get("best_wave"))
+        self.best_checkpoints_level = _num(old.get("best_checkpoints_level"))
+        if isinstance(old.get("campaign"), dict):
+            self.campaign = True
+            self.best_time = _num(old["campaign"].get("best_time"))
         self.previous_elapsed_s = _num(old.get("elapsed_s")) or 0.0
         self.ppo_metrics = {k: v for k, v in (old.get("ppo") or {}).items() if isinstance(v, (int, float))}
 
@@ -200,7 +214,12 @@ class ProgressCallback(BaseCallback):
             "enemy_elev_over15_frac": field("enemy_elev_over15_frac"),
             "wave": field("wave"),
             "style": field("style"),
-            "route_progress": field("route_progress"),
+            "completed": field("completed"),
+            "fresh_start": field("fresh_start"),
+            "level_seconds": field("level_seconds"),
+            "checkpoints_level": field("checkpoints_level"),
+            "cells_new": field("cells_new"),
+            "exit_dist_min": field("exit_dist_min"),
             "end_reason": info.get("end_reason"),
             "reset_seconds": _num(info.get("reset_seconds")),
             "reward_parts": parts,
@@ -211,11 +230,21 @@ class ProgressCallback(BaseCallback):
             self.best_reward = stats["reward"]
         if stats["wave"] is not None and (self.best_wave is None or stats["wave"] > self.best_wave):
             self.best_wave = stats["wave"]
+        if stats["checkpoints_level"] is not None and (self.best_checkpoints_level is None or stats["checkpoints_level"] > self.best_checkpoints_level):
+            self.best_checkpoints_level = stats["checkpoints_level"]
+        if stats["fresh_start"] is not None:
+            self.campaign = True
+            if stats["fresh_start"]:
+                completed, seconds = stats["completed"] or 0.0, stats["level_seconds"]
+                self.fresh_recent.append((completed, seconds))
+                if completed and seconds is not None and (self.best_time is None or seconds < self.best_time):
+                    self.best_time = seconds
         self.per_env[env_index] = {
             "reward": stats["reward"],
             "length": stats["length"],
             "kills": stats["kills"],
             "wave": stats["wave"],
+            "checkpoints_level": stats["checkpoints_level"],
             "end_reason": stats["end_reason"],
             "ended_at": time.time(),
             "episodes": self.per_env.get(env_index, {}).get("episodes", 0) + 1,
@@ -233,6 +262,16 @@ class ProgressCallback(BaseCallback):
     def _recent_mean(self, key: str) -> float | None:
         return _mean(ep[key] for ep in self.episodes_recent)
 
+    def _campaign_stats(self) -> dict:
+        n = len(self.fresh_recent)
+        times = [seconds for completed, seconds in self.fresh_recent if completed and seconds is not None]
+        return {
+            "fresh_window": n,
+            "fresh_completion_rate": sum(completed for completed, _ in self.fresh_recent) / n if n else None,
+            "median_time_50": statistics.median(times) if times else None,
+            "best_time": self.best_time,
+        }
+
     def _add_history(self, point: dict) -> None:
         self.history.append(point)
         if len(self.history) > HISTORY_MAX:
@@ -245,7 +284,8 @@ class ProgressCallback(BaseCallback):
         remaining = max(0, self.target_timesteps - self.num_timesteps)
         eta = remaining / steps_per_s if steps_per_s and self.state == "running" else None
 
-        recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "kills_per_min", "deaths", "wave", "style", "route_progress", "reset_seconds",
+        recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "kills_per_min", "deaths", "wave", "style", "reset_seconds",
+                                                 "completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "exit_dist_min",
                                                  "firing_frac", "on_target_frac", "firing_on_target_frac",
                                                  "enemy_visible_frac", "enemy_angle_mean", "enemy_dist_mean",
                                                  "enemy_close_frac", "yaw_per_step_mean", "enemy_yaw_angle_mean", "enemy_pitch_err_mean", "pitch_abs_mean",
@@ -255,6 +295,7 @@ class ProgressCallback(BaseCallback):
         n = len(self.episodes_recent)
         parts_mean = {name: sum(ep["reward_parts"].get(name, 0.0) for ep in self.episodes_recent) / n for name in part_names} if n else {}
         end_reasons = Counter(ep["end_reason"] for ep in self.episodes_recent if ep["end_reason"])
+        campaign = self._campaign_stats() if self.campaign else None
 
         if now >= self._next_history and self.state == "running":
             self._next_history = now + HISTORY_EVERY_S
@@ -265,6 +306,8 @@ class ProgressCallback(BaseCallback):
                 "mean_kills_100": recent["kills"],
                 "mean_kills_per_min_100": recent["kills_per_min"],
                 "mean_wave_100": recent["wave"],
+                "completion_rate_fresh_50": campaign["fresh_completion_rate"] if campaign else None,
+                "mean_checkpoints_level_100": recent["checkpoints_level"],
                 "steps_per_s": steps_per_s,
             })
 
@@ -276,7 +319,7 @@ class ProgressCallback(BaseCallback):
             else:
                 envs.append({"env": i, **{k: v for k, v in e.items() if k != "ended_at"}, "age_s": now - e["ended_at"], "last_episode_at": e["ended_at"]})
 
-        return {
+        status = {
             "version": 1,
             "run_name": self.run_name,
             "state": self.state,
@@ -297,11 +340,15 @@ class ProgressCallback(BaseCallback):
             "reward_parts_mean_100": parts_mean,
             "best_reward": self.best_reward,
             "best_wave": self.best_wave,
+            "best_checkpoints_level": self.best_checkpoints_level,
             "end_reasons_100": dict(end_reasons.most_common()),
             "envs": envs,
             "ppo": self.ppo_metrics,
             "history": self.history,
         }
+        if campaign is not None:
+            status["campaign"] = campaign
+        return status
 
     def _write(self, now: float) -> None:
         self._next_write = now + self.update_every_s

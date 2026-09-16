@@ -1,4 +1,4 @@
-"""Tests for ultrakill_ai.progress.ProgressCallback, without the game.
+"""Tests for ultrakill_ai.progress.ProgressCallback, the dashboard and poll_status.py, without the game.
 
     .venv\\Scripts\\python -m pytest tests -q     (if pytest is installed)
     .venv\\Scripts\\python tests\\test_progress.py
@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import csv
+import importlib.util
 import json
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -23,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ultrakill_ai import progress as progress_mod  # noqa: E402
+from ultrakill_ai.env import CAMPAIGN_INFO_KEYS  # noqa: E402
 from ultrakill_ai.progress import ProgressCallback  # noqa: E402
 from ultrakill_ai.spaces import ObsLayout, action_space  # noqa: E402
 
@@ -66,18 +70,76 @@ class FakeGrindEnv(gym.Env):
         return self._obs(), reward, terminated, truncated, info
 
 
+class FakeCampaignEnv(gym.Env):
+    """Campaign-style infos: every other episode is a fresh start, and about half the episodes finish the level."""
+
+    def __init__(self, seed: int, log: list[dict]):
+        self.observation_space = ObsLayout().space()
+        self.action_space = action_space()
+        self.rng = np.random.default_rng(seed)
+        self.log = log  # final info of every finished episode, in the order the callback records them
+        self.episode = 0
+        self.steps = 0
+        self.fresh = 1
+
+    def _obs(self):
+        return self.rng.uniform(-1, 1, self.observation_space.shape).astype(np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.fresh = 1 if self.episode % 2 == 0 else 0
+        self.episode += 1
+        self.steps = 0
+        return self._obs(), {}
+
+    def step(self, action):
+        self.steps += 1
+        terminated = bool(self.rng.random() < 0.1)
+        completed = int(terminated and self.rng.random() < 0.5)
+        info = {
+            "kills": 0,
+            "style": 0,
+            "wave": 0,  # the real env keeps this Cyber Grind key in campaign mode
+            "deaths": self.steps // 8,
+            "completed": completed,
+            "fresh_start": self.fresh,
+            # The env reports the official time only for fresh-start completions.
+            "level_seconds": round(self.steps * 2 / 15, 3) if completed and self.fresh else None,
+            "checkpoints_level": min(3, self.steps // 4),
+            "cells_new": self.steps * 2,
+            "exit_dist_min": max(0.0, 60.0 - self.steps),
+            "reward_parts": {"time": -0.01, "novelty": 0.5},
+        }
+        if terminated:
+            info["end_reason"] = "level_complete" if completed else "stuck"
+            self.log.append(info)
+        return self._obs(), 0.49, terminated, False, info
+
+
 def _make(seed):
     return lambda: Monitor(FakeGrindEnv(seed), info_keywords=("kills", "wave", "style"))
 
 
-def _train(status_path: Path, timesteps: int, model=None, resume=False):
-    venv = DummyVecEnv([_make(1), _make(2)])
+def _make_campaign(seed, log):
+    return lambda: Monitor(FakeCampaignEnv(seed, log), info_keywords=CAMPAIGN_INFO_KEYS)
+
+
+def _load_dashboard():
+    """Imports scripts/dashboard.py as a module (it is a script, not part of the package)."""
+    spec = importlib.util.spec_from_file_location("dashboard", ROOT / "scripts" / "dashboard.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _train(status_path: Path, timesteps: int, model=None, resume=False, env_fns=None, run_name="test_run"):
+    venv = DummyVecEnv(env_fns or [_make(1), _make(2)])
     if model is None:
         model = PPO("MlpPolicy", venv, n_steps=256, batch_size=128, n_epochs=2, policy_kwargs={"net_arch": [32]}, device="cpu", verbose=0)
     else:
         model.set_env(venv)
     target = (model.num_timesteps if resume else 0) + timesteps
-    cb = ProgressCallback(status_path, target, "test_run", 2, update_every_s=0.2)
+    cb = ProgressCallback(status_path, target, run_name, 2, update_every_s=0.2)
     model.learn(total_timesteps=timesteps, callback=cb, reset_num_timesteps=not resume)
     return model, cb
 
@@ -105,7 +167,10 @@ def test_progress_callback_writes_status():
         m = s["mean_100"]
         assert m["reward"] is not None and m["length"] > 1
         assert m["kills"] >= 0 and m["wave"] >= 1 and m["style"] >= 0
-        assert m["route_progress"] is None
+        assert "route_progress" not in m, "route_progress is retired"
+        assert m["completed"] is None and m["checkpoints_level"] is None
+        assert "campaign" not in s, "a Cyber Grind run has no campaign block"
+        assert s["best_checkpoints_level"] is None
         assert s["best_reward"] >= m["reward"]
         assert s["best_wave"] >= m["wave"]
         assert set(s["end_reasons_100"]) <= {"death", "max_steps"}
@@ -117,6 +182,7 @@ def test_progress_callback_writes_status():
         assert "entropy_loss" in s["ppo"] and "approx_kl" in s["ppo"]
         assert s["history"], "expected chart history points"
         assert all(p["timesteps"] <= s["timesteps"] for p in s["history"])
+        assert all(p["completion_rate_fresh_50"] is None for p in s["history"])
         assert not list(status_path.parent.glob("*.tmp"))
 
         # Resume: the target is absolute, counting on from the loaded model.
@@ -153,6 +219,148 @@ def test_dashboard_smoke():
             capture_output=True, text=True, timeout=60,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_campaign_progress():
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = Path(tmp) / "runs" / "campaign_run" / "status.json"
+        log: list[dict] = []
+        old_every = progress_mod.HISTORY_EVERY_S
+        progress_mod.HISTORY_EVERY_S = 0.5
+        try:
+            _train(status_path, 3000, env_fns=[_make_campaign(1, log), _make_campaign(2, log)], run_name="campaign_run")
+        finally:
+            progress_mod.HISTORY_EVERY_S = old_every
+
+        s = json.loads(status_path.read_text(encoding="utf-8"))
+        assert "campaign" in s, "expected a campaign block once episodes report fresh_start"
+        assert s["episodes"] == len(log)
+        fresh = [ep for ep in log if ep["fresh_start"]]
+        window = fresh[-progress_mod.FRESH_WINDOW:]
+        fresh_times = [ep["level_seconds"] for ep in fresh if ep["completed"]]
+        assert len(fresh) > progress_mod.FRESH_WINDOW and fresh_times, "the fake run is too short"
+
+        c = s["campaign"]
+        assert c["fresh_window"] == progress_mod.FRESH_WINDOW
+        assert 0.0 <= c["fresh_completion_rate"] <= 1.0
+        assert abs(c["fresh_completion_rate"] - sum(ep["completed"] for ep in window) / len(window)) < 1e-9
+        assert c["best_time"] == min(fresh_times)
+        assert c["median_time_50"] == statistics.median(ep["level_seconds"] for ep in window if ep["completed"])
+        assert s["best_checkpoints_level"] == max(ep["checkpoints_level"] for ep in log)
+
+        m = s["mean_100"]
+        assert "route_progress" not in m
+        for key in ("completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "exit_dist_min"):
+            assert m[key] is not None, key
+        assert set(s["end_reasons_100"]) <= {"level_complete", "stuck"}
+        assert set(s["reward_parts_mean_100"]) == {"time", "novelty"}
+        for e in s["envs"]:
+            assert e["episodes"] > 0 and e["checkpoints_level"] is not None
+        assert s["history"], "expected chart history points"
+        assert all("completion_rate_fresh_50" in p and "mean_checkpoints_level_100" in p for p in s["history"])
+        rates = [p["completion_rate_fresh_50"] for p in s["history"] if p["completion_rate_fresh_50"] is not None]
+        assert rates and all(0.0 <= r <= 1.0 for r in rates)
+
+        # A restart keeps the best time and the best checkpoint count; the 50-episode window starts empty.
+        restored = ProgressCallback(status_path, 10, "campaign_run", 2)
+        restored.mark_stopped()
+        r = json.loads(status_path.read_text(encoding="utf-8"))
+        assert r["campaign"]["best_time"] == c["best_time"]
+        assert r["campaign"]["fresh_window"] == 0 and r["campaign"]["fresh_completion_rate"] is None
+        assert r["campaign"]["median_time_50"] is None
+        assert r["best_checkpoints_level"] == s["best_checkpoints_level"]
+
+
+def test_dashboard_campaign_panel():
+    dashboard = _load_dashboard()
+    lines = dashboard.campaign_lines(
+        {"fresh_window": 50, "fresh_completion_rate": 0.62, "median_time_50": 59.9996, "best_time": 83.25},
+        {"completed": 0.4, "checkpoints_level": 2.14, "cells_new": 84.4, "deaths": 1.3, "exit_dist_min": 12.2},
+        {"time": -9.0, "checkpoint": 20.0, "novelty": 5.04, "path": 0.8, "level_complete": 50.0, "death": None},
+    )
+    assert lines == [
+        "  fresh completed  62% of last 50",
+        "  all completed    40%",
+        "  best time        01:23.250",
+        "  median time      01:00.000",  # whole milliseconds, never "00:60.000"
+        "  checkpoints/load 2.1",
+        "  new cells/ep     84",
+        "  deaths/ep        1.30",
+        "  closest to exit  12m",
+        "  reward parts/ep",
+        "    level_complete +50.0",
+        "    checkpoint     +20.0",
+        "    time           -9.0",
+        "    novelty        +5.0",
+    ], lines
+    empty = dashboard.campaign_lines({"fresh_window": 0, "fresh_completion_rate": None, "median_time_50": None, "best_time": None}, {})
+    assert empty[0] == "  fresh completed  — of last 0", empty
+    assert [line.split()[-1] for line in empty[1:]] == ["—"] * 7, empty
+
+    # The whole window on a real campaign status (charts, games table, Campaign panel).
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = Path(tmp) / "status.json"
+        old_every = progress_mod.HISTORY_EVERY_S
+        progress_mod.HISTORY_EVERY_S = 0.2
+        try:
+            _train(status_path, 600, env_fns=[_make_campaign(1, []), _make_campaign(2, [])], run_name="campaign_run")
+        finally:
+            progress_mod.HISTORY_EVERY_S = old_every
+        assert "campaign" in json.loads(status_path.read_text(encoding="utf-8"))
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "dashboard.py"), "--file", str(status_path), "--smoke-test"],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_poll_status_keeps_old_header():
+    status = {
+        "state": "running", "timesteps": 123456, "episodes": 300, "window": 100, "steps_per_s": 190.0,
+        "mean_100": {"reward": 12.5, "kills": 3.0, "deaths": 1.2, "completed": 0.4, "fresh_start": 0.2,
+                     "checkpoints_level": 1.5, "cells_new": 60.0, "exit_dist_min": 20.0},
+        "campaign": {"fresh_window": 50, "fresh_completion_rate": 0.4, "median_time_50": 95.0, "best_time": 83.25},
+        "best_checkpoints_level": 3,
+        "ppo": {"entropy_loss": -8.0},
+        "reward_parts_mean_100": {"time": -9.0, "checkpoint": 20.0, "novelty": 5.0},
+    }
+    # The header an older poll_status.py wrote: none of the campaign columns.
+    old_header = ["wall_time", "timesteps", "episodes", "window", "steps_per_s", "state",
+                  "reward", "kills", "ppo_entropy_loss", "part_kill", "part_total", "aim_share"]
+    with tempfile.TemporaryDirectory() as tmp:
+        runs = Path(tmp) / "runs"
+        for run in ("old_run", "new_run"):
+            (runs / run).mkdir(parents=True)
+            (runs / run / "status.json").write_text(json.dumps(status), encoding="utf-8")
+        with (runs / "old_run" / "metrics_log.csv").open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(old_header)
+            w.writerow(["2026-09-15 23:00:00", 1000, 10, 10, 150.0, "running", 1.0, 0.5, -9.0, 0.5, 1.0, 0.0])
+
+        for run in ("old_run", "new_run"):
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts" / "poll_status.py"), "--run", run, "--runs-dir", str(runs), "--once"],
+                capture_output=True, text=True, timeout=60,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+
+        with (runs / "old_run" / "metrics_log.csv").open(newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f))
+        assert rows[0] == old_header, rows[0]
+        assert len(rows) == 3, rows
+        assert len(rows[2]) == len(old_header), (len(rows[2]), len(old_header))
+        appended = dict(zip(old_header, rows[2]))
+        assert appended["timesteps"] == "123456" and appended["reward"] == "12.5" and appended["part_total"] == "16.0", appended
+
+        # A new log gets every column, campaign ones included.
+        with (runs / "new_run" / "metrics_log.csv").open(newline="", encoding="utf-8") as f:
+            new_rows = list(csv.DictReader(f))
+        assert len(new_rows) == 1, new_rows
+        logged = new_rows[0]
+        assert logged["fresh_window"] == "50" and logged["fresh_completion_rate"] == "0.4", logged
+        assert logged["median_time_50"] == "95.0" and logged["best_time"] == "83.25", logged
+        assert logged["best_checkpoints_level"] == "3" and logged["checkpoints_level"] == "1.5", logged
+        assert logged["part_time"] == "-9.0" and logged["part_novelty"] == "5.0" and logged["part_level_complete"] == "", logged
 
 
 if __name__ == "__main__":
