@@ -450,3 +450,16 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - Stop with Ctrl+C in the training console and wait for `train.py` to exit (it prints `Saved models\campaign_ppo\latest.zip` last; `runs/campaign_ppo_train.log` is appended across restarts, so an older such line proves nothing), then resume with `python scripts/train.py --config configs/campaign_0-1.yaml --resume models/campaign_ppo/latest.zip`. After a hard stop resume from the newest `ckpt_*_steps.zip`, not `best.zip`: `keep_best.py --metric campaign` only replaces `best.zip` when the smoothed fresh completion rate beats its record, so until levels are being completed it holds the first checkpoint scored (rate 0) and resuming from it would throw the run away. Use `best.zip` to roll back once completions have peaked and fallen (keep_best warns). Helpers: `poll_status.py --run campaign_ppo`, `keep_best.py --run campaign_ppo --metric campaign`, `dashboard.py --run campaign_ppo --monitor 1`.
   - Ctrl+C leaves the exploration archives slightly stale: SB3's subprocess workers exit on KeyboardInterrupt without calling `env.close()`, so each `explore_*.npz` holds its last 20-episode save.
   - Checks: `best_checkpoints_level` >= 1 by 250k steps; >= 2 by 1M steps, else a 1M-step fresh-weights comparison run (`campaign_ppo_fresh`); eval gate once `campaign.fresh_completion_rate` >= 0.5 with `fresh_window` >= 20.
+  - 1M-step falsifier passed: `best_checkpoints_level` 4, checkpoints per level load 0.13 -> 2.19 between 250k and
+    1M steps, kills/episode 0 -> 15.1, deaths 0.03 -> 0.50, entropy 9.12. The transferred weights reach well past
+    the first checkpoint, so no fresh-weights comparison run was needed.
+  - **Watch novelty's share.** At 1M the parts are `novelty` 539.6, `time` -62.3, `kill` 9.3, `damage_dealt` 9.3,
+    `checkpoint` 6.2, `arena_clear` 3.3, `door_unlock` 0.9 of 501 total: exploration is about 90% of the gross
+    positive reward, the same one-term dominance that broke the Cyber Grind run's aim shaping. It is not yet
+    decaying (new cells/episode 425 -> 1492) because 0-1 is big and the agent keeps finding real ground, and
+    progress is genuinely improving, so it stays for now. Tripwire: if the fresh completion rate is still 0 at
+    3M steps while `novelty` is above 70% of the gross positive reward, cut `novelty` 0.5 -> 0.15 so the
+    milestones and the time cost drive instead, and give it 400k steps before judging.
+  - `exit_dist_min` went 157.9 m -> 193.6 m over the same window. That is straight-line distance, and 0-1's route
+    does not run straight at the pit, so it is not yet evidence of anything; it matters only if it keeps rising
+    while checkpoints stop.
