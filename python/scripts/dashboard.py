@@ -117,18 +117,32 @@ def fmt_pct(value) -> str:
     return "—" if v is None else f"{v * 100:.0f}%"
 
 
-def campaign_lines(campaign: dict, mean: dict, parts: dict | None = None) -> list[str]:
-    """Campaign panel rows: completion and official times, per-episode means over the last 100, then the largest reward parts."""
+def campaign_lines(campaign: dict, mean: dict, parts: dict | None = None, best: dict | None = None,
+                   fresh: dict | None = None, ppo: dict | None = None) -> list[str]:
+    """Campaign panel rows: completion and official times, per-episode means over the last 100, then the largest reward parts.
+
+    `gates/load` shows the all-episode mean AND the fresh-start mean, because a respawn episode inherits the
+    count from its level load: reading the all-episode number alone is how the pre-fix run's "peak by depth"
+    was misread. The look-mode shares and the per-dimension entropy sit together, since a look mode leaves the
+    yaw and pitch heads causally inert and only the entropy bonus acts on them on those steps.
+    """
+    best, fresh, ppo = best or {}, fresh or {}, ppo or {}
     exit_dist = fmt_float(mean.get("exit_dist_min"), 0)
     rows = (
         ("fresh completed ", f"{fmt_pct(campaign.get('fresh_completion_rate'))} of last {fmt_int(campaign.get('fresh_window'))}"),
         ("all completed   ", fmt_pct(mean.get("completed"))),  # fresh starts and checkpoint respawns alike
         ("best time       ", fmt_time(campaign.get("best_time"))),
         ("median time     ", fmt_time(campaign.get("median_time_50"))),
+        ("gates/load      ", f"{fmt_float(mean.get('gates_reached'), 1)} fresh {fmt_float(fresh.get('gates_reached'), 1)}"
+                             f" best {fmt_int(best.get('best_gates_reached'))} hops {fmt_int(best.get('best_gate_hops'))}"),
         ("checkpoints/load", fmt_float(mean.get("checkpoints_level"), 1)),
+        ("wedged/ep       ", fmt_float(mean.get("wedged_steps"), 0)),
         ("new cells/ep    ", fmt_float(mean.get("cells_new"), 0)),
         ("deaths/ep       ", fmt_float(mean.get("deaths"))),
         ("closest to exit ", exit_dist if exit_dist == "—" else f"{exit_dist}m"),
+        ("look free/gate  ", f"{fmt_pct(mean.get('look_free_frac'))}/{fmt_pct(mean.get('look_gate_frac'))}"
+                             f"  ent y/p/m {fmt_compact(ppo.get('entropy_yaw'))}/{fmt_compact(ppo.get('entropy_pitch'))}"
+                             f"/{fmt_compact(ppo.get('entropy_look_mode'))}"),
     )
     lines = [f"  {label} {value}" for label, value in rows]
     # The four largest reward parts by size, so a term that dominates the return shows up at a glance.
@@ -447,9 +461,9 @@ class Dashboard:
 
         self.chart_reward.set_series([("reward", GREEN, series("mean_reward_100"))])
         if campaign is not None:
-            self.chart_kw.title = "Fresh completion % & checkpoints"
+            self.chart_kw.title = "Fresh completion % & gates"
             fresh_pct = [(x, y * 100.0) for x, y in series("completion_rate_fresh_50")]
-            self.chart_kw.set_series([("fresh %", PURPLE, fresh_pct), ("checkpoints", YELLOW, series("mean_checkpoints_level_100"))])
+            self.chart_kw.set_series([("fresh %", PURPLE, fresh_pct), ("gates", YELLOW, series("mean_gates_reached_100"))])
         else:
             self.chart_kw.title = "Kills/min & wave (100 ep)"
             self.chart_kw.set_series([("kills/min", RED, series("mean_kills_per_min_100")), ("wave", YELLOW, series("mean_wave_100"))])
@@ -478,7 +492,10 @@ class Dashboard:
                 shooting.append(f"  {label} {mean[key]:+.2f}")
         if campaign is not None:
             parts = get("reward_parts_mean_100") if isinstance(get("reward_parts_mean_100"), dict) else {}
-            self.behaviour.config(text="Campaign (last 100)\n" + "\n".join(campaign_lines(campaign, mean, parts)))
+            fresh = get("mean_fresh_100") if isinstance(get("mean_fresh_100"), dict) else {}
+            bests = {k: get(k) for k in ("best_gates_reached", "best_gate_hops")}
+            ppo_now = get("ppo") if isinstance(get("ppo"), dict) else {}
+            self.behaviour.config(text="Campaign (last 100)\n" + "\n".join(campaign_lines(campaign, mean, parts, bests, fresh, ppo_now)))
         else:
             self.behaviour.config(text="Shooting (last 100)\n" + "\n".join(shooting) if shooting else "")
         reasons = get("end_reasons_100") if isinstance(get("end_reasons_100"), dict) else {}

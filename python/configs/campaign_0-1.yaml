@@ -1,15 +1,19 @@
-# Campaign level 0-1 on Violent with every weapon unlocked in memory, learned without human routes: the rewards
-# come from checkpoints, arena clears, door unlocks, exploration and the NavMesh distance to the exit.
+# Campaign level 0-1 on Violent with every weapon unlocked in memory, learned without human routes. The route
+# signal is the door graph the mod reports as campaign.gates (hops to the exit), not the NavMesh: `path` never
+# once read "complete" in 2.9M steps and is now 0. Rewards: the gate ladder and its approach shaping, the
+# milestones (checkpoints, arena clears, door unlocks), and exploration as a secondary explorer.
 # From python/ (on a one-display PC add --monitor 1 to games.py and dashboard.py):
-#   python scripts/transfer_weights.py models/cybergrind_ppo_v2/best.zip models/campaign_ppo/transfer_init.zip
+#   python scripts/add_look_mode.py models/campaign_ppo_ground/latest.zip models/campaign_gates/look_init.zip
 #   python scripts/games.py launch --count 5
-#   python scripts/train.py --config configs/campaign_0-1.yaml --resume models/campaign_ppo/transfer_init.zip
-#   python scripts/poll_status.py --run campaign_ppo
-#   python scripts/keep_best.py --run campaign_ppo --metric campaign
-#   python scripts/dashboard.py --run campaign_ppo
+#   python scripts/train.py --config configs/campaign_0-1.yaml --resume models/campaign_gates/look_init.zip
+#   python scripts/poll_status.py --run campaign_gates
+#   python scripts/keep_best.py --run campaign_gates --metric campaign
+#   python scripts/dashboard.py --run campaign_gates
 #   python scripts/games.py stop
-# To continue a stopped run, resume from models/campaign_ppo/best.zip once keep_best.py has written it, else
-# from the newest ckpt_*_steps.zip (latest.zip is only current after a graceful Ctrl+C).
+# Before the first run, copy models/campaign_ppo_ground/explore_*.npz into models/campaign_gates/ (explore_dir
+# follows run_name, and those counts carry the 1/sqrt(N) decay), and move any old metrics_log.csv aside so
+# poll_status.py writes the new columns. To continue a stopped run, resume from latest.zip after a graceful
+# Ctrl+C, else from the newest ckpt_*_steps.zip; best.zip only once completions have peaked and fallen.
 env:
   mode: campaign
   level: "Level 0-1"
@@ -26,13 +30,14 @@ env:
   stuck_seconds: 45
   stuck_repeats: 3
   cell_size: 4.0
-  rewards: {time: 0.02, level_complete: 100.0, checkpoint: 10.0, arena_clear: 10.0, door_unlock: 3.0,
-            novelty: 0.5, path: 0.1, kill: 0.5, damage_dealt: 0.5, damage_taken: 0.01, death: 5.0, style: 0.0,
-            punch: 0.01}
+  pitch_limit_deg: 45.0  # the campaign run left this off and the camera sat at a mean of -78 degrees
+  rewards: {time: 0.02, level_complete: 100.0, checkpoint: 10.0, arena_clear: 10.0, door_unlock: 15.0,
+            gate: 15.0, gate_approach: 0.15, novelty: 0.2, path: 0.0, kill: 0.5, damage_dealt: 0.5,
+            damage_taken: 0.01, death: 5.0, style: 0.0, punch: 0.01}
 train:
   algo: ppo
   num_envs: 5
-  run_name: campaign_ppo_ground
+  run_name: campaign_gates
   timesteps: 20000000
   save_every: 50000
   policy_kwargs: {net_arch: [512, 512]}

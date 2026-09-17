@@ -14,6 +14,7 @@ import numpy as np
 
 from ultrakill_ai.campaign import (
     ExplorationArchive,
+    GateProgress,
     MilestoneTracker,
     PathProgress,
     choose_fresh_start,
@@ -23,12 +24,19 @@ from ultrakill_ai.campaign import (
 )
 from ultrakill_ai.protocol import DEFAULT_PORT, BridgeClient
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
-from ultrakill_ai.spaces import ObsLayout, action_space, decode_action, pack_observation
+from ultrakill_ai.spaces import PITCH_BINS, YAW_BINS, ObsLayout, action_space, decode_action, pack_observation, yaw_frame
 
 CYBERGRIND_SCENE = "Endless"
 # Per-episode info the campaign Monitor records (scripts/train.py); every key is in every campaign info.
 CAMPAIGN_INFO_KEYS = ("kills", "style", "deaths", "completed", "fresh_start", "level_seconds",
-                      "checkpoints_level", "cells_new", "exit_dist_min", "oob_frac")
+                      "checkpoints_level", "cells_new", "exit_dist_min", "oob_frac",
+                      "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac")
+
+YAW_CAP = max(abs(b) for b in YAW_BINS)  # 90 degrees per decision, the widest look bin
+PITCH_CAP = max(abs(b) for b in PITCH_BINS)  # 20 degrees per decision
+MODE1_PITCH_LIMIT = 85.0  # inside the game's own +-90 clamp (ActionInjector.ApplyLook)
+ARCHIVE_CHECK_EVERY = 500  # steps between exploration-archive schedule checks (the save itself costs ~16 ms)
+DEFAULT_WEDGE_HOLD_S = 3.0  # wedge_seconds 0 turns the episode end off; counting still uses this hold
 
 
 def _known_fields(cls, d: dict[str, Any]) -> dict[str, Any]:
@@ -78,6 +86,16 @@ class EnvConfig:
     max_locked_skip_s: float = 120.0  # longest input lock (landing, cutscene) stepped through without the policy
     explore_dir: str = ""  # folder for the exploration archive, so a resumed run keeps its visit counts ("" = memory only)
     best_runs_dir: str = ""  # folder for the fastest fresh-start completion of each level ("" = off)
+    # Route gates (campaign.gates): the door-graph ladder GateProgress walks.
+    gate_reach_m: float = 8.0  # horizontal radius at which a gate counts as reached (2x while it is open)
+    gate_reach_v_m: float = 6.0  # vertical half-height of the same test, so a roof over a door is not "reached"
+    gate_min_gain_m: float = 0.5  # metres of new best closeness below which gate_approach pays nothing
+    # The absorbing slowMode/heavyFall movement state: airborne forever, stamina frozen, a 0.477 m/s creep.
+    wedge_seconds: float = 3.0  # game seconds wedged before the episode ends (0 = no end, the steps are still counted)
+    wedge_creep_mps: float = 1.5  # movement below this counts as not moving, in the wedge test only
+    slide_min_hold: int = 0  # decisions slide stays held once pressed (0 = off; an experiment, see the design spec)
+    archive_save_steps: int = 20000  # env lifetime steps between exploration-archive saves
+    archive_save_seconds: float = 600.0  # ... or this much wall time, whichever comes first
 
     layout: ObsLayout = field(default_factory=ObsLayout)
     rewards: RewardConfig = field(default_factory=RewardConfig)
@@ -95,7 +113,8 @@ class EnvConfig:
 
 BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "yaw_err_sum", "dist_sum", "yaw_sum",
                   "pitch_steps", "pitch_sum", "pitch_signed_sum", "look_up_sum", "elev_steps", "elev_sum", "elev_abs_sum", "elev_over15", "pitch_err_sum",
-                  "yaw_track", "yaw_track_n", "pitch_track", "pitch_track_n")
+                  "yaw_track", "yaw_track_n", "pitch_track", "pitch_track_n",
+                  "look_free", "look_enemy", "look_gate", "slide_forced")
 
 
 def clamp_pitch_command(current_pitch: float, pitch_cmd: float, limit: float) -> float:
@@ -119,7 +138,8 @@ class UltrakillEnv(gym.Env):
             self.cfg = replace(self.cfg, layout=replace(self.cfg.layout, campaign=campaign))
 
         self.observation_space = self.cfg.layout.space()
-        self.action_space = action_space()
+        # Campaign only: the look mode is appended as a 12th dimension, so Cyber Grind checkpoints stay loadable.
+        self.action_space = action_space(campaign)
 
         self.client = BridgeClient(self.cfg.host, self.cfg.port)
         self._connected = False
@@ -143,6 +163,7 @@ class UltrakillEnv(gym.Env):
         else:
             self.archive = ExplorationArchive(self.cfg.cell_size)
         self.milestones = MilestoneTracker()
+        self.gates = GateProgress(self.cfg.gate_reach_m, self.cfg.gate_reach_v_m, self.cfg.gate_min_gain_m)
         self.path_progress = PathProgress()
         self._rng = random.Random()
         self._stuck_streak = 0  # episodes in a row that ended stuck at the same current checkpoint
@@ -153,6 +174,22 @@ class UltrakillEnv(gym.Env):
         self._oob_steps = 0  # steps with no ground under the player: off the map, or in a fall
         self._exit_dist_min = math.inf
         self._episodes = 0
+        self._start_checkpoint: str | None = None  # the checkpoint this episode began at (None on a fresh load)
+        self._level_started = False  # campaign.level_started was true at some point this episode
+        self._last_pos: list[float] | None = None  # so end_pos survives a final frame without a player
+        # The wedge detector (see _wedge_now). CREEP is per decision, so it is frameskip-independent.
+        steps_per_second = self.cfg.fixed_fps / max(1, self.cfg.frameskip)
+        self._creep_m = self.cfg.wedge_creep_mps / steps_per_second
+        self._wedge_hold = max(1, int(round((self.cfg.wedge_seconds or DEFAULT_WEDGE_HOLD_S) * steps_per_second)))
+        self._wedge_ends = self.cfg.wedge_seconds > 0
+        self._wedge_run = 0  # consecutive wedged decisions right now
+        self._wedged_steps = 0  # steps inside runs that reached the hold, credited retroactively
+        self._slide_latch = 0  # decisions slide is still held for (slide_min_hold)
+        # Lifetime steps never reset, so the archive schedule does not depend on episode boundaries: the whole
+        # ground run saved nothing because episodes are ~3900 decisions and no worker reached 20 of them.
+        self._lifetime_steps = 0
+        self._last_save_steps = 0
+        self._last_save_time = time.monotonic()
 
     @property
     def scene(self) -> str:
@@ -212,6 +249,9 @@ class UltrakillEnv(gym.Env):
         self._deaths = 0
         self._behaviour = dict.fromkeys(BEHAVIOUR_KEYS, 0)
         self._last_end_reason = ""
+        self._wedge_run = 0
+        self._wedged_steps = 0
+        self._slide_latch = 0
 
         if self.cfg.mode == "campaign":
             self.archive.start_episode()
@@ -220,29 +260,54 @@ class UltrakillEnv(gym.Env):
             self._cells_new = 0
             self._oob_steps = 0
             self._exit_dist_min = math.inf
+            self._start_checkpoint = self._current_checkpoint(self._raw)
+            self._level_started = bool((self._raw.get("campaign") or {}).get("level_started"))
             player = self._raw.get("player")
             if player:
+                self._last_pos = list(player["pos"])
                 ground = self._ground_point(self._raw)
                 if ground is not None:
                     self.archive.visit(ground)  # the spawn cell is entered, but pays nothing
                 if self._fresh_start:
                     self._positions.append(self._rounded(player["pos"]))
+            # _campaign_reset has already run new_level_load or mark_paid; the episode's own approach baseline is
+            # cleared here, and retarget runs before the observation is packed so slot 452 reads 1.0 on the first
+            # decision of every episode and look mode 2 is never dead on step 1.
+            self.gates.reset_episode()
+            self.gates.retarget(self._raw.get("campaign"), player["pos"] if player else None)
 
         return self._pack(self._raw), self._info(self._raw)
 
     def step(self, action):
         prev = self._raw
         command = decode_action(action)
+        # The look mode is resolved here, against the observation the policy acted on, and popped: the wire
+        # `action` message is unchanged and the mod never sees it.
+        look_mode = int(command.pop("look_mode", 0))
         raw_pitch_cmd = command["look"][1]
-        if self.cfg.pitch_limit_deg and prev.get("player"):
+        resolved = self._look_at_enemy(prev) if look_mode == 1 else self._look_at_target(prev) if look_mode == 2 else None
+        # A mode that found nothing to aim at behaves exactly as mode 0, so mode 0 is what applied this step. The
+        # diagnostics record the applied mode, never the requested one: mode 1 falls back whenever nothing is
+        # visible (~30% of steps at the measured enemy_visible_frac) and mode 2 falls back on every step of an
+        # unordered level or an older mod, and counting those as aimed would report the yaw and pitch heads as
+        # causally inert on steps where they alone drove the camera -- the share R6 says to read the
+        # per-dimension entropy against -- and would throw away their tracking samples.
+        applied_mode = look_mode if resolved is not None else 0
+        if resolved is not None:
+            command["look"] = resolved
+        elif self.cfg.pitch_limit_deg and prev.get("player"):
             command["look"][1] = clamp_pitch_command(prev["player"]["pitch"], command["look"][1], self.cfg.pitch_limit_deg)
-        self._note_behaviour(prev, command, raw_pitch_cmd)
+        self._hold_slide(prev, command)
+        self._note_behaviour(prev, command, raw_pitch_cmd, applied_mode)
         campaign = self.cfg.mode == "campaign"
         cur = self.client.step(command)
         if campaign:
             cur = self._skip_locked(cur)
         self._raw = cur
         self._steps += 1
+        self._lifetime_steps += 1
+        if self._lifetime_steps % ARCHIVE_CHECK_EVERY == 0:
+            self._save_archive_on_schedule()
         self._track_enemies(cur)
 
         player = cur.get("player")
@@ -250,8 +315,10 @@ class UltrakillEnv(gym.Env):
         died = player is None or player["dead"] or (
             player.get("soft_deaths", 0) > prev_player.get("soft_deaths", player.get("soft_deaths", 0))
         )
-        # Milestones, novelty and path progress are measured before the reward, from the frame the policy caused.
-        campaign_step = self._campaign_progress(cur) if campaign else None
+        # Milestones, novelty, route gates and path progress are measured before the reward, from the frame the
+        # policy caused; `prev` is needed as well, because kills and style reset the stuck clock.
+        campaign_step = self._campaign_progress(prev, cur) if campaign else None
+        wedged = campaign and self._note_wedge(prev, cur)
         reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, died=died,
                                 campaign=campaign_step, buttons=command["buttons"])
 
@@ -291,6 +358,11 @@ class UltrakillEnv(gym.Env):
             terminated, reason = True, "scene_changed"
         elif self.cfg.mode == "cybergrind" and self.cfg.max_wave and (cur.get("cybergrind") or {}).get("wave", 0) > self.cfg.max_wave:
             terminated, reason = True, "max_wave"
+        elif wedged and self._wedge_ends:
+            # A distinct reason, never folded into "stuck", so the dashboard can tell "cannot move" from "moving
+            # but making no progress". It is a safety net: once the mod's un-wedge lands this should almost never
+            # fire, and if it keeps firing no reward change will help.
+            truncated, reason = True, "wedged"
         elif stuck:
             truncated, reason = True, "stuck"
         elif self._steps >= self.cfg.max_steps:
@@ -374,9 +446,87 @@ class UltrakillEnv(gym.Env):
             raw = self.client.step(forward)
         raise RuntimeError("Failed to enter the Cyber Grind arena after reset")
 
-    def _note_behaviour(self, raw: dict[str, Any], command: dict[str, Any], raw_pitch_cmd: float) -> None:
-        """Per-episode diagnostics: is the agent shooting, is it shooting at anything, and does it turn toward enemies?"""
+    def _look_at_enemy(self, prev: dict[str, Any]) -> list[float] | None:
+        """Look mode 1: turn toward the nearest visible enemy the policy can actually see.
+
+        Only the first `max_enemies` entries count: the env asks the mod for 32 enemies so damage rewards are not
+        missed, but the observation carries 8, and this must not aim at something that is not in it. `rel` is the
+        enemy centre in camera space, so un-pitching by the current pitch gives the player's yaw frame. `visible`
+        is line of sight with no frustum test, so the target can be behind the player and this turns 180 degrees
+        toward it -- intended (turn and fight), not a bug to filter out.
+
+        Returns None (behave exactly as mode 0) with no player, no visible enemy in the first 8, or a degenerate
+        `rel`. Mode 1 deliberately ignores `pitch_limit_deg` -- an enemy overhead in an arena is exactly the case
+        the band blocks -- but stays inside the game's own +-90 clamp.
+        """
+        player = prev.get("player")
+        if not player:
+            return None
+        for enemy in (prev.get("enemies") or ())[: self.cfg.layout.max_enemies]:
+            if not enemy.get("visible"):
+                continue
+            x, y, z = enemy["rel"]
+            if math.sqrt(x * x + y * y + z * z) <= 1e-6:
+                return None
+            p = player["pitch"]
+            cp, sp = math.cos(math.radians(p)), math.sin(math.radians(p))
+            xf, yf, zf = x, y * cp + z * sp, -y * sp + z * cp  # yaw frame: +x right, +y up, +z forward
+            yaw_cmd = max(-YAW_CAP, min(YAW_CAP, math.degrees(math.atan2(xf, zf))))
+            elevation = math.degrees(math.atan2(yf, math.hypot(xf, zf)))
+            pitch_cmd = max(-PITCH_CAP, min(PITCH_CAP, elevation - p))
+            pitch_cmd = max(-MODE1_PITCH_LIMIT, min(MODE1_PITCH_LIMIT, p + pitch_cmd)) - p
+            return [yaw_cmd, pitch_cmd]
+        return None
+
+    def _look_at_target(self, prev: dict[str, Any]) -> list[float] | None:
+        """Look mode 2: turn toward the route target, the same object packed into the observation's target slots.
+
+        Movement stays camera-relative, as the game computes it, so turning toward a gate also turns "forward"
+        toward it -- which is the point. Returns None (mode 0) without a player or a target. `pitch_limit_deg` 0
+        means "off" everywhere else in this codebase, so the band falls back to the game's own clamp rather than
+        welding the camera level.
+        """
+        player, target = prev.get("player"), self.gates.target
+        if not player or not target or not target.get("pos"):
+            return None
+        pos, tp = player["pos"], target["pos"]
+        gx, gy, gz = yaw_frame((tp[0] - pos[0], tp[1] - pos[1], tp[2] - pos[2]), player["yaw"])
+        if math.sqrt(gx * gx + gy * gy + gz * gz) <= 1e-6:
+            return None
+        p = player["pitch"]
+        band = self.cfg.pitch_limit_deg or MODE1_PITCH_LIMIT
+        yaw_cmd = max(-YAW_CAP, min(YAW_CAP, math.degrees(math.atan2(gx, gz))))
+        elevation = math.degrees(math.atan2(gy, math.hypot(gx, gz)))
+        target_pitch = max(-band, min(band, elevation))
+        return [yaw_cmd, max(-PITCH_CAP, min(PITCH_CAP, target_pitch - p))]
+
+    def _hold_slide(self, prev: dict[str, Any], command: dict[str, Any]) -> None:
+        """Keeps slide held for `slide_min_hold` decisions once pressed. Never removes a slide, only adds one.
+
+        0-1's vent needs slide held over a run of 3-18 consecutive decisions and the policy presses it on ~90% of
+        them, which is close to the observed pass rate -- but the latch also holds slide while the policy presses
+        jump, and a jump out of a grounded slide is one of the two ways into the wedge. Off by default.
+        """
+        if self.cfg.slide_min_hold <= 0:
+            return
+        if (prev.get("campaign") or {}).get("input_locked"):
+            self._slide_latch = 0
+            return
+        if "slide" in command["buttons"]:
+            self._slide_latch = self.cfg.slide_min_hold - 1
+        elif self._slide_latch > 0:
+            command["buttons"] = [*command["buttons"], "slide"]
+            self._slide_latch -= 1
+            self._behaviour["slide_forced"] += 1
+
+    def _note_behaviour(self, raw: dict[str, Any], command: dict[str, Any], raw_pitch_cmd: float, applied_mode: int = 0) -> None:
+        """Per-episode diagnostics: is the agent shooting, is it shooting at anything, and does it turn toward enemies?
+
+        `applied_mode` is the look mode that actually drove the camera (step() passes 0 whenever the requested
+        mode found nothing to aim at), not the one the policy sampled.
+        """
         self._behaviour["steps"] += 1
+        self._behaviour[("look_free", "look_enemy", "look_gate")[applied_mode if 0 <= applied_mode <= 2 else 0]] += 1
         firing = "fire1" in command["buttons"] or "fire2" in command["buttons"]
         self._behaviour["firing"] += firing
         self._behaviour["yaw_sum"] += abs(command["look"][0])
@@ -413,7 +563,10 @@ class UltrakillEnv(gym.Env):
         # below the mean-action agreement (86% at 2.0M): the gap between them is the exploration noise.
         x, y, z = visible[0]["rel"]
         yaw_cmd = command["look"][0]
-        if visible[0] is raw["enemies"][0]:  # gates only the two tracking scores, not the metrics below
+        # Look modes 1 and 2 aim from geometry, not from the look heads, so grading those steps would score ~1.0
+        # by construction and stop measuring the thing these numbers exist to measure. A step where the requested
+        # mode fell back to the sampled bins is graded, because there the look heads did drive the camera.
+        if applied_mode == 0 and visible[0] is raw["enemies"][0]:  # gates only the two tracking scores, not the metrics below
             if yaw_cmd and abs(math.degrees(math.atan2(x, z))) > 5.0:
                 self._behaviour["yaw_track_n"] += 1
                 self._behaviour["yaw_track"] += 1 if (yaw_cmd > 0) == (x > 0) else -1
@@ -449,6 +602,25 @@ class UltrakillEnv(gym.Env):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.archive.save(path)
 
+    def _save_archive_on_schedule(self) -> None:
+        """Saves the exploration archive every `archive_save_steps` or `archive_save_seconds`, whichever is first.
+
+        The episode-counted save is not enough on its own: campaign episodes are thousands of decisions, no
+        worker of the ground run ever reached 20 of them before a restart, and SubprocVecEnv workers never call
+        close() on Ctrl+C -- so that run saved nothing at all and threw away every visit count it earned.
+        """
+        if self.cfg.mode != "campaign" or not self.cfg.explore_dir:
+            return
+        now = time.monotonic()
+        if (self._lifetime_steps - self._last_save_steps < self.cfg.archive_save_steps
+                and now - self._last_save_time < self.cfg.archive_save_seconds):
+            return
+        self._last_save_steps, self._last_save_time = self._lifetime_steps, now
+        try:
+            self._save_archive()
+        except OSError as exc:
+            print(f"UltrakillEnv: could not save the exploration archive: {exc}")
+
     @staticmethod
     def _current_checkpoint(raw: dict[str, Any]) -> str | None:
         """Id of the checkpoint a respawn would return to, or None when no checkpoint is active in this level load."""
@@ -466,9 +638,10 @@ class UltrakillEnv(gym.Env):
         prev = self._raw or {}
         camp = prev.get("campaign") or {}
         current = self._current_checkpoint(prev)
-        if self._last_end_reason == "stuck":
+        if self._last_end_reason in ("stuck", "wedged"):
             # A respawn can leave a door locked behind the player; three stuck episodes in a row at the same
-            # checkpoint force a fresh load.
+            # checkpoint force a fresh load. "wedged" counts too: a checkpoint whose respawn point is wedge-prone
+            # could otherwise never escalate to a reload, since it never ends an episode "stuck".
             self._stuck_streak = self._stuck_streak + 1 if current == self._stuck_checkpoint else 1
             self._stuck_checkpoint = current
         else:
@@ -483,12 +656,16 @@ class UltrakillEnv(gym.Env):
             fresh_prob=self.cfg.fresh_start_prob,
         )
         raw = self._skip_locked(self.client.reset(self.cfg.level, checkpoint=not fresh))
+        pos = (raw.get("player") or {}).get("pos")
         if fresh:
             self.milestones.new_level_load(raw.get("campaign"))
+            self.gates.new_level_load(raw.get("campaign"), pos)
             self._stuck_streak, self._stuck_checkpoint = 0, None
         else:
-            # Whatever the respawn itself changes (doors it unlocks, rooms it resets) pays nothing.
+            # Whatever the respawn itself changes (doors it unlocks, rooms it resets, gates it already stands at)
+            # pays nothing.
             self.milestones.mark_paid(raw.get("campaign"))
+            self.gates.mark_paid(raw.get("campaign"), pos)
         self._fresh_start = fresh
         return raw
 
@@ -497,8 +674,15 @@ class UltrakillEnv(gym.Env):
         before = self._raw.get("stats", {})
         raw = self._skip_locked(self.client.reset(self.cfg.level, checkpoint=True))
         self.milestones.mark_paid(raw.get("campaign"))
-        self._track_enemies(raw)
         player = raw.get("player")
+        # No reset_episode here: the episode continues, so the gate approach it has already earned stands.
+        self.gates.mark_paid(raw.get("campaign"), (player or {}).get("pos"))
+        self.gates.retarget(raw.get("campaign"), (player or {}).get("pos"))
+        # A respawn moves the player, so the pre-death stuck clock says nothing about where they are now.
+        self._steps_since_progress = 0
+        self._wedge_run = 0
+        self._slide_latch = 0
+        self._track_enemies(raw)
         if player and self._current_checkpoint(raw) is None:
             # No checkpoint yet, so StatsManager.Restart reloaded the level and its counters started again. Keep
             # the kills and style from before the death in this episode's info, and start a best run's positions
@@ -532,27 +716,66 @@ class UltrakillEnv(gym.Env):
         fall pays nothing (no ground within range), a jump on the spot pays once instead of once per cell of
         height, and running forward still pays for every new patch of floor -- including while airborne, which
         matters because fast movement in this game is mostly airborne.
+
+        The centre ray is the measure, when the mod reports one: the 8-ray ring's minimum can be a ledge 4 m away
+        rather than the floor, and the measured spread among rays that hit is p50 0.5 m but p90 10.8 m. That
+        re-keys about 23% of the cells a carried archive holds, which is accepted -- the counts are not
+        comparable across this change anyway, and `oob_frac` takes a fresh baseline. A 0.5.x mod sends no centre
+        ray, so the ring minimum stays as the fallback.
         """
         player = raw.get("player")
         if not player:
             return None
+        centre = raw.get("ground_ray_center")
         rays = raw.get("ground_rays") or ()
-        if not rays:
+        if centre is None and not rays:
             return None
-        drop = min(rays)
+        drop = float(centre) if centre is not None else min(rays)
         if drop >= self.cfg.layout.ground_ray_length - 0.5:
             return None  # the mod writes ground_ray_length exactly when the ray hits nothing: off the map
         x, y, z = player["pos"]
         return (x, y - drop, z)
 
-    def _campaign_progress(self, raw: dict[str, Any]) -> CampaignStep:
+    def _note_wedge(self, prev: dict[str, Any], cur: dict[str, Any]) -> bool:
+        """Tracks the absorbing slowMode/heavyFall state; returns whether the current run has reached the hold.
+
+        The signature is airborne, not sliding, not moving, with the game's own `slowMode` or `heavyFall` set.
+        Both halves are load-bearing, measured over 32,022 live decisions: without the movement term ordinary
+        falls and slams flag 26.9% of all decisions (346 an episode), and at a 0.05 m threshold one of the five
+        real wedge runs -- the 694-decision one after checkpoint 3, whose per-decision movement has p90 0.055 m
+        -- fragments below the hold and is lost. 1.5 m/s (0.10 m per decision at both speed settings) keeps all
+        five. A mod older than 0.6.0 sends neither flag; the fallback is the same predicate without the flag test.
+
+        `wedged_steps` counts only steps inside a run that reached the hold, crediting the whole run
+        retroactively when it trips, so ordinary airborne time never enters it.
+        """
+        player = cur.get("player")
+        wedged = False
+        if player:
+            vel = player.get("vel") or (0.0, 0.0, 0.0)
+            prev_pos = (prev.get("player") or {}).get("pos")
+            moved = math.dist(player["pos"], prev_pos) if prev_pos else 0.0
+            still = math.hypot(vel[0], vel[2]) < 1.0 and moved < self._creep_m
+            wedged = still and not player.get("grounded") and not player.get("sliding")
+            if wedged and ("slow_mode" in player or "heavy_fall" in player):
+                wedged = bool(player.get("slow_mode") or player.get("heavy_fall"))
+        self._wedge_run = self._wedge_run + 1 if wedged else 0
+        if self._wedge_run == self._wedge_hold:
+            self._wedged_steps += self._wedge_hold  # the whole run, credited the moment it counts as one
+        elif self._wedge_run > self._wedge_hold:
+            self._wedged_steps += 1
+        return self._wedge_run >= self._wedge_hold
+
+    def _campaign_progress(self, prev: dict[str, Any], raw: dict[str, Any]) -> CampaignStep:
         """What the level did this step. Any progress restarts the stuck clock."""
         camp = raw.get("campaign") or {}
         checkpoints, arenas, doors = self.milestones.update(raw.get("campaign"))
         novelty = 0.0
         player = raw.get("player")
+        pos = player["pos"] if player else None
+        gates_new, approach = self.gates.update(raw.get("campaign"), pos)
         if player:
-            pos = player["pos"]
+            self._last_pos = list(pos)
             ground = self._ground_point(raw)
             if ground is None:
                 self._oob_steps += 1
@@ -564,12 +787,21 @@ class UltrakillEnv(gym.Env):
                 self._positions.append(self._rounded(pos))
             if camp.get("exit"):
                 self._exit_dist_min = min(self._exit_dist_min, math.dist(pos, camp["exit"]["pos"]))
+        if camp.get("level_started"):
+            self._level_started = True
         path_gain = self.path_progress.update(camp.get("path"))
-        if checkpoints or arenas or doors or novelty > 0 or path_gain > 0:
+        # Kills and style restart the clock too: four of 0-1's gate doors sit behind kill gates in locked rooms
+        # where novelty runs out, and the live probe recorded 193 s of fighting after checkpoint 3 that the clock
+        # truncated. Damage dealt deliberately does NOT count -- rewards.py attributes none of it to the player
+        # and ULTRAKILL enemies damage each other, so a crossfire tail would simply never truncate.
+        stats, before = raw.get("stats", {}), prev.get("stats", {})
+        fought = stats.get("kills", 0) > before.get("kills", 0) or stats.get("style", 0) > before.get("style", 0)
+        if checkpoints or arenas or doors or novelty > 0 or path_gain > 0 or gates_new or approach > 0 or fought:
             self._steps_since_progress = 0
         else:
             self._steps_since_progress += 1
-        return CampaignStep(checkpoints=checkpoints, arenas=arenas, doors=doors, novelty=novelty, path_gain=path_gain)
+        return CampaignStep(checkpoints=checkpoints, arenas=arenas, doors=doors, novelty=novelty, path_gain=path_gain,
+                            gates=gates_new, gate_approach=approach)
 
     def _level_result(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Official time, kills, style, restarts and rank as the game's results screen would count them."""
@@ -632,7 +864,9 @@ class UltrakillEnv(gym.Env):
             # The same ground projection the archive is keyed on, so the map the policy reads addresses the cells
             # novelty is actually paid for. Falling back to the raw position off the map keeps the map defined.
             explore = self.archive.features(self._ground_point(raw) or player["pos"], player["yaw"])
-        return pack_observation(raw, self.cfg.layout, self._enemy_max_health, explore)
+        # The same target object look mode 2 aims at, so what the policy sees and what it can point at agree.
+        target = self.gates.target if self.cfg.mode == "campaign" else None
+        return pack_observation(raw, self.cfg.layout, self._enemy_max_health, explore, target)
 
     def _info(self, raw: dict[str, Any]) -> dict[str, Any]:
         stats = raw.get("stats", {})
@@ -677,4 +911,18 @@ class UltrakillEnv(gym.Env):
             info["exit_dist_min"] = None if math.isinf(self._exit_dist_min) else self._exit_dist_min
             info["completed"] = 0  # set to 1 on the step that ends with level_complete
             info["level_seconds"] = None  # official time, only for a fresh-start completion
+            # Route gates. `gates_reached` is numeric and always present so it can be charted; `gate_hops_best`
+            # is None until a gate is reached, so it only ever reaches episodes.jsonl. Both are inherited by a
+            # respawn episode from its level load, so judge them on fresh starts.
+            info["gates_reached"] = self.gates.gates_reached
+            info["gate_hops_best"] = self.gates.best_hops
+            info["wedged_steps"] = self._wedged_steps
+            info["level_started"] = int(self._level_started)
+            info["look_free_frac"] = b["look_free"] / steps
+            info["look_enemy_frac"] = b["look_enemy"] / steps
+            info["look_gate_frac"] = b["look_gate"] / steps
+            info["slide_forced_frac"] = b["slide_forced"] / steps
+            info["start_checkpoint"] = self._start_checkpoint
+            pos = player.get("pos") or self._last_pos
+            info["end_pos"] = self._rounded(pos) if pos else None  # where the episode actually ended up
         return info

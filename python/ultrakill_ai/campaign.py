@@ -215,8 +215,13 @@ class ExplorationArchive:
 
 
 # ---------------------------------------------------------------------------
-# Milestones, path progress and episode starts
+# Milestones, route gates, path progress and episode starts
 # ---------------------------------------------------------------------------
+
+
+def _dist3(a, b) -> float:
+    """3-D distance between two [x, y, z] sequences (tolerant of lists, tuples and numpy rows)."""
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
 
 
 class MilestoneTracker:
@@ -264,6 +269,178 @@ class MilestoneTracker:
     def checkpoints_reached(self) -> int:
         """Distinct checkpoints activated in this level load (paid or absorbed)."""
         return len(self._checkpoints)
+
+
+GATE_EXIT_KEY = "exit"  # the sentinel target key for campaign.exit; a real Door key is always "x,y,z"
+
+
+class GateProgress:
+    """Route progress along the door graph the mod reports as `campaign.gates` (docs/protocol.md).
+
+    Each gate carries `hops`: the rooms still to traverse after passing it, 0 being the door into the exit's
+    room. That ladder is the route signal the NavMesh never gave us (`path.status` was never once `complete` in
+    2.9M steps), so the reward and the observation both hang off it:
+
+      - `gate` pays once per level load for every new lower `hops` value reached, so a shortcut from 9 to 6 pays
+        three instalments and re-walking the same doors after a death pays nothing;
+      - `gate_approach` pays metres of new best closeness to the *current target*, which is the nearest active
+        gate one rung down the ladder (or the exit once rung 0 is reached).
+
+    `best_dist` is keyed per gate, seeded the first time a key becomes the target and never re-seeded, so
+    walking A -> B -> A across a multi-gate tier pays A's approach once and B's once and nothing after. The
+    earlier design's single scalar, re-seeded on every target change, was a farming loop worth more than
+    finishing the level.
+
+    Scope, and the one place this differs from the design spec (lead ruling R1): the `gate` ladder
+    (`best_hops` / `paid_hops` / `reached`) is LEVEL-LOAD scoped exactly like `MilestoneTracker`, but
+    `best_dist` is EPISODE scoped -- cleared by `reset_episode`, not by a death respawn inside an episode.
+    PPO returns are computed within an episode and a truncation bootstraps the same state, so ending an episode
+    early is never profitable, and most episodes are checkpoint respawns that need the dense signal on ground
+    earlier episodes already covered. It is still not farmable: an episode's total approach is bounded by the
+    gate-to-gate polyline either way (723-736 m on 0-1).
+
+    `gates[].controller_active` is reported by the mod (a door whose `ActivateArena` has not run is neither
+    locked nor approachable) but no rule here reads it yet; every field is read with `.get`, so a 0.5.x mod
+    without it -- or without `gates` at all -- simply produces no target and pays nothing.
+    """
+
+    def __init__(self, reach_m: float = 8.0, reach_v_m: float = 6.0, min_gain_m: float = 0.5):
+        self.reach_h = float(reach_m)
+        self.reach_v = float(reach_v_m)
+        self.min_gain = float(min_gain_m)
+        # Per level load
+        self.best_hops: int | None = None  # lowest hops reached
+        self.paid_hops: int | None = None  # lowest hops already paid or absorbed
+        self.reached: set[str] = set()  # gate keys ever reached this level load
+        self.hops_reached: set[int] = set()  # their hop values, which is what `gates_reached` counts
+        # Per episode
+        self.best_dist: dict[str, float] = {}  # gate key (or "exit") -> closest approach made this episode
+        self.target: dict | None = None
+
+    # -- lifecycle ---------------------------------------------------------------------------
+
+    def new_level_load(self, campaign: dict | None, player_pos=None) -> None:
+        """Starts a level load: forgets the ladder, then absorbs whatever the fresh level already reports."""
+        self.best_hops = self.paid_hops = None
+        self.reached.clear()
+        self.hops_reached.clear()
+        self.best_dist.clear()
+        self.target = None
+        self.mark_paid(campaign, player_pos)
+
+    def mark_paid(self, campaign: dict | None, player_pos=None) -> None:
+        """Absorbs the gates the player already stands at (a checkpoint respawn, or any reset) without paying."""
+        self._note_reached(campaign, player_pos)
+        self.paid_hops = self.best_hops
+        # best_dist is deliberately untouched: a respawn inside an episode must not re-earn the approach.
+
+    def reset_episode(self) -> None:
+        """A new episode: pick the target again from scratch, and let it re-earn its approach (ruling R1)."""
+        self.target = None
+        self.best_dist.clear()
+
+    def retarget(self, campaign: dict | None, player_pos=None) -> None:
+        """Chooses the current target. Pays nothing; call it before packing any observation."""
+        self._note_reached(campaign, player_pos)
+        self.target = self._choose_target(campaign, player_pos)
+        key = self._key_of(self.target)
+        if key is not None and player_pos is not None and key not in self.best_dist:
+            self.best_dist[key] = _dist3(player_pos, self.target["pos"])  # seeded once, never re-seeded
+
+    # -- per step ----------------------------------------------------------------------------
+
+    def update(self, campaign: dict | None, player_pos=None) -> tuple[int, float]:
+        """(new hop values crossed, metres of new best closeness to the target) for this step."""
+        prev_key = self._key_of(self.target)
+        prev_best = self.best_dist.get(prev_key, math.inf) if prev_key is not None else math.inf
+        self.retarget(campaign, player_pos)
+
+        paid = 0
+        if self.best_hops is not None:
+            if self.paid_hops is None:
+                paid = 1
+            elif self.best_hops < self.paid_hops:
+                paid = self.paid_hops - self.best_hops
+            self.paid_hops = self.best_hops if self.paid_hops is None else min(self.paid_hops, self.best_hops)
+
+        approach = 0.0
+        key = self._key_of(self.target)
+        # Only a target that did not change this step can pay: the step a target changes has no comparable
+        # baseline, and `prev_best` is infinite until a target has been seeded with the player's position.
+        if key is not None and key == prev_key and player_pos is not None and math.isfinite(prev_best):
+            distance = _dist3(player_pos, self.target["pos"])
+            if distance < prev_best - self.min_gain:
+                approach = prev_best - distance
+                self.best_dist[key] = distance
+        return paid, approach
+
+    @property
+    def gates_reached(self) -> int:
+        """Distinct hop values reached in this level load (0 when none)."""
+        return len(self.hops_reached)
+
+    # -- helpers -----------------------------------------------------------------------------
+
+    @staticmethod
+    def _gates(campaign: dict | None) -> list[dict]:
+        """The ordered gate array, or nothing at all when the mod did not order this level (0-5, or a 0.5.x mod)."""
+        if not campaign or not campaign.get("gates_ordered"):
+            return []
+        return [g for g in (campaign.get("gates") or ()) if isinstance(g, dict) and g.get("pos")]
+
+    @staticmethod
+    def _key_of(target: dict | None) -> str | None:
+        return None if target is None else str(target.get("key"))
+
+    @staticmethod
+    def _exit(campaign: dict | None) -> dict | None:
+        """The exit as a target, or None when the mod reports no `FinalPit`. `hops` None marks it as the exit."""
+        exit_ = (campaign or {}).get("exit")
+        if not exit_ or not exit_.get("pos"):
+            return None
+        return {"key": GATE_EXIT_KEY, "pos": list(exit_["pos"]), "hops": None,
+                "open": False, "locked": False, "active": True}
+
+    def _is_reached(self, gate: dict, pos) -> bool:
+        """A cylinder, not a sphere: 8 m horizontal (the DoorController trigger plus the door's height over the
+        floor), 6 m vertical so standing on the roof above a door is not "passing" it. An open door doubles
+        both; `open` alone never counts, because enemies open doors too."""
+        hops, gate_pos = gate.get("hops"), gate.get("pos")
+        if hops is None or not gate.get("active") or not gate_pos:
+            return False
+        margin = 2.0 if gate.get("open") else 1.0
+        return (math.hypot(pos[0] - gate_pos[0], pos[2] - gate_pos[2]) <= margin * self.reach_h
+                and abs(pos[1] - gate_pos[1]) <= margin * self.reach_v)
+
+    def _note_reached(self, campaign: dict | None, pos) -> None:
+        if pos is None:
+            return
+        for gate in self._gates(campaign):
+            if self._is_reached(gate, pos):
+                self.reached.add(str(gate.get("key")))
+                hops = int(gate["hops"])
+                self.hops_reached.add(hops)
+                if self.best_hops is None or hops < self.best_hops:
+                    self.best_hops = hops
+
+    @staticmethod
+    def _nearest(gates: list[dict], pos) -> dict | None:
+        return min(gates, key=lambda g: _dist3(pos, g["pos"])) if gates else None
+
+    def _choose_target(self, campaign: dict | None, pos) -> dict | None:
+        if pos is None:
+            return self.target  # no player this frame: keep pointing where we were
+        active = [g for g in self._gates(campaign) if g.get("hops") is not None and g.get("active")]
+        if not active:
+            return self.target  # keep the previous target rather than flapping while the graph is rebuilt
+        if self.best_hops is None:
+            return self._nearest(active, pos)
+        if self.best_hops == 0:
+            return self._exit(campaign) or self._nearest([g for g in active if int(g["hops"]) == 0], pos) or self.target
+        lower = {int(g["hops"]) for g in active if int(g["hops"]) < self.best_hops}
+        if not lower:
+            return self._exit(campaign) or self.target
+        return self._nearest([g for g in active if int(g["hops"]) == max(lower)], pos)
 
 
 class PathProgress:

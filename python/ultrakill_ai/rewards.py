@@ -43,6 +43,10 @@ class RewardConfig:
     door_unlock: float = 0.0  # per door unlocked by play, once per level load (respawn unlocks never pay)
     novelty: float = 0.0  # times CampaignStep.novelty, the summed 1/sqrt(N+1) of cells new this episode
     path: float = 0.0  # per metre of new best NavMesh distance to the exit
+    # The door-graph route (campaign.gates): the signal the NavMesh never gave, since `path.status` was never
+    # once `complete` in 2.9M logged steps. `gate` is the milestone, `gate_approach` the shaping between them.
+    gate: float = 0.0  # per new lower `hops` value reached, once per level load
+    gate_approach: float = 0.0  # per metre of new best 3-D closeness to the current target
 
 
 @dataclass
@@ -54,6 +58,8 @@ class CampaignStep:
     doors: int = 0
     novelty: float = 0.0  # sum of 1/sqrt(N+1) over cells entered for the first time this episode
     path_gain: float = 0.0  # metres of new best NavMesh distance to the exit
+    gates: int = 0  # new lower `hops` values reached this step (GateProgress.update)
+    gate_approach: float = 0.0  # metres of new best closeness to the current gate/exit target
 
 
 @dataclass
@@ -154,6 +160,8 @@ def compute_reward(
         r.add("door_unlock", cfg.door_unlock * campaign.doors)
         r.add("novelty", cfg.novelty * campaign.novelty)
         r.add("path", cfg.path * campaign.path_gain)
+        r.add("gate", cfg.gate * campaign.gates)
+        r.add("gate_approach", cfg.gate_approach * campaign.gate_approach)
 
     pp, cp = prev.get("player"), cur.get("player")
     if not pp or not cp:

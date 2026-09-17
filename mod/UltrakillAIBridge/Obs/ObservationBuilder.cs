@@ -23,6 +23,10 @@ namespace UltrakillAIBridge.Obs
         private static AccessTools.FieldRef<EndlessGrid, ActivateNextWave> anwRef;
         private static bool anwResolved;
 
+        // Same idea for NewMovement.crouching, which is private: a rename costs the crouching flag, not the obs.
+        private static AccessTools.FieldRef<NewMovement, bool> crouchingRef;
+        private static bool crouchingResolved;
+
         private static readonly List<EnemyIdentifier> EmptyEnemies = new List<EnemyIdentifier>();
 
         private static ActivateNextWave GetAnw(EndlessGrid grid)
@@ -40,6 +44,23 @@ namespace UltrakillAIBridge.Obs
                 }
             }
             return anwRef?.Invoke(grid);
+        }
+
+        private static bool GetCrouching(NewMovement nm)
+        {
+            if (!crouchingResolved)
+            {
+                crouchingResolved = true;
+                try
+                {
+                    crouchingRef = AccessTools.FieldRefAccess<NewMovement, bool>("crouching");
+                }
+                catch (System.Exception e)
+                {
+                    Plugin.Log.LogWarning($"NewMovement.crouching not found, reported as false: {e.Message}");
+                }
+            }
+            return crouchingRef != null && crouchingRef.Invoke(nm);
         }
 
         private readonly List<(EnemyIdentifier eid, float dist)> sorted = new List<(EnemyIdentifier, float)>();
@@ -101,6 +122,7 @@ namespace UltrakillAIBridge.Obs
             obs["enemies"] = BuildEnemies(cam, envMask);
             obs["rays"] = BuildHorizontalRays(nm, playerPos, envMask);
             obs["ground_rays"] = BuildGroundRays(nm, playerPos, envMask);
+            obs["ground_ray_center"] = GroundRayCenter(nm, playerPos, envMask);
             obs["stats"] = BuildStats(nm);
 
             var sm = MonoSingleton<StatsManager>.Instance;
@@ -166,6 +188,9 @@ namespace UltrakillAIBridge.Obs
                 ["stamina"] = nm.boostCharge,
                 ["grounded"] = nm.gc != null && nm.gc.onGround,
                 ["sliding"] = nm.sliding,
+                ["slow_mode"] = nm.slowMode,
+                ["heavy_fall"] = nm.gc != null && nm.gc.heavyFall,
+                ["crouching"] = GetCrouching(nm),
                 ["dead"] = nm.dead,
                 ["activated"] = nm.activated,
                 ["level_over"] = nm.levelOver,
@@ -259,6 +284,20 @@ namespace UltrakillAIBridge.Obs
                 arr.Add(Physics.Raycast(start, -up, out var hit, GroundRayLength, envMask, QueryTriggerInteraction.Ignore) ? hit.distance - 1f : GroundRayLength);
             }
             return arr;
+        }
+
+        /// <summary>
+        /// Height of the ground directly below the player, same convention as <see cref="BuildGroundRays"/>
+        /// (the ray length exactly when nothing is hit, negative when the ground is above the player's
+        /// feet). The ring's minimum can be a ledge four metres away rather than the floor underfoot, so
+        /// the centre is the measure that says where the player actually is.
+        /// </summary>
+        private float GroundRayCenter(NewMovement nm, Vector3 origin, int envMask)
+        {
+            var up = nm.transform.up;
+            return Physics.Raycast(origin + up, -up, out var hit, GroundRayLength, envMask, QueryTriggerInteraction.Ignore)
+                ? hit.distance - 1f
+                : GroundRayLength;
         }
 
         private static JObject BuildStats(NewMovement nm)

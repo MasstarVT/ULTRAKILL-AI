@@ -21,16 +21,24 @@ YAW_BINS = (-90.0, -30.0, -10.0, -3.0, -1.0, 0.0, 1.0, 3.0, 10.0, 30.0, 90.0)  #
 PITCH_BINS = (-20.0, -6.0, -1.5, 0.0, 1.5, 6.0, 20.0)  # degrees per step, positive looks up
 BUTTONS = ("jump", "dash", "slide", "fire1", "fire2", "punch")
 NUM_WEAPON_CHOICES = 6  # 0 = keep current, 1..5 = select slot
+LOOK_MODES = 3  # 0 free look, 1 nearest visible enemy, 2 the current route target (campaign only)
 
 # [move_forward, move_side, *buttons, weapon, yaw, pitch]
-ACTION_NVEC = np.array([3, 3, *([2] * len(BUTTONS)), NUM_WEAPON_CHOICES, len(YAW_BINS), len(PITCH_BINS)], dtype=np.int64)
+BASE_NVEC = (3, 3, *([2] * len(BUTTONS)), NUM_WEAPON_CHOICES, len(YAW_BINS), len(PITCH_BINS))
+ACTION_NVEC = np.array(BASE_NVEC, dtype=np.int64)  # 11 dims, 42 logits: Cyber Grind, unchanged
+# Campaign only, with the look mode appended so every existing logit row keeps its index. Widening the Cyber
+# Grind vector would make its checkpoints unloadable against their own env, and look mode 1 is an auto-aim:
+# handing it to the run that has spent 6.5M steps learning to aim would short-circuit the thing it is learning.
+ACTION_NVEC_CAMPAIGN = np.array((*BASE_NVEC, LOOK_MODES), dtype=np.int64)  # 12 dims, 45 logits
+LOOK_MODE_INDEX = len(BASE_NVEC)
 
 
-def action_space() -> spaces.MultiDiscrete:
-    return spaces.MultiDiscrete(ACTION_NVEC)
+def action_space(campaign: bool = False) -> spaces.MultiDiscrete:
+    return spaces.MultiDiscrete(ACTION_NVEC_CAMPAIGN if campaign else ACTION_NVEC)
 
 
 def decode_action(a: np.ndarray) -> dict[str, Any]:
+    """The mod command for one action. The width tells the mode apart: 12 values carry a look mode, 11 do not."""
     a = np.asarray(a, dtype=np.int64)
     forward = int(a[0]) - 1
     side = int(a[1]) - 1
@@ -41,15 +49,20 @@ def decode_action(a: np.ndarray) -> dict[str, Any]:
         "buttons": pressed,
         "slot": int(a[i]),
         "look": [YAW_BINS[int(a[i + 1])], PITCH_BINS[int(a[i + 2])]],
+        # env.step resolves this and pops it: it is a Python-side look policy, never sent to the mod.
+        "look_mode": int(a[LOOK_MODE_INDEX]) if len(a) > LOOK_MODE_INDEX else 0,
     }
 
 
-def noop_action() -> np.ndarray:
-    a = np.zeros(len(ACTION_NVEC), dtype=np.int64)
+def noop_action(campaign: bool = False) -> np.ndarray:
+    """Stand still and look straight ahead. Explicit indices: negative ones address the wrong slots at width 12."""
+    nvec = ACTION_NVEC_CAMPAIGN if campaign else ACTION_NVEC
+    a = np.zeros(len(nvec), dtype=np.int64)
     a[0] = a[1] = 1
-    a[-2] = YAW_BINS.index(0.0)
-    a[-1] = PITCH_BINS.index(0.0)
-    return a
+    i = 2 + len(BUTTONS)
+    a[i + 1] = YAW_BINS.index(0.0)
+    a[i + 2] = PITCH_BINS.index(0.0)
+    return a  # the look-mode slot stays 0 (free look)
 
 
 # ---------------------------------------------------------------------------
@@ -116,19 +129,28 @@ def yaw_frame(vec_world: tuple[float, float, float], yaw_deg: float) -> tuple[fl
     return (dx * math.cos(y) - dz * math.sin(y), dy, dx * math.sin(y) + dz * math.cos(y))
 
 
-def campaign_block(obs: dict[str, Any], explore: list[float] | None = None) -> list[float]:
+def campaign_block(obs: dict[str, Any], explore: list[float] | None = None, target: dict | None = None) -> list[float]:
     """The 36 campaign values, all zero without a `campaign` block or a player.
 
     Targets are relative to the player in its yaw frame (x right, y up, z forward), so "ahead" is +z whichever way
     the player faces.
 
         0-4    exit: rel xyz / 100, distance / 200, mask
-        5-9    path next corner: rel xyz / 50, distance / 50, path length / 300 (complete or partial path only)
-        10-12  path status one-hot: complete, partial, none
+        5-8    route target (GateProgress.target): rel xyz and 3-D distance, gate scales 50/100, exit scales
+               100/200 -- the exit is ~195 m from 0-1's spawn, which the gate scales would put near 4.0. All four
+               are clipped to +-4.0 as a guard
+        9      target mask: 1.0 when a target exists
+        10-12  target gate `open`, `locked`, `hops` / 20 -- all 0.0 when the target is the exit or absent
         13-17  nearest checkpoint neither activated nor current: rel xyz / 100, distance / 200, mask
         18-22  first locked door (the mod sends them nearest first): rel xyz / 50, distance / 100, mask
         23-26  arena enemies alive / 20, timer running, input locked, level seconds / 600
         27-35  exploration map (ExplorationArchive.features: current cell, then 8 neighbours from straight ahead)
+
+    Slots 5-12 carried the NavMesh path hint until the gates work. That hint never once read `complete` in
+    2.9M steps, so it was replaced in place rather than appended: every other index keeps its meaning, the vector
+    stays 479 long and the run continues from its own weights (scripts/add_look_mode.py zeroes those eight
+    first-layer columns and folds their mean into the bias). `target` is threaded in from the env because
+    GateProgress lives there; a target with no `hops` is the exit sentinel.
     """
     out = [0.0] * CAMPAIGN_BLOCK
     c, p = obs.get("campaign"), obs.get("player")
@@ -144,11 +166,15 @@ def campaign_block(obs: dict[str, Any], explore: list[float] | None = None) -> l
     if exit_:
         out[0:5] = relative(exit_["pos"], 100.0, 200.0) + [1.0]
 
-    path = c.get("path") or {}
-    status = path.get("status", "none")
-    if status in ("complete", "partial") and path.get("next_corner"):
-        out[5:10] = relative(path["next_corner"], 50.0, 50.0) + [path.get("length", 0.0) / 300.0]
-    out[10:13] = [float(status == "complete"), float(status == "partial"), float(status not in ("complete", "partial"))]
+    if target and target.get("pos"):
+        is_exit = target.get("hops") is None
+        scales = (100.0, 200.0) if is_exit else (50.0, 100.0)
+        out[5:9] = [max(-4.0, min(4.0, v)) for v in relative(target["pos"], *scales)]
+        out[9] = 1.0
+        if not is_exit:
+            out[10] = float(bool(target.get("open")))
+            out[11] = float(bool(target.get("locked")))
+            out[12] = float(target["hops"]) / 20.0
 
     pending = [cp for cp in (c.get("checkpoints") or []) if not cp["activated"] and not cp["current"]]
     if pending:
@@ -176,6 +202,7 @@ def pack_observation(
     layout: ObsLayout,
     enemy_max_health: dict[int, float],
     explore: list[float] | None = None,
+    target: dict | None = None,
 ) -> np.ndarray:
     out = np.zeros(layout.size, dtype=np.float32)
     p = obs.get("player")
@@ -226,7 +253,7 @@ def pack_observation(
     put([cg["wave"] / 30.0, max(cg["enemies_left"], 0) / 30.0] if cg else [0.0, 0.0])
 
     # Cyber Grind keeps 5 zeros where the route waypoint used to be, so its 448-input checkpoints still load.
-    put(campaign_block(obs, explore) if layout.campaign else [0.0] * 5)
+    put(campaign_block(obs, explore, target) if layout.campaign else [0.0] * 5)
 
     assert i == layout.size, f"packed {i} values, layout expects {layout.size}"
     return out

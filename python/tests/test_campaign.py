@@ -17,8 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ultrakill_ai.campaign import (  # noqa: E402
     CAMPAIGN_LEVELS,
+    GATE_EXIT_KEY,
     RANK_LETTERS,
     ExplorationArchive,
+    GateProgress,
     MilestoneTracker,
     PathProgress,
     choose_fresh_start,
@@ -303,6 +305,285 @@ def test_milestones_new_level_load_pays_again():
     m.new_level_load(milestones_block(checkpoints=[("0,1,20", False, False)]))
     assert m.checkpoints_reached == 0
     assert m.update(reached) == (1, 1, 1)
+
+
+# ---------------------------------------------------------------------------
+# GateProgress: the door-graph route
+# ---------------------------------------------------------------------------
+
+def gate(key, pos, hops, *, open=False, locked=False, active=True, controller=True):
+    g = {"key": key, "pos": list(pos), "hops": hops, "open": open, "locked": locked, "active": active}
+    if controller is not None:
+        g["controller_active"] = controller
+    return g
+
+
+def gates_block(gates, *, ordered=True, truncated=False, exit_pos=(0.0, 0.0, 200.0)):
+    block = {"gates_ordered": ordered, "gates_truncated": truncated, "gates": list(gates)}
+    if exit_pos is not None:
+        block["exit"] = {"pos": list(exit_pos), "active": False}
+    return block
+
+
+# A corridor along +z: one gate every 20 m, hops counting down to the exit.
+LADDER = [gate(f"0,0,{20 * (9 - h)}", (0.0, 0.0, 20.0 * (9 - h)), h) for h in range(9, -1, -1)]
+
+
+def walk(progress: GateProgress, camp: dict, positions) -> tuple[int, float]:
+    """Steps the tracker through a list of positions and returns the totals it paid."""
+    paid, approach = 0, 0.0
+    for pos in positions:
+        g, a = progress.update(camp, pos)
+        paid += g
+        approach += a
+    return paid, approach
+
+
+def test_gate_hops_pays_once_per_level_load():
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -30.0))
+    paid, _ = walk(p, camp, [(0.0, 0.0, float(z)) for z in range(0, 190, 2)])
+    assert paid == 10 and p.best_hops == 0 and p.gates_reached == 10
+    p.mark_paid(camp, (0.0, 0.0, 180.0))
+    p.reset_episode()
+    again, _ = walk(p, camp, [(0.0, 0.0, float(z)) for z in range(0, 190, 2)])
+    assert again == 0, "the ladder is per level load, however often it is re-walked"
+
+
+def test_gate_skipped_hops_pay_per_hop():
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -30.0))
+    assert p.update(camp, (0.0, 0.0, 0.0))[0] == 1  # the hops 9 gate: the first instalment
+    assert p.update(camp, (0.0, 0.0, 60.0))[0] == 3  # straight to hops 6: three rungs crossed
+    assert p.best_hops == 6
+
+
+def test_gate_approach_pays_only_new_best():
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, -60.0))
+    _, forward = walk(p, camp, [(0.0, 0.0, -60.0 + 2.0 * k) for k in range(1, 11)])  # 20 m closer
+    assert abs(forward - 20.0) < 1e-6
+    _, back = walk(p, camp, [(0.0, 0.0, -40.0 - 2.0 * k) for k in range(1, 11)])
+    assert back == 0.0
+    _, again = walk(p, camp, [(0.0, 0.0, -60.0 + 2.0 * k) for k in range(1, 11)])
+    assert again == 0.0, "only new best closeness pays"
+    assert forward + back + again <= 60.0  # bounded by the distance the target was first seen at
+
+
+def test_gate_approach_does_not_pay_for_flapping_between_two_gates_at_the_same_hops():
+    """The exploit the per-gate dict closes: a tier of two gates 60 m apart, walked back and forth forever."""
+    tier = [gate("a", (0.0, 0.0, 0.0), 2), gate("b", (60.0, 0.0, 0.0), 2), gate("c", (0.0, 0.0, 300.0), 1)]
+    camp = gates_block(tier)
+    p = GateProgress()
+    p.new_level_load(camp, (30.0, 0.0, 0.0))  # the bisector, 30 m from each and outside both reach radii
+    p.reset_episode()
+    p.retarget(camp, (30.0, 0.0, 0.0))
+    assert p.best_hops is None and p.target["key"] in ("a", "b")
+    cycle = list(range(30, 10, -2)) + list(range(10, 50, 2)) + list(range(50, 28, -2))
+
+    def cycles(n: int) -> float:
+        return sum(p.update(camp, (float(x), 0.0, 0.0))[1] for _ in range(n) for x in cycle)
+
+    first = cycles(5)
+    # Bounded by the sum over distinct targets of the distance each was first targeted at, never by the number
+    # of crossings: the old scalar best_dist, re-seeded on every target change, paid 0.065 a decision forever.
+    assert first <= 60.0 + 1e-6, f"a tier must pay each gate's first approach once, got {first}"
+    assert cycles(5) == 0.0, "crossing the tier again pays nothing at all"
+    assert p.best_hops is None  # neither gate was ever actually reached
+
+
+def test_gate_approach_survives_a_respawn():
+    """A death inside an episode must not re-earn the ground the episode already covered."""
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, -60.0))
+    walk(p, camp, [(0.0, 0.0, -60.0 + 2.0 * k) for k in range(1, 31)])
+    p.mark_paid(camp, (0.0, 0.0, -60.0))  # respawned back at the start, inside the same episode
+    p.retarget(camp, (0.0, 0.0, -60.0))
+    _, again = walk(p, camp, [(0.0, 0.0, -60.0 + 2.0 * k) for k in range(1, 31)])
+    assert again == 0.0
+
+
+def test_gate_approach_is_re_earned_in_a_new_episode():
+    """Lead ruling R1: `best_dist` is episode scoped, so a new episode's dense signal starts again.
+
+    The `gate` ladder stays level-load scoped either way, and an episode's approach is bounded by the route
+    length, so this is not farmable -- a truncation bootstraps the same state, so ending an episode early can
+    never pay.
+    """
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, -60.0))
+    _, first = walk(p, camp, [(0.0, 0.0, -60.0 + 2.0 * k) for k in range(1, 11)])
+    p.mark_paid(camp, (0.0, 0.0, -60.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, -60.0))
+    _, second = walk(p, camp, [(0.0, 0.0, -60.0 + 2.0 * k) for k in range(1, 11)])
+    assert abs(first - 20.0) < 1e-6 and abs(second - first) < 1e-6
+    assert p.paid_hops == p.best_hops  # the ladder itself was absorbed, not re-paid
+
+
+def test_target_changes_do_not_pay_approach():
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, -60.0))
+    before = p.target["key"]
+    _, approach = p.update(camp, (0.0, 0.0, 0.0))  # arrives at the first gate: the target moves on
+    assert p.target["key"] != before and approach == 0.0
+
+
+def test_target_before_any_gate_is_the_nearest():
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.retarget(camp, (0.0, 0.0, -60.0))
+    assert p.target["hops"] == 9 and p.best_hops is None
+
+
+def test_target_after_hops_zero_is_the_exit():
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.retarget(camp, (0.0, 0.0, 180.0))  # standing at the hops 0 gate
+    assert p.best_hops == 0 and p.target["key"] == GATE_EXIT_KEY and p.target["hops"] is None
+    no_exit = gates_block(LADDER, exit_pos=None)
+    q = GateProgress()
+    q.new_level_load(no_exit, (0.0, 0.0, 180.0))
+    q.retarget(no_exit, (0.0, 0.0, 180.0))
+    assert q.target is not None and q.target["hops"] == 0  # no exit reported: hold the last gate
+
+
+def test_retarget_pays_nothing():
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.reset_episode()
+    for pos in ((0.0, 0.0, -60.0), (0.0, 0.0, 0.0), (0.0, 0.0, 100.0)):
+        assert p.retarget(camp, pos) is None
+    assert p.paid_hops is None and p.best_hops == 4  # the z 100 gate: reached, noted, never paid
+
+
+def test_unordered_gates_have_no_target():
+    camp = gates_block([gate("a", (0.0, 0.0, 10.0), None)], ordered=False)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, 0.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    assert p.target is None
+    assert p.update(camp, (0.0, 0.0, 5.0)) == (0, 0.0) and p.gates_reached == 0
+
+
+def test_empty_gates_have_no_target():
+    for camp in (gates_block([]), {"exit": {"pos": [0.0, 0.0, 10.0], "active": True}}, {}, None):
+        p = GateProgress()
+        p.new_level_load(camp, (0.0, 0.0, 0.0))
+        p.reset_episode()
+        p.retarget(camp, (0.0, 0.0, 0.0))
+        assert p.target is None
+        assert p.update(camp, (0.0, 0.0, 5.0)) == (0, 0.0)
+
+
+def test_open_gate_counts_as_reached_at_double_range():
+    closed = gates_block([gate("a", (0.0, 0.0, 0.0), 1)])
+    p = GateProgress()
+    p.new_level_load(closed, (0.0, 0.0, 100.0))
+    p.retarget(closed, (0.0, 0.0, 12.0))
+    assert p.best_hops is None  # 12 m away, outside the 8 m radius
+    opened = gates_block([gate("a", (0.0, 0.0, 0.0), 1, open=True)])
+    q = GateProgress()
+    q.new_level_load(opened, (0.0, 0.0, 100.0))
+    q.retarget(opened, (0.0, 0.0, 12.0))
+    assert q.best_hops == 1  # an open door doubles both radii
+
+
+def test_reach_is_a_cylinder():
+    camp = gates_block([gate("a", (0.0, 0.0, 0.0), 1)])
+    roof = GateProgress()
+    roof.new_level_load(camp, (0.0, 0.0, 100.0))
+    roof.retarget(camp, (3.0, 12.0, 0.0))
+    assert roof.best_hops is None, "standing on the roof over a door is not passing it"
+    beside = GateProgress()
+    beside.new_level_load(camp, (0.0, 0.0, 100.0))
+    beside.retarget(camp, (7.0, 4.0, 0.0))
+    assert beside.best_hops == 1
+
+
+def test_inactive_gates_are_ignored():
+    camp = gates_block([gate("a", (0.0, 0.0, 0.0), 1, active=False), gate("b", (0.0, 0.0, 80.0), 0)])
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, 100.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    assert p.best_hops is None and p.target["key"] == "b"
+
+
+def test_hops_shifting_without_moving_pays_nothing():
+    """A Scan() that renumbers the graph must not itself pay: best_hops only falls when a gate is reached."""
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.reset_episode()
+    assert p.update(camp, (0.0, 0.0, 0.0))[0] == 1
+    lower = gates_block([gate(g["key"], g["pos"], max(0, g["hops"] - 1)) for g in LADDER])
+    assert p.update(lower, (0.0, 0.0, 0.0))[0] == 1  # the same gate now reads hops 8: one rung, paid once
+    assert p.update(lower, (0.0, 0.0, 0.0))[0] == 0
+
+
+def test_duplicate_gate_keys_do_not_freeze_the_target():
+    """CampaignPatches.Key rounds to whole metres, so the mod appends #2 to a collision. Keys are opaque."""
+    camp = gates_block([gate("40,1,408", (40.0, 1.0, 408.0), 3), gate("40,1,408#2", (40.3, 1.0, 408.4), 2),
+                        gate("40,1,500", (40.0, 1.0, 500.0), 1)])
+    p = GateProgress()
+    p.new_level_load(camp, (40.0, 1.0, 300.0))
+    p.reset_episode()
+    p.retarget(camp, (40.0, 1.0, 300.0))
+    assert p.target["key"] == "40,1,408"
+    assert p.update(camp, (40.0, 1.0, 408.0))[0] == 1  # both doors are within reach; the first rung pays once
+    assert p.best_hops == 2 and p.reached == {"40,1,408", "40,1,408#2"}
+    assert p.target["key"] == "40,1,500"  # the duplicate key did not freeze it
+
+
+def test_truncated_gates_still_target():
+    camp = gates_block(LADDER[:4], truncated=True)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, -60.0))
+    assert p.target is not None
+    assert p.update(camp, (0.0, 0.0, 0.0))[0] == 1
+
+
+def test_gates_without_controller_active_still_work():
+    """Graceful degradation: a mod that does not report controller_active must not break targeting."""
+    camp = gates_block([gate("a", (0.0, 0.0, 0.0), 1, controller=None)])
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, 100.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 100.0))
+    assert p.target["key"] == "a"
+    assert p.update(camp, (0.0, 0.0, 0.0))[0] == 1
+
+
+def test_gate_progress_survives_a_step_without_a_player():
+    camp = gates_block(LADDER)
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, -60.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, -60.0))
+    held = p.target
+    assert p.update(camp, None) == (0, 0.0)
+    assert p.target is held  # a frame with no player keeps pointing where it was
 
 
 def nav_path(length, status="complete"):

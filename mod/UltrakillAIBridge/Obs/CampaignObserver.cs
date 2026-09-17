@@ -11,7 +11,8 @@ namespace UltrakillAIBridge.Obs
 {
     /// <summary>
     /// Builds the obs "campaign" block in the 35 main levels: the exit, checkpoints, a NavMesh path hint to
-    /// the exit, locked doors, arena enemies, milestone keys and rank thresholds (keys in docs/protocol.md).
+    /// the exit, locked doors, arena enemies, the door-graph route ("gates"), milestone keys and rank
+    /// thresholds (keys in docs/protocol.md).
     ///
     /// The exit and later checkpoints can sit in rooms that start inactive, so scene objects are found with
     /// FindObjectsOfType(includeInactive). That also returns the disabled room templates CheckPoint.Start
@@ -27,6 +28,13 @@ namespace UltrakillAIBridge.Obs
         private const int RescanEvery = 30;
         private const int PathEvery = 4;
         private const int MaxLockedDoors = 4;
+
+        /// <summary>
+        /// Most gates reported per level. Measured candidate counts are 11 (0-1), 17 (0-2), 12 (0-3),
+        /// 7 (0-4), 3 (0-5) and 13 (1-1), so this is only a wire-size guard; a level that exceeds it keeps
+        /// the gates nearest the player (the ones the agent needs first) and sets "gates_truncated".
+        /// </summary>
+        private const int MaxGates = 64;
         // The player end is snapped too, and ULTRAKILL is played in the air: jumping, dashing and falling are
         // most of a run. At 6 m an airborne player can miss the mesh, and a missed sample reports the whole
         // path as "none", withholding the path reward and the policy's next-corner input until they land.
@@ -63,6 +71,32 @@ namespace UltrakillAIBridge.Obs
         private readonly HashSet<Transform> templates = new HashSet<Transform>();
         private readonly List<(Door door, float dist)> lockedDoors = new List<(Door, float)>();
 
+        // The door-graph route. The doors, the room graph, the keys and the hop counts are all decided in
+        // Scan(); a step only reads four live flags off each Door (see BuildGates).
+        private readonly List<Gate> gates = new List<Gate>();
+        private bool gatesOrdered;
+        private bool gatesTruncated;
+        // hops per gate key for THIS level load. Rules 7 and 12 of the spec: a Scan() that lands while a
+        // checkpoint respawn is re-creating the exit's room finds no goal room, and renumbering the route
+        // under the agent (or blanking it) would move the target for reasons the player had nothing to do
+        // with. Keys are stable across re-instantiation, so a key that has ever had a hops value keeps it
+        // until the scene changes.
+        private readonly Dictionary<string, int> hopsByKey = new Dictionary<string, int>();
+        private bool duplicateKeysWarned;
+
+        // Scratch for the room graph, reused across scans.
+        private readonly HashSet<string> roomNodes = new HashSet<string>();
+        private readonly Dictionary<string, List<string>> roomEdges = new Dictionary<string, List<string>>();
+        private readonly Dictionary<string, int> roomHops = new Dictionary<string, int>();
+        private readonly Queue<string> bfs = new Queue<string>();
+        private readonly HashSet<int> roomIds = new HashSet<int>();
+        private readonly HashSet<string> gateKeys = new HashSet<string>();
+
+        // The FinalPit chosen for this level load. Rule 4 of the spec: the preference order is
+        // time-varying (a pit's room activates mid-run) and every hops value depends on which pit was
+        // chosen, so re-running it mid-load could silently renumber the route.
+        private FinalPit chosenExit;
+
         private bool scanned;
         private int sceneHandle;
         private int lastRestarts;
@@ -90,10 +124,20 @@ namespace UltrakillAIBridge.Obs
         public JObject Build(NewMovement nm, StatsManager sm, List<EnemyIdentifier> enemies)
         {
             int handle = SceneManager.GetActiveScene().handle;
-            if (!scanned || handle != sceneHandle || sm.restarts != lastRestarts)
+            if (!scanned || handle != sceneHandle)
             {
-                // A new scene, or a checkpoint respawn that re-created rooms and moved the player.
+                // A new scene: the route, the chosen exit and the duplicate-key warning are all
+                // level-load scoped (a checkpoint respawn must NOT clear them, see hopsByKey).
                 sceneHandle = handle;
+                builds = 0;
+                pathCached = false;
+                hopsByKey.Clear();
+                chosenExit = null;
+                duplicateKeysWarned = false;
+            }
+            else if (sm.restarts != lastRestarts)
+            {
+                // A checkpoint respawn that re-created rooms and moved the player.
                 builds = 0;
                 pathCached = false;
             }
@@ -105,9 +149,9 @@ namespace UltrakillAIBridge.Obs
                 builds = 0;
                 pathCached = false;
             }
-            if (builds % RescanEvery == 0) Scan(sm);
-
             var playerPos = nm.transform.position;
+            if (builds % RescanEvery == 0) Scan(sm, playerPos);
+
             var exit = ChooseExit();
             if (!pathCached || builds % PathEvery == 0) UpdatePath(playerPos, exit);
             builds++;
@@ -133,6 +177,9 @@ namespace UltrakillAIBridge.Obs
                 ["arena_enemies_alive"] = ArenaEnemiesAlive(enemies),
                 ["cleared_arenas"] = Strings(CampaignPatches.ClearedArenas),
                 ["unlocked_doors"] = Strings(CampaignPatches.UnlockedDoors),
+                ["gates_ordered"] = gatesOrdered,
+                ["gates_truncated"] = gatesTruncated,
+                ["gates"] = BuildGates(),
                 ["ranks"] = new JObject
                 {
                     ["time"] = Ints(sm.timeRanks),
@@ -142,7 +189,7 @@ namespace UltrakillAIBridge.Obs
             };
         }
 
-        private void Scan(StatsManager sm)
+        private void Scan(StatsManager sm, Vector3 playerPos)
         {
             scanned = true;
             lastRestarts = sm.restarts;
@@ -169,7 +216,13 @@ namespace UltrakillAIBridge.Obs
             pits.Clear();
             foreach (var pit in Object.FindObjectsOfType<FinalPit>(true))
             {
-                if (pit != null && !pit.fakeEnd && !pit.secondPit && !pit.rankless && !IsTemplate(pit.transform)) pits.Add(pit);
+                if (pit == null || pit.fakeEnd || pit.secondPit || pit.rankless || IsTemplate(pit.transform)) continue;
+                // A pit with no target, or one that drops into a secret level ("Level 0-S"), is never the
+                // mission exit. Measured on 0-2 and 1-1, which each carry both kinds; after this filter
+                // exactly one pit is left on every level checked (0-1..0-5, 1-1).
+                var target = pit.targetLevelName;
+                if (string.IsNullOrEmpty(target) || target.EndsWith("-S", StringComparison.OrdinalIgnoreCase)) continue;
+                pits.Add(pit);
             }
             doors.Clear();
             foreach (var door in Object.FindObjectsOfType<Door>(true))
@@ -177,6 +230,254 @@ namespace UltrakillAIBridge.Obs
                 if (door != null && !IsTemplate(door.transform)) doors.Add(door);
             }
             checkpointSignature = CheckpointSignature(sm);
+            ScanGates(playerPos);
+        }
+
+        /// <summary>
+        /// One door that connects two or more rooms, with everything about it a scan decides: its
+        /// closed-position key and position, its hop count to the exit and its DoorControllers.
+        /// </summary>
+        private sealed class Gate
+        {
+            public Door Door;
+            public DoorController[] Controllers;
+            public string Key;
+            public Vector3 Pos;
+            public int? Hops;
+            public List<string> Rooms;
+            public float Dist;
+        }
+
+        /// <summary>
+        /// Rebuilds the route: which doors are gates, the room graph they form, and each gate's hop count
+        /// from the room holding the exit. Runs inside <see cref="Scan"/>, i.e. at most once every
+        /// <see cref="RescanEvery"/> builds, so a step never walks the scene or the graph again.
+        ///
+        /// A door is a gate when its activatedRooms holds at least two distinct GameObjects; the rooms of
+        /// those doors (and nothing else) are the graph's nodes, identified by their rounded world position
+        /// rather than by reference, because CheckPoint.ResetRoom destroys and re-instantiates a room on
+        /// every respawn. Two rooms are adjacent when one gate lists both, and a BFS from the exit's own
+        /// room gives every room its hop count; a gate takes the lowest hop count among its rooms.
+        ///
+        /// The JSON objects themselves are built per step by <see cref="BuildGates"/> rather than cached:
+        /// a JToken that already has a parent is deep-copied when it is assigned to the next step's obs,
+        /// so caching them would pay for a clone of the whole array every step and look like it didn't.
+        /// </summary>
+        private void ScanGates(Vector3 playerPos)
+        {
+            gates.Clear();
+            roomNodes.Clear();
+            roomEdges.Clear();
+            gateKeys.Clear();
+
+            int duplicates = 0;
+            foreach (var door in doors)
+            {
+                if (door == null || door.activatedRooms == null) continue;
+                roomIds.Clear();
+                List<string> rooms = null;
+                foreach (var room in door.activatedRooms)
+                {
+                    if (room == null || !roomIds.Add(room.GetInstanceID())) continue;
+                    if (rooms == null) rooms = new List<string>(door.activatedRooms.Length);
+                    var node = CampaignPatches.Key(room.transform.position);
+                    if (!rooms.Contains(node)) rooms.Add(node);
+                }
+                if (roomIds.Count < 2) continue;
+
+                var pos = ClosedPosition(door);
+                var key = CampaignPatches.Key(pos);
+                // CampaignPatches.Key rounds to whole metres, so two doors within a metre would collide,
+                // and Python uses the key alone to tell one gate from another.
+                if (!gateKeys.Add(key))
+                {
+                    duplicates++;
+                    var collided = key;
+                    for (int n = 2; ; n++)
+                    {
+                        key = collided + "#" + n.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        if (gateKeys.Add(key)) break;
+                    }
+                }
+                gates.Add(new Gate
+                {
+                    Door = door,
+                    Controllers = FindControllers(door),
+                    Key = key,
+                    Pos = pos,
+                    Rooms = rooms,
+                    Dist = Vector3.Distance(playerPos, pos),
+                });
+
+                foreach (var node in rooms)
+                {
+                    roomNodes.Add(node);
+                    if (!roomEdges.TryGetValue(node, out var neighbours))
+                    {
+                        neighbours = new List<string>();
+                        roomEdges[node] = neighbours;
+                    }
+                    foreach (var other in rooms)
+                    {
+                        if (other != node && !neighbours.Contains(other)) neighbours.Add(other);
+                    }
+                }
+            }
+            if (duplicates > 0 && !duplicateKeysWarned)
+            {
+                duplicateKeysWarned = true;
+                Plugin.Log.LogWarning($"{duplicates} gate position key(s) collide in {SceneHelper.CurrentScene}, suffixed with #N");
+            }
+
+            gatesTruncated = gates.Count > MaxGates;
+            if (gatesTruncated)
+            {
+                // Keep the ones nearest the player: the agent needs the gates around it long before the
+                // ones near the exit, so dropping the highest hop counts would drop exactly the wrong end.
+                gates.Sort((a, b) => a.Dist.CompareTo(b.Dist));
+                gates.RemoveRange(MaxGates, gates.Count - MaxGates);
+            }
+
+            ComputeHops();
+            gates.Sort(CompareGates);
+            // Sorted hops-first, so only the first entry has to be checked.
+            gatesOrdered = gates.Count > 0 && gates[0].Hops.HasValue;
+        }
+
+        /// <summary>
+        /// BFS from the exit's own room over the room graph, writing each gate's "hops". A gate keeps a
+        /// hops value it was given earlier in this level load (see <see cref="hopsByKey"/>).
+        /// </summary>
+        private void ComputeHops()
+        {
+            roomHops.Clear();
+            var goal = GoalRoom();
+            if (goal != null)
+            {
+                roomHops[goal] = 0;
+                bfs.Clear();
+                bfs.Enqueue(goal);
+                while (bfs.Count > 0)
+                {
+                    var room = bfs.Dequeue();
+                    if (!roomEdges.TryGetValue(room, out var neighbours)) continue;
+                    int next = roomHops[room] + 1;
+                    foreach (var neighbour in neighbours)
+                    {
+                        if (roomHops.ContainsKey(neighbour)) continue;
+                        roomHops[neighbour] = next;
+                        bfs.Enqueue(neighbour);
+                    }
+                }
+            }
+
+            foreach (var gate in gates)
+            {
+                int hops = int.MaxValue;
+                if (gate.Rooms != null)
+                {
+                    foreach (var room in gate.Rooms)
+                    {
+                        if (roomHops.TryGetValue(room, out var h) && h < hops) hops = h;
+                    }
+                }
+                if (hopsByKey.TryGetValue(gate.Key, out var known)) hops = known;
+                else if (hops != int.MaxValue) hopsByKey[gate.Key] = hops;
+                gate.Hops = hops == int.MaxValue ? (int?)null : hops;
+            }
+        }
+
+        /// <summary>
+        /// The room the exit sits in: the first room node on the chosen FinalPit's own transform chain,
+        /// starting at the pit. Never "every room under a common root" -- a level whose rooms share one
+        /// container would then report every gate at hops 0, which looks valid and means nothing.
+        /// </summary>
+        private string GoalRoom()
+        {
+            var exit = ChooseExit();
+            if (exit == null) return null;
+            for (var t = exit.transform; t != null; t = t.parent)
+            {
+                var key = CampaignPatches.Key(t.position);
+                if (roomNodes.Contains(key)) return key;
+            }
+            return null;
+        }
+
+        /// <summary>Lowest hops first, nulls last, then by key, so Python sees a stable order.</summary>
+        private static int CompareGates(Gate a, Gate b)
+        {
+            if (a.Hops.HasValue != b.Hops.HasValue) return a.Hops.HasValue ? -1 : 1;
+            if (a.Hops.HasValue)
+            {
+                int cmp = a.Hops.Value.CompareTo(b.Hops.Value);
+                if (cmp != 0) return cmp;
+            }
+            return string.CompareOrdinal(a.Key, b.Key);
+        }
+
+        /// <summary>
+        /// A door's CLOSED world position. Door.Update moves a Normal door's own transform to
+        /// closedPos + openPos while it opens (measured (0, 5.75, 0) on every gate door of 0-1..0-5), so
+        /// reading transform.position during a rescan while the player stands in the proximity trigger
+        /// would capture the open position and change the door's key mid-level. A door whose Awake has not
+        /// run yet is still sitting at its closed position, which is what the fallback reads.
+        /// </summary>
+        private static Vector3 ClosedPosition(Door door)
+        {
+            if (!door.gotPos) return door.transform.position;
+            var parent = door.transform.parent;
+            return parent != null ? parent.TransformPoint(door.closedPos) : door.closedPos;
+        }
+
+        /// <summary>
+        /// The door's DoorControllers, found the way Door.Awake finds them but including inactive ones:
+        /// Awake's own search skips inactive objects, so <c>Door.docons</c> is empty for exactly the doors
+        /// whose controller an ActivateArena has not switched on yet -- which is the case
+        /// "controller_active" exists to report.
+        /// </summary>
+        private static DoorController[] FindControllers(Door door)
+        {
+            if (door.doorType != DoorType.Normal) return door.GetComponentsInChildren<DoorController>(true);
+            var parent = door.transform.parent;
+            return parent != null ? parent.GetComponentsInChildren<DoorController>(true) : new DoorController[0];
+        }
+
+        /// <summary>
+        /// The gates array with this step's live flags. "open" is transient (a DoorController closes the
+        /// door as soon as the player and every enemy leave, and opening one door force-closes the others),
+        /// so it means "currently open or opening", never "has been passed". A destroyed door stays in the
+        /// array with every flag false rather than disappearing from it.
+        /// </summary>
+        private JArray BuildGates()
+        {
+            var arr = new JArray();
+            foreach (var gate in gates)
+            {
+                var door = gate.Door;
+                bool alive = door != null;
+                arr.Add(new JObject
+                {
+                    ["key"] = gate.Key,
+                    ["pos"] = ObservationBuilder.Vec(gate.Pos),
+                    ["hops"] = gate.Hops.HasValue ? new JValue(gate.Hops.Value) : JValue.CreateNull(),
+                    ["open"] = alive && door.open,
+                    ["locked"] = alive && door.locked,
+                    ["active"] = alive && door.gameObject.activeInHierarchy,
+                    ["controller_active"] = alive && ControllerActive(gate.Controllers),
+                });
+            }
+            return arr;
+        }
+
+        private static bool ControllerActive(DoorController[] controllers)
+        {
+            if (controllers == null) return false;
+            foreach (var controller in controllers)
+            {
+                if (controller != null && controller.gameObject.activeInHierarchy) return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -212,17 +513,49 @@ namespace UltrakillAIBridge.Obs
             return false;
         }
 
-        /// <summary>The real exit; an active pit is preferred over one in a room that hasn't loaded yet.</summary>
+        /// <summary>
+        /// The real exit, chosen once per level load. Decoys and secret-level pits are already out of
+        /// <see cref="pits"/> (see Scan), so this only has to prefer the pit that leads to the next
+        /// mission, then an active pit over one whose room hasn't loaded yet. The choice is frozen because
+        /// "active" changes as the level plays and every gate's hop count depends on which pit was picked.
+        /// </summary>
         private FinalPit ChooseExit()
         {
-            FinalPit inactive = null;
+            if (chosenExit != null) return chosenExit;
+
+            var current = MissionNumber(SceneHelper.CurrentScene);
+            FinalPit best = null;
+            int bestRank = int.MaxValue;
             foreach (var pit in pits)
             {
                 if (pit == null) continue;
-                if (pit.gameObject.activeInHierarchy) return pit;
-                if (inactive == null) inactive = pit;
+                bool successor = current.HasValue && IsSuccessor(current.Value, MissionNumber(pit.targetLevelName));
+                int rank = (successor ? 0 : 2) + (pit.gameObject.activeInHierarchy ? 0 : 1);
+                if (rank >= bestRank) continue; // ties keep FindObjectsOfType order
+                best = pit;
+                bestRank = rank;
             }
-            return inactive;
+            chosenExit = best;
+            return chosenExit;
+        }
+
+        /// <summary>"Level 3-2" to (3, 2); null for anything that doesn't parse (a secret, the menu, ...).</summary>
+        private static (int act, int mission)? MissionNumber(string scene)
+        {
+            if (string.IsNullOrEmpty(scene) || !scene.StartsWith("Level ", StringComparison.Ordinal)) return null;
+            var parts = scene.Substring(6).Split('-');
+            if (parts.Length != 2) return null;
+            if (!int.TryParse(parts[0].Trim(), out var act) || !int.TryParse(parts[1].Trim(), out var mission)) return null;
+            return (act, mission);
+        }
+
+        /// <summary>The next mission in campaign order: 0-1 to 0-2, 0-5 to 1-1. No level table needed.</summary>
+        private static bool IsSuccessor((int act, int mission) current, (int act, int mission)? target)
+        {
+            if (!target.HasValue) return false;
+            var t = target.Value;
+            return (t.act == current.act && t.mission == current.mission + 1)
+                   || (t.act == current.act + 1 && t.mission == 1);
         }
 
         /// <summary>

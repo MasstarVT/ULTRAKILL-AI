@@ -16,6 +16,8 @@ exit code is 1 when any check failed. The bridge is single-client, so never run 
   3 checkpoint     teleporting onto the nearest pending checkpoint activates it within 30 decisions
   4 death respawn  a real (not healed) death respawns at that checkpoint inside the same episode
   5 exit           teleporting into the exit ends the episode with level_complete, and the official time stops
+  6 gates          campaign.gates is present, ordered, sorted by hops, uniquely keyed, and unchanged after a
+                   respawn -- hops must be stable for a level load, or the route silently renumbers mid-run
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.spaces import noop_action  # noqa: E402
 
+CAMPAIGN_NOOP = noop_action(campaign=True)  # the campaign action space has the look mode as a 12th dimension
+
 CONFIG = Path(__file__).resolve().parents[1] / "configs" / "campaign_0-1.yaml"
 VIOLENT = 3
 CHECKPOINT_TRIES = 3  # pending checkpoints to try, nearest first: one may sit in a room that is still switched off
@@ -40,7 +44,7 @@ CHECKPOINT_STEPS = 30  # decisions to wait on each (2 game seconds at 15 decisio
 EXIT_STEPS = 60  # decisions to wait for the exit trigger (4 game seconds, room to drop into the pit)
 TIMER_STEPS = 15  # decisions after the finish during which the official time must not move (1 game second)
 RESPAWN_RADIUS = 10.0  # metres from the checkpoint a respawn must land within
-NAMES = ("level load", "arsenal", "checkpoint", "death respawn", "exit")
+NAMES = ("level load", "arsenal", "checkpoint", "death respawn", "exit", "gates")
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 
 Result = tuple[int, str, str, str]  # (number, name, status, detail)
@@ -96,7 +100,7 @@ def run_noops(env: UltrakillEnv, steps: int, until: Callable[[dict[str, Any]], b
     """Steps no-op decisions until `until(raw)` holds or the episode ends: (condition met, last info, episode ended)."""
     info: dict[str, Any] = {}
     for _ in range(steps):
-        _, _, terminated, truncated, info = env.step(noop_action())
+        _, _, terminated, truncated, info = env.step(CAMPAIGN_NOOP)
         if until(env._raw):  # the raw snapshot the env just received from the mod
             return True, info, terminated or truncated
         if terminated or truncated:
@@ -168,7 +172,7 @@ def check_death(env: UltrakillEnv, checkpoint: dict[str, Any] | None) -> tuple[s
     killed = env.client.kill()
     # A real death only: soft death heals the lethal hit, and the env would still count and respawn that one.
     killed_dead = (killed.get("player") or {}).get("dead")
-    _, _, terminated, truncated, info = env.step(noop_action())
+    _, _, terminated, truncated, info = env.step(CAMPAIGN_NOOP)
     ended = terminated or truncated
     player = env._raw.get("player")
     alive = player is not None and not player["dead"]
@@ -203,6 +207,50 @@ def check_exit(env: UltrakillEnv) -> tuple[str, str]:
     return (PASS if ok else FAIL), detail
 
 
+def gate_summary(gates: list[dict]) -> str:
+    hops = [g.get("hops") for g in gates]
+    ordered_hops = sorted({h for h in hops if h is not None})
+    return (f"{len(gates)} gates, hops {min(ordered_hops) if ordered_hops else '-'}..{max(ordered_hops) if ordered_hops else '-'} "
+            f"({len(ordered_hops)} distinct), {sum(1 for h in hops if h is None)} unordered, "
+            f"{sum(1 for g in gates if not g.get('controller_active', True))} with an inactive controller")
+
+
+def check_gates(before: dict[str, Any], after: dict[str, Any] | None) -> tuple[str, str]:
+    """(status, detail) for the gates block on a fresh load, and again after a respawn if there was one."""
+    if "gates" not in before:
+        return SKIP, "campaign.gates is missing (mod older than v0.6.0)"
+    gates = before.get("gates") or []
+    detail = gate_summary(gates)
+    problems = []
+    if not before.get("gates_ordered"):
+        problems.append("gates_ordered is false: no room node is an ancestor of the exit pit")
+    if before.get("gates_truncated"):
+        problems.append("gates_truncated is true: the level has more gate candidates than the cap")
+    keys = [str(g.get("key")) for g in gates]
+    if len(set(keys)) != len(keys):
+        problems.append("duplicate keys: Python uses the key alone to detect a target change")
+    if not gates:
+        problems.append("the gates array is empty")
+    elif not any(g.get("hops") == 0 for g in gates):
+        problems.append("no gate reports hops 0, so nothing leads into the exit's room")
+    # Sorted by hops ascending with null last, then by key: the contract the mod sends them under.
+    sort_key = [(g.get("hops") is None, g.get("hops") if g.get("hops") is not None else 0, str(g.get("key"))) for g in gates]
+    if sort_key != sorted(sort_key):
+        problems.append("the array is not sorted by hops ascending with null last, then by key")
+    if after is not None:
+        was = {str(g.get("key")): g.get("hops") for g in gates}
+        now = {str(g.get("key")): g.get("hops") for g in (after.get("gates") or [])}
+        detail += f"; after a respawn: {gate_summary(after.get('gates') or [])}"
+        if was != now:
+            changed = sorted(k for k in set(was) | set(now) if was.get(k) != now.get(k))[:5]
+            problems.append(f"hops changed across a respawn for {changed}: the route renumbered mid-load")
+    else:
+        detail += "; no respawn happened, so stability across one was not checked"
+    if problems:
+        return FAIL, detail + "".join(f"\n      {p}" for p in problems)
+    return PASS, detail
+
+
 def run_checks(env: UltrakillEnv) -> list[Result]:
     results: list[Result] = []
 
@@ -211,18 +259,23 @@ def run_checks(env: UltrakillEnv) -> list[Result]:
         print(f"[{status}] {number} {NAMES[number - 1]}: {detail}", flush=True)
 
     env.reset()
+    fresh_gates = dict(block(env._raw))
     record(1, *check_level_load(env._raw))
     record(2, *check_arsenal(env._raw, env.cfg.level))
     status, detail, checkpoint, ended = check_checkpoint(env)
     record(3, status, detail)
+    respawned = None
     if ended:
         record(4, SKIP, "the episode ended during check 3")
     else:
         status, detail, ended = check_death(env, checkpoint)
         record(4, status, detail)
+        if checkpoint is not None:
+            respawned = dict(block(env._raw))  # the obs after the death respawn
     if ended:
         env.reset()  # the exit check needs a running episode; this is another fresh level load
     record(5, *check_exit(env))
+    record(6, *check_gates(fresh_gates, respawned))
     return results
 
 

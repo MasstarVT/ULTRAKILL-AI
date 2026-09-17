@@ -385,8 +385,8 @@ class GateProgress:
     best_hops  = None    # lowest hops reached
     paid_hops  = None    # lowest hops already paid or absorbed
     reached    = set()   # gate keys ever reached this level load
-    best_dist  = {}      # gate key (or "exit") -> closest 3-D approach ever made to it
-    # ---- per EPISODE -------------------------------------------------------
+    # ---- per EPISODE (best_dist: lead ruling R1, see the scope bullet below) ----
+    best_dist  = {}      # gate key (or "exit") -> closest 3-D approach made this episode
     target     = None    # a gate dict, the exit sentinel, or None
 
     # ---- lifecycle ---------------------------------------------------------
@@ -398,10 +398,11 @@ class GateProgress:
     def mark_paid(camp, player_pos):           # checkpoint respawn, and any reset
         h = _note_reached(camp, player_pos)    # updates `reached` and `best_hops`
         paid_hops = best_hops                  # absorbed, never paid
-        # best_dist is deliberately NOT cleared: re-walking after a death must not pay again
+        # best_dist is deliberately NOT cleared: re-walking after a death INSIDE an episode must not pay again
 
     def reset_episode():                       # env.reset() only
-        target = None                          # best_dist survives: it is level-load scoped
+        target = None
+        best_dist.clear()                      # R1: episode scoped, so a new episode re-earns its approach
 
     def retarget(camp, player_pos):            # pays NOTHING; call before packing any observation
         _note_reached(camp, player_pos)
@@ -482,11 +483,16 @@ Behaviour this pins down:
   sits 33 m from each, well outside any reach radius) and on every tier of 0-2, 0-3, 0-4 and 1-1.
 - **`gate_approach` is bounded by the route.** Total over a level load ≤ Σ over distinct targets of the distance at
   which each was first targeted ≈ the gate-to-gate polyline, measured at **723-736 m** on 0-1.
-- **`best_dist` is level-load scoped, not per-episode.** It is cleared only by `new_level_load`, exactly like
-  `paid_hops` and exactly like `MilestoneTracker`'s checkpoint/arena/door sets. A death, a respawn, and the next
-  respawn episode all re-walk the same ground for nothing; only ground no episode of this level load has covered
-  pays. That is the frontier design of the foundation spec, and it closes the one remaining loop (an agent that
-  could end its own episode cheaply would otherwise re-earn the whole route). See R12 for the rollback.
+- **`best_dist` is EPISODE scoped (lead ruling R1, overriding this spec's original level-load scope).** It is
+  cleared by `reset_episode` — R12's rollback, taken as the default. A death *inside* an episode still does not
+  clear it (`mark_paid` leaves it alone), so re-walking after a respawn pays nothing within the episode. The
+  `gate` ladder (`best_hops`/`paid_hops`/`reached`) stays level-load scoped exactly as written above, like
+  `MilestoneTracker`'s checkpoint/arena/door sets.
+  *Rationale for the ruling:* PPO returns are computed within an episode and a truncation bootstraps
+  `gamma * V(s_T)` on the same state, so ending an episode early can never be profitable; and most episodes are
+  checkpoint respawns, which under level-load scope would get no dense signal at all on ground an earlier
+  episode already covered. It is still not farmable — with the per-gate dict an episode's total is bounded by
+  the gate-to-gate polyline (723-736 m on 0-1) either way.
 - **Skipped hop values** (a lucky shortcut from 9 to 6) pay `paid_hops - best_hops` = 3, one per hop crossed.
 - **`hops` shifting without the player moving pays nothing.** `best_hops` only ever falls inside `_note_reached`,
   i.e. because a gate was newly *reached*; a `Scan()` that renumbers the graph cannot itself trigger a payment.
@@ -522,7 +528,7 @@ gate_approach: float = 0.0  # per metre of new best 3-D closeness to the current
 | `novelty` | 0.5 | **0.2** | demoted to a secondary explorer now that a real forward signal exists |
 | `path` | 0.1 | **0.0** | it has never paid, and its observation slots are now the target's. The term stays in `RewardConfig` and in `compute_reward` |
 | `pitch_limit_deg` | absent (0 = off) | **45.0** | F3: the camera sits at −78° |
-| `run_name` | `campaign_ppo_ground` | **`campaign_ppo_gates`** | §10 |
+| `run_name` | `campaign_ppo_ground` | **`campaign_gates`** | §10 |
 | header run commands | reference `campaign_ppo` | the §10 block | the header is stale already |
 
 Everything else unchanged: `time` 0.02, `level_complete` 100, `checkpoint` 10, `arena_clear` 10, `kill` 0.5,
@@ -713,6 +719,16 @@ turns "forward" toward it, which is the point.
 **Diagnostics.** `look_free_frac`, `look_enemy_frac`, `look_gate_frac` per episode. `yaw_track` and `pitch_track`
 must only count steps where `look_mode == 0`, or they become ~1.0 by construction and stop measuring the look head.
 
+**All four count the mode that APPLIED, not the one the policy sampled** (clarified during implementation review;
+it follows from "behave exactly as mode 0" above, and is how it is implemented and tested —
+`test_look_mode_counters_record_the_mode_that_applied`). A fall-back step is a mode-0 step in every way that
+matters here: the sampled bins drove the camera, so grading it cannot score ~1.0 by construction, and it is a
+genuine look-head sample. The fall-backs are not rare — mode 2 falls back on *every* step of an unordered level or
+against a 0.5.x mod (§3.7), so the run's first window can have no gates at all, and mode 1 falls back on the ~30% of
+steps with nothing visible. Counting the request instead would report `look_free_frac` ≈ 0 for a window whose yaw
+and pitch heads were causally live on every step, which is exactly the number R6 mandates reading the per-dimension
+entropy against.
+
 **Known and accepted:** on a step where mode 1 or 2 is selected the yaw and pitch dimensions are causally inert, so
 `E[∇ log π(yaw) · A] = 0` there and only the entropy bonus acts on those two heads, pushing them toward uniform in
 proportion to the non-mode-0 share. Today's entropy is 10.6 of 12.49 nats, i.e. the head is near-uniform anyway, so
@@ -725,8 +741,8 @@ alongside the total** and put `look_free_frac` in the same dashboard panel, so t
 New `python/scripts/add_look_mode.py`, modelled on `scripts/transfer_weights.py` and its test.
 
 ```
-python scripts/add_look_mode.py models/campaign_ppo_ground/ckpt_<newest>_steps.zip \
-                                models/campaign_ppo_gates/init.zip
+python scripts/add_look_mode.py models/campaign_ppo_ground/latest.zip \
+                                models/campaign_gates/look_init.zip
 ```
 
 | tensor | contract |
@@ -815,8 +831,29 @@ What the decompiled code supports:
 
 A Harmony **postfix on the private `NewMovement.HandleSlideState`** (patch by name), running only while in control.
 
-*Guard:* act only when `!nm.gc.onGround && nm.slowMode`. A legitimate **grounded** crouch under a low ceiling keeps
-`slowMode` true and is untouched (and still reports `slow_mode: true` in the obs — A8).
+*Guard:* act only when `!nm.gc.onGround && nm.slowMode`, **held for `unwedge_frames` consecutive frames**
+(default **10**, clamped to at least 1; the counter resets on any frame the guard fails, including the frames the
+fix is off or the AI does not have control). A legitimate **grounded** crouch under a low ceiling keeps `slowMode`
+true and is untouched (and still reports `slow_mode: true` in the obs — A8).
+
+**Why the hold is on the preferred fix and not only on §8.3's fallback (added during implementation review).** The
+guard alone cannot tell the wedge from a legitimate ground slam on frame 1. `Update` runs `HandleInputs()` (:686)
+before the `heavyFall` block (:701) and `HandleSlideState()` (:740), and `TryStartSlam` (:1108) calls `StopSlide()`,
+which does **not** restore `playerCollider.height` (:2448-2474) — the stand-up inside `HandleSlideState` does, on a
+later frame. So a slam started out of a slide arrives at :921 with `height == 1.25f`, and under a vent roof, a
+doorway lintel or any overhang the stand-up raycast (3.5 m) or spherecast (0.5 r, 2 m) hits and the game sets
+`crouching = true; slowMode = true;` on the very frame `gc.heavyFall` and `rb.velocity = (0,-100,0)` were set.
+Steps 1-2 on that frame silently cancel the slam: no `LandingImpact`, no ground-slam enemy damage, and no
+`Breakable.Break(2f)` from `Update` (:708-716) — one of the few ways through the two weak planks that seal 0-1's
+`unlock_all_gear` starting room (§13). `heavyFall` cannot come back without a fresh Slide press with
+`slamCooldown == 0`. A8 cannot catch it: its slide/slam/crouch steps all run **grounded** (`a8_steps.jsonl` records
+`grounded: true` on every `D_slam` step), where the `!onGround` guard stops the patch running at all.
+G1 only asks for recovery within 1.0 s of game time, so frame 1 buys nothing. 10 frames is 0.33 s at `fixed_fps` 30
+and 0.17 s at 60 — inside G1 either way, and two orders of magnitude below the shortest measured wedge (672
+decisions). The separation is clean because a slam that can make progress lands (`onGround`) or falls out of the
+3.5 m ceiling ray within a frame or two, resetting the counter, while the wedge holds `slowMode` continuously:
+`NewMovement.slowMode` is written at exactly three places (:927 true, :931 and :2203 false), so nothing clears it
+while the stand-up test keeps failing. `Recoveries` is now counted once per armed run rather than once per frame.
 
 *Then, in this exact order (the order is normative, not incidental):*
 
@@ -859,9 +896,10 @@ postfix recurses through the patch. It is also unnecessary: the branch is re-ent
 
 ### 8.3 Fallback watchdog
 
-If §8.2 cannot be made to hold, add a per-frame watchdog while in control, config key `unwedge_frames`
-(default **30**; 0 = off):
+Not needed: §8.2 holds, and its hold counter is what §8.3 proposed. `unwedge_frames` is therefore the config key of
+the §8.2 hold (default **10**, minimum 1), not of a separate watchdog, and `unwedge` stays the only off switch.
 
+If a broader signature is ever needed, the watchdog form is:
 *Signature:* `!gc.onGround && !nm.sliding && (nm.slowMode || nm.gc.heavyFall) && horizontal speed < 1.0 m/s`, held
 for `unwedge_frames` consecutive frames (30 frames = 1.0 s of game time at `fixed_fps` 30, 0.5 s at 60).
 *Action:* steps 1-5 of §8.2, in that order. *Reset:* the counter clears on any frame the signature is false.
@@ -1106,20 +1144,20 @@ A write failure prints a warning and never stops training, like `write_json_atom
    fresh branch. Today `campaign_ppo_train.log` is 0 bytes because only the fresh branch passes it.
 4. No other change. **No PPO hyperparameter changes.**
 
-New run: **`campaign_ppo_gates`** (a new name is required: `part_novelty`, `cells_new`, `part_door_unlock` and the
+New run: **`campaign_gates`** (a new name is required: `part_novelty`, `cells_new`, `part_door_unlock` and the
 action space all change meaning). Before starting it, copy `models/campaign_ppo_ground/explore_*.npz` into
-`models/campaign_ppo_gates/` — `explore_dir` follows `run_name`, and those counts carry the `1/sqrt(N)` decay that
-makes the agent push outward — and move `runs/campaign_ppo_gates/metrics_log.csv` aside if one exists.
+`models/campaign_gates/` — `explore_dir` follows `run_name`, and those counts carry the `1/sqrt(N)` decay that
+makes the agent push outward — and move `runs/campaign_gates/metrics_log.csv` aside if one exists.
 
 Run order:
 
 ```
-python scripts/add_look_mode.py models/campaign_ppo_ground/ckpt_<newest>_steps.zip models/campaign_ppo_gates/init.zip
+python scripts/add_look_mode.py models/campaign_ppo_ground/latest.zip models/campaign_gates/look_init.zip
 python scripts/games.py launch --count 5
-python scripts/train.py --config configs/campaign_0-1.yaml --resume models/campaign_ppo_gates/init.zip
-python scripts/poll_status.py --run campaign_ppo_gates
-python scripts/keep_best.py --run campaign_ppo_gates --metric campaign
-python scripts/dashboard.py --run campaign_ppo_gates
+python scripts/train.py --config configs/campaign_0-1.yaml --resume models/campaign_gates/look_init.zip
+python scripts/poll_status.py --run campaign_gates
+python scripts/keep_best.py --run campaign_gates --metric campaign
+python scripts/dashboard.py --run campaign_gates
 ```
 
 ---
@@ -1137,7 +1175,7 @@ python scripts/dashboard.py --run campaign_ppo_gates
 | `test_gate_approach_pays_only_new_best` | forward-back-forward pays the forward distance once; total ≤ the initial distance |
 | `test_gate_approach_does_not_pay_for_flapping_between_two_gates_at_the_same_hops` | two gates at hops 2 that are 60 m apart, 5 A→B→A cycles that never come within reach: total approach ≤ the larger of the two first-seen distances; the second crossing pays 0 |
 | `test_gate_approach_survives_a_respawn` | `mark_paid` then re-walking the same 60 m pays 0 |
-| `test_gate_approach_survives_a_new_episode` | `reset_episode` then re-walking the same 60 m pays 0 (level-load scope) |
+| `test_gate_approach_is_re_earned_in_a_new_episode` | `reset_episode` then re-walking the same 60 m pays the same again, and the `gate` ladder is still absorbed (ruling R1) |
 | `test_target_changes_do_not_pay_approach` | the step a target changes pays 0 approach |
 | `test_target_before_any_gate_is_the_nearest` | fresh spawn ⇒ the `hops` 9 gate |
 | `test_target_after_hops_zero_is_the_exit` | `best_hops == 0` ⇒ the exit sentinel; and `None` when `campaign.exit` is null |
@@ -1193,6 +1231,7 @@ yaw/pitch neutrals at the right indices and look mode 0; `decode_action` on an 1
 | `test_look_mode_enemy_turns_toward_the_enemy` | mode 1 with an enemy 90° right ⇒ `look[0] == +90`; overhead ⇒ positive pitch; no visible enemy ⇒ identical to mode 0 |
 | `test_look_mode_gate_turns_toward_the_target` | mode 2 yaw sign matches the target's yaw-frame x; pitch clamped to the band; `pitch_limit_deg == 0` uses the 85° fallback, not 0; no target ⇒ mode 0 |
 | `test_look_mode_is_popped_from_the_command` | the dict handed to the client has no `look_mode` key |
+| `test_look_mode_counters_record_the_mode_that_applied` | a mode that finds nothing to aim at counts as `look_free` and is graded by `yaw_track`; a mode that really aims counts as its own and is not graded (§7.2) |
 | `test_ground_ray_center_is_preferred` | a centre hit different from the ring minimum decides the ground point; a centre miss with ring hits ⇒ `None` and `oob_frac` counts it |
 | `test_archive_saved_on_a_step_schedule` | `archive_save_steps` small ⇒ the `.npz` exists mid-episode |
 | `test_episode_info_has_the_new_keys` | every key in §9.7 present at every episode end |
@@ -1211,7 +1250,7 @@ floats and `start_checkpoint` the checkpoint id string on a respawn episode; a w
 
 **`tests/test_campaign_config.py`**: `configs/campaign_0-1.yaml` still builds a 479-input env with a 12-dimension
 action space; `gate`, `gate_approach`, `pitch_limit_deg`, `door_unlock` are real fields with the §6.1 values;
-`path` is 0; `run_name` is `campaign_ppo_gates`.
+`path` is 0; `run_name` is `campaign_gates`.
 
 Run all: from `python/`, `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }`.
 
@@ -1272,7 +1311,7 @@ No file appears in both buckets.
 | `Obs/CampaignObserver.cs` | room graph from `Door.activatedRooms` keyed by rounded room position, BFS from the nearest room-node ancestor of the chosen `FinalPit`, per-gate `hops` (§3.1) built and cached in `Scan()` with the closed-door `key`/`pos`; `BuildGates()` assigning `open`/`locked`/`active`/`controller_active` into the cached `JObject`s every step; `gates_ordered`, `gates_truncated`; `ChooseExit` secret-pit + mission-successor fix, frozen per level load (§3.2) |
 | `Obs/ObservationBuilder.cs` | `ground_ray_center` (§3.3); `slow_mode`, `heavy_fall`, `crouching` in `BuildPlayer` (§3.4, `crouching` via `AccessTools`) |
 | `Env/TrainingSpeed.cs` | the un-wedge postfix/watchdog (§8) — it is the existing home of "optional training behaviour active only while in control" |
-| `Env/EpisodeController.cs` | `unwedge_frames` config key wired into §8.3 (only if the fallback is used) |
+| `Env/EpisodeController.cs` | `unwedge` and `unwedge_frames` config keys (§8.2's hold; the §8.3 watchdog was not needed) |
 | `docs/protocol.md` | document `gates`, `gates_ordered`, `gates_truncated`, `ground_ray_center`, the three player flags, the `ChooseExit` rule and `unwedge_frames`; fix the stale "The player end snaps within 6 m" at line 120 (it is `PlayerSnapDistance = 25f`) |
 | `docs/game-internals.md` | `Door.activatedRooms` as the room graph; **a Normal `Door` moves its OWN transform by `openPos`, measured (0, 5.75, 0) on every gate door of 0-1..0-5, while the `NavMeshObstacle` sits on the `Door Object` child and the `DoorController`s are siblings under `Door (Large) With Controllers (N)`**; `CheckPoint.Start` clones each room, deactivates the original and moves it +10,000 X, and `ResetRoom()` re-instantiates the clone on every respawn; `NewMovement.gc` is a `GroundCheckGroup` with **no** `ForceGroundCheck` — that method is on `GroundCheck`, reached through the private `instances` list; the `slowMode` wedge and the fields it depends on |
 
@@ -1291,7 +1330,7 @@ No file appears in both buckets.
 | `scripts/poll_status.py` | new columns (§9.8) |
 | `scripts/dashboard.py` | gates and wedged rows, fresh-start split, chart series (§9.8) |
 | `scripts/campaign_check.py` | new check 6: the gates block is present, ordered, hop-monotone and unchanged after a respawn |
-| `configs/campaign_0-1.yaml` | §6.1 weights, `pitch_limit_deg` 45, `door_unlock` 15, `run_name: campaign_ppo_gates`, header run commands |
+| `configs/campaign_0-1.yaml` | §6.1 weights, `pitch_limit_deg` 45, `door_unlock` 15, `run_name: campaign_gates`, header run commands |
 | `tests/test_campaign.py`, `test_campaign_rewards.py`, `test_spaces.py`, `test_campaign_env.py`, `test_progress.py`, `test_campaign_config.py`, `test_look_mode_transfer.py`, `test_transfer.py`, `test_campaign_check.py` | §11.1 |
 
 ### INTEGRATION (after both land)
@@ -1316,7 +1355,7 @@ merges second, so neither engineer conflicts on it.
 | R9 | Cutting `novelty` 0.5 → 0.2 removes forward pressure before the gate terms prove themselves | The route group is ~8× novelty for a route-walker (§6.2), and run gate 2 fails fast if not. Reverting `novelty` to 0.5 is a one-line rollback. **But in the wanderer regime novelty is still 87% of gross positive income** — the design makes that regime unprofitable rather than un-dominated, and the §11.3 tripwire watches it |
 | R10 | The mod and Python land at different times | §3.7 degradation is a hard requirement on both sides, with an offline test for each fallback (§11.1) |
 | R11 | Key strings recomputed on the Python side would not match | §3.5: keys are opaque, including the `#N` suffix |
-| R12 | Level-load-scoped `best_dist` leaves respawn episodes with no approach income | Intended (the frontier design), and novelty still pays per episode. If PPO's credit assignment visibly suffers, the rollback is one line: also clear `best_dist` in `reset_episode()`. That is still not farmable — the per-gate dict bounds an episode's total by the route length either way — but it lets an agent that can cheaply end its own episode re-earn, which is why it is not the default |
+| R12 | Level-load-scoped `best_dist` leaves respawn episodes with no approach income | **Taken, by lead ruling R1: `best_dist` is cleared in `reset_episode()`, i.e. episode scoped.** The per-gate dict bounds an episode's total by the route length either way, and a truncation bootstraps the same state, so ending an episode early cannot pay. The residual risk is the mirror image — a respawn episode re-earning ground an earlier one covered — which is bounded by the same polyline and is the price of giving the majority of episodes (checkpoint respawns) a dense signal at all. Rollback is one line: drop the `best_dist.clear()` from `reset_episode` |
 | R13 | `_ground_point`'s centre ray re-keys 23.2% of the carried archive cells | Accepted and stated (§9.6). Novelty income rises slightly; `oob_frac` gets a fresh baseline from the new run's first 100 episodes |
 
 ### Deliberately not included (flagged for the lead, not decided here)
@@ -1336,6 +1375,26 @@ merges second, so neither engineer conflicts on it.
 ---
 
 ## 14. Review dispositions
+
+### Lead rulings during implementation (these override the text above where they conflict)
+
+- **R1. `GateProgress.best_dist` is EPISODE scoped, not level-load scoped.** It is cleared in `reset_episode`
+  (R12's rollback, taken as the default) and is *not* cleared by an in-episode death respawn. The `gate`
+  milestone ladder stays level-load scoped exactly as §5 describes. Rationale: PPO returns are computed within
+  an episode and a truncation bootstraps the same state, so ending an episode cannot be profitable; and most
+  episodes are checkpoint respawns, which need the dense signal on ground earlier episodes already covered.
+  §5, §11.1 and R12 were updated to match; implemented and tested
+  (`test_gate_approach_is_re_earned_in_a_new_episode`, `test_gate_approach_survives_a_respawn`).
+- **R2.** `ObsLayout` stays 479 with the §4 slot reuse and the mandatory zero + mean-fold surgery (the 487-input
+  variant flagged at the end of this section stays flagged, not taken).
+- **R3.** The items under "Deliberately not included" stay out of scope: no `punch` change before
+  `level_started`, no more than 5 games, no title-wait skip.
+- **R4 (integration).** The new run is named **`campaign_gates`**, not `campaign_ppo_gates`, and its starting
+  weights are **`models/campaign_gates/look_init.zip`**, not `init.zip`. `explore_dir` follows `run_name`, so
+  the name and the directory the archives are copied into have to agree or the run restarts exploration from
+  nothing. §6.1, §10, §11.1 and `configs/campaign_0-1.yaml` were updated to match.
+
+### From the three review lenses
 
 Three lenses reviewed the previous draft. Everything below was re-verified against the code or the diagnosis data
 while revising; the measurement scripts are in the scratchpad alongside the diagnosis artifacts.
@@ -1409,11 +1468,13 @@ while revising; the measurement scripts are in the scratchpad alongside the diag
   the lead prefers zero displacement, the 487-input variant is a drop-in replacement for §4 and §7.3** — it changes
   `ObsLayout.campaign_block` to 44, `SHARED_INPUTS` stays 443, and `add_look_mode.py` zeroes the new columns exactly
   as `transfer_weights.py` already does. Flagged, not taken.
-- **`best_dist` scope.** The two reviews disagreed: one wanted level-load scope, the other per-episode. §5 takes
-  **level-load**, matching `paid_hops` and `MilestoneTracker` exactly. Per-episode is also not farmable once the
-  dict is per-gate (an episode's total is bounded by the route length either way), but it lets an agent that can
-  cheaply end its own episode re-earn, and this project has twice paid millions of steps for an income stream
-  nobody bounded. R12 records the one-line rollback and its trade-off.
+- **`best_dist` scope.** The two reviews disagreed: one wanted level-load scope, the other per-episode. This
+  draft took **level-load**, matching `paid_hops` and `MilestoneTracker` exactly; **the lead then ruled for
+  per-episode (R1 above), which is what is implemented.** Per-episode is not farmable once the dict is per-gate
+  (an episode's total is bounded by the route length either way); the reason the draft hesitated was that it
+  lets an agent which can cheaply end its own episode re-earn, and this project has twice paid millions of steps
+  for an income stream nobody bounded. The ruling's counter-argument is that a truncation bootstraps
+  `gamma * V(s_T)` on the same state, so there is no cheap way to end an episode in the first place.
 
 ### Rejected, with reasons
 

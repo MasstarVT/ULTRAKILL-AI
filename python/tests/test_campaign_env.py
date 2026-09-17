@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ultrakill_ai.env import CAMPAIGN_INFO_KEYS, EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.protocol import BridgeClient  # noqa: E402
 from ultrakill_ai.rewards import RewardConfig  # noqa: E402
-from ultrakill_ai.spaces import noop_action  # noqa: E402
+from ultrakill_ai.spaces import BUTTONS, PITCH_BINS, YAW_BINS, noop_action  # noqa: E402
 
 LEVEL = "Level 0-1"
 EXIT_Z = 60.0
@@ -23,19 +23,34 @@ RESPAWN_DOOR_KEY = "0,0,25"
 RANKS = {"time": [120, 90, 60, 30], "kills": [0, 1, 2, 3], "style": [0, 100, 200, 300]}
 ENEMY_ID = 7
 ENEMY_MAX_HP = 50.0
+# Three doors along the corridor, the door graph the mod reports as campaign.gates: hops counts the rooms left
+# after passing one, so 0 is the door into the exit's room.
+GATES = (("0,1,15", (0.0, 1.0, 15.0), 2), ("0,1,35", (0.0, 1.0, 35.0), 1), ("0,1,55", (0.0, 1.0, 55.0), 0))
+TIER_GATES = (("0,1,15", (0.0, 1.0, 15.0), 2), ("60,1,15", (60.0, 1.0, 15.0), 2), ("0,1,55", (0.0, 1.0, 55.0), 1))
+GATE_BLOCK = 443 + 5  # absolute index of the campaign block's target slots (448-455)
+WEDGE_HOLD = 45  # wedge_seconds 3.0 at 30 fps / frameskip 2 = 15 decisions/s
 
 
 class FakeLevel:
     """Stands in for BridgeClient: a straight corridor along +z.
 
     Walking forward covers 2 m a step. The checkpoint at z 20 activates (and becomes current) on arrival, the
-    arena at z 30 clears on arrival, and the exit is at z 60. A checkpoint respawn puts the player back at z 20
-    and unlocks a door, the way `StatsManager.Restart` unlocks `doorsToUnlock`: that unlock must never pay.
+    arena at z 30 clears on arrival, gates sit at z 15, 35 and 55, and the exit is at z 60. A checkpoint respawn
+    puts the player back at z 20 and unlocks a door, the way `StatsManager.Restart` unlocks `doorsToUnlock`: that
+    unlock must never pay.
 
     The room holds one enemy, alive from the moment the level is entered or re-entered (`reset`, fresh or
     checkpoint), so a respawn re-creates it exactly like the real game while `kills` (the game's own counter)
     keeps whatever value it already had -- the pairing `test_kill_reward_can_be_farmed_across_a_checkpoint_respawn`
     documents.
+
+    The switches stand in for states the real game gets into and for older mods:
+      `falling`        off the map, ground rays missing, still moving (a void fall)
+      `wedged`         the absorbing slowMode state: airborne, not sliding, not moving, z frozen
+      `mod_flags`      False drops slow_mode/heavy_fall/crouching, as a mod older than 0.6.0 does
+      `gates_present`  False drops the whole gates block, same reason
+      `gates_ordered`  False is a level whose door graph has no goal room (0-5)
+      `ground_center`  overrides the centre ground ray, which the ring minimum can disagree with
     """
 
     def __init__(self):
@@ -46,6 +61,15 @@ class FakeLevel:
         self.lock_steps = 0  # the next N steps report input_locked
         self.drop_campaign_steps = 0  # the next N obs omit "campaign", as the mod does when building it throws
         self.falling = False  # off the map: the ground rays miss and the player sinks, as in a real void fall
+        self.wedged = False
+        self.mod_flags = True
+        self.gates_present = True
+        self.gates_ordered = True
+        self.gates = GATES
+        self.ground_center: float | None = None
+        self.yaw = 0.0
+        self.enemy_rel = [0.0, 0.0, 5.0]
+        self.last_action: dict | None = None  # the command dict the env last sent
         self._load()
 
     def _load(self) -> None:
@@ -60,6 +84,7 @@ class FakeLevel:
         self.arenas: list[str] = []
         self.doors: list[str] = []
         self.enemy_alive = False  # reset() below turns this on: every level (re-)entry re-creates the room
+        self.enemy_health = ENEMY_MAX_HP
 
     # The BridgeClient methods UltrakillEnv uses ----------------------------
 
@@ -86,16 +111,18 @@ class FakeLevel:
         else:
             self._load()
         self.enemy_alive = True  # a fresh load or a checkpoint respawn both re-create the room's enemy
+        self.enemy_health = ENEMY_MAX_HP
         return self._obs("reset")
 
     def step(self, action: dict) -> dict:
         self.steps += 1
+        self.last_action = dict(action)
         if self.falling:
             self.y -= 20.0  # terminal velocity through the void, a brand-new 4 m cell every step
         self.locked = self.lock_steps > 0
         if self.locked:
             self.lock_steps -= 1
-        if not self.dead and self.z < EXIT_Z:
+        if not self.dead and self.z < EXIT_Z and not self.wedged:
             if self.kill_next:
                 self.dead, self.kill_next = True, False
             elif not self.locked and action.get("move", [0, 0])[1] > 0:
@@ -111,32 +138,52 @@ class FakeLevel:
             self.arenas.append(ARENA_KEY)
         return self._obs()
 
+    def _gates_block(self) -> dict:
+        """The gates the mod reports, or nothing at all when `gates_present` stands in for an older mod."""
+        if not self.gates_present:
+            return {}
+        gates = [{
+            "key": key, "pos": list(pos), "hops": hops if self.gates_ordered else None,
+            "open": abs(self.z - pos[2]) <= 8.0,  # the DoorController proximity trigger
+            "locked": False, "active": True, "controller_active": True,
+        } for key, pos, hops in self.gates]
+        return {"gates_ordered": self.gates_ordered, "gates_truncated": False, "gates": gates}
+
+    def _ground_rays(self) -> list[float]:
+        # The mod measures down from the player to the floor (y = 1 in this corridor) and writes
+        # ground_ray_length exactly when the ray hits nothing, which is what being off the map looks like.
+        if self.falling:
+            return [GROUND_RAY_LENGTH] * 8
+        return [min(GROUND_RAY_LENGTH, max(0.0, self.y - 1.0))] * 8
+
     def _obs(self, event: str | None = None) -> dict:
         over = self.z >= EXIT_Z
         enemies = []
         if self.enemy_alive:
             enemies = [{
-                "id": ENEMY_ID, "type": 0, "health": ENEMY_MAX_HP, "visible": True,
-                "rel": [0.0, 0.0, 5.0], "dist": 5.0, "pos": [0.0, 1.0, self.z + 5.0],
+                "id": ENEMY_ID, "type": 0, "health": self.enemy_health, "visible": True,
+                "rel": list(self.enemy_rel), "dist": 5.0, "pos": [0.0, 1.0, self.z + 5.0],
             }]
+        airborne = self.falling or self.wedged
+        player = {
+            "pos": [0.0, self.y, self.z], "vel": [0.0, -20.0 if self.falling else 0.0, 0.0], "local_vel": [0.0, 0.0, 0.0],
+            "forward": [0.0, 0.0, 1.0], "yaw": self.yaw, "pitch": 0.0, "hp": 0 if self.dead else 100,
+            "anti_hp": 0.0, "stamina": 300.0, "grounded": not airborne, "sliding": False, "dead": self.dead,
+            "activated": True, "level_over": over, "weapon_slot": 0, "weapon_variation": 0,
+            "soft_deaths": 0, "soft_death_instakill": False, "slot_counts": [1, 0, 0, 0, 0],
+        }
+        if self.mod_flags:  # mod 0.6.0 and later
+            player.update(slow_mode=self.wedged, heavy_fall=self.falling, crouching=False)
         obs = {
             "type": "obs",
             "step": self.steps,
             "scene": LEVEL,
             "ready": not self.dead,
-            "player": {
-                "pos": [0.0, self.y, self.z], "vel": [0.0, 0.0, 0.0], "local_vel": [0.0, 0.0, 0.0],
-                "forward": [0.0, 0.0, 1.0], "yaw": 0.0, "pitch": 0.0, "hp": 0 if self.dead else 100,
-                "anti_hp": 0.0, "stamina": 300.0, "grounded": True, "sliding": False, "dead": self.dead,
-                "activated": True, "level_over": over, "weapon_slot": 0, "weapon_variation": 0,
-                "soft_deaths": 0, "soft_death_instakill": False, "slot_counts": [1, 0, 0, 0, 0],
-            },
+            "player": player,
             "enemies": enemies,
             "rays": [50.0] * 16,
-            # The mod measures down from the player to the floor (y = 1 in this corridor) and writes
-            # ground_ray_length exactly when the ray hits nothing, which is what being off the map looks like.
-            "ground_rays": [GROUND_RAY_LENGTH] * 8 if self.falling
-                           else [min(GROUND_RAY_LENGTH, max(0.0, self.y - 1.0))] * 8,
+            "ground_rays": self._ground_rays(),
+            "ground_ray_center": self.ground_center if self.ground_center is not None else self._ground_rays()[0],
             "stats": {"kills": self.kills, "style": 0, "seconds": self.seconds, "restarts": self.restarts, "level_complete": over},
             "campaign": {
                 "mission": 1, "difficulty": 3, "seconds": self.seconds, "timer_running": not over,
@@ -149,6 +196,7 @@ class FakeLevel:
                 "cleared_arenas": list(self.arenas),
                 "unlocked_doors": list(self.doors),
                 "ranks": RANKS,
+                **self._gates_block(),
             },
         }
         if event:
@@ -160,17 +208,35 @@ class FakeLevel:
         return obs
 
 
-def make_env(**overrides) -> tuple[UltrakillEnv, FakeLevel]:
-    rewards = RewardConfig(time=0.01, checkpoint=10.0, arena_clear=10.0, door_unlock=3.0, novelty=0.5, path=0.1)
+def make_env(rewards: RewardConfig | None = None, **overrides) -> tuple[UltrakillEnv, FakeLevel]:
+    rewards = rewards or RewardConfig(time=0.01, checkpoint=10.0, arena_clear=10.0, door_unlock=3.0, novelty=0.5,
+                                      path=0.1, gate=15.0, gate_approach=0.15)
     cfg = EnvConfig(mode="campaign", level=LEVEL, fixed_fps=30, frameskip=2, rewards=rewards, **overrides)
     env = UltrakillEnv(cfg)
     env.client = FakeLevel()
     return env, env.client
 
 
+def idle():
+    return noop_action(campaign=True)
+
+
 def forward():
-    a = noop_action()
+    a = idle()
     a[0] = 2  # move forward
+    return a
+
+
+def action(*, look_mode: int = 0, yaw: float = 0.0, pitch: float = 0.0, buttons: tuple[str, ...] = (), move: bool = False):
+    a = idle()
+    if move:
+        a[0] = 2
+    for name in buttons:
+        a[2 + BUTTONS.index(name)] = 1
+    i = 2 + len(BUTTONS)
+    a[i + 1] = YAW_BINS.index(yaw)
+    a[i + 2] = PITCH_BINS.index(pitch)
+    a[i + 3] = look_mode
     return a
 
 
@@ -181,7 +247,7 @@ def add_parts(total: dict[str, float], info: dict) -> None:
 
 def run_until_end(env: UltrakillEnv, limit: int = 500) -> dict:
     for _ in range(limit):
-        _, _, terminated, truncated, info = env.step(noop_action())
+        _, _, terminated, truncated, info = env.step(idle())
         if terminated or truncated:
             return info
     raise AssertionError(f"episode did not end within {limit} steps")
@@ -244,7 +310,7 @@ def test_death_after_the_checkpoint_respawns_inside_the_episode():
         _, _, terminated, truncated, info = env.step(forward())
         add_parts(parts, info)
     fake.kill_next = True
-    _, _, terminated, truncated, info = env.step(noop_action())
+    _, _, terminated, truncated, info = env.step(idle())
     add_parts(parts, info)
     assert not terminated and not truncated
     assert fake.resets == [False, True]
@@ -269,7 +335,7 @@ def test_death_before_any_checkpoint_reloads_the_level_inside_the_episode():
             env.step(forward())
         fake.kills = 2
         fake.kill_next = True
-        _, _, terminated, truncated, info = env.step(noop_action())
+        _, _, terminated, truncated, info = env.step(idle())
         assert not terminated and not truncated
         assert fake.resets == [False, True] and fake.z == 0.0  # no checkpoint yet, so the level reloaded
         assert info["deaths"] == 1 and info["kills"] == 2  # kills from before the reload still count
@@ -296,19 +362,19 @@ def test_kill_reward_can_be_farmed_across_a_checkpoint_respawn():
         env.step(forward())
 
     fake.kill_enemy_next = True
-    _, _, terminated, truncated, info = env.step(noop_action())
+    _, _, terminated, truncated, info = env.step(idle())
     assert not terminated and not truncated
     first_kill, first_damage = info["reward_parts"]["kill"], info["reward_parts"]["damage_dealt"]
     assert info["kills"] == 1 and first_kill > 0 and first_damage > 0
 
     fake.kill_next = True  # the player also dies now, which triggers a checkpoint respawn
-    _, _, terminated, truncated, info = env.step(noop_action())
+    _, _, terminated, truncated, info = env.step(idle())
     assert not terminated and not truncated  # a death inside a campaign episode respawns it, not ends it
     assert info["deaths"] == 1
     assert fake.enemy_alive and fake.kills == 1  # the room's enemy is back; the kill counter did not reset
 
     fake.kill_enemy_next = True
-    _, _, terminated, truncated, info = env.step(noop_action())
+    _, _, terminated, truncated, info = env.step(idle())
     assert not terminated and not truncated
     assert info["kills"] == 2 and fake.kills == 2
     assert info["reward_parts"]["kill"] == first_kill  # paid again for the re-created enemy
@@ -332,18 +398,19 @@ def test_missing_campaign_block_mid_episode_does_not_break_the_episode():
 
     fake.drop_campaign_steps = 2
     fake.kill_enemy_next = True
-    _, _, terminated, truncated, info = env.step(noop_action())  # campaign block missing, but the kill still lands
+    _, _, terminated, truncated, info = env.step(idle())  # campaign block missing, but the kill still lands
     add_parts(parts, info)
     assert not terminated and not truncated
     assert info["kills"] == 1
     assert info["reward_parts"]["kill"] > 0 and info["reward_parts"]["damage_dealt"] > 0
-    assert env._steps_since_progress == 1  # no checkpoint/arena/door/novelty/path signal while the block is gone
+    assert env._steps_since_progress == 0  # the kill counts as progress; it does not need the campaign block
 
-    _, _, terminated, truncated, info = env.step(noop_action())  # still missing (2nd of the 2 dropped steps)
+    _, _, terminated, truncated, info = env.step(idle())  # still missing (2nd of the 2 dropped steps)
     add_parts(parts, info)
     assert not terminated and not truncated
     assert fake.drop_campaign_steps == 0
-    assert env._steps_since_progress == 2
+    # No checkpoint/arena/door/novelty/path/gate signal while the block is gone, and no kill this step either.
+    assert env._steps_since_progress == 1
 
     for _ in range(40):  # the block is back; finish the level to prove the gap left nothing corrupted
         _, _, terminated, truncated, info = env.step(forward())
@@ -376,7 +443,7 @@ def test_input_locked_frames_are_skipped():
     env.reset(seed=0)
     fake_steps, env_steps = fake.steps, env._steps
     fake.lock_steps = 3
-    env.step(noop_action())
+    env.step(idle())
     assert fake.steps - fake_steps == 3 + 1  # the policy's step, then empty steps until the lock ends
     assert env._steps - env_steps == 1
     assert env._raw["campaign"]["input_locked"] is False
@@ -483,7 +550,7 @@ def test_novelty_pays_for_new_ground_not_for_height():
     paid = []
     for _ in range(4):
         level.y += 3.0
-        _, _, _, _, info = env.step(noop_action())
+        _, _, _, _, info = env.step(idle())
         paid.append(info["reward_parts"].get("novelty", 0.0))
     assert paid[0] == 0.0 and sum(paid) == 0.0, f"height alone must not pay, got {paid}"
     # Moving forward over new floor still pays, airborne or not -- fast movement in this game is airborne.
@@ -492,6 +559,377 @@ def test_novelty_pays_for_new_ground_not_for_height():
         env.step(forward())
     env.close()
     assert env._cells_new > before, "covering new ground must still pay while airborne"
+
+
+def test_walking_the_corridor_pays_each_gate_once():
+    """The gate ladder: one payment per new lower hops value, and nothing at all on a second pass."""
+    env, fake = make_env(fresh_start_prob=0.0, max_steps=27)  # stop at z 54, short of the exit
+    env.reset(seed=0)
+    parts: dict[str, float] = {}
+    for _ in range(11):  # z 22: past the gate at 15 (hops 2) and the checkpoint, short of the one at 35
+        _, _, terminated, truncated, info = env.step(forward())
+        add_parts(parts, info)
+    assert parts["gate"] == 15.0 and info["gates_reached"] == 1 and info["gate_hops_best"] == 2
+    assert parts["gate_approach"] > 0.0
+    for _ in range(16):  # on past the hops 1 and hops 0 gates
+        _, _, terminated, truncated, info = env.step(forward())
+        add_parts(parts, info)
+    assert truncated and info["end_reason"] == "max_steps"
+    assert parts["gate"] == 45.0 and info["gates_reached"] == 3 and info["gate_hops_best"] == 0
+
+    # A respawn absorbs what the player already stands at; re-walking the same doors pays nothing.
+    _, info = env.reset()
+    assert fake.resets == [False, True] and info["fresh_start"] == 0
+    again: dict[str, float] = {}
+    for _ in range(27):
+        _, _, terminated, truncated, info = env.step(forward())
+        add_parts(again, info)
+    assert "gate" not in again, f"the gate ladder is per level load, got {again.get('gate')}"
+    assert info["gates_reached"] == 3  # still counted, just not paid again
+    env.close()
+
+
+def test_gate_slots_track_the_target():
+    env, fake = make_env()
+    obs, info = env.reset(seed=0)
+    # retarget runs before reset's observation is packed, so the target is live on the very first decision.
+    assert obs[GATE_BLOCK + 4] == 1.0  # target mask
+    assert "reward_parts" not in info  # retarget picks a target without paying for it
+    assert abs(obs[GATE_BLOCK + 2] - 15.0 / 50.0) < 1e-6  # the hops 2 gate, 15 m straight ahead, gate scale
+    assert abs(obs[GATE_BLOCK + 3] - 15.0 / 100.0) < 1e-6
+    assert obs[GATE_BLOCK + 7] == 2.0 / 20.0  # hops / 20
+    for _ in range(9):  # z 18: the hops 2 gate is reached, so the target is the hops 1 gate at z 35
+        obs, _, _, _, _ = env.step(forward())
+    assert abs(obs[GATE_BLOCK + 2] - (35.0 - 18.0) / 50.0) < 1e-6
+    assert obs[GATE_BLOCK + 7] == 1.0 / 20.0
+    for _ in range(15):  # z 48: past the hops 0 gate, so the target becomes the exit, at the exit's own scales
+        obs, _, _, _, _ = env.step(forward())
+    assert obs[GATE_BLOCK + 4] == 1.0 and obs[GATE_BLOCK + 5] == 0.0 and obs[GATE_BLOCK + 7] == 0.0
+    assert abs(obs[GATE_BLOCK + 2] - (EXIT_Z - 48.0) / 100.0) < 1e-6
+    env.close()
+
+
+def test_unordered_level_falls_back_to_the_exit_vector():
+    env, fake = make_env()
+    fake.gates_ordered = False  # 0-5: the door graph has no goal room, so every hops is null
+    obs, _ = env.reset(seed=0)
+    assert not obs[GATE_BLOCK : GATE_BLOCK + 8].any()
+    assert obs[443 + 4] == 1.0  # the straight-line exit vector is still there, as it was before gates existed
+    parts: dict[str, float] = {}
+    for _ in range(35):
+        obs, _, terminated, truncated, info = env.step(forward())
+        add_parts(parts, info)
+        if terminated or truncated:
+            break
+    assert info["end_reason"] == "level_complete" and info["gates_reached"] == 0
+    assert "gate" not in parts and "gate_approach" not in parts
+    assert not obs[GATE_BLOCK : GATE_BLOCK + 8].any()
+    env.close()
+
+
+def test_old_mod_without_gates_still_runs():
+    """Graceful degradation: the Python side has to run against a mod that sends no gates block at all."""
+    env, fake = make_env()
+    fake.gates_present = False
+    obs, _ = env.reset(seed=0)
+    assert not obs[GATE_BLOCK : GATE_BLOCK + 8].any()
+    parts: dict[str, float] = {}
+    for _ in range(35):
+        _, _, terminated, truncated, info = env.step(action(look_mode=2, move=True))  # mode 2 with no target: free look
+        add_parts(parts, info)
+        if terminated or truncated:
+            break
+    assert info["end_reason"] == "level_complete"
+    assert "gate" not in parts and info["gates_reached"] == 0 and info["gate_hops_best"] is None
+    env.close()
+
+
+def test_a_wedged_player_ends_the_episode():
+    env, fake = make_env()
+    env.reset(seed=0)
+    fake.wedged = True
+    for step in range(WEDGE_HOLD):
+        _, _, terminated, truncated, info = env.step(forward())
+        if terminated or truncated:
+            break
+    assert truncated and not terminated
+    assert info["end_reason"] == "wedged" and step == WEDGE_HOLD - 1
+    assert info["wedged_steps"] == WEDGE_HOLD  # the whole run, credited when it tripped
+    env.close()
+
+
+def test_a_short_wedge_is_not_counted():
+    env, fake = make_env()
+    env.reset(seed=0)
+    fake.wedged = True
+    for _ in range(WEDGE_HOLD - 1):
+        _, _, terminated, truncated, info = env.step(forward())
+    assert not terminated and not truncated and info["wedged_steps"] == 0
+    fake.wedged = False
+    _, _, terminated, truncated, info = env.step(forward())
+    assert info["wedged_steps"] == 0, "a run that never reached the hold is ordinary airborne time"
+    env.close()
+
+
+def test_falling_is_not_wedged():
+    """Ordinary airborne time flags the state flags but keeps moving; without the movement term it would be
+    26.9% of all decisions."""
+    env, fake = make_env()
+    env.reset(seed=0)
+    fake.falling = True
+    for _ in range(WEDGE_HOLD + 5):
+        _, _, terminated, truncated, info = env.step(forward())
+        if terminated or truncated:
+            break
+    assert info["wedged_steps"] == 0 and info.get("end_reason") != "wedged"
+    env.close()
+
+
+def test_wedge_fallback_without_mod_flags():
+    """A mod older than 0.6.0 sends no slow_mode/heavy_fall: the same predicate without the flag test."""
+    env, fake = make_env()
+    fake.mod_flags = False
+    env.reset(seed=0)
+    assert "slow_mode" not in env._raw["player"]
+    fake.wedged = True
+    for _ in range(WEDGE_HOLD):
+        _, _, terminated, truncated, info = env.step(forward())
+        if terminated or truncated:
+            break
+    assert truncated and info["end_reason"] == "wedged" and info["wedged_steps"] == WEDGE_HOLD
+    env.close()
+
+
+def test_three_wedges_force_a_fresh_start():
+    """`wedged` has to feed the same escape hatch as `stuck`, or a wedge-prone checkpoint is inescapable."""
+    env, fake = make_env(fresh_start_prob=0.0)
+    env.reset(seed=0)
+    for _ in range(10):  # z 20: the checkpoint activates
+        env.step(forward())
+    fake.wedged = True
+    assert run_until_end(env)["end_reason"] == "wedged"
+    for _ in range(2):
+        _, info = env.reset()
+        assert info["fresh_start"] == 0
+        assert run_until_end(env)["end_reason"] == "wedged"
+    _, info = env.reset()
+    assert fake.resets == [False, True, True, False]
+    assert info["fresh_start"] == 1
+    env.close()
+
+
+def test_kills_reset_the_stuck_clock():
+    """Four of 0-1's gate doors are behind kill gates in rooms where novelty runs out: fighting is progress."""
+    env, fake = make_env(stuck_seconds=1.0)  # 15 decisions without progress
+    env.reset(seed=0)
+    for _ in range(14):
+        _, _, terminated, truncated, info = env.step(idle())
+    assert not terminated and not truncated and env._steps_since_progress == 14
+    fake.kills += 1  # the game's own kill counter, which only the player moves
+    env.step(idle())
+    assert env._steps_since_progress == 0
+    for _ in range(14):
+        _, _, terminated, truncated, info = env.step(idle())
+    assert not terminated and not truncated, "29 decisions of standing still, and the kill kept it alive"
+    env.close()
+
+
+def test_enemy_crossfire_does_not_reset_the_stuck_clock():
+    """Damage dealt is unattributed (enemies damage each other), so it must not hold an episode open."""
+    env, fake = make_env(stuck_seconds=1.0)
+    env.reset(seed=0)
+    for _ in range(14):
+        _, _, terminated, truncated, info = env.step(idle())
+    fake.enemy_health -= 10.0  # something hurt the enemy; no kill and no style
+    _, _, terminated, truncated, info = env.step(idle())
+    assert info["reward_parts"].get("damage_dealt", 0.0) > 0.0
+    assert truncated and info["end_reason"] == "stuck"
+    env.close()
+
+
+def test_respawn_resets_the_stuck_clock():
+    env, fake = make_env(stuck_seconds=1.0)
+    env.reset(seed=0)
+    for _ in range(10):  # z 20, the checkpoint
+        env.step(forward())
+    for _ in range(5):
+        env.step(idle())
+    assert env._steps_since_progress == 5
+    fake.kill_next = True
+    _, _, terminated, truncated, info = env.step(idle())
+    assert not terminated and not truncated and info["deaths"] == 1
+    assert env._steps_since_progress == 0, "a respawn moves the player, so the pre-death clock is meaningless"
+    env.close()
+
+
+def test_slide_min_hold_holds_slide():
+    env, fake = make_env(slide_min_hold=3)
+    env.reset(seed=0)
+    env.step(action(buttons=("slide",)))
+    assert "slide" in fake.last_action["buttons"]
+    for _ in range(2):  # the next N-1 decisions get it added
+        env.step(idle())
+        assert "slide" in fake.last_action["buttons"]
+    env.step(idle())
+    assert "slide" not in fake.last_action["buttons"]
+    assert env._info(env._raw)["slide_forced_frac"] > 0.0
+    env.step(action(buttons=("slide",)))
+    env.reset()
+    env.step(idle())
+    assert "slide" not in fake.last_action["buttons"], "the latch is cleared on reset"
+    env.close()
+
+
+def settle(env: UltrakillEnv) -> None:
+    """One idle decision, so the next one is resolved against a fresh observation.
+
+    A look mode aims from `prev`, the observation the policy acted on, so a change made to the fake level only
+    reaches the geometry after the next step brings it back.
+    """
+    env.step(idle())
+
+
+def test_look_mode_enemy_turns_toward_the_enemy():
+    env, fake = make_env()
+    env.reset(seed=0)
+    fake.enemy_rel = [5.0, 0.0, 0.0]  # 90 degrees to the right, in camera space
+    settle(env)
+    env.step(action(look_mode=1))
+    assert fake.last_action["look"] == [90.0, 0.0]
+    fake.enemy_rel = [0.0, 5.0, 0.0]  # straight overhead: positive pitch, capped at one decision's worth
+    settle(env)
+    env.step(action(look_mode=1))
+    assert fake.last_action["look"][1] == 20.0
+    fake.enemy_alive = False  # nothing visible: exactly mode 0, the sampled bins
+    settle(env)
+    env.step(action(look_mode=1, yaw=30.0, pitch=-6.0))
+    assert fake.last_action["look"] == [30.0, -6.0]
+    env.close()
+
+
+def test_look_mode_gate_turns_toward_the_target():
+    env, fake = make_env()
+    env.reset(seed=0)
+    env.step(action(look_mode=2))
+    assert fake.last_action["look"] == [0.0, 0.0]  # the hops 2 gate is straight ahead
+    fake.yaw = 90.0  # facing +x, so the gate along +z is on the left
+    settle(env)
+    env.step(action(look_mode=2))
+    assert fake.last_action["look"][0] < 0.0
+    fake.yaw, fake.y = 0.0, -100.0  # far below the gate: clamped to the band, then to one decision's worth
+    settle(env)
+    env.step(action(look_mode=2))
+    assert fake.last_action["look"][1] == 20.0  # pitch_limit_deg 0 means "off": the 85 degree fallback, not 0
+    env.close()
+
+    banded, fake = make_env(pitch_limit_deg=5.0)
+    banded.reset(seed=0)
+    fake.y = -100.0
+    settle(banded)
+    banded.step(action(look_mode=2))
+    assert abs(fake.last_action["look"][1] - 5.0) < 1e-6
+    banded.close()
+
+
+def test_look_mode_is_popped_from_the_command():
+    env, fake = make_env()
+    env.reset(seed=0)
+    for mode in (0, 1, 2):
+        env.step(action(look_mode=mode))
+        assert "look_mode" not in fake.last_action, "the mod never sees it; the wire message is unchanged"
+    env.close()
+
+
+def test_look_mode_counters_record_the_mode_that_applied():
+    """A mode that finds nothing to aim at IS mode 0 that step, and must be counted and graded as one.
+
+    Counting the requested mode instead reported `look_free_frac` 0% for a run whose look heads were driving the
+    camera on every single step -- the share R6 says to read the per-dimension entropy against -- and suppressed
+    every yaw/pitch tracking sample on those steps. Both fall-backs are common: mode 2 has no target at all on an
+    unordered level or against a 0.5.x mod, and mode 1 falls back whenever nothing is visible.
+    """
+    env, fake = make_env(max_steps=20)
+    fake.gates_present = False  # mode 2 with no target: the sampled bins drive the camera, as in mode 0
+    env.reset(seed=0)
+    fake.enemy_rel = [5.0, 0.0, 0.0]  # 90 degrees right, so the sampled yaw bin can be graded against it
+    settle(env)
+    for _ in range(10):
+        _, _, _, _, info = env.step(action(look_mode=2, yaw=30.0))
+    assert fake.last_action["look"] == [30.0, 0.0], "the look heads, not the geometry, aimed this step"
+    assert info["look_free_frac"] == 1.0 and info["look_gate_frac"] == 0.0
+    assert info["yaw_track"] == 1.0, "a fall-back step is a look-head sample and has to be graded"
+    env.close()
+
+    env, fake = make_env(max_steps=20)
+    env.reset(seed=0)
+    fake.enemy_alive = False  # mode 1 with nothing visible: the same fall-back
+    settle(env)
+    for _ in range(10):
+        _, _, _, _, info = env.step(action(look_mode=1, yaw=30.0))
+    assert fake.last_action["look"] == [30.0, 0.0]
+    assert info["look_free_frac"] == 1.0 and info["look_enemy_frac"] == 0.0
+    env.close()
+
+    env, fake = make_env(max_steps=20)  # the control: a mode that really does aim is counted and left ungraded
+    env.reset(seed=0)
+    fake.enemy_rel = [5.0, 0.0, 0.0]
+    settle(env)
+    for _ in range(10):
+        _, _, _, _, info = env.step(action(look_mode=1, yaw=30.0))
+    assert fake.last_action["look"] == [90.0, 0.0], "the geometry aimed this step"
+    assert abs(info["look_enemy_frac"] - 10 / 11) < 1e-9 and abs(info["look_free_frac"] - 1 / 11) < 1e-9
+    assert info["yaw_track"] == 0.0, "an aimed step would score ~1.0 by construction, so it is not a sample"
+    env.close()
+
+
+def test_ground_ray_center_is_preferred():
+    """The ring minimum can be a ledge 4 m away (p90 spread 10.8 m); the centre ray is the floor underfoot."""
+    env, fake = make_env()
+    env.reset(seed=0)
+    fake.ground_center = 8.0  # the ring still reads 0 m to the floor at y 1
+    env.step(idle())
+    assert (0, -2, 0) in env.archive.counts, sorted(env.archive.counts)
+    assert (0, 0, 0) in env.archive.counts  # the spawn cell, from the ring, before the override
+    fake.ground_center = GROUND_RAY_LENGTH  # the centre misses while every ring ray hits: no ground under us
+    _, _, _, _, info = env.step(idle())
+    assert info["oob_frac"] > 0.0
+    env.close()
+
+
+def test_archive_saved_on_a_step_schedule():
+    """Episodes are thousands of decisions long, so an episode-counted save alone saves nothing in practice."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env, _ = make_env(explore_dir=tmp, archive_save_steps=10)
+        env.reset(seed=0)
+        path = Path(tmp) / f"explore_Level_0-1_{env.cfg.port}.npz"
+        for _ in range(500):  # the schedule is checked every 500 steps
+            _, _, terminated, truncated, _ = env.step(idle())
+            assert not terminated and not truncated
+        assert path.exists(), "the archive should be saved mid-episode, without close() or 20 episodes"
+        env.close()
+
+
+def test_episode_info_has_the_new_keys():
+    env, fake = make_env(fresh_start_prob=0.0, max_steps=25)
+    env.reset(seed=0)
+    for _ in range(25):  # z 50: past the checkpoint and two gates, short of the exit, then the cap
+        _, _, terminated, truncated, info = env.step(forward())
+    assert truncated and info["end_reason"] == "max_steps"
+    for key in CAMPAIGN_INFO_KEYS:
+        assert key in info, key
+    for key in ("gate_hops_best", "look_free_frac", "look_enemy_frac", "start_checkpoint", "end_pos"):
+        assert key in info, key
+    assert info["level_started"] == 1 and info["start_checkpoint"] is None  # a fresh load starts at no checkpoint
+    assert info["end_pos"] == [0.0, 1.0, 50.0] and len(info["end_pos"]) == 3
+    assert info["look_free_frac"] == 1.0 and info["look_gate_frac"] == 0.0
+    # z 50 is within reach of the hops 0 gate at z 55 as well, so all three are behind us.
+    assert info["gates_reached"] == 3 and info["gate_hops_best"] == 0 and info["wedged_steps"] == 0
+
+    _, info = env.reset()  # a checkpoint respawn: the episode records where it began
+    assert info["fresh_start"] == 0 and info["start_checkpoint"] == CHECKPOINT_ID
+    _, _, _, _, info = env.step(forward())
+    assert info["start_checkpoint"] == CHECKPOINT_ID
+    env.close()
 
 
 def test_human_routes_are_retired():

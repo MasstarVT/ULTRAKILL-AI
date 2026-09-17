@@ -7,7 +7,9 @@ in both. The widened policy:
   - takes first-layer columns 0-442 from the source and leaves columns 443-478 at zero, so on any Cyber
     Grind input it computes exactly what the source did and the campaign block starts disconnected;
   - scales the action head (weights and bias) by --action-scale, which softens every logit and raises
-    entropy, so the fighting reflexes carry over without locking in "fire always, walk backwards";
+    entropy, so the fighting reflexes carry over without locking in "fire always, walk backwards", and
+    widens it from Cyber Grind's 42 rows to the campaign's 45: the last three are the look mode, left at
+    zero so all three modes start equally likely (the same widening scripts/add_look_mode.py does);
   - keeps its own freshly initialised final value layer, because the campaign's reward scale has nothing
     to do with Cyber Grind's;
   - starts with a fresh optimizer.
@@ -52,7 +54,8 @@ class SpacesEnv(gym.Env):
 def widen_state_dict(src: dict, dst: dict, shared_inputs: int, action_scale: float) -> dict:
     """`dst` (a policy state dict) with the source's weights widened into it; neither input is modified.
 
-    First-layer columns from `shared_inputs` on are zero; `value_net.*` stays the destination's own.
+    First-layer columns from `shared_inputs` on are zero; the action head keeps the source's rows (scaled) and
+    zeroes any the destination has beyond them (the campaign's look mode); `value_net.*` stays the destination's own.
     """
     out = {name: value.clone() for name, value in dst.items()}
     for name in HIDDEN_LAYERS:
@@ -63,7 +66,9 @@ def widen_state_dict(src: dict, dst: dict, shared_inputs: int, action_scale: flo
         else:
             out[name] = src[name].clone()
     for name in ACTION_HEAD:
-        out[name] = src[name] * action_scale
+        widened = torch.zeros_like(dst[name])
+        widened[: src[name].shape[0]] = src[name] * action_scale
+        out[name] = widened
     return out
 
 
@@ -76,7 +81,10 @@ def transfer(source: Path, dest: Path, action_scale: float = 0.5, seed: int = 0)
     # Seed torch here instead of passing seed= to PPO: a seed stored in the model would reseed every
     # later resume of the campaign run to the same random sequence.
     torch.manual_seed(seed)
-    dst = PPO("MlpPolicy", SpacesEnv(ObsLayout(campaign=True).space(), src.action_space), policy_kwargs=src.policy_kwargs, device="cpu")
+    # The campaign action space, not the source's: the look mode is a 12th dimension there, and a model saved
+    # with 11 could not be resumed against a campaign env at all.
+    dst = PPO("MlpPolicy", SpacesEnv(ObsLayout(campaign=True).space(), action_space(campaign=True)),
+              policy_kwargs=src.policy_kwargs, device="cpu")
     dst.policy.load_state_dict(widen_state_dict(src.policy.state_dict(), dst.policy.state_dict(), SHARED_INPUTS, action_scale))
     dest.parent.mkdir(parents=True, exist_ok=True)
     dst.save(dest)
@@ -97,7 +105,7 @@ def main() -> None:
         if name.endswith(".0.weight"):
             note = f"columns 0-{SHARED_INPUTS - 1} copied, {SHARED_INPUTS}+ zero"
         elif name in ACTION_HEAD:
-            note = f"copied x{a.action_scale}"
+            note = f"rows 0-{src_state[name].shape[0] - 1} copied x{a.action_scale}, the rest zero (look mode)"
         elif name in HIDDEN_LAYERS:
             note = "copied"
         else:

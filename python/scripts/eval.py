@@ -7,6 +7,10 @@ Campaign evaluation always starts from a fresh level load with real deaths. It r
 exploration counts (the policy was trained with them as inputs) but never writes them back, and never writes the
 training runs' best-run files. `--record-times` adds the fastest completion to the repo-root times.md
 (generation history, plus the leaderboard when it is a record).
+
+Point it at the run whose action space the model has: a campaign checkpoint from before the look modes has 11
+action dimensions, and its actions still decode (look mode 0, free look), but scripts/add_look_mode.py is what
+migrates a run properly.
 """
 
 from __future__ import annotations
@@ -124,7 +128,9 @@ def main() -> None:
                 seconds = info.get("level_seconds")
                 extra = (f" completed={info.get('completed', 0)} time={format_time(seconds) if seconds is not None else '-'}"
                          f" rank={info.get('rank') or '-'} style={info.get('style', 0)}"
-                         f" restarts={info.get('restarts', '-')} deaths={info['deaths']}")
+                         f" restarts={info.get('restarts', '-')} deaths={info['deaths']}"
+                         f" gates={info.get('gates_reached', 0)} hops={info.get('gate_hops_best')}"
+                         f" wedged={info.get('wedged_steps', 0)}")
             else:
                 extra = f" wave={info['wave']}"
             results.append((total, info))

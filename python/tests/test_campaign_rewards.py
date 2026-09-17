@@ -12,7 +12,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, compute_reward  # noqa: E402
 
 CAMPAIGN_WEIGHTS = {"time": 0.01, "checkpoint": 10.0, "arena_clear": 10.0, "door_unlock": 3.0, "novelty": 0.5, "path": 0.1}
-CAMPAIGN_PARTS = ("time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path")
+CAMPAIGN_PARTS = ("time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path", "gate", "gate_approach")
+# The weights configs/campaign_0-1.yaml runs with, for the arithmetic below.
+GATES_WEIGHTS = {"time": 0.02, "level_complete": 100.0, "checkpoint": 10.0, "arena_clear": 10.0, "door_unlock": 15.0,
+                 "gate": 15.0, "gate_approach": 0.15, "novelty": 0.2, "path": 0.0, "kill": 0.5, "damage_dealt": 0.5,
+                 "damage_taken": 0.01, "death": 5.0, "style": 0.0, "punch": 0.01}
 
 
 def snapshot(level_complete: bool = False, hp: int = 100, kills: int = 0) -> dict:
@@ -27,6 +31,59 @@ def snapshot(level_complete: bool = False, hp: int = 100, kills: int = 0) -> dic
 def test_campaign_step_defaults_to_nothing_happened():
     step = CampaignStep()
     assert (step.checkpoints, step.arenas, step.doors, step.novelty, step.path_gain) == (0, 0, 0, 0.0, 0.0)
+    assert (step.gates, step.gate_approach) == (0, 0.0)
+
+
+def test_gate_terms_default_to_zero():
+    cfg = RewardConfig()
+    assert cfg.gate == 0.0 and cfg.gate_approach == 0.0  # Cyber Grind and every old config are unchanged
+    off = compute_reward(cfg, snapshot(), snapshot(), {}, campaign=CampaignStep(gates=3, gate_approach=40.0))
+    assert off.parts == {}
+
+
+def test_gate_terms_scale_by_their_weights():
+    cfg = RewardConfig(**GATES_WEIGHTS)
+    parts = compute_reward(cfg, snapshot(), snapshot(), {}, campaign=CampaignStep(gates=2, gate_approach=12.0)).parts
+    assert abs(parts["gate"] - 30.0) < 1e-9
+    assert abs(parts["gate_approach"] - 1.8) < 1e-9
+    quiet = compute_reward(cfg, snapshot(), snapshot(), {}, campaign=CampaignStep()).parts
+    assert "gate" not in quiet and "gate_approach" not in quiet
+
+
+def test_gate_terms_are_paid_on_a_step_without_a_player():
+    """The env has already marked the ladder paid before the reward runs, so a player-less frame must not drop it."""
+    cfg = RewardConfig(**GATES_WEIGHTS)
+    loading = {"enemies": [], "stats": {}}
+    parts = compute_reward(cfg, snapshot(), loading, {}, campaign=CampaignStep(gates=1, gate_approach=4.0)).parts
+    assert set(parts) == {"time", "gate", "gate_approach"}
+
+
+def test_the_route_is_the_largest_positive_group_for_a_route_walker():
+    """The arithmetic of the design spec: 0-1 walked at human pace, 146.58 s = 2199 decisions at 15/s.
+
+    10 hop values, a 723 m gate-to-gate polyline, 4 arena-held gate doors, 6 checkpoints, 3 distinct arena
+    clear keys, 59 kills and ~60 health bars, ~200 raw novelty units through mostly-visited start rooms.
+    """
+    cfg = RewardConfig(**GATES_WEIGHTS)
+    decisions = 2199
+    parts: dict[str, float] = {}
+    for name, step in (("route", CampaignStep(gates=10, gate_approach=723.0, doors=4)),
+                       ("milestones", CampaignStep(checkpoints=6, arenas=3, novelty=200.0))):
+        for key, value in compute_reward(cfg, snapshot(), snapshot(), {}, campaign=step).parts.items():
+            parts[key] = parts.get(key, 0.0) + value
+        assert name  # both steps contributed
+    route = parts["gate"] + parts["gate_approach"] + parts["door_unlock"]
+    assert abs(route - (150.0 + 108.45 + 60.0)) < 1e-6
+    assert route > 100.0  # larger than finishing
+    assert route > parts["checkpoint"] + parts["arena_clear"]  # and than the milestones
+    assert route > parts["novelty"] * 1.5
+    time_cost = decisions * cfg.time
+    assert abs(time_cost - 43.98) < 1e-9 and route > 7 * time_cost
+
+    # A wanderer that never leaves the start area: 9000 decisions, one gate approach, a measured 346 raw novelty.
+    wander = compute_reward(cfg, snapshot(), snapshot(), {}, campaign=CampaignStep(gate_approach=64.8, novelty=346.0)).parts
+    wandered = wander["gate_approach"] + wander["novelty"] - 9000 * cfg.time
+    assert wandered < 0.0, f"wandering to the cap must not pay for itself, got {wandered:+.1f}"
 
 
 def test_time_is_only_charged_with_a_campaign_step():
@@ -45,6 +102,10 @@ def test_each_milestone_weight_multiplies_its_count():
     assert "novelty" not in parts and "path" not in parts  # nothing new this step pays nothing
     single = compute_reward(cfg, snapshot(), snapshot(), {}, campaign=CampaignStep(doors=1)).parts
     assert abs(single["door_unlock"] - 3.0) < 1e-9 and "checkpoint" not in single and "arena_clear" not in single
+    # The campaign config raises door_unlock to 15: the fight that unlocks a gate is the one place the route
+    # signal is flat, and MilestoneTracker already pays it once per level load per key.
+    raised = compute_reward(RewardConfig(**GATES_WEIGHTS), snapshot(), snapshot(), {}, campaign=CampaignStep(doors=4)).parts
+    assert abs(raised["door_unlock"] - 60.0) < 1e-9
 
 
 def test_novelty_and_path_scale_by_their_weights():

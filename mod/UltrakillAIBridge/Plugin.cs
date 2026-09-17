@@ -15,7 +15,7 @@ namespace UltrakillAIBridge
     {
         public const string Guid = "masstarvt.ultrakill.aibridge";
         public const string Name = "ULTRAKILL AI Bridge";
-        public const string Version = "0.5.0";
+        public const string Version = "0.6.0";
         public const int ProtocolVersion = 1;
 
         internal static ManualLogSource Log;
@@ -59,6 +59,16 @@ namespace UltrakillAIBridge
             harmony.PatchAll(typeof(BackgroundPatches));
             harmony.PatchAll(typeof(InstancePatches));
             harmony.PatchAll(typeof(TrainingSpeed));
+            try
+            {
+                // Binds the private NewMovement.HandleSlideState, so a game update renaming it would throw.
+                // Isolated so the un-wedge failing can't take soft death and the rest of TrainingSpeed down.
+                harmony.PatchAll(typeof(UnwedgePatch));
+            }
+            catch (System.Exception e)
+            {
+                Log.LogError($"Un-wedge patch failed to apply, the slowMode state will not be broken: {e}");
+            }
             try
             {
                 // CampaignPatches binds a private method (ActivateNextWave.EndWaves) among its five targets;

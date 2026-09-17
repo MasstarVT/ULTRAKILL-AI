@@ -36,7 +36,17 @@ PPO_METRICS = (
     "train/clip_fraction",
     "train/loss",
     "train/learning_rate",
+    # Per-dimension entropy (scripts/train.py). Once the look modes exist, total entropy stops being an
+    # interpretable ent_coef signal on its own: on a step where a look mode aims, the yaw and pitch heads are
+    # causally inert and only the entropy bonus acts on them. These are read next to look_free_frac.
+    "train/entropy_yaw",
+    "train/entropy_pitch",
+    "train/entropy_look_mode",
 )
+# Per-episode fields carried straight into runs/<run>/episodes.jsonl. `field()` routes everything through
+# _num(), which returns None for anything float() rejects, so a string checkpoint id and a [x, y, z] list have
+# to bypass it -- otherwise the two fields that say where an episode died would both be written as null.
+EPISODE_LOG_RAW = ("start_checkpoint", "end_pos", "end_reason", "level_seconds", "gate_hops_best")
 
 
 def _num(value: Any) -> float | None:
@@ -77,6 +87,11 @@ class ProgressCallback(BaseCallback):
     def __init__(self, status_path: Path, target_timesteps: int, run_name: str, num_envs: int, update_every_s: float = 2.0):
         super().__init__()
         self.status_path = Path(status_path)
+        # One JSON object per finished episode, appended. Written here rather than in the env because with
+        # SubprocVecEnv five workers would interleave appends to one file, while this callback sees every
+        # finished episode in the main process.
+        self.episodes_path = self.status_path.with_name("episodes.jsonl")
+        self._episode_log_warned = False
         self.target_timesteps = int(target_timesteps)
         self.run_name = run_name
         self.num_envs = int(num_envs)
@@ -95,6 +110,11 @@ class ProgressCallback(BaseCallback):
         self.best_reward: float | None = None
         self.best_wave: float | None = None
         self.best_checkpoints_level: float | None = None
+        # Route gates, over fresh starts only: a respawn episode inherits both from its level load, and the
+        # pre-fix run's corr(fresh_start, checkpoints_level) = -0.975 produced a "peak by depth" that was purely
+        # that inheritance. best_gate_hops is a MINIMUM (lower is better), so it needs its own comparison.
+        self.best_gates_reached: float | None = None
+        self.best_gate_hops: float | None = None
         self.best_time: float | None = None  # fastest fresh-start completion, official level seconds
         self.fresh_recent: deque[tuple[float, float | None]] = deque(maxlen=FRESH_WINDOW)  # (completed, level_seconds)
         self.campaign = False  # set once an episode reports fresh_start
@@ -117,6 +137,8 @@ class ProgressCallback(BaseCallback):
         self.best_reward = _num(old.get("best_reward"))
         self.best_wave = _num(old.get("best_wave"))
         self.best_checkpoints_level = _num(old.get("best_checkpoints_level"))
+        self.best_gates_reached = _num(old.get("best_gates_reached"))
+        self.best_gate_hops = _num(old.get("best_gate_hops"))
         if isinstance(old.get("campaign"), dict):
             self.campaign = True
             self.best_time = _num(old["campaign"].get("best_time"))
@@ -221,6 +243,13 @@ class ProgressCallback(BaseCallback):
             "cells_new": field("cells_new"),
             "oob_frac": field("oob_frac"),
             "exit_dist_min": field("exit_dist_min"),
+            "gates_reached": field("gates_reached"),
+            "wedged_steps": field("wedged_steps"),
+            "level_started": field("level_started"),
+            "look_free_frac": field("look_free_frac"),
+            "look_enemy_frac": field("look_enemy_frac"),
+            "look_gate_frac": field("look_gate_frac"),
+            "slide_forced_frac": field("slide_forced_frac"),
             "end_reason": info.get("end_reason"),
             "reset_seconds": _num(info.get("reset_seconds")),
             "reward_parts": parts,
@@ -240,6 +269,12 @@ class ProgressCallback(BaseCallback):
                 self.fresh_recent.append((completed, seconds))
                 if completed and seconds is not None and (self.best_time is None or seconds < self.best_time):
                     self.best_time = seconds
+                reached = stats["gates_reached"]
+                if reached is not None and (self.best_gates_reached is None or reached > self.best_gates_reached):
+                    self.best_gates_reached = reached
+                hops = _num(info.get("gate_hops_best"))
+                if hops is not None and (self.best_gate_hops is None or hops < self.best_gate_hops):
+                    self.best_gate_hops = hops
         self.per_env[env_index] = {
             "reward": stats["reward"],
             "length": stats["length"],
@@ -250,6 +285,38 @@ class ProgressCallback(BaseCallback):
             "ended_at": time.time(),
             "episodes": self.per_env.get(env_index, {}).get("episodes", 0) + 1,
         }
+        self._log_episode(env_index, info, stats)
+
+    def _log_episode(self, env_index: int, info: dict, stats: dict) -> None:
+        """Appends one line to runs/<run>/episodes.jsonl: what happened, and where it ended.
+
+        This is the only record of an individual episode. `status.json` keeps 100-episode means that a restart
+        throws away, so without this a failure mode is invisible unless someone is watching live.
+        """
+        line = {
+            "t": round(time.time(), 1),
+            "env": env_index,
+            "timesteps": self.num_timesteps,
+            "reward": stats["reward"],
+            "length": stats["length"],
+            "fresh_start": stats["fresh_start"],
+            "kills": stats["kills"],
+            "deaths": stats["deaths"],
+            "checkpoints_level": stats["checkpoints_level"],
+            "gates_reached": stats["gates_reached"],
+            "level_started": stats["level_started"],
+            "wedged_steps": stats["wedged_steps"],
+            "completed": stats["completed"],
+        }
+        line.update({name: info.get(name) for name in EPISODE_LOG_RAW})
+        try:
+            self.episodes_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.episodes_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(line, separators=(",", ":"), default=str) + "\n")
+        except (OSError, TypeError, ValueError) as exc:  # an episode log must never stop training
+            if not self._episode_log_warned:
+                self._episode_log_warned = True
+                print(f"ProgressCallback: could not write {self.episodes_path}: {exc}")
 
     def _steps_per_s(self, now: float) -> float | None:
         samples = self._rate_samples
@@ -262,6 +329,10 @@ class ProgressCallback(BaseCallback):
 
     def _recent_mean(self, key: str) -> float | None:
         return _mean(ep[key] for ep in self.episodes_recent)
+
+    def _fresh_mean(self, key: str) -> float | None:
+        """The same mean over fresh-start episodes only: what run gates 2 and 3 are judged on."""
+        return _mean(ep[key] for ep in self.episodes_recent if ep.get("fresh_start"))
 
     def _campaign_stats(self) -> dict:
         n = len(self.fresh_recent)
@@ -302,7 +373,10 @@ class ProgressCallback(BaseCallback):
                                                  "enemy_visible_frac", "enemy_angle_mean", "enemy_dist_mean",
                                                  "enemy_close_frac", "yaw_per_step_mean", "enemy_yaw_angle_mean", "enemy_pitch_err_mean", "pitch_abs_mean",
                                                  "yaw_track", "pitch_track",
-                                                 "pitch_mean", "look_up_mean", "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac")}
+                                                 "pitch_mean", "look_up_mean", "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac",
+                                                 "gates_reached", "wedged_steps", "level_started", "slide_forced_frac",
+                                                 "look_free_frac", "look_enemy_frac", "look_gate_frac")}
+        fresh_recent = {key: self._fresh_mean(key) for key in ("gates_reached", "checkpoints_level", "completed", "wedged_steps")}
         part_names = sorted({name for ep in self.episodes_recent for name in ep["reward_parts"]})
         n = len(self.episodes_recent)
         parts_mean = {name: sum(ep["reward_parts"].get(name, 0.0) for ep in self.episodes_recent) / n for name in part_names} if n else {}
@@ -320,6 +394,7 @@ class ProgressCallback(BaseCallback):
                 "mean_wave_100": recent["wave"],
                 "completion_rate_fresh_50": campaign["fresh_completion_rate"] if campaign else None,
                 "mean_checkpoints_level_100": recent["checkpoints_level"],
+                "mean_gates_reached_100": recent["gates_reached"],
                 "steps_per_s": steps_per_s,
             })
 
@@ -349,10 +424,13 @@ class ProgressCallback(BaseCallback):
             "episodes": self.episodes,
             "window": n,
             "mean_100": recent,
+            "mean_fresh_100": fresh_recent,
             "reward_parts_mean_100": parts_mean,
             "best_reward": self.best_reward,
             "best_wave": self.best_wave,
             "best_checkpoints_level": self.best_checkpoints_level,
+            "best_gates_reached": self.best_gates_reached,
+            "best_gate_hops": self.best_gate_hops,
             "end_reasons_100": dict(end_reasons.most_common()),
             "envs": envs,
             "ppo": self.ppo_metrics,

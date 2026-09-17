@@ -13,22 +13,37 @@ Watch progress with:  python scripts/dashboard.py   (or: tensorboard --logdir ru
 
 from __future__ import annotations
 
-import argparse
-import sys
-from collections import defaultdict
-from dataclasses import replace
-from pathlib import Path
+import os
 
-import yaml
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+# Before anything imports torch (stable_baselines3 does, at module import) -- OpenMP reads this at library load.
+# Measured: 11.03 -> 1.43 cores busy with no change to the update time, so the trainer stops burning 11 cores on
+# spin-wait next to five games on the same 12-core CPU. Do NOT set OMP_NUM_THREADS=1: that costs 2.5x per update.
+os.environ.setdefault("KMP_BLOCKTIME", "1")
+
+import argparse  # noqa: E402
+import sys  # noqa: E402
+from collections import defaultdict  # noqa: E402
+from dataclasses import replace  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+import torch  # noqa: E402
+import yaml  # noqa: E402
+from stable_baselines3 import PPO  # noqa: E402
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback  # noqa: E402
+from stable_baselines3.common.monitor import Monitor  # noqa: E402
+from stable_baselines3.common.utils import obs_as_tensor  # noqa: E402
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ultrakill_ai.env import CAMPAIGN_INFO_KEYS, EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.progress import ProgressCallback  # noqa: E402
+
+# Argument validation in torch.distributions costs 0.95 ms of a 3.1 ms forward pass, about 2.9% of wall time.
+torch.distributions.Distribution.set_default_validate_args(False)
+
+ENTROPY_DIMS = {-1: "look_mode", -2: "pitch", -3: "yaw"}  # the action dimensions worth naming, from the end
+ENTROPY_SAMPLE = 256  # rollout rows per entropy measurement; one forward pass an update is ~3 ms
 
 
 class EpisodeStatsCallback(BaseCallback):
@@ -52,6 +67,52 @@ class EpisodeStatsCallback(BaseCallback):
                     self.logger.record_mean("time/reset_seconds", info["reset_seconds"])
                 parts.clear()
         return True
+
+
+class ActionEntropyCallback(BaseCallback):
+    """Logs per-dimension action entropy, so total entropy stays readable once the look modes exist.
+
+    On a step where look mode 1 or 2 aims, the yaw and pitch dimensions are causally inert: no advantage flows
+    back into them and only the entropy bonus acts, pushing them toward uniform in proportion to the non-mode-0
+    share. Total entropy then mixes a head being trained with a head being pushed around, and `ent_coef` stops
+    being an interpretable signal. These three are read next to `look_free_frac` on the dashboard.
+
+    Measured on a sample of the finished rollout, so it costs one forward pass an update. Any failure (a
+    recurrent policy, a future distribution type) disables it rather than interrupting training.
+    """
+
+    def __init__(self, sample: int = ENTROPY_SAMPLE):
+        super().__init__()
+        self.sample = sample
+        self.enabled = True
+        self.entropies: dict[str, float] = {}
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        """Measures on the finished rollout; the values are recorded at the next rollout start (see below)."""
+        if not self.enabled:
+            return
+        try:
+            buffer = self.model.rollout_buffer
+            flat = buffer.observations.reshape(-1, buffer.obs_shape[0])
+            obs = obs_as_tensor(flat[: self.sample], self.model.device)
+            with torch.no_grad():
+                dists = self.model.policy.get_distribution(obs).distribution
+            self.entropies = {name: float(dists[index].entropy().mean())
+                              for index, name in ENTROPY_DIMS.items() if len(dists) >= -index}
+        except Exception as exc:  # never let a diagnostic stop a run
+            self.enabled = False
+            self.entropies = {}
+            print(f"ActionEntropyCallback disabled: {exc}")
+
+    def _on_rollout_start(self) -> None:
+        # SB3 dumps the logger between rollout end and train(), so anything recorded at rollout end is wiped
+        # before it reaches TensorBoard or ProgressCallback. Recording here gives these the same lifetime as
+        # PPO's own train/* metrics, and this callback runs before ProgressCallback in the list that reads them.
+        for name, value in self.entropies.items():
+            self.logger.record(f"train/entropy_{name}", value)
 
 
 def make_env(cfg: EnvConfig, info_keywords: tuple[str, ...]):
@@ -135,12 +196,14 @@ def main() -> None:
     else:
         cls, policy = PPO, "MlpPolicy"
 
+    verbose = train_cfg.get("verbose", 1)
     if args.resume:
         # The rollout buffer is rebuilt for the current number of environments, and the config's
-        # hyperparameters override the saved ones so tuning applies when resuming.
-        model = cls.load(args.resume, env=venv, device=args.device, tensorboard_log="runs", **hyper)
+        # hyperparameters override the saved ones so tuning applies when resuming. `verbose` belongs on this
+        # branch too: without it a resumed run's train log is 0 bytes, which is most of this project's runs.
+        model = cls.load(args.resume, env=venv, device=args.device, tensorboard_log="runs", verbose=verbose, **hyper)
     else:
-        model = cls(policy, venv, policy_kwargs=policy_kwargs, tensorboard_log="runs", device=args.device, verbose=1, **hyper)
+        model = cls(policy, venv, policy_kwargs=policy_kwargs, tensorboard_log="runs", device=args.device, verbose=verbose, **hyper)
 
     # timesteps is the total for the run. learn() adds its argument to the loaded step count when
     # resuming, so only the remaining steps are requested.
@@ -149,6 +212,7 @@ def main() -> None:
     callbacks = CallbackList([
         CheckpointCallback(save_freq=max(1, train_cfg.get("save_every", 50_000) // num_envs), save_path=str(model_dir), name_prefix="ckpt"),
         EpisodeStatsCallback(),
+        ActionEntropyCallback(),
         progress,
     ])
 

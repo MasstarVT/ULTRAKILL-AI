@@ -15,14 +15,16 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from transfer_weights import SHARED_INPUTS, SpacesEnv, transfer, widen_state_dict  # noqa: E402
-from ultrakill_ai.spaces import CAMPAIGN_BLOCK, ObsLayout  # noqa: E402
+from ultrakill_ai.spaces import ACTION_NVEC, CAMPAIGN_BLOCK, ObsLayout, action_space  # noqa: E402
 
 NET_ARCH = [16, 16]
+GRIND_LOGITS = int(ACTION_NVEC.sum())  # 42; the campaign head has three more for the look mode
 
 
 def small_model(campaign: bool, seed: int) -> PPO:
     torch.manual_seed(seed)
-    return PPO("MlpPolicy", SpacesEnv(ObsLayout(campaign=campaign).space()), policy_kwargs={"net_arch": NET_ARCH}, device="cpu")
+    return PPO("MlpPolicy", SpacesEnv(ObsLayout(campaign=campaign).space(), action_space(campaign=campaign)),
+               policy_kwargs={"net_arch": NET_ARCH}, device="cpu")
 
 
 def inputs(rows: int = 32, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
@@ -63,7 +65,9 @@ def test_widened_latents_match_the_source():
     src_pi, src_vf, src_logits = outputs(src.policy, grind)
     dst_pi, dst_vf, dst_logits = outputs(dst.policy, campaign)
     assert close(src_pi, dst_pi) and close(src_vf, dst_vf)
-    assert close(src_logits, dst_logits)
+    assert dst_logits.shape[1] == GRIND_LOGITS + 3
+    assert close(src_logits, dst_logits[:, :GRIND_LOGITS])
+    assert not dst_logits[:, GRIND_LOGITS:].any()  # the look mode starts uniform over its three values
 
 
 def test_action_scale_halves_the_logits():
@@ -72,8 +76,8 @@ def test_action_scale_halves_the_logits():
     src_pi, src_vf, src_logits = outputs(src.policy, grind)
     dst_pi, dst_vf, dst_logits = outputs(dst.policy, campaign)
     assert close(src_pi, dst_pi) and close(src_vf, dst_vf)
-    assert close(dst_logits, 0.5 * src_logits)
-    assert (src_logits - dst_logits).abs().max() > 1e-4  # the scale really changed something
+    assert close(dst_logits[:, :GRIND_LOGITS], 0.5 * src_logits)
+    assert (src_logits - dst_logits[:, :GRIND_LOGITS]).abs().max() > 1e-4  # the scale really changed something
 
 
 def test_widen_keeps_the_destinations_value_head_and_zeroes_new_inputs():
@@ -91,6 +95,10 @@ def test_widen_keeps_the_destinations_value_head_and_zeroes_new_inputs():
         assert torch.equal(first[:, :SHARED_INPUTS], src_state[f"mlp_extractor.{net}.0.weight"][:, :SHARED_INPUTS])
         assert not first[:, SHARED_INPUTS:].any()
         assert torch.equal(out[f"mlp_extractor.{net}.2.weight"], src_state[f"mlp_extractor.{net}.2.weight"])
+    for name in ("action_net.weight", "action_net.bias"):
+        assert out[name].shape == dst_before[name].shape  # 45 rows: the 12th action dimension
+        assert torch.equal(out[name][:GRIND_LOGITS], src_state[name] * 0.5)
+        assert not out[name][GRIND_LOGITS:].any()
     for name, value in dst_before.items():  # the destination dict itself was not written to
         assert torch.equal(dst_state[name], value)
 
@@ -102,12 +110,16 @@ def test_transfer_saves_a_loadable_campaign_model():
         transfer(source, dest, action_scale=0.5, seed=3)
         loaded = PPO.load(dest, device="cpu")
         assert loaded.observation_space.shape == (479,)
+        # 12 dimensions, so the documented Cyber Grind -> campaign path still produces a model train.py can
+        # resume against a campaign env.
+        assert list(loaded.action_space.nvec) == [3, 3, 2, 2, 2, 2, 2, 2, 6, 11, 7, 3]
         assert loaded.policy_kwargs == {"net_arch": NET_ARCH}
         assert loaded.seed is None
         grind, campaign = inputs(seed=2)
         _, _, src_logits = outputs(PPO.load(source, device="cpu").policy, grind)
         _, _, dst_logits = outputs(loaded.policy, campaign)
-        assert close(dst_logits, 0.5 * src_logits)
+        assert close(dst_logits[:, :GRIND_LOGITS], 0.5 * src_logits)
+        assert not dst_logits[:, GRIND_LOGITS:].any()
 
         again = Path(tmp) / "again.zip"
         transfer(source, again, action_scale=0.5, seed=3)

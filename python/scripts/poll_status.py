@@ -33,12 +33,19 @@ FIELDS = [
     "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac",
     "enemy_dist_mean", "enemy_close_frac", "reset_seconds",
     "completed", "fresh_start", "checkpoints_level", "cells_new", "oob_frac", "exit_dist_min",
+    "gates_reached", "wedged_steps", "level_started", "look_free_frac", "look_gate_frac", "slide_forced_frac",
 ]
+# The same means over fresh-start episodes only (status["mean_fresh_100"]): a respawn episode inherits
+# gates_reached and checkpoints_level from its level load, so only these two say how a whole run goes.
+FRESH_FIELDS = ["gates_reached", "checkpoints_level", "completed"]
 # Campaign runs only (status["campaign"]): completion rate and median time over the last 50 fresh starts.
 CAMPAIGN_FIELDS = ["fresh_window", "fresh_completion_rate", "median_time_50", "best_time"]
-PPO_FIELDS = ["entropy_loss", "approx_kl", "clip_fraction", "explained_variance", "value_loss", "learning_rate"]
+BEST_FIELDS = ["best_checkpoints_level", "best_gates_reached", "best_gate_hops"]
+PPO_FIELDS = ["entropy_loss", "approx_kl", "clip_fraction", "explained_variance", "value_loss", "learning_rate",
+              "entropy_yaw", "entropy_pitch", "entropy_look_mode"]
 PART_FIELDS = ["aim_yaw", "aim_pitch", "aim_locked", "aim", "kill", "damage_dealt", "damage_taken", "death", "wave", "style", "step",
-               "time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path", "level_complete", "punch"]
+               "time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path", "level_complete", "punch",
+               "gate", "gate_approach"]
 
 
 def row(status: dict) -> dict:
@@ -55,9 +62,11 @@ def row(status: dict) -> dict:
         "steps_per_s": status.get("steps_per_s"),
         "state": status.get("state"),
     }
+    fresh = status.get("mean_fresh_100") or {}
     out.update({k: m.get(k) for k in FIELDS})
+    out.update({f"{k}_fresh": fresh.get(k) for k in FRESH_FIELDS})
     out.update({k: campaign.get(k) for k in CAMPAIGN_FIELDS})
-    out["best_checkpoints_level"] = status.get("best_checkpoints_level")
+    out.update({k: status.get(k) for k in BEST_FIELDS})
     out.update({f"ppo_{k}": ppo.get(k) for k in PPO_FIELDS})
     out.update({f"part_{k}": parts.get(k) for k in PART_FIELDS})
     total = sum(v for v in parts.values() if isinstance(v, (int, float)))

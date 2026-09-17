@@ -1,0 +1,58 @@
+auto_enter_arena: true
+best_runs_dir: runs/campaign_ppo_ground/best_runs
+block_human_input: true
+cell_size: 4.0
+difficulty: 3
+end_episode_on_death: true
+explore_dir: models/campaign_ppo_ground
+fixed_fps: 30
+frameskip: 2
+fresh_start_prob: 0.2
+hard_reset_above_wave: 5
+host: 127.0.0.1
+layout:
+  campaign: false
+  ground_ray_length: 30.0
+  ground_rays: 8
+  horizontal_rays: 16
+  max_enemies: 8
+  ray_length: 50.0
+level: Level 0-1
+max_locked_skip_s: 120.0
+max_steps: 9000
+max_wave: 0
+mode: campaign
+mute: true
+pitch_limit_deg: 0.0
+port: 47800
+render: false
+reset_settle_frames: 10
+rewards:
+  aim: 0.0
+  aim_cone_deg: 15.0
+  aim_locked: 0.0
+  aim_pitch: 0.0
+  aim_yaw: 0.0
+  arena_clear: 10.0
+  checkpoint: 10.0
+  damage_dealt: 0.5
+  damage_taken: 0.01
+  death: 5.0
+  door_unlock: 3.0
+  kill: 0.5
+  level_complete: 100.0
+  novelty: 0.5
+  path: 0.1
+  punch: 0.01
+  step_penalty: 0.0
+  style: 0.0
+  time: 0.02
+  wave: 5.0
+soft_death: false
+stuck_repeats: 3
+stuck_seconds: 45
+unlimited_fps: true
+unlock_all_gear: true
+window_height: 207
+window_width: 368
+windowed: true

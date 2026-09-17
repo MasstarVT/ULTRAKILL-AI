@@ -18,6 +18,8 @@ SPAWN = (0.0, 1.0, 0.0)
 CHECKPOINTS = ((0.0, 0.0, 20.0), (0.0, 0.0, 40.0))
 EXIT = (0.0, 0.0, 80.0)
 TRIGGER_RADIUS = 2.0
+# The door graph, sorted by hops ascending as the mod sends it.
+GATES = (("0,0,60", (0.0, 0.0, 60.0), 0), ("0,0,30", (0.0, 0.0, 30.0), 1), ("0,0,10", (0.0, 0.0, 10.0), 2))
 
 
 def load_script():
@@ -38,7 +40,10 @@ class FakeGame:
     """
 
     def __init__(self, *, scene="Level 0-1", slot_counts=(0, 0, 0, 0, 0, 0), apply_difficulty=True, triggers=True, exit=EXIT,
-                 void_checkpoint=None, heal_lethal=False):
+                 void_checkpoint=None, heal_lethal=False, gates=GATES, gates_ordered=True, renumber_on_respawn=False):
+        self.gates = gates  # None stands in for a mod older than 0.6.0
+        self.gates_ordered = gates_ordered
+        self.renumber_on_respawn = renumber_on_respawn
         self.scene = scene
         self.slot_counts = list(slot_counts)
         self.apply_difficulty = apply_difficulty
@@ -133,6 +138,15 @@ class FakeGame:
             "locked_doors": [], "arena_enemies_alive": 0, "cleared_arenas": [], "unlocked_doors": [],
             "ranks": {"time": [120, 90, 60, 30], "kills": [0, 1, 2, 3], "style": [0, 100, 200, 300]},
         }
+        if self.gates is not None:
+            shift = 1 if (self.renumber_on_respawn and self.restarts) else 0  # a Scan() that renumbered the route
+            campaign.update(
+                gates_ordered=self.gates_ordered,
+                gates_truncated=False,
+                gates=[{"key": key, "pos": list(pos), "hops": (hops + shift) if self.gates_ordered else None,
+                        "open": False, "locked": False, "active": True, "controller_active": True}
+                       for key, pos, hops in self.gates],
+            )
         obs = {
             "type": "obs", "step": self.steps, "scene": self.scene, "ready": not self.dead, "player": player,
             "enemies": [], "rays": [50.0] * 16, "ground_rays": [0.0] * 8,
@@ -162,16 +176,18 @@ def statuses(results):
 def test_every_check_passes_on_a_working_level():
     game = FakeGame()
     script, results = run(game)
-    assert statuses(results) == ["PASS", "SKIP", "PASS", "PASS", "PASS"], results
+    assert statuses(results) == ["PASS", "SKIP", "PASS", "PASS", "PASS", "PASS"], results
     assert game.settings["difficulty"] == 3 and game.settings["unlock_all_gear"] is True
     assert game.resets == [False, True]  # one fresh load, then the respawn after the kill
     assert "revolver pickup" in results[1][3]
+    assert "3 gates, hops 0..2 (3 distinct)" in results[5][3]
+    assert "after a respawn" in results[5][3]
     assert script.exit_code(results) == 0
 
 
 def test_the_arsenal_passes_when_every_weapon_slot_is_filled():
     _, results = run(FakeGame(scene="Level 1-1", slot_counts=(4, 3, 3, 3, 3, 0)))
-    assert statuses(results) == ["PASS", "PASS", "PASS", "PASS", "PASS"], results
+    assert statuses(results) == ["PASS", "PASS", "PASS", "PASS", "PASS", "PASS"], results
 
 
 def test_a_difficulty_the_game_ignores_fails_the_level_load():
@@ -184,22 +200,23 @@ def test_a_difficulty_the_game_ignores_fails_the_level_load():
 def test_triggers_that_never_fire_fail_the_checkpoint_and_exit_and_skip_the_death():
     game = FakeGame(triggers=False)
     script, results = run(game)
-    assert statuses(results) == ["PASS", "SKIP", "FAIL", "SKIP", "FAIL"], results
+    assert statuses(results) == ["PASS", "SKIP", "FAIL", "SKIP", "FAIL", "PASS"], results
     assert results[2][3].count("did not activate") == len(CHECKPOINTS)  # every pending checkpoint was tried
     assert "did not fire" in results[4][3]
+    assert "no respawn happened" in results[5][3]  # nothing to compare the gates against
     assert script.exit_code(results) == 1
 
 
 def test_a_null_exit_fails_the_exit_check():
     _, results = run(FakeGame(exit=None))
-    assert statuses(results) == ["PASS", "SKIP", "PASS", "PASS", "FAIL"], results
+    assert statuses(results) == ["PASS", "SKIP", "PASS", "PASS", "FAIL", "PASS"], results
     assert results[4][3].startswith("exit null")
 
 
 def test_a_fall_during_the_checkpoint_check_does_not_fail_the_death_check():
     game = FakeGame(void_checkpoint=0)
     _, results = run(game)
-    assert statuses(results) == ["PASS", "SKIP", "PASS", "PASS", "PASS"], results
+    assert statuses(results) == ["PASS", "SKIP", "PASS", "PASS", "PASS", "PASS"], results
     assert game.resets == [False, True, True]  # the fresh load, the reload after the fall, the respawn after the kill
     assert "0,0,20 did not activate" in results[2][3] and "0,0,40 activated" in results[2][3]
     assert "deaths 1 -> 2" in results[3][3]
@@ -207,9 +224,41 @@ def test_a_fall_during_the_checkpoint_check_does_not_fail_the_death_check():
 
 def test_a_kill_that_soft_death_heals_fails_the_death_check():
     script, results = run(FakeGame(heal_lethal=True))
-    assert statuses(results) == ["PASS", "SKIP", "PASS", "FAIL", "PASS"], results
+    assert statuses(results) == ["PASS", "SKIP", "PASS", "FAIL", "PASS", "PASS"], results
     assert "kill reply dead=False, deaths 0 -> 1" in results[3][3]  # the env still counted and respawned it
     assert script.exit_code(results) == 1
+
+
+def test_a_mod_without_gates_skips_the_gates_check():
+    """Graceful degradation: Python may be merged before the mod, and then there is nothing to check."""
+    script, results = run(FakeGame(gates=None))
+    assert statuses(results)[5] == "SKIP", results
+    assert "older than v0.6.0" in results[5][3]
+    assert script.exit_code(results) == 0
+
+
+def test_an_unordered_level_fails_the_gates_check():
+    script, results = run(FakeGame(gates_ordered=False))
+    assert statuses(results)[5] == "FAIL", results
+    assert "gates_ordered is false" in results[5][3] and "no gate reports hops 0" in results[5][3]
+    assert script.exit_code(results) == 1
+
+
+def test_hops_that_renumber_across_a_respawn_fail_the_gates_check():
+    """A Scan() landing mid-room-recreation must not blank or renumber the route: hops is stable per level load."""
+    script, results = run(FakeGame(renumber_on_respawn=True))
+    assert statuses(results)[5] == "FAIL", results
+    assert "renumbered mid-load" in results[5][3]
+    assert script.exit_code(results) == 1
+
+
+def test_gates_out_of_order_or_duplicated_fail_the_gates_check():
+    unsorted = (("0,0,10", (0.0, 0.0, 10.0), 2), ("0,0,60", (0.0, 0.0, 60.0), 0))
+    _, results = run(FakeGame(gates=unsorted))
+    assert statuses(results)[5] == "FAIL" and "not sorted" in results[5][3], results
+    duplicated = (("0,0,60", (0.0, 0.0, 60.0), 0), ("0,0,60", (0.0, 0.0, 60.5), 1))
+    _, results = run(FakeGame(gates=duplicated))
+    assert statuses(results)[5] == "FAIL" and "duplicate keys" in results[5][3], results
 
 
 def test_command_line_overrides_and_config_defaults():

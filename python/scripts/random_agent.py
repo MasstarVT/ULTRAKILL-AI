@@ -39,7 +39,9 @@ def main() -> None:
                     break
             elapsed = time.perf_counter() - start
             if env.cfg.mode == "campaign":
-                progress = f"completed={info['completed']} checkpoints_level={info['checkpoints_level']} cells_new={info['cells_new']}"
+                progress = (f"completed={info['completed']} checkpoints_level={info['checkpoints_level']} "
+                            f"gates_reached={info['gates_reached']} wedged_steps={info['wedged_steps']} "
+                            f"cells_new={info['cells_new']}")
             else:
                 progress = f"wave={info['wave']}"
             print(

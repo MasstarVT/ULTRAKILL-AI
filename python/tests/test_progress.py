@@ -75,7 +75,7 @@ class FakeCampaignEnv(gym.Env):
 
     def __init__(self, seed: int, log: list[dict]):
         self.observation_space = ObsLayout().space()
-        self.action_space = action_space()
+        self.action_space = action_space(campaign=True)
         self.rng = np.random.default_rng(seed)
         self.log = log  # final info of every finished episode, in the order the callback records them
         self.episode = 0
@@ -109,10 +109,21 @@ class FakeCampaignEnv(gym.Env):
             "cells_new": self.steps * 2,
             "oob_frac": 0.1,  # fraction of steps with no ground under the player
             "exit_dist_min": max(0.0, 60.0 - self.steps),
-            "reward_parts": {"time": -0.01, "novelty": 0.5},
+            # The route gates and the wedge detector (§9.7 of the design spec).
+            "gates_reached": min(4, self.steps // 3),
+            "gate_hops_best": max(0, 9 - self.steps // 3) if self.steps >= 3 else None,
+            "wedged_steps": 45 if self.steps % 5 == 0 else 0,
+            "level_started": 1,
+            "look_free_frac": 0.5,
+            "look_enemy_frac": 0.2,
+            "look_gate_frac": 0.3,
+            "slide_forced_frac": 0.0,
+            "start_checkpoint": None if self.fresh else "40,-2,414",
+            "end_pos": [40.0, -0.5, 361.2 + self.steps],
+            "reward_parts": {"time": -0.01, "novelty": 0.5, "gate": 15.0},
         }
         if terminated:
-            info["end_reason"] = "level_complete" if completed else "stuck"
+            info["end_reason"] = "level_complete" if completed else "wedged" if self.steps % 4 == 0 else "stuck"
             self.log.append(info)
         return self._obs(), 0.49, terminated, False, info
 
@@ -288,21 +299,43 @@ def test_campaign_progress():
         assert c["best_time"] == min(fresh_times)
         assert c["median_time_50"] == statistics.median(ep["level_seconds"] for ep in window if ep["completed"])
         assert s["best_checkpoints_level"] == max(ep["checkpoints_level"] for ep in log)
+        # The route bests are over fresh starts only: a respawn episode inherits both from its level load.
+        assert s["best_gates_reached"] == max(ep["gates_reached"] for ep in fresh)
+        assert s["best_gate_hops"] == min(ep["gate_hops_best"] for ep in fresh if ep["gate_hops_best"] is not None)
 
         m = s["mean_100"]
         assert "route_progress" not in m
-        for key in ("completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "exit_dist_min"):
+        for key in ("completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "exit_dist_min",
+                    "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac"):
             assert m[key] is not None, key
-        assert set(s["end_reasons_100"]) <= {"level_complete", "stuck"}
-        assert set(s["reward_parts_mean_100"]) == {"time", "novelty"}
+        assert s["mean_fresh_100"]["gates_reached"] is not None
+        assert set(s["end_reasons_100"]) <= {"level_complete", "stuck", "wedged"}
+        assert set(s["reward_parts_mean_100"]) == {"time", "novelty", "gate"}
         for e in s["envs"]:
             assert e["episodes"] > 0 and e["checkpoints_level"] is not None
         assert s["history"], "expected chart history points"
         assert all("completion_rate_fresh_50" in p and "mean_checkpoints_level_100" in p for p in s["history"])
+        assert all("mean_gates_reached_100" in p for p in s["history"])  # dashboard.py reads it by this name
         rates = [p["completion_rate_fresh_50"] for p in s["history"] if p["completion_rate_fresh_50"] is not None]
         assert rates and all(0.0 <= r <= 1.0 for r in rates)
 
-        # A restart keeps the best time and the best checkpoint count; the 50-episode window starts empty.
+        # One JSON line per finished episode, with the fields status.json's means throw away.
+        lines = [json.loads(line) for line in (status_path.parent / "episodes.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert len(lines) == s["episodes"]
+        for entry in lines:
+            for key in ("t", "env", "timesteps", "reward", "length", "fresh_start", "start_checkpoint", "end_reason",
+                        "kills", "deaths", "checkpoints_level", "gates_reached", "gate_hops_best", "level_started",
+                        "wedged_steps", "end_pos", "level_seconds", "completed"):
+                assert key in entry, key
+            assert isinstance(entry["end_pos"], list) and len(entry["end_pos"]) == 3
+            assert all(isinstance(v, float) for v in entry["end_pos"])
+            assert entry["end_reason"] in ("level_complete", "stuck", "wedged")
+        respawned = [e for e in lines if not e["fresh_start"]]
+        assert respawned and all(e["start_checkpoint"] == "40,-2,414" for e in respawned)
+        assert any(e["gate_hops_best"] is not None for e in lines)
+
+        # A restart keeps the best time, the best checkpoint count and both route bests; the 50-episode window
+        # starts empty.
         restored = ProgressCallback(status_path, 10, "campaign_run", 2)
         restored.mark_stopped()
         r = json.loads(status_path.read_text(encoding="utf-8"))
@@ -310,24 +343,43 @@ def test_campaign_progress():
         assert r["campaign"]["fresh_window"] == 0 and r["campaign"]["fresh_completion_rate"] is None
         assert r["campaign"]["median_time_50"] is None
         assert r["best_checkpoints_level"] == s["best_checkpoints_level"]
+        assert r["best_gates_reached"] == s["best_gates_reached"]
+        assert r["best_gate_hops"] == s["best_gate_hops"], "a minimum must survive a resume too"
+
+
+def test_episode_log_write_failure_does_not_stop_training():
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = Path(tmp) / "runs" / "broken" / "status.json"
+        cb = ProgressCallback(status_path, 10, "broken", 1)
+        cb.episodes_path = Path(tmp) / "runs" / "broken"  # a directory: every open() for append raises
+        cb.episodes_path.mkdir(parents=True, exist_ok=True)
+        cb._record_episode(0, {"episode": {"r": 1.0, "l": 2}, "kills": 0, "end_reason": "stuck"})
+        assert cb.episodes == 1  # the episode was still recorded
 
 
 def test_dashboard_campaign_panel():
     dashboard = _load_dashboard()
     lines = dashboard.campaign_lines(
         {"fresh_window": 50, "fresh_completion_rate": 0.62, "median_time_50": 59.9996, "best_time": 83.25},
-        {"completed": 0.4, "checkpoints_level": 2.14, "cells_new": 84.4, "deaths": 1.3, "exit_dist_min": 12.2},
+        {"completed": 0.4, "checkpoints_level": 2.14, "cells_new": 84.4, "deaths": 1.3, "exit_dist_min": 12.2,
+         "gates_reached": 1.82, "wedged_steps": 612.4, "look_free_frac": 0.51, "look_gate_frac": 0.29},
         {"time": -9.0, "checkpoint": 20.0, "novelty": 5.04, "path": 0.8, "level_complete": 50.0, "death": None},
+        {"best_gates_reached": 4, "best_gate_hops": 2},
+        {"gates_reached": 0.91},
+        {"entropy_yaw": 2.3, "entropy_pitch": 1.8, "entropy_look_mode": 1.09},
     )
     assert lines == [
         "  fresh completed  62% of last 50",
         "  all completed    40%",
         "  best time        01:23.250",
         "  median time      01:00.000",  # whole milliseconds, never "00:60.000"
+        "  gates/load       1.8 fresh 0.9 best 4 hops 2",
         "  checkpoints/load 2.1",
+        "  wedged/ep        612",
         "  new cells/ep     84",
         "  deaths/ep        1.30",
         "  closest to exit  12m",
+        "  look free/gate   51%/29%  ent y/p/m 2.3/1.8/1.09",
         "  reward parts/ep",
         "    level_complete +50.0",
         "    checkpoint     +20.0",
@@ -336,7 +388,8 @@ def test_dashboard_campaign_panel():
     ], lines
     empty = dashboard.campaign_lines({"fresh_window": 0, "fresh_completion_rate": None, "median_time_50": None, "best_time": None}, {})
     assert empty[0] == "  fresh completed  — of last 0", empty
-    assert [line.split()[-1] for line in empty[1:]] == ["—"] * 7, empty
+    assert len(empty) == 11, empty
+    assert all("—" in line for line in empty[1:]), empty
 
     # The whole window on a real campaign status (charts, games table, Campaign panel).
     with tempfile.TemporaryDirectory() as tmp:
@@ -359,11 +412,15 @@ def test_poll_status_keeps_old_header():
     status = {
         "state": "running", "timesteps": 123456, "episodes": 300, "window": 100, "steps_per_s": 190.0,
         "mean_100": {"reward": 12.5, "kills": 3.0, "deaths": 1.2, "completed": 0.4, "fresh_start": 0.2,
-                     "checkpoints_level": 1.5, "cells_new": 60.0, "exit_dist_min": 20.0},
+                     "checkpoints_level": 1.5, "cells_new": 60.0, "exit_dist_min": 20.0,
+                     "gates_reached": 1.8, "wedged_steps": 612.0, "look_gate_frac": 0.3},
+        "mean_fresh_100": {"gates_reached": 0.9, "checkpoints_level": 0.4, "completed": 0.0},
         "campaign": {"fresh_window": 50, "fresh_completion_rate": 0.4, "median_time_50": 95.0, "best_time": 83.25},
         "best_checkpoints_level": 3,
-        "ppo": {"entropy_loss": -8.0},
-        "reward_parts_mean_100": {"time": -9.0, "checkpoint": 20.0, "novelty": 5.0},
+        "best_gates_reached": 4,
+        "best_gate_hops": 2,
+        "ppo": {"entropy_loss": -8.0, "entropy_yaw": 2.3},
+        "reward_parts_mean_100": {"time": -9.0, "checkpoint": 20.0, "novelty": 5.0, "gate": 30.0, "gate_approach": 8.5},
     }
     # The header an older poll_status.py wrote: none of the campaign columns.
     old_header = ["wall_time", "timesteps", "episodes", "window", "steps_per_s", "state",
@@ -391,7 +448,7 @@ def test_poll_status_keeps_old_header():
         assert len(rows) == 3, rows
         assert len(rows[2]) == len(old_header), (len(rows[2]), len(old_header))
         appended = dict(zip(old_header, rows[2]))
-        assert appended["timesteps"] == "123456" and appended["reward"] == "12.5" and appended["part_total"] == "16.0", appended
+        assert appended["timesteps"] == "123456" and appended["reward"] == "12.5" and appended["part_total"] == "54.5", appended
 
         # A new log gets every column, campaign ones included.
         with (runs / "new_run" / "metrics_log.csv").open(newline="", encoding="utf-8") as f:
@@ -402,6 +459,12 @@ def test_poll_status_keeps_old_header():
         assert logged["median_time_50"] == "95.0" and logged["best_time"] == "83.25", logged
         assert logged["best_checkpoints_level"] == "3" and logged["checkpoints_level"] == "1.5", logged
         assert logged["part_time"] == "-9.0" and logged["part_novelty"] == "5.0" and logged["part_level_complete"] == "", logged
+        # The route columns, and the fresh-start split gates 2 and 3 are judged on.
+        assert logged["gates_reached"] == "1.8" and logged["gates_reached_fresh"] == "0.9", logged
+        assert logged["wedged_steps"] == "612.0" and logged["look_gate_frac"] == "0.3", logged
+        assert logged["best_gates_reached"] == "4" and logged["best_gate_hops"] == "2", logged
+        assert logged["part_gate"] == "30.0" and logged["part_gate_approach"] == "8.5", logged
+        assert logged["ppo_entropy_yaw"] == "2.3", logged
 
 
 if __name__ == "__main__":
