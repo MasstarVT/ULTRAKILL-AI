@@ -140,6 +140,13 @@ re-earned by re-walking.
    Relaxing it for fallbacks costs 0-1 nothing, measured: **all 46 of 0-1's window expiries are on ladder
    targets and none on a fallback target**, so the same single park happens either way. It does make A2's tail
    ("then the exit when none remain") reachable, which is why `_exhausted` exists.
+   **Known residual, not fixed here.** Keeping the test for ladder picks leaves one shape of Bug A alive: a
+   level where the unreachable rung-below door is ALSO the nearest unreached gate would never be parked, because
+   nothing is strictly nearer. 0-3 is not that shape (`0,13,362` and `0,53,330` are nearer than `-16,73,315`
+   from the pit) and neither is any level with probe data, but 1-1, 1-2, 2-3, 4-3 and 8-1 have none. The
+   detector is `targets_parked` reading 0 on a level whose fresh `gates_reached` is stuck; the cure is the route
+   redesign, not a knob. Dropping the test outright is not the cure either: it is the only thing holding 0-1's
+   45 other expiries, and without it the recorded run parks 0-13 gates per episode.
    **The seventh 0-1 episode, exactly.** Episode 5 parks `40,11,624` once and hands over to `66,21,640` — the
    same gate the ladder was going to pick next, in the same order — **78 decisions early** (3183/1092 becomes
    3105/1170). `gate` instalments are identical at 7, the reached set and `best_hops` are identical, and

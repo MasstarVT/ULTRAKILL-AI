@@ -1795,7 +1795,11 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - **What to watch once this is merged**, in this order:
     1. `targets_parked` — expect **~0 on 0-1** (one park in seven recorded episodes) and **> 0 on 0-3, 1-1, 1-2,
        2-3, 4-3 and 8-1**. A collapsed level reading 0 means the mechanism is not firing there, not that the
-       level is fine: that is exactly what the unbounded arena suspension used to look like.
+       level is fine: that is exactly what the unbounded arena suspension used to look like, and it is also the
+       **known residual** — a ladder pick is only parked when some unreached gate is strictly nearer, so a level
+       whose unreachable rung-below door is *also* the nearest unreached gate still wedges. 0-3 is not that
+       shape; 1-1, 1-2, 2-3, 4-3 and 8-1 have no probe data either way. Do not answer it by dropping that test:
+       it is the only thing holding 0-1's other 45 window expiries.
     2. `exit_banished` — expect **1 on 0-2** once checkpoint `-55,-11,277` activates, and **0 everywhere else**.
        A 1 on another level means a second banish site nobody has looked at.
     3. **0-3 and 0-2 fresh** `gates_reached` and `checkpoints_level`. Judge these on fresh starts only, on a
