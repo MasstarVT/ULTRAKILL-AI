@@ -211,6 +211,46 @@ def test_history_is_capped():
     assert ts == sorted(ts) and ts[-1] == progress_mod.HISTORY_MAX * 3 - 1
 
 
+def test_history_drops_the_tail_a_rewound_resume_supersedes():
+    """Resuming from an older checkpoint must not leave the chart's x axis running backwards.
+
+    `_restore` carries the whole old history over, but a resume from an older checkpoint rewinds
+    num_timesteps, so the restored tail sits ahead of the points that follow it and the dashboard draws a line
+    that doubles back. This happened for real on campaign_ppo_ground (2,691,640 -> 2,654,560).
+    """
+    cb = ProgressCallback(Path(tempfile.gettempdir()) / "unused.json", 100, "x", 1)
+    for step in (100, 200, 300, 400):
+        cb._add_history({"timesteps": step, "mean_reward_100": step / 10.0})
+    cb._add_history({"timesteps": 250, "mean_reward_100": 99.0})  # resumed from the 250 checkpoint
+    ts = [p["timesteps"] for p in cb.history]
+    assert ts == [100, 200, 250], f"superseded points should be dropped, got {ts}"
+    assert ts == sorted(ts)
+    cb._add_history({"timesteps": 300, "mean_reward_100": 1.0})
+    assert [p["timesteps"] for p in cb.history] == [100, 200, 250, 300]
+    # The surviving point at 300 is the one from the continuing run, not the abandoned one.
+    assert cb.history[-1]["mean_reward_100"] == 1.0
+
+
+def test_dashboard_renders_a_history_that_already_rewound():
+    """The dashboard is a viewer: it must cope with a status.json written before the callback fix."""
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = Path(tmp) / "status.json"
+        _train(status_path, 600)
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        history = status.get("history") or []
+        if len(history) >= 2:  # splice a rewind in, the way a resume from an older checkpoint leaves one
+            rewound = dict(history[-1])
+            rewound["timesteps"] = int(history[0].get("timesteps") or 0)
+            history.append(rewound)
+        status["history"] = history
+        status_path.write_text(json.dumps(status), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "dashboard.py"), "--file", str(status_path), "--smoke-test"],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_dashboard_smoke():
     with tempfile.TemporaryDirectory() as tmp:
         status_path = Path(tmp) / "status.json"

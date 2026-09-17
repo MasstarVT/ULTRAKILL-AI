@@ -431,12 +431,19 @@ class Dashboard:
         history = [p for p in (get("history") or []) if isinstance(p, dict)]
 
         def series(key, x_key="timesteps", x_offset=0.0):
+            # x must increase, or the line doubles back and the chart looks scrambled. A status.json written
+            # before the ProgressCallback fix can still hold a rewind, from a training restart that resumed an
+            # older checkpoint, so clean it at draw time too: this is a viewer, and it must render whatever is
+            # already on disk. Dropping the superseded points keeps the run that continued.
             out = []
             for p in history:
                 x, y = num(p.get(x_key)), num(p.get(key))
-                if x is not None and y is not None:
-                    out.append((x - x_offset, y))
-            return out
+                if x is None or y is None:
+                    continue
+                while out and out[-1][0] >= x:
+                    out.pop()
+                out.append((x, y))
+            return [(x - x_offset, y) for x, y in out]
 
         self.chart_reward.set_series([("reward", GREEN, series("mean_reward_100"))])
         if campaign is not None:

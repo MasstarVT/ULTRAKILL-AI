@@ -274,6 +274,17 @@ class ProgressCallback(BaseCallback):
         }
 
     def _add_history(self, point: dict) -> None:
+        # Keep `timesteps` strictly increasing. `_restore` carries the whole old history over, but resuming from
+        # an older checkpoint rewinds num_timesteps, so the restored tail can sit ahead of the point being added
+        # and the dashboard draws a line that doubles back on itself. Dropping the superseded tail keeps the run
+        # that is actually continuing and discards the abandoned one, which is what the chart should show.
+        steps = _num(point.get("timesteps"))
+        if steps is not None:
+            while self.history:
+                last = _num(self.history[-1].get("timesteps"))
+                if last is None or last < steps:
+                    break
+                self.history.pop()
         self.history.append(point)
         if len(self.history) > HISTORY_MAX:
             # Halve the resolution of the older half; recent points stay dense.
