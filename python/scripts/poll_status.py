@@ -34,6 +34,9 @@ FIELDS = [
     "enemy_dist_mean", "enemy_close_frac", "reset_seconds",
     "completed", "fresh_start", "checkpoints_level", "cells_new", "oob_frac", "exit_dist_min",
     "gates_reached", "wedged_steps", "level_started", "look_free_frac", "look_gate_frac", "slide_forced_frac",
+    # The 2026-09-17 patience/exit-guard mechanisms. An existing metrics_log.csv keeps its own header, so move
+    # the old file aside to get these two columns.
+    "targets_parked", "exit_banished",
 ]
 # The same means over fresh-start episodes only (status["mean_fresh_100"]): a respawn episode inherits
 # gates_reached and checkpoints_level from its level load, so only these two say how a whole run goes.

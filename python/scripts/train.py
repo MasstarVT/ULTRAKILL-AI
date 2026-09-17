@@ -214,6 +214,7 @@ def main() -> None:
     progress = ProgressCallback(Path("runs") / run_name / "status.json", timesteps, run_name, num_envs,
                                 levels=env_cfg.levels, curriculum_path=env_cfg.curriculum_path,
                                 unlock_rate=env_cfg.unlock_rate, unlock_window=env_cfg.unlock_window,
+                                unlock_after_fresh_episodes=env_cfg.unlock_after_fresh_episodes,
                                 level_weight_floor=env_cfg.level_weight_floor)
     if env_cfg.levels:
         # Written before learn(), because SB3's _setup_learn calls env.reset() before _on_training_start ever

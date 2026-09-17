@@ -9,7 +9,8 @@ Best time per level. A generation only takes a spot by beating the current recor
 
 | Level | Time | Rank | Generation | Difficulty | Date | Notes |
 |-------|------|------|------------|------------|------|-------|
-| — | — | — | — | — | — | No completed runs yet |
+| 0-1 | 03:03.628 | A | campaign_gates@6.85M | Violent | 2026-09-17 | training episode (sampled actions), fresh start |
+| 0-2 | 06:43.906 | B | campaign_gates@8.24M | Violent | 2026-09-17 | training episode (sampled actions), fresh start |
 
 ## Generation history
 
@@ -17,7 +18,10 @@ Best run from each generation, newest first. Keep every generation here, even on
 
 | Generation | Level | Time | Rank | Kills | Deaths | Δ vs previous | Date | Notes |
 |------------|-------|------|------|-------|--------|---------------|------|-------|
-| — | — | — | — | — | — | — | — | No generations trained yet |
+| campaign_gates@8.24M | 0-2 | 06:43.906 | B | 51 | 2 | — | 2026-09-17 | training episode (sampled actions), fresh start |
+| campaign_gates@6.85M | 0-1 | 03:03.628 | A | 61 | 0 | -76.656s | 2026-09-17 | training episode (sampled actions), fresh start |
+| campaign_gates@6.44M | 0-1 | 04:20.284 | B | 63 | 1 | -180.430s | 2026-09-17 | training episode (sampled actions), fresh start |
+| campaign_gates@5.57M | 0-1 | 07:20.714 | B | 64 | 1 | — | 2026-09-17 | training episode (sampled actions), fresh start |
 
 <!--
 How to add an entry:

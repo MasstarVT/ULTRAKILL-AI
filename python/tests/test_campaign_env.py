@@ -24,6 +24,7 @@ RESPAWN_DOOR_KEY = "0,0,25"
 RANKS = {"time": [120, 90, 60, 30], "kills": [0, 1, 2, 3], "style": [0, 100, 200, 300]}
 ENEMY_ID = 7
 ENEMY_MAX_HP = 50.0
+BANISH_X = 10000.0  # CheckPoint.Start / ResetRoom: defaultRooms[i].transform.position.x + 10000f
 # Three doors along the corridor, the door graph the mod reports as campaign.gates: hops counts the rooms left
 # after passing one, so 0 is the door into the exit's room.
 GATES = (("0,1,15", (0.0, 1.0, 15.0), 2), ("0,1,35", (0.0, 1.0, 35.0), 1), ("0,1,55", (0.0, 1.0, 55.0), 0))
@@ -82,6 +83,12 @@ class FakeLevel:
                        0-4's `CustomKey1` standing in a level that also has skull altars
       `item_active`    False is the carryable's room still switched off: it is reported but has no collider, so
                        no punch can reach it -- what a teleport into an unactivated room leaves you with
+
+    Bridge faults are injected with `fail_resets` / `fail_steps`: each is a queue of exceptions, one popped and
+    raised per call, so a test can say "time out the next two resets, then work". That is what the live failures
+    look like from Python -- a `BridgeTimeout` on a reset, a `BridgeClosed` when the socket drops, a
+    `BridgeSceneUnknown` from a game that has not finished booting -- and `connects` counts how often the env
+    rebuilt the connection in response.
     """
 
     def __init__(self):
@@ -100,6 +107,10 @@ class FakeLevel:
         self.gates_ordered = True
         self.gates = GATES
         self.ground_center: float | None = None
+        # `CheckPoint.Start` / `ResetRoom` move the ORIGINAL room by x + 10000 and leave a clone behind; the
+        # mod's frozen FinalPit reference follows the original. This is that displacement, in banish steps:
+        # set it mid-load to reproduce Level 0-2's jump, and the level load clears it like a real reload.
+        self.exit_banish_steps = 0
         self.yaw = 0.0
         self.enemy_rel = [0.0, 0.0, 5.0]
         self.last_action: dict | None = None  # the command dict the env last sent
@@ -112,7 +123,19 @@ class FakeLevel:
         self.item_active = True
         self.picked_up = 0  # times a punch picked the skull up, and times one threw it: the physical events
         self.thrown = 0
+        # Injected bridge faults, popped one per call (see the class docstring).
+        self.fail_resets: list[BaseException] = []
+        self.fail_steps: list[BaseException] = []
+        self.connects = 0
+        self.configures = 0
+        self.closes = 0
         self._load()
+
+    def fail_next_resets(self, exc: BaseException, times: int = 1) -> None:
+        self.fail_resets.extend(type(exc)(*exc.args) for _ in range(times))
+
+    def fail_next_steps(self, exc: BaseException, times: int = 1) -> None:
+        self.fail_steps.extend(type(exc)(*exc.args) for _ in range(times))
 
     def enable_skulls(self, *, fields: bool = True, altars: bool = True, item_type: str = ALTAR_ITEM) -> None:
         """Turns the level into the skull room. Call before reset(); `fields=False` is a mod older than 0.7.0.
@@ -134,6 +157,7 @@ class FakeLevel:
     def _load(self) -> None:
         self.z = 0.0
         self.y = 1.0
+        self.exit_banish_steps = 0  # a real level load re-instantiates the rooms, so nothing is banished yet
         # A level load puts the skull back on its pedestal. A checkpoint respawn does too, but under a fresh key:
         # CheckPoint.ResetRoom destroys and re-instantiates the room, which is why nothing may key on an instance.
         self.skull_key = "skull"
@@ -154,13 +178,15 @@ class FakeLevel:
     # The BridgeClient methods UltrakillEnv uses ----------------------------
 
     def connect(self, retry_seconds: float = 60.0) -> dict:
+        self.connects += 1
         return {"type": "hello", "protocol": 1, "mod_version": "0.5.0", "scene": LEVEL}
 
     def configure(self, **settings) -> None:
+        self.configures += 1
         self.settings = settings
 
     def close(self) -> None:
-        pass
+        self.closes += 1
 
     def get_obs(self) -> dict:
         return self._obs()
@@ -171,6 +197,8 @@ class FakeLevel:
         return self._obs("kill")
 
     def reset(self, scene: str | None = None, checkpoint: bool = False) -> dict:
+        if self.fail_resets:
+            raise self.fail_resets.pop(0)
         self.resets.append(checkpoint)
         self.reset_scenes.append(scene)
         switched = scene is not None and scene != self.scene_name
@@ -207,6 +235,8 @@ class FakeLevel:
             self.picked_up += 1
 
     def step(self, action: dict) -> dict:
+        if self.fail_steps:
+            raise self.fail_steps.pop(0)
         self.steps += 1
         self.last_action = dict(action)
         if self.falling:
@@ -320,7 +350,7 @@ class FakeLevel:
             "campaign": {
                 "mission": 1, "difficulty": 3, "seconds": self.seconds, "timer_running": not over,
                 "level_started": True, "level_over": over, "restarts": self.restarts, "input_locked": self.locked,
-                "exit": {"pos": [0.0, 1.0, EXIT_Z], "active": True},
+                "exit": {"pos": [BANISH_X * self.exit_banish_steps, 1.0, EXIT_Z], "active": True},
                 "checkpoints": [{"id": CHECKPOINT_ID, "pos": [0.0, 1.0, 20.0], "activated": self.checkpoint, "current": self.checkpoint}],
                 "path": {"status": "complete", "length": EXIT_Z - self.z, "next_corner": [0.0, 1.0, EXIT_Z]},
                 "locked_doors": [],
@@ -739,6 +769,108 @@ def test_gate_slots_track_the_target():
         obs, _, _, _, _ = env.step(forward())
     assert obs[GATE_BLOCK + 4] == 1.0 and obs[GATE_BLOCK + 5] == 0.0 and obs[GATE_BLOCK + 7] == 0.0
     assert abs(obs[GATE_BLOCK + 2] - (EXIT_Z - 48.0) / 100.0) < 1e-6
+    env.close()
+
+
+# -- the banished FinalPit (docs/superpowers/specs/2026-09-17-ladder-patience-and-exit-guard.md) -----------
+
+def test_a_banished_exit_is_ignored_for_the_target_the_observation_and_exit_dist():
+    """Level 0-2's bug: `CheckPoint.Start` moves the ORIGINAL room x + 10000 and the mod's exit follows it."""
+    env, fake = make_env()
+    obs, _ = env.reset(seed=0)
+    assert obs[443 + 4] == 1.0 and abs(obs[443 + 2] - EXIT_Z / 100.0) < 1e-6
+    for _ in range(24):  # z 48: past the hops 0 gate, so the target is the exit itself
+        obs, _, _, _, info = env.step(forward())
+    assert not info["exit_banished"]
+    before = env.gates.target["pos"]
+    fake.exit_banish_steps = 1  # the checkpoint's room clone lands, and the reported pit jumps +10,000 on x
+    obs, _, _, _, info = env.step(forward())
+    assert info["exit_banished"] == 1
+    assert env.gates.target["pos"] == before, "the target stays on the real pit"
+    assert abs(obs[443 + 2] - (EXIT_Z - 50.0) / 100.0) < 1e-6, "and so do observation slots 0-4"
+    assert obs[443] == 0.0, "rel x would read ~100 (10,000 m / the 100 m scale, clipped) against the twin"
+    assert abs(obs[443 + 3] - (EXIT_Z - 50.0) / 200.0) < 1e-6
+    assert info["exit_dist_min"] < 100.0, "exit_dist_min never sees the 9,801 m twin"
+    fake.exit_banish_steps = 2  # ResetRoom runs again on the next respawn: the offset is k * 10000
+    obs, _, terminated, truncated, info = env.step(forward())
+    assert env.gates.target["pos"] == before and info["exit_banished"] == 1
+    env.close()
+
+
+def test_a_banished_exit_does_not_stop_the_level_completing():
+    env, fake = make_env()
+    env.reset(seed=0)
+    fake.exit_banish_steps = 1
+    parts: dict[str, float] = {}
+    for _ in range(35):
+        _, _, terminated, truncated, info = env.step(forward())
+        add_parts(parts, info)
+        if terminated or truncated:
+            break
+    assert info["end_reason"] == "level_complete" and info["exit_banished"] == 1
+    assert parts.get("gate", 0) > 0
+    env.close()
+
+
+def test_a_new_level_load_accepts_whatever_exit_it_reports():
+    env, fake = make_env()
+    env.reset(seed=0)
+    fake.exit_banish_steps = 1
+    env.step(forward())
+    assert env.exit_guard.banished
+    env.reset(seed=1)  # a fresh load: FakeLevel._load puts the rooms back, as the real game does
+    assert not env.exit_guard.banished and env.exit_guard.frozen == [0.0, 1.0, EXIT_Z]
+    _, _, _, _, info = env.step(forward())
+    assert info["exit_banished"] == 0
+    env.close()
+
+
+def test_targets_parked_is_zero_on_a_monotone_level():
+    """The corridor is 0-1's shape: every rung is walked in order, so nothing is ever parked."""
+    env, _ = make_env()
+    env.reset(seed=0)
+    for _ in range(35):
+        _, _, terminated, truncated, info = env.step(forward())
+        if terminated or truncated:
+            break
+    assert info["end_reason"] == "level_complete"
+    assert info["targets_parked"] == 0 and info["exit_banished"] == 0
+    env.close()
+
+
+def test_patience_is_measured_in_game_seconds_whatever_the_frameskip():
+    for fps, skip in ((30.0, 2), (60.0, 4), (60.0, 1)):
+        cfg = EnvConfig(mode="campaign", level=LEVEL, fixed_fps=fps, frameskip=skip, gate_target_patience_s=20.0)
+        env = UltrakillEnv(cfg)
+        env.client = FakeLevel()
+        assert env.gates.patience_steps == int(round(20.0 * fps / skip))
+        env.close()
+    env, _ = make_env(gate_target_patience_s=0.0)
+    assert env.gates.patience_steps == 0, "0 turns parking off and restores the pre-patience tracker"
+    env.close()
+
+
+def test_a_target_the_agent_cannot_reach_is_parked_in_a_real_episode():
+    """The 0-3 shape through the env: the ladder's next rung is 200 m up, and standing still must not wedge."""
+    env, fake = make_env(max_steps=1200, stuck_seconds=1000.0)
+    fake.gates = (("0,1,15", (0.0, 1.0, 15.0), 2), ("0,201,15", (0.0, 201.0, 15.0), 1),
+                  ("0,1,55", (0.0, 1.0, 55.0), 0))
+    fake._load()
+    env.reset(seed=0)
+    for _ in range(9):  # reach the hops 2 gate, which locks best_hops at 2
+        env.step(forward())
+    assert env.gates.target["key"] == "0,201,15", "the ladder points at the unreachable rung"
+    for _ in range(env.gates.patience_steps + 2):
+        _, _, terminated, truncated, info = env.step(idle())
+        if terminated or truncated:
+            break
+    assert env.gates.parked == {"0,201,15"}
+    assert env.gates.target["key"] == "0,1,55", "the nearest unreached, unparked gate at any hop count"
+    for _ in range(25):
+        _, _, terminated, truncated, info = env.step(forward())
+        if terminated or truncated:
+            break
+    assert info["targets_parked"] == 1
     env.close()
 
 
@@ -1307,6 +1439,31 @@ def test_punch_passes_through_while_carrying_an_item_the_altars_do_not_accept():
         kept += "punch" in fake.last_action["buttons"]
     env.close()
     assert kept == 6, "an unwanted carry never gates the button, however far from an altar it goes"
+
+
+def test_a_carry_that_stalls_past_the_patience_window_keeps_its_punch_protection():
+    """The interaction the patience mechanism must not break, end to end through the env.
+
+    `_protect_carry` drops the punch button only while `gates.target` is the ALTAR sub-goal of a held item --
+    one source of truth, so the button can never be taken away and left that way. Parking the GATE that leg
+    serves deletes the leg, `_subgoal` never rebuilds it, and the protection silently lapses with the skull
+    still held; the live policy presses punch on ~35% of decisions and `Punch.ActiveStart` turns one into a
+    throw. On 1-1 that gate is the only route forward, so the level load is lost. `_tick_patience` therefore
+    never parks a carry, nor any gate still reporting `needs_item`.
+
+    Stalled here for twenty patience windows, 16 m short of the altar and punching on every decision.
+    """
+    env, fake = skull_env(max_steps=700, gate_target_patience_s=2.0)  # 30 decisions per window at 30 fps / 2
+    assert env.gates.patience_steps == 30
+    env.reset(seed=0)
+    walk(env, 9, punch=True)  # z 18: the skull was picked up at z 16 and is being carried
+    assert fake.skull_held and fake.picked_up == 1 and fake.thrown == 0
+    for _ in range(600):  # stand still, punching, for twenty windows
+        env.step(action(buttons=("punch",)))
+    env.close()
+    assert fake.thrown == 0 and fake.skull_held, "the skull is still in the player's hands"
+    assert env.gates.parks == 0 and not env.gates.parked, "and the gate its altar opens was never parked"
+    assert env.gates.target["subgoal"] == "altar", "so the carry leg is still the target"
 
 
 def test_carry_protection_can_be_turned_off_and_then_the_punch_throws_it():

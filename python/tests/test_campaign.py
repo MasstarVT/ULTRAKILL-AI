@@ -22,6 +22,7 @@ from ultrakill_ai.campaign import (  # noqa: E402
     RANK_LETTERS,
     SUBGOAL_ALTAR,
     SUBGOAL_ITEM,
+    ExitGuard,
     ExplorationArchive,
     GateProgress,
     MilestoneTracker,
@@ -65,9 +66,9 @@ def test_shipped_levels_exclude_the_two_with_no_scene_bundle():
 ORDER = ["Level 0-1", "Level 0-3", "Level 0-4"]
 
 
-def record(*, unlocked=True, window=50, rate=None, best=None, episodes=0):
+def record(*, unlocked=True, window=50, rate=None, best=None, episodes=0, fresh_episodes=0):
     return {"unlocked": unlocked, "fresh_window": window, "fresh_completion_rate": rate,
-            "best_time": best, "episodes": episodes}
+            "best_time": best, "episodes": episodes, "fresh_episodes": fresh_episodes}
 
 
 def draws(stats, n=4000, seed=0, floor=0.1):
@@ -137,6 +138,69 @@ def test_unlock_is_a_latch_the_caller_holds():
     stats = {"Level 0-1": record(rate=0.9), "Level 0-3": record(unlocked=True, rate=0.0, window=50)}
     assert unlock_next(ORDER, stats) is None
     assert "Level 0-3" in dict(level_weights(ORDER, stats))
+
+
+def test_a_level_inserted_before_an_unlocked_one_does_not_re_lock_it():
+    """Inserting 0-2 between 0-1 and 0-3 must leave 0-3 unlocked and still sampled.
+
+    This is the 2026-09-17 pause's own case: the live run had 0-1 and 0-3 unlocked, and the new order puts 0-2
+    between them. `unlock_next` walks the order and stops at the first LOCKED level, so with 0-2 locked it never
+    looks at 0-3 -- and it has no way to lock anything, since it only ever names a level for the caller to
+    unlock. The danger would be `level_weights` dropping 0-3 for having a locked predecessor; it does not, it
+    reads each level's own `unlocked` flag.
+    """
+    order = ["Level 0-1", "Level 0-2", "Level 0-3", "Level 0-4"]
+    stats = {"Level 0-1": record(window=0, rate=None), "Level 0-2": record(unlocked=False),
+             "Level 0-3": record(unlocked=True, window=9, rate=0.0), "Level 0-4": record(unlocked=False)}
+    assert unlock_next(order, stats) is None, "0-1's window is empty after a restart, so nothing unlocks yet"
+    assert set(dict(level_weights(order, stats))) == {"Level 0-1", "Level 0-3"}, "0-3 keeps its sampling weight"
+    stats["Level 0-1"] = record(window=20, rate=0.54)  # the window refills at the old rate
+    assert unlock_next(order, stats) == "Level 0-2", "and then the inserted level unlocks normally"
+    stats["Level 0-2"] = record(unlocked=True, window=0, rate=None)
+    assert unlock_next(order, stats) is None, "0-3 is already unlocked; 0-4 waits on 0-3's own rate"
+
+
+def test_the_safety_valve_unlocks_on_fresh_episodes_alone():
+    """`unlock_after_fresh_episodes` stops one hard level blocking the whole campaign.
+
+    Off by default (0), so every existing run is byte for byte unchanged. When set, a level that has spent that
+    many of its own fresh episodes without reaching `unlock_rate` opens its successor anyway -- the rate bar is
+    the fast path, this is the slow one. It counts CUMULATIVE fresh episodes, not the 50-deep window, because a
+    window saturates at 50 and could never express "600 tries".
+    """
+    stats = {"Level 0-1": record(window=50, rate=0.1, fresh_episodes=599)}
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) is None
+    assert unlock_next(ORDER, stats) is None, "and with the valve off it stays shut forever"
+    stats["Level 0-1"]["fresh_episodes"] = 600
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) == "Level 0-3"
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=0) is None, "0 means off, not 'always'"
+
+
+def test_the_safety_valve_is_chained_like_the_rate_bar():
+    """It opens exactly one rung: the successor of the level that ran out of patience, not the whole ladder."""
+    stats = {"Level 0-1": record(window=50, rate=0.0, fresh_episodes=900),
+             "Level 0-3": record(unlocked=False), "Level 0-4": record(unlocked=False)}
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) == "Level 0-3"
+    stats["Level 0-3"] = record(unlocked=True, window=50, rate=0.0, fresh_episodes=10)
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) is None, "0-4 waits its own 600 out"
+    stats["Level 0-3"]["fresh_episodes"] = 600
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) == "Level 0-4"
+
+
+def test_the_safety_valve_still_needs_the_predecessor_unlocked():
+    """A locked level cannot accumulate fresh episodes, but a hand-edited table must not open a hole either."""
+    stats = {"Level 0-1": record(window=50, rate=0.0, fresh_episodes=5),
+             "Level 0-3": record(unlocked=False, fresh_episodes=9999), "Level 0-4": record(unlocked=False)}
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) is None
+
+
+def test_a_table_written_before_the_safety_valve_existed_still_loads():
+    """Old `curriculum.json` / `status.json` rows have no `fresh_episodes`; they must read as 0, not raise."""
+    old = {"Level 0-1": {"unlocked": True, "fresh_window": 50, "fresh_completion_rate": 0.1,
+                         "best_time": None, "episodes": 400}}
+    assert unlock_next(ORDER, old, unlock_after_fresh_episodes=600) is None
+    old["Level 0-1"]["fresh_completion_rate"] = 0.6
+    assert unlock_next(ORDER, old, unlock_after_fresh_episodes=600) == "Level 0-3", "the rate bar still works"
 
 
 def curriculum_file(path, *, order=ORDER, run_name="campaign_prelude", levels=None):
@@ -1215,6 +1279,598 @@ def test_gate_progress_survives_a_step_without_a_player():
     held = p.target
     assert p.update(camp, None) == (0, 0.0)
     assert p.target is held  # a frame with no player keeps pointing where it was
+
+
+# ---------------------------------------------------------------------------
+# Target patience, parking and the A2 fallback
+# (docs/superpowers/specs/2026-09-17-ladder-patience-and-exit-guard.md)
+# ---------------------------------------------------------------------------
+
+# A collapsed ladder in miniature, with Level 0-3's shape: the gate nearest the spawn is already hops 1, the
+# hops 0 door is unreachable straight up, and the walkable route runs AWAY from the exit through hops 2 and 3
+# before it comes back. `PATIENCE` is the default 20 game seconds at 30 fps / frameskip 2.
+PATIENCE = 300
+COLLAPSED = [
+    gate("0,80,0", (0.0, 80.0, 0.0), 0),       # 80 m straight up, the ladder's answer and unreachable
+    gate("0,0,10", (0.0, 0.0, 10.0), 1),       # touched from below at the spawn, which locks best_hops at 1
+    gate("0,0,60", (0.0, 0.0, 60.0), 2),       # the real next leg, further from the exit
+    gate("0,0,110", (0.0, 0.0, 110.0), 3),     # and the one after it
+]
+
+
+def patient(**kw) -> GateProgress:
+    kw.setdefault("patience_steps", PATIENCE)
+    return GateProgress(**kw)
+
+
+def dwell(progress: GateProgress, camp: dict, pos, steps: int, **kw) -> tuple[int, float]:
+    """Stands still for `steps` decisions, which is what runs the patience clock down."""
+    return walk_kw(progress, camp, [pos] * steps, **kw)
+
+
+def walk_kw(progress: GateProgress, camp: dict, positions, **kw) -> tuple[int, float]:
+    paid, approach = 0, 0.0
+    for pos in positions:
+        g, a = progress.update(camp, pos, **kw)
+        paid += g
+        approach += a
+    return paid, approach
+
+
+def test_patience_is_off_by_default_so_the_tracker_is_the_pre_patience_one():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = GateProgress()  # no patience_steps
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), 3 * PATIENCE)
+    assert p.target["key"] == "0,80,0" and not p.parked, "with patience 0 nothing is ever parked"
+
+
+def test_a_target_that_never_gets_closer_is_parked_and_the_fallback_takes_over():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))  # the spawn already touches the hops 1 gate
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    assert p.best_hops == 1 and p.target["key"] == "0,80,0"
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE - 1)
+    assert p.target["key"] == "0,80,0", "the clock has not run out yet"
+    dwell(p, camp, (0.0, 0.0, 10.0), 1)
+    assert p.parked == {"0,80,0"} and p.parks == 1
+    assert p.target["key"] == "0,0,60", "the nearest unreached, unparked gate at any hop count"
+
+
+def test_parking_needs_somewhere_better_to_go():
+    """The whole reason Level 0-1 is left alone: with nothing nearer unreached, the ladder's answer stands."""
+    camp = gates_block([gate("0,0,0", (0.0, 0.0, 0.0), 0), gate("0,0,40", (0.0, 0.0, 40.0), 1)], exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 40.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 40.0))
+    assert p.target["key"] == "0,0,0"
+    dwell(p, camp, (0.0, 0.0, 200.0), 4 * PATIENCE)  # far from both, and the only other gate is reached
+    assert not p.parked and p.parks == 0
+    assert p.target["key"] == "0,0,0"
+
+
+def test_an_arena_holding_the_door_shut_suspends_the_clock():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    held = dict(camp, arena_enemies_alive=4)
+    p = patient()
+    p.new_level_load(held, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(held, (0.0, 0.0, 10.0))
+    dwell(p, held, (0.0, 0.0, 10.0), 2 * PATIENCE - 1)  # just inside the bound the suspension is allowed
+    assert not p.parked, "a door an ActivateArena wave is holding cannot be approached; that is not the ladder's fault"
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)  # the wave is dead and the door still never gets closer
+    assert p.parked == {"0,80,0"}
+
+
+def test_an_arena_that_never_dies_still_parks_the_gate_eventually():
+    """The suspension is BOUNDED, because `arena_enemies_alive` is not scoped to the target's own arena.
+
+    The mod counts every enemy whose `ActivateNextWave` has not run anywhere on the level, so a wave the agent
+    walks away from and never clears used to freeze the clock for the rest of the level load: an unreachable
+    door then stayed the target forever and `targets_parked` read 0, which on the dashboard looks exactly like
+    a monotone level with the mechanism correctly inert. Three of the four collapsed levels in the live
+    curriculum (1-1, 1-2, 2-3) have arenas, and no probe data exists for any of them.
+    """
+    held = dict(gates_block(COLLAPSED, exit_pos=None), arena_enemies_alive=4)
+    p = patient()
+    p.new_level_load(held, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(held, (0.0, 0.0, 10.0))
+    dwell(p, held, (0.0, 0.0, 10.0), 2 * PATIENCE)
+    assert p.parked == {"0,80,0"} and p.parks == 1, "forced at clock + suspended == 2 * patience_steps"
+    assert p.target["key"] == "0,0,60", "and the fallback takes over, as on any other level"
+    # 600 decisions is still inside the 675 of `stuck_seconds` 45 at 30 fps / frameskip 2, so the episode's own
+    # budget remains the outer bound and the park happens with room to act on it.
+    assert 2 * PATIENCE < 675
+
+
+def test_a_kill_or_a_style_event_suspends_the_clock():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    for _ in range(2 * PATIENCE - 1):
+        p.update(camp, (0.0, 0.0, 10.0), fought=True)
+    assert not p.parked
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    assert p.parked == {"0,80,0"}
+
+
+def test_an_endless_fight_under_the_door_still_parks_it():
+    """`fought` is bounded by the same counter: farming enemies under an unreachable door is not progress."""
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    for _ in range(2 * PATIENCE):
+        p.update(camp, (0.0, 0.0, 10.0), fought=True)
+    assert p.parked == {"0,80,0"} and p.target["key"] == "0,0,60"
+
+
+def test_an_approach_restarts_the_clock():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    for k in range(1, 7):
+        dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE - 2)
+        assert p.update(camp, (0.0, 10.0 * k, 10.0))[1] > 0.0  # climbing 10 m further each time is a new best
+        p.update(camp, (0.0, 0.0, 10.0))
+    assert not p.parked, "every window was broken by a real approach"
+
+
+def test_a_parked_gate_comes_back_when_the_player_gets_nearer_than_it_was_parked_at():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient(unpark_m=2.0)
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    parked_at = math.dist((0.0, 0.0, 10.0), (0.0, 80.0, 0.0))
+    assert p.parked == {"0,80,0"} and abs(p.park_best["0,80,0"] - parked_at) < 1e-6
+    p.update(camp, (0.0, 0.0, 10.0))
+    assert p.parked == {"0,80,0"}, "standing still is not getting closer"
+    p.update(camp, (0.0, 1.9, 10.0))
+    assert p.parked == {"0,80,0"}, "under the 2 m threshold"
+    p.update(camp, (0.0, 4.0, 10.0))
+    assert not p.parked
+    assert p.park_best["0,80,0"] == parked_at, \
+        "the baseline outlives the park: a re-park can only lower it, never read a farther spot as a fresh start"
+    assert p.target["key"] == "0,80,0", "the ladder takes it back the moment it is un-parked"
+
+
+def test_parks_survive_an_episode_reset_but_the_clock_restarts():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    assert p.parked == {"0,80,0"}
+    p.mark_paid(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    assert p.parked == {"0,80,0"}, "a park is a fact about this level load, not about one episode"
+    assert p.target["key"] == "0,0,60"
+    assert p._clock == 0, "the clock measures the current attempt, whose approach baseline was just cleared"
+
+
+def test_a_new_level_load_forgets_every_park():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    assert p.parked and p.parks == 1
+    p.new_level_load(camp, (0.0, 0.0, -50.0))
+    assert not p.parked and not p.park_best and not p.paid_fallback
+    assert p.parks == 1, "the counter is an env-lifetime total; the env reports parks per episode by difference"
+
+
+def test_reaching_a_fallback_target_pays_a_gate_instalment_once_per_level_load():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    assert dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)[0] == 0
+    assert p.target["key"] == "0,0,60"
+    paid, _ = walk_kw(p, camp, [(0.0, 0.0, float(z)) for z in range(12, 62, 2)])
+    assert paid == 1, "a forward leg away from the exit earns something, which the monotone rule never did"
+    assert p.best_hops == 1, "and it does NOT move the ladder: hops 2 is above the floor"
+    back, _ = walk_kw(p, camp, [(0.0, 0.0, 10.0), (0.0, 0.0, 60.0)])
+    assert back == 0, "once per key per level load"
+
+
+def test_a_door_off_the_ladder_is_never_a_target_and_never_pays():
+    """0-2's secret arena shape: an `altar_only` door with no `hops` is not on the exit chain at all."""
+    secret = gate("6,0,60", (6.0, 0.0, 60.0), None)
+    secret["altar_only"] = True
+    camp = gates_block(COLLAPSED + [secret], exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    paid, _ = walk_kw(p, camp, [(0.0, 0.0, float(z)) for z in range(12, 62, 2)])
+    assert paid == 1 and "6,0,60" not in p.reached, "a door with no hops is neither targeted nor paid"
+
+
+def test_a_second_door_on_a_rung_already_reached_pays_nothing():
+    """A4's stated goal is "no incentive to tour doors", and per-KEY payment does not deliver it.
+
+    `_pick` re-selects the nearest unreached, unparked gate every step, so door after door becomes the fallback
+    target in turn and used to pay 15 each: measured on eight side doors sharing one rung, a tour collected six
+    instalments where the ladder's depth was two, and on 8-1's 52 phase-1 gates the ceiling was 780 against
+    `level_complete` 100. The instalment is bounded by the ladder's own unit instead, so the twin here is worth
+    nothing while every genuine forward leg still pays (see the 0-3 route test in test_ladder_replay.py).
+    """
+    twin = gate("6,0,60", (6.0, 0.0, 60.0), 2)  # 6 m from the route gate, inside the same reach cylinder
+    camp = gates_block(COLLAPSED + [twin], exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    assert p.target["key"] == "0,0,60", "the nearest unreached gate, by a third of a metre"
+    walk = [(0.0, 0.0, float(z)) for z in range(12, 62, 2)]
+    paid, _ = walk_kw(p, camp, walk)
+    assert paid == 1 and {"0,0,60", "6,0,60"} <= p.reached, "one rung reached, one instalment, two doors"
+    assert walk_kw(p, camp, [(0.0, 0.0, 10.0)] + walk)[0] == 0, "re-walking the pair pays nothing"
+
+
+def test_touring_many_doors_on_one_rung_cannot_out_earn_the_ladder():
+    """The ceiling is the ladder depth, not the gate count. Eight doors on one rung; the tour pays once."""
+    hub = (0.0, 0.0, 300.0)
+    ring = [gate(f"side{i}", (hub[0] + 60.0 * math.cos(i * math.pi / 4), 0.0,
+                              hub[2] + 60.0 * math.sin(i * math.pi / 4)), 4) for i in range(8)]
+    camp = gates_block([gate("0,120,300", (0.0, 120.0, 300.0), 3),  # the unreachable ladder answer, 120 m up
+                        gate("0,0,0", (0.0, 0.0, 0.0), 5)] + ring, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 0.0))  # touch the hops 5 door: best_hops 5, so rung 4 is the ring
+    assert p.best_hops == 5, "the ring is not within reach of the spawn"
+    p.reset_episode()
+    p.retarget(camp, hub)
+    paid = 0
+    for g in ring:  # reach every door on the rung, lingering at each so the sticky fallback settles on it
+        paid += walk_kw(p, camp, [tuple(g["pos"])] * 40)[0]
+        paid += dwell(p, camp, hub, 40)[0]
+    assert {g["key"] for g in ring} <= p.reached, "all eight were walked through"
+    assert len(p.paid_fallback) >= 4, "several of them really did become the fallback target in turn"
+    assert paid == 1, f"one new rung, one instalment, however many of its doors were toured (paid {paid})"
+
+
+def test_a_respawn_onto_the_fallback_target_is_absorbed_not_paid():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    assert p.target["key"] == "0,0,60"
+    p.mark_paid(camp, (0.0, 0.0, 60.0))  # the respawn puts the player on the gate the fallback was pointing at
+    assert p.update(camp, (0.0, 0.0, 60.0))[0] == 0
+
+
+def test_the_fallback_is_sticky_within_the_hysteresis():
+    twins = [gate("0,80,0", (0.0, 80.0, 0.0), 0), gate("0,0,10", (0.0, 0.0, 10.0), 1),
+             gate("-30,0,60", (-30.0, 0.0, 60.0), 2), gate("30,0,60", (30.0, 0.0, 60.0), 2)]
+    camp = gates_block(twins, exit_pos=None)
+    p = patient(fallback_hysteresis_m=10.0)
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    first = p.target["key"]
+    p.update(camp, (5.0 if first == "-30,0,60" else -5.0, 0.0, 10.0))  # a step toward the other twin
+    assert p.target["key"] == first, "a rival must beat the sticky choice by more than the hysteresis"
+    p.update(camp, (25.0 if first == "-30,0,60" else -25.0, 0.0, 10.0))
+    assert p.target["key"] != first, "far enough, and the nearest wins again"
+
+
+def test_the_exit_is_never_parked():
+    camp = gates_block([gate("0,0,0", (0.0, 0.0, 0.0), 0)], exit_pos=(0.0, 0.0, 200.0))
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 0.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    assert p.target["key"] == GATE_EXIT_KEY
+    dwell(p, camp, (0.0, 0.0, 0.0), 4 * PATIENCE)
+    assert not p.parked and p.target["key"] == GATE_EXIT_KEY
+
+
+def test_a_stalled_skull_leg_is_never_parked_at_all():
+    """A carry is exempt from the clock, and this one is a safety rule rather than a tuning choice.
+
+    `env._protect_carry` drops the punch button only while `gates.target` is the ALTAR sub-goal of a held item,
+    because protection and release have to come from one source or the button can be taken away and never given
+    back. Parking the gate deletes the leg, `_subgoal` never rebuilds it, and the protection switches off with
+    the skull still in the player's hands -- and the live policy presses punch on ~35% of decisions, which
+    `Punch.ActiveStart` turns into a throw. On 1-1 the gate is the only route forward, so the level load is lost.
+    A skull-locked door is held shut by its altar, not by geometry, exactly like the arena case §3 exempts.
+    """
+    camp = skull_block(altars=[LIVE_ALTAR], items=[PEDESTAL])
+    camp["gates"].append(gate("0,0,60", (0.0, 0.0, 60.0), 3))  # somewhere nearer the fallback could have gone
+    here = (0.0, 0.0, 90.0)
+    p = patient()
+    p.new_level_load(camp, here)
+    p.reset_episode()
+    p.retarget(camp, here)
+    assert p.target["subgoal"] == SUBGOAL_ITEM and p.target["gate_key"] == GATE_KEY
+    dwell(p, camp, here, 6 * PATIENCE)
+    assert not p.parked and p.parks == 0, "a fetch leg is not parked, however long it stalls"
+    assert p.target["gate_key"] == GATE_KEY, "so the carry machine is still pointing at the skull"
+
+
+def test_a_gate_still_wanting_a_skull_is_never_parked():
+    """The same rule keyed on the block rather than on the leg, for the states where `_subgoal` returns the gate
+    itself (no free source, or only dead twins left): its approach is blocked by the altar, not by geometry."""
+    camp = skull_block(altars=[LIVE_ALTAR], items=[])  # nothing to fetch, so the target IS the locked gate
+    camp["gates"].append(gate("0,0,60", (0.0, 0.0, 60.0), 3))
+    here = (0.0, 0.0, 90.0)
+    p = patient()
+    p.new_level_load(camp, here)
+    p.reset_episode()
+    p.retarget(camp, here)
+    assert p.target["key"] == GATE_KEY and not p.target.get("subgoal")
+    dwell(p, camp, here, 6 * PATIENCE)
+    assert not p.parked and p.target["key"] == GATE_KEY
+
+
+def test_a_fallback_target_that_never_gets_closer_is_parked_too():
+    """Finding 1: the patience mechanism must not protect exactly one hand-over and then switch itself off.
+
+    `_pick` chooses the fallback as the nearest unreached, unparked, active gate and `_nearer_unreached` filters
+    that identical set, so nothing can ever be strictly nearer than a fallback target. Requiring "somewhere
+    better to go" for it made every fallback permanent: reproduced as 4,000 consecutive decisions aimed through
+    a ceiling with `targets_parked` reading 1, i.e. the wedge moved one door over and the telemetry showed the
+    mechanism as having fired. A fallback hands over to the next candidate instead, which is the A2 rule already.
+    """
+    camp = gates_block([gate("0,30,0", (0.0, 30.0, 0.0), 1),     # 30 m up through the ceiling
+                        gate("0,60,0", (0.0, 60.0, 0.0), 2),     # the ladder's answer, 60 m up
+                        gate("0,0,200", (0.0, 0.0, 200.0), 3),   # touched from the wrong side, so best_hops 3
+                        gate("0,0,400", (0.0, 0.0, 400.0), 4)], exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 200.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    assert p.target["key"] == "0,60,0", "the ladder's rung, and unreachable"
+    dwell(p, camp, (0.0, 0.0, 0.0), PATIENCE)
+    assert p.parked == {"0,60,0"} and p.target["key"] == "0,30,0", "the fallback, and also unreachable"
+    dwell(p, camp, (0.0, 0.0, 0.0), PATIENCE)
+    assert p.target["key"] != "0,30,0", "which is parked in its turn rather than held for the level load"
+    assert p.parked == {"0,60,0", "0,30,0"} and p.parks == 2
+
+
+def test_when_every_gate_is_parked_the_target_becomes_the_exit():
+    """A2's tail: "then the exit when none remain". Only reachable now that a fallback can be parked."""
+    camp = gates_block([gate("0,30,0", (0.0, 30.0, 0.0), 0), gate("0,60,0", (0.0, 60.0, 0.0), 1),
+                        gate("0,0,200", (0.0, 0.0, 200.0), 2)], exit_pos=(0.0, 0.0, 600.0))
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 200.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    dwell(p, camp, (0.0, 0.0, 0.0), 4 * PATIENCE)
+    assert p.parked == {"0,30,0", "0,60,0"}
+    assert p.target["key"] == GATE_EXIT_KEY, "aiming at the real goal beats aiming at a proved dead end"
+    dwell(p, camp, (0.0, 0.0, 0.0), 4 * PATIENCE)
+    assert p.target["key"] == GATE_EXIT_KEY and p.parks == 2, "and the exit is still never parked"
+
+
+def test_wandering_away_and_stalling_again_cannot_buy_a_cheap_un_park():
+    """Finding 3's real loophole: the un-park bar was measured from wherever the player happened to be standing
+    when the clock next ran out, so the baseline could be RAISED by walking away.
+
+    Measured on the recorded 0-3 probe: the first park recorded 40.9 m, and the second was taken at 77.5 m after
+    the agent had wandered off -- at which point simply walking back into the pit cleared the bar for nothing.
+    `park_best` is now the closest the player has been at any park of that key this level load, and a re-park
+    can only lower it.
+    """
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    near, far = (0.0, 0.0, 10.0), (0.0, 0.0, 200.0)
+    parked_at = math.dist(near, (0.0, 80.0, 0.0))
+    p = patient(unpark_m=2.0)
+    p.new_level_load(camp, near)
+    p.reset_episode()
+    p.retarget(camp, near)
+    dwell(p, camp, near, PATIENCE)
+    assert p.parked == {"0,80,0"} and p.park_best["0,80,0"] == parked_at
+    p.update(camp, (0.0, 4.0, 10.0))  # a real 4 m gain clears the first bar
+    assert not p.parked
+    dwell(p, camp, far, PATIENCE)  # stall again, this time 215 m off, and the gate is parked a second time
+    assert p.parked == {"0,80,0"} and p.park_best["0,80,0"] <= parked_at, "the baseline was not raised"
+    assert dwell(p, camp, near, 5) and p.parked == {"0,80,0"}, \
+        "so walking all the way back to where it was first parked is not 'getting closer than it has ever been'"
+
+
+def test_bobbing_under_a_parked_door_cannot_un_park_it():
+    """And inside the bar, nothing at all happens: the door stays parked while the agent shuffles beneath it."""
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient(unpark_m=2.0)
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    assert p.parked == {"0,80,0"}
+    for y in (1.5, 0.0, 1.9, 0.5, 1.8, 0.0):  # every one of these is under a 2 m gain on the baseline
+        p.update(camp, (0.0, y, 10.0))
+        assert p.parked == {"0,80,0"}, f"y {y} is not a change of situation"
+
+
+def test_the_un_park_bar_doubles_each_time_a_door_is_parked_again():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient(unpark_m=2.0)
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    assert p.park_count["0,80,0"] == 1
+    p.update(camp, (0.0, 4.0, 10.0))  # a 3.9 m gain clears the first 2 m bar
+    assert not p.parked
+    dwell(p, camp, (0.0, 4.0, 10.0), PATIENCE)
+    assert p.parked == {"0,80,0"} and p.park_count["0,80,0"] == 2
+    p.update(camp, (0.0, 7.0, 10.0))  # a 2.8 m gain would have cleared 2 m; it does not clear 4 m
+    assert p.parked == {"0,80,0"}, "a door already proved unreachable twice needs a real change of situation"
+    p.update(camp, (0.0, 12.0, 10.0))
+    assert not p.parked, "and genuinely climbing 7 m toward it is one"
+
+
+def test_a_death_respawn_does_not_park_the_door_the_agent_is_walking_at():
+    """Finding 4: the clock cannot be timed off `gate_approach`, which ruling R1 makes episode scoped.
+
+    `env._respawn` calls `mark_paid` and deliberately not `reset_episode`, so `best_dist` keeps the pre-death
+    minimum and the whole walk back over ground already covered pays nothing by design. A clock reading the
+    reward therefore ran out on a target the agent was walking straight at -- measured, parked at decision 299
+    of a flawless 389 m approach with 101 m still to go, and `park_best` was set from the stale pre-death
+    minimum, so the correct door only came back once the agent was nearer than it had ever been.
+    """
+    camp = gates_block([gate("0,0,400", (0.0, 0.0, 400.0), 1), gate("40,0,330", (40.0, 0.0, 330.0), 0),
+                        gate("0,0,0", (0.0, 0.0, 0.0), 2)], exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 0.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    approach = [(0.0, 0.0, float(z)) for z in range(0, 389)]
+    walk_kw(p, camp, approach)
+    assert p.target["key"] == "0,0,400" and p.best_dist["0,0,400"] == 12.0
+    p.mark_paid(camp, (0.0, 0.0, 0.0))  # the death respawn, exactly as env._respawn drives it
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    assert p.best_dist["0,0,400"] == 12.0, "R1: the approach already earned is not re-earned"
+    paid, gained = walk_kw(p, camp, approach)
+    assert gained == 0.0, "and the re-walk pays nothing, which is what used to run the clock out"
+    assert not p.parked and p.target["key"] == "0,0,400", "the clock measures THIS attempt, so nothing is parked"
+
+
+def test_a_respawn_restarts_the_patience_clock():
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE - 1)
+    p.mark_paid(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE - 1)
+    assert not p.parked, "a respawn is a new attempt, so the window starts again"
+    dwell(p, camp, (0.0, 0.0, 10.0), 2)
+    assert p.parked == {"0,80,0"}, "and it still runs out when the new attempt stalls too"
+
+
+def test_a_fallback_gate_reporting_no_hops_does_not_raise():
+    """Finding 8: `_gate_by_key` searches the full array, which carries `altar_only` doors with `hops: null`.
+
+    An unguarded `int(gate["hops"])` raises out of `update`, past `env.step` (which catches only
+    `BridgeRecovered`), past SubprocVecEnv's worker and into all twelve games -- the failure mode commit e9a53d4
+    exists to prevent. One line of guard against the whole run.
+    """
+    camp = gates_block(COLLAPSED, exit_pos=None)
+    p = patient()
+    p.new_level_load(camp, (0.0, 0.0, 10.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 10.0))
+    dwell(p, camp, (0.0, 0.0, 10.0), PATIENCE)
+    target = p.target["key"]
+    assert target == "0,0,60" and p._fallback
+    for mutate in (lambda g: g.update(hops=None), lambda g: g.pop("hops")):
+        broken = gates_block([dict(g) for g in COLLAPSED], exit_pos=None)
+        mutate(next(g for g in broken["gates"] if g["key"] == target))
+        assert p.update(broken, (0.0, 0.0, 60.0)) == (0, 0.0), "no payment, and above all no exception"
+
+
+# ---------------------------------------------------------------------------
+# ExitGuard: the banished FinalPit
+# ---------------------------------------------------------------------------
+
+L02_EXIT = [-199.0, -86.1, 277.0]  # Level 0-2's real FinalPit, measured on a fresh load
+BANISH = 10000.0  # CheckPoint.Start:132 / ResetRoom:681
+
+
+def exit_block(pos):
+    return {"exit": {"pos": list(pos), "active": False}}
+
+
+def test_exit_guard_freezes_the_first_report_of_a_level_load():
+    g = ExitGuard()
+    g.new_level_load()
+    camp = exit_block(L02_EXIT)
+    assert g.apply(camp) is False and camp["exit"]["pos"] == L02_EXIT
+    assert g.frozen == L02_EXIT and not g.banished
+
+
+def test_exit_guard_ignores_the_ten_thousand_metre_banish():
+    g = ExitGuard()
+    g.new_level_load()
+    g.apply(exit_block(L02_EXIT))
+    camp = exit_block([L02_EXIT[0] + BANISH, L02_EXIT[1], L02_EXIT[2]])
+    assert g.apply(camp) is True
+    assert camp["exit"]["pos"] == L02_EXIT, "the block is rewritten, so every consumer sees the real pit"
+    assert g.banished and g.rejections == 1
+
+
+def test_exit_guard_ignores_a_repeated_banish():
+    """ResetRoom runs again on every respawn, so the offset is k * 10000."""
+    g = ExitGuard()
+    g.new_level_load()
+    g.apply(exit_block(L02_EXIT))
+    for k in (1, 2, 3):
+        camp = exit_block([L02_EXIT[0] + k * BANISH, L02_EXIT[1], L02_EXIT[2]])
+        assert g.apply(camp) is True and camp["exit"]["pos"] == L02_EXIT
+    assert g.rejections == 3
+
+
+def test_exit_guard_ignores_any_implausible_jump():
+    g = ExitGuard(max_shift_m=100.0)
+    g.new_level_load()
+    g.apply(exit_block(L02_EXIT))
+    camp = exit_block([L02_EXIT[0], L02_EXIT[1] + 500.0, L02_EXIT[2]])
+    assert g.apply(camp) is True and camp["exit"]["pos"] == L02_EXIT
+
+
+def test_exit_guard_accepts_a_small_move():
+    g = ExitGuard(max_shift_m=100.0)
+    g.new_level_load()
+    g.apply(exit_block(L02_EXIT))
+    moved = [L02_EXIT[0] + 3.0, L02_EXIT[1], L02_EXIT[2]]
+    camp = exit_block(moved)
+    assert g.apply(camp) is False and camp["exit"]["pos"] == moved and g.frozen == moved
+
+
+def test_exit_guard_recovers_when_the_first_report_was_already_banished():
+    """The banish only ever ADDS to x, so a whole multiple back toward 0 is the live pit, not a twin."""
+    g = ExitGuard()
+    g.new_level_load()
+    g.apply(exit_block([L02_EXIT[0] + BANISH, L02_EXIT[1], L02_EXIT[2]]))
+    camp = exit_block(L02_EXIT)
+    assert g.apply(camp) is False and g.frozen == L02_EXIT and camp["exit"]["pos"] == L02_EXIT
+
+
+def test_exit_guard_accepts_a_different_exit_after_a_new_level_load():
+    g = ExitGuard()
+    g.new_level_load()
+    g.apply(exit_block(L02_EXIT))
+    g.new_level_load()
+    other = [157.0, 28.0, 640.0]
+    camp = exit_block(other)
+    assert g.apply(camp) is False and g.frozen == other and not g.banished
+
+
+def test_exit_guard_is_silent_without_an_exit():
+    g = ExitGuard()
+    g.new_level_load()
+    assert g.apply(None) is False
+    assert g.apply({}) is False
+    assert g.apply({"exit": None}) is False
+    assert g.apply({"exit": {"pos": None}}) is False
+    assert g.apply({"exit": {"pos": [float("nan"), 0.0, 0.0]}}) is False
+    assert g.frozen is None
 
 
 def nav_path(length, status="complete"):

@@ -3,6 +3,7 @@ archive_save_steps: 20000
 auto_enter_arena: true
 best_runs_dir: runs/campaign_gates/best_runs
 block_human_input: true
+camera_height_m: 0.9
 cell_size: 4.0
 curriculum_path: runs/campaign_gates/curriculum.json
 difficulty: 3
@@ -28,10 +29,19 @@ level: Level 0-1
 level_weight_floor: 0.1
 levels:
 - Level 0-1
+- Level 0-2
 - Level 0-3
 - Level 0-4
+- Level 1-1
+- Level 1-2
+- Level 2-1
+- Level 2-2
+- Level 2-3
+- Level 3-1
+- Level 4-1
 max_locked_skip_s: 120.0
-max_steps: 9000
+max_steps: 12000
+max_steps_per_level: {}
 max_wave: 0
 mode: campaign
 mute: true
@@ -53,8 +63,8 @@ rewards:
   door_unlock: 15.0
   gate: 15.0
   gate_approach: 0.15
-  item_pickup: 0.0
-  item_placed: 0.0
+  item_pickup: 10.0
+  item_placed: 20.0
   kill: 0.5
   level_complete: 100.0
   novelty: 0.2
@@ -71,6 +81,7 @@ stuck_seconds: 45
 subgoal_punch_range_m: 4.0
 target_kind_slots: false
 unlimited_fps: true
+unlock_after_fresh_episodes: 600
 unlock_all_gear: true
 unlock_rate: 0.5
 unlock_window: 20

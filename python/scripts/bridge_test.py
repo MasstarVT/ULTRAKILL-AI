@@ -86,7 +86,10 @@ def summarize_campaign(obs: dict) -> str:
         for a in altars:
             doors = ", ".join(str(d.get("key")) for d in a.get("doors") or ()) or "none"
             reverse = ", ".join(str(d.get("key")) for d in a.get("reverse_doors") or ()) or "none"
-            lines.append(f"  {a['key']} at ({vec(a['pos'])}) {a.get('item')} filled={a.get('filled')}"
+            # `aim_pos` is the collider centre a placement punch must hit (mod 0.7.1). `-` means an older mod,
+            # where `campaign.altar_aim_point` falls back to `pos` minus a metre.
+            aim = f"({vec(a['aim_pos'])})" if a.get("aim_pos") else "-"
+            lines.append(f"  {a['key']} at ({vec(a['pos'])}) aim={aim} {a.get('item')} filled={a.get('filled')}"
                          f" active={a.get('active')} inactive_ancestors={a.get('inactive_ancestors')}"
                          f" opens=[{doors}] closes=[{reverse}]")
     items = c.get("items")

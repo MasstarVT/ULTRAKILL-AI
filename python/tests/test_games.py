@@ -79,6 +79,62 @@ def test_five_is_the_documented_disk_log_limit():
     assert games.DISK_LOG_LIMIT == 5
 
 
+# -- launch readiness: by port and process, never by the Popen handle --------------------------------
+
+NETSTAT = """\
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1084
+  TCP    127.0.0.1:47800        0.0.0.0:0              LISTENING       23180
+  TCP    127.0.0.1:47801        0.0.0.0:0              LISTENING       9044
+  TCP    127.0.0.1:47800        127.0.0.1:52001        ESTABLISHED     23180
+  TCP    [::]:47802             [::]:0                 LISTENING       4120
+"""
+
+TASKLIST = (
+    '"ULTRAKILL.exe","23180","Console","1","1,004,532 K"\n'
+    '"ULTRAKILL.exe","9044","Console","1","57,344 K"\n'
+    '"ULTRAKILL.exe","4120","Console","1","N/A"\n'
+)
+
+
+def test_listening_ports_are_read_with_their_owning_pid():
+    found = games.parse_listening(NETSTAT)
+    assert found == {135: 1084, 47800: 23180, 47801: 9044, 47802: 4120}
+    # ESTABLISHED rows are not listeners and must not overwrite the listener's pid.
+    assert found[47800] == 23180
+
+
+def test_working_sets_survive_thousands_separators_and_na():
+    sets = games.parse_working_sets(TASKLIST)
+    assert sets[23180] == 1004532 * 1024  # a booted copy, about 1 GB
+    assert sets[9044] == 57344 * 1024  # the half-booted one that answered every reset "unknown scene"
+    assert 4120 not in sets, "N/A must drop out, not read as 0 and so as 'never booted'"
+
+
+def test_a_re_exec_during_startup_is_not_reported_as_an_exit():
+    # The false alarm: the games re-exec under new pids, so the Popen handles report dead processes while the
+    # instances are coming up perfectly well. It printed "Instance(s) [0..8] exited during startup" twice
+    # during the 2026-09-17 recovery while the ports came up two minutes later.
+    wanted = [47800, 47801]
+    assert games.startup_verdict(wanted, set(), game_count=9, elapsed=90.0, timeout=180.0) == "waiting"
+    assert games.startup_verdict(wanted, {47800}, game_count=9, elapsed=90.0, timeout=180.0) == "waiting"
+    assert games.startup_verdict(wanted, {47800, 47801}, game_count=9, elapsed=90.0, timeout=180.0) == "ready"
+
+
+def test_a_launch_with_no_game_process_left_is_a_real_failure_but_only_after_the_grace():
+    wanted = [47800]
+    assert games.startup_verdict(wanted, set(), game_count=0, elapsed=5.0, timeout=180.0) == "waiting"
+    assert games.startup_verdict(wanted, set(), game_count=0, elapsed=90.0, timeout=180.0) == "no_processes"
+    # Ready wins even with nothing matched by name, so an odd tasklist cannot fail a launch that worked.
+    assert games.startup_verdict(wanted, {47800}, game_count=0, elapsed=900.0, timeout=180.0) == "ready"
+
+
+def test_a_launch_that_never_opens_its_ports_times_out():
+    assert games.startup_verdict([47800], set(), game_count=3, elapsed=181.0, timeout=180.0) == "timeout"
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     for name, fn in tests:
