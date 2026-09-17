@@ -4,12 +4,14 @@ auto_enter_arena: true
 best_runs_dir: runs/campaign_gates/best_runs
 block_human_input: true
 cell_size: 4.0
+curriculum_path: runs/campaign_gates/curriculum.json
 difficulty: 3
 end_episode_on_death: true
 explore_dir: models/campaign_gates
 fixed_fps: 30
 frameskip: 2
 fresh_start_prob: 0.2
+gate_hops_min_frac: 0.5
 gate_min_gain_m: 0.5
 gate_reach_m: 8.0
 gate_reach_v_m: 6.0
@@ -23,6 +25,11 @@ layout:
   max_enemies: 8
   ray_length: 50.0
 level: Level 0-1
+level_weight_floor: 0.1
+levels:
+- Level 0-1
+- Level 0-3
+- Level 0-4
 max_locked_skip_s: 120.0
 max_steps: 9000
 max_wave: 0
@@ -46,6 +53,8 @@ rewards:
   door_unlock: 15.0
   gate: 15.0
   gate_approach: 0.15
+  item_pickup: 0.0
+  item_placed: 0.0
   kill: 0.5
   level_complete: 100.0
   novelty: 0.2
@@ -59,8 +68,12 @@ slide_min_hold: 0
 soft_death: false
 stuck_repeats: 3
 stuck_seconds: 45
+subgoal_punch_range_m: 4.0
+target_kind_slots: false
 unlimited_fps: true
 unlock_all_gear: true
+unlock_rate: 0.5
+unlock_window: 20
 wedge_creep_mps: 1.5
 wedge_seconds: 3.0
 window_height: 207

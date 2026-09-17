@@ -21,6 +21,7 @@ from ultrakill_ai.rewards import RewardConfig  # noqa: E402
 CONFIG = ROOT / "configs" / "campaign_0-1.yaml"
 PRELUDE = ROOT / "configs" / "campaign_prelude.yaml"
 LEVEL_1_1 = ROOT / "configs" / "campaign_1-1.yaml"
+GATES_PRELUDE = ROOT / "configs" / "campaign_gates_prelude.yaml"
 RUN_NAME = "campaign_gates"
 MODEL_DIR = Path("models") / RUN_NAME
 RUN_DIR = Path("runs") / RUN_NAME
@@ -73,9 +74,46 @@ def test_the_0_1_config_is_still_a_single_level_run():
     assert filled.curriculum_path == "", "a single-level run never opens a curriculum file"
 
 
+def test_the_gates_prelude_config_carries_the_live_run_forward():
+    """The config the live run resumes on (2026-09-17): the curriculum, the SAME run name and weights, ent_coef cut.
+
+    Every reward weight and every env setting has to match configs/campaign_0-1.yaml, which is what
+    models/campaign_gates/env_config.yaml records for the 4.8M steps already trained. Only three things may
+    differ: the levels list (and its three knobs), num_envs and ent_coef.
+    """
+    live_env, live_train = train.load_config(str(CONFIG))
+    env_dict, train_cfg = train.load_config(str(GATES_PRELUDE))
+    live, cfg = EnvConfig.from_dict(live_env), EnvConfig.from_dict(env_dict)
+
+    assert cfg.rewards == live.rewards, "no reward weight may change while the same policy continues"
+    assert cfg.rewards.item_pickup == 0.0 and cfg.rewards.item_placed == 0.0, "S4 stays dormant"
+    curriculum = {"level", "levels", "unlock_rate", "unlock_window", "level_weight_floor"}
+    differing = {f.name for f in dataclasses.fields(EnvConfig)
+                 if getattr(cfg, f.name) != getattr(live, f.name)}
+    assert differing <= curriculum, f"env settings changed besides the curriculum: {sorted(differing - curriculum)}"
+    assert cfg.levels == ["Level 0-1", "Level 0-3", "Level 0-4"] and cfg.levels[0] == "Level 0-1"
+    assert all(lv in CAMPAIGN_LEVELS_SHIPPED for lv in cfg.levels)
+    assert (cfg.unlock_rate, cfg.unlock_window, cfg.level_weight_floor) == (0.5, 20, 0.1)
+
+    # The run name is deliberately NOT changed: models/campaign_gates/ holds the weights, best.zip and the
+    # exploration archives, and runs/campaign_gates/status.json the chart history.
+    assert train_cfg["run_name"] == RUN_NAME == live_train["run_name"]
+    assert train_cfg["num_envs"] == 8, "eight games, which needs [Logging.Disk] Enabled = false in BepInEx.cfg"
+    hyper, live_hyper = dict(train_cfg["hyperparams"]), dict(live_train["hyperparams"])
+    assert hyper.pop("ent_coef") == 0.004 and live_hyper.pop("ent_coef") == 0.01, "the one training change"
+    assert hyper == live_hyper, "ent_coef is the only hyperparameter that moves"
+    assert train_cfg["policy_kwargs"] == live_train["policy_kwargs"]
+
+    filled = train.fill_campaign_dirs(cfg, MODEL_DIR, RUN_DIR)
+    assert filled.curriculum_path == f"runs/{RUN_NAME}/curriculum.json"
+    assert filled.explore_dir == f"models/{RUN_NAME}", "the eight archives stay where they are"
+    header = GATES_PRELUDE.read_text(encoding="utf-8")
+    assert "ent_coef" in header and "6.0" in header, "the header has to carry the falsifier and the tripwire"
+
+
 def test_every_campaign_setting_is_a_real_field():
     # EnvConfig.from_dict drops keys it does not know, so a misspelt setting would silently use its default.
-    for path in (CONFIG, PRELUDE, LEVEL_1_1):
+    for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE):
         env_dict, _ = train.load_config(str(path))
         unknown = sorted(set(env_dict) - field_names(EnvConfig))
         assert not unknown, f"{path.name}: env keys EnvConfig does not know: {unknown}"
@@ -250,7 +288,8 @@ def test_a_campaign_checkpoint_loads_against_every_campaign_config():
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import DummyVecEnv
 
-    configs = {path.name: EnvConfig.from_dict(train.load_config(str(path))[0]) for path in (CONFIG, PRELUDE, LEVEL_1_1)}
+    configs = {path.name: EnvConfig.from_dict(train.load_config(str(path))[0])
+               for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE)}
     envs = {}
     try:
         for name, cfg in configs.items():

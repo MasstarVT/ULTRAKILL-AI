@@ -1,0 +1,76 @@
+# The live `campaign_gates` run continuing as a curriculum: same run name, same weights, same policy, but
+# `levels` instead of `level` and `ent_coef` 0.01 -> 0.004. Written for the 2026-09-17 integration pause, which
+# merged the multi-level curriculum onto main; it replaces configs/campaign_0-1.yaml as the run's config.
+#
+# Why the run name does NOT change, against the integration plan's own advice: models/campaign_gates/ holds
+# 4.8M steps of weights, best.zip, first_completion_3214785.zip and eight exploration archives, and
+# runs/campaign_gates/status.json holds the chart history and the bests. Renaming orphans all of it. The cost is
+# that `campaign.fresh_completion_rate` becomes a shrunk SUM over the unlocked levels once a second level
+# unlocks -- a score, not a rate, which can exceed 1.0. With only Level 0-1 unlocked it is exactly the number it
+# has always been, so nothing jumps today. Judge this run per level, on the dashboard's `levels` rows and
+# status.json's campaign.levels table, never on the pooled mean_100 numbers: max_steps is one value for every
+# level, so a longer level is truncated by construction. The old metrics_log.csv was moved to
+# metrics_log_pre_multilevel.csv so poll_status.py writes the levels_unlocked and part_item_* columns.
+#
+# Why these three levels: 0-1, 0-3 and 0-4 are the level survey's Tier A Prelude (walkable, usable gate ladders,
+# no key items). 0-2 is held back for the skull carry and 0-5's door graph has no goal room at all (the Cerberus
+# kill opens the exit), so it has no route signal. 0-3 unlocks only when 0-1 completes half of its last 20+
+# fresh starts, so for its whole early life this is the 0-1 run continuing.
+#
+# THE ONE CHANGE: ent_coef 0.01 -> 0.004. At 4.8M steps the policy was statistically uniform on every look head
+# (total entropy 11.8 nats of a 13.59 maximum and still RISING; yaw 2.19/2.20, pitch 1.78/1.79, look mode
+# 1.04/1.10), on_target_frac 5.7%, and fresh gates_reached flat at ~4.7 of 10 with no fresh-start completion in
+# 343 episodes. The Cyber Grind run's biggest single gain came from exactly this cut (CLAUDE.md), and its
+# failure mode is known: below ~3 nats that run went deterministic and regressed. Falsifier: entropy should fall
+# toward 6-8 nats within ~1M steps WHILE fresh gates_reached rises above 5 and fresh completions appear. If
+# entropy falls but gates_reached does not rise, the cut is not the constraint -- put it back. Tripwire: if
+# total entropy drops below 6.0, stop and raise ent_coef; keep_best.py --metric campaign guards the weights.
+# The config's hyperparameters override the checkpoint's saved ones on --resume (train.py passes them into
+# `PPO.load`, whose `model.__dict__.update(kwargs)` is what applies them), so this value is live on resume.
+#
+# num_envs is 8, not 5. The old five-copy limit was BepInEx's DiskLogListener, not the game: with
+# `[Logging.Disk] Enabled = false` in <game>/BepInEx/config/BepInEx.cfg, 8 copies load and measured 235 steps/s
+# against 5 copies' 152 on the same checkpoint (+54%), at 33% CPU. Undo by restoring BepInEx.cfg and setting
+# num_envs back to 5. Ports are 47800-47807; 47805-47807's exploration archives were seeded from 47802-47804.
+#
+# From python/ (one display, so --monitor 1 everywhere):
+#   python scripts/games.py launch --count 8 --monitor 1
+#   python scripts/train.py --config configs/campaign_gates_prelude.yaml --resume models/campaign_gates/latest.zip
+#   python scripts/poll_status.py --run campaign_gates
+#   python scripts/keep_best.py --run campaign_gates --metric campaign
+#   python scripts/dashboard.py --run campaign_gates --monitor 1
+#   python scripts/games.py stop
+env:
+  mode: campaign
+  levels: ["Level 0-1", "Level 0-3", "Level 0-4"]
+  unlock_rate: 0.5
+  unlock_window: 20
+  level_weight_floor: 0.1
+  difficulty: 3
+  unlock_all_gear: true
+  fixed_fps: 30
+  frameskip: 2
+  render: false
+  soft_death: false
+  window_width: 368
+  window_height: 207
+  max_steps: 9000
+  fresh_start_prob: 0.2
+  stuck_seconds: 45
+  stuck_repeats: 3
+  cell_size: 4.0
+  pitch_limit_deg: 45.0
+  # Character-for-character configs/campaign_0-1.yaml's, which is what models/campaign_gates/env_config.yaml
+  # records for the live run. A test pins them equal, so no weight can change here by accident.
+  rewards: {time: 0.02, level_complete: 100.0, checkpoint: 10.0, arena_clear: 10.0, door_unlock: 15.0,
+            gate: 15.0, gate_approach: 0.15, novelty: 0.2, path: 0.0, kill: 0.5, damage_dealt: 0.5,
+            damage_taken: 0.01, death: 5.0, style: 0.0, punch: 0.01}
+train:
+  algo: ppo
+  num_envs: 8
+  run_name: campaign_gates
+  timesteps: 20000000
+  save_every: 50000
+  policy_kwargs: {net_arch: [512, 512]}
+  hyperparams: {learning_rate: 0.0002, n_steps: 2048, batch_size: 512, n_epochs: 5, gamma: 0.998,
+                gae_lambda: 0.95, ent_coef: 0.004, target_kl: 0.03}

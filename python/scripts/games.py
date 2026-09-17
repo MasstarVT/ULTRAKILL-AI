@@ -8,6 +8,14 @@
 Each instance runs as a "training instance": it opens your settings read-only and never writes
 settings or save data, so parallel copies can't corrupt anything. Unity saves the window size on exit,
 so launch snapshots your display settings and stop puts them back.
+
+**How many copies can run.** The old "at most 5" limit was never the game's: BepInEx's DiskLogListener opens
+`LogOutput.log` plus `.1`-`.4` and a sixth copy fails to load because it cannot open a log file. Setting
+`[Logging.Disk] Enabled = false` in `<game>/BepInEx/config/BepInEx.cfg` removes the listener and with it the
+limit (measured 2026-09-17: 8 copies load and serve the bridge). Nothing else here caps the count -- ports are
+`base_port + i`, readiness is read from netstat and `tile` wraps onto a second row when a row is full. With disk
+logging off the plugin still logs to the console listener, so a crash has no file to leave a trace in; turn
+`Enabled` back on when diagnosing one.
 """
 
 from __future__ import annotations
@@ -45,6 +53,30 @@ def game_dir() -> Path:
         if m:
             return Path(m.group(1))
     return Path(r"C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL")
+
+
+# How many copies BepInEx's DiskLogListener allows: LogOutput.log plus .1-.4.
+DISK_LOG_LIMIT = 5
+
+
+def disk_logging_enabled(cfg_path: Path) -> bool:
+    """True when BepInEx writes a log file per copy, which is what caps the number of instances at five.
+
+    Reads `Enabled` inside `[Logging.Disk]` only -- `[Logging.Console]` has a key of the same name above it.
+    A missing file or a missing key means the BepInEx default, which is on.
+    """
+    try:
+        text = cfg_path.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    section = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1]
+        elif section == "Logging.Disk" and line.lower().startswith("enabled"):
+            return line.split("=", 1)[-1].strip().lower() != "false"
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +201,12 @@ def launch(
     exe = game_dir() / EXE_NAME
     if not exe.exists():
         sys.exit(f"Game not found at {exe}. Set ULTRAKILL_DIR or mod/GamePaths.props.")
+    cfg = game_dir() / "BepInEx" / "config" / "BepInEx.cfg"
+    if count > DISK_LOG_LIMIT and disk_logging_enabled(cfg):
+        sys.exit(
+            f"--count {count} needs BepInEx's disk log off: copy {DISK_LOG_LIMIT + 1} onward cannot open a log "
+            f"file and the plugin never loads. Set [Logging.Disk] Enabled = false in {cfg} (back it up first)."
+        )
 
     stop_all()
     backup_display()
@@ -217,7 +255,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_launch = sub.add_parser("launch")
-    p_launch.add_argument("--count", type=int, default=5, help="at most 5: BepInEx stops loading after 5 log files")
+    p_launch.add_argument("--count", type=int, default=5,
+                          help="how many copies; more than 5 needs [Logging.Disk] Enabled = false in BepInEx.cfg")
     p_launch.add_argument("--base-port", type=int, default=47800)
     p_launch.add_argument("--width", type=int, default=368)
     p_launch.add_argument("--height", type=int, default=207)
