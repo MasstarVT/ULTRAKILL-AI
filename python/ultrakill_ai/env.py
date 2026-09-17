@@ -93,6 +93,9 @@ class EnvConfig:
     curriculum_path: str = ""  # runs/<run>/curriculum.json, written by ProgressCallback ("" = no curriculum)
     unlock_rate: float = 0.5  # fresh completion rate a level needs before the next one unlocks
     unlock_window: int = 20  # ... over at least this many of its own fresh episodes
+    # Safety valve (0 = off): a level also opens its successor after this many of its own CUMULATIVE fresh
+    # episodes, whatever its rate, so one level the policy cannot crack does not block the whole campaign.
+    unlock_after_fresh_episodes: int = 0
     level_weight_floor: float = 0.1  # a mastered level keeps this much of the sampling weight, so it is not forgotten
     difficulty: int = -1  # difficulty the game reads while the AI has control (3 = Violent, -1 = leave the game's own)
     unlock_all_gear: bool = False  # every weapon and variant while the AI has control, in memory only

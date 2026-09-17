@@ -65,9 +65,9 @@ def test_shipped_levels_exclude_the_two_with_no_scene_bundle():
 ORDER = ["Level 0-1", "Level 0-3", "Level 0-4"]
 
 
-def record(*, unlocked=True, window=50, rate=None, best=None, episodes=0):
+def record(*, unlocked=True, window=50, rate=None, best=None, episodes=0, fresh_episodes=0):
     return {"unlocked": unlocked, "fresh_window": window, "fresh_completion_rate": rate,
-            "best_time": best, "episodes": episodes}
+            "best_time": best, "episodes": episodes, "fresh_episodes": fresh_episodes}
 
 
 def draws(stats, n=4000, seed=0, floor=0.1):
@@ -137,6 +137,69 @@ def test_unlock_is_a_latch_the_caller_holds():
     stats = {"Level 0-1": record(rate=0.9), "Level 0-3": record(unlocked=True, rate=0.0, window=50)}
     assert unlock_next(ORDER, stats) is None
     assert "Level 0-3" in dict(level_weights(ORDER, stats))
+
+
+def test_a_level_inserted_before_an_unlocked_one_does_not_re_lock_it():
+    """Inserting 0-2 between 0-1 and 0-3 must leave 0-3 unlocked and still sampled.
+
+    This is the 2026-09-17 pause's own case: the live run had 0-1 and 0-3 unlocked, and the new order puts 0-2
+    between them. `unlock_next` walks the order and stops at the first LOCKED level, so with 0-2 locked it never
+    looks at 0-3 -- and it has no way to lock anything, since it only ever names a level for the caller to
+    unlock. The danger would be `level_weights` dropping 0-3 for having a locked predecessor; it does not, it
+    reads each level's own `unlocked` flag.
+    """
+    order = ["Level 0-1", "Level 0-2", "Level 0-3", "Level 0-4"]
+    stats = {"Level 0-1": record(window=0, rate=None), "Level 0-2": record(unlocked=False),
+             "Level 0-3": record(unlocked=True, window=9, rate=0.0), "Level 0-4": record(unlocked=False)}
+    assert unlock_next(order, stats) is None, "0-1's window is empty after a restart, so nothing unlocks yet"
+    assert set(dict(level_weights(order, stats))) == {"Level 0-1", "Level 0-3"}, "0-3 keeps its sampling weight"
+    stats["Level 0-1"] = record(window=20, rate=0.54)  # the window refills at the old rate
+    assert unlock_next(order, stats) == "Level 0-2", "and then the inserted level unlocks normally"
+    stats["Level 0-2"] = record(unlocked=True, window=0, rate=None)
+    assert unlock_next(order, stats) is None, "0-3 is already unlocked; 0-4 waits on 0-3's own rate"
+
+
+def test_the_safety_valve_unlocks_on_fresh_episodes_alone():
+    """`unlock_after_fresh_episodes` stops one hard level blocking the whole campaign.
+
+    Off by default (0), so every existing run is byte for byte unchanged. When set, a level that has spent that
+    many of its own fresh episodes without reaching `unlock_rate` opens its successor anyway -- the rate bar is
+    the fast path, this is the slow one. It counts CUMULATIVE fresh episodes, not the 50-deep window, because a
+    window saturates at 50 and could never express "600 tries".
+    """
+    stats = {"Level 0-1": record(window=50, rate=0.1, fresh_episodes=599)}
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) is None
+    assert unlock_next(ORDER, stats) is None, "and with the valve off it stays shut forever"
+    stats["Level 0-1"]["fresh_episodes"] = 600
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) == "Level 0-3"
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=0) is None, "0 means off, not 'always'"
+
+
+def test_the_safety_valve_is_chained_like_the_rate_bar():
+    """It opens exactly one rung: the successor of the level that ran out of patience, not the whole ladder."""
+    stats = {"Level 0-1": record(window=50, rate=0.0, fresh_episodes=900),
+             "Level 0-3": record(unlocked=False), "Level 0-4": record(unlocked=False)}
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) == "Level 0-3"
+    stats["Level 0-3"] = record(unlocked=True, window=50, rate=0.0, fresh_episodes=10)
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) is None, "0-4 waits its own 600 out"
+    stats["Level 0-3"]["fresh_episodes"] = 600
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) == "Level 0-4"
+
+
+def test_the_safety_valve_still_needs_the_predecessor_unlocked():
+    """A locked level cannot accumulate fresh episodes, but a hand-edited table must not open a hole either."""
+    stats = {"Level 0-1": record(window=50, rate=0.0, fresh_episodes=5),
+             "Level 0-3": record(unlocked=False, fresh_episodes=9999), "Level 0-4": record(unlocked=False)}
+    assert unlock_next(ORDER, stats, unlock_after_fresh_episodes=600) is None
+
+
+def test_a_table_written_before_the_safety_valve_existed_still_loads():
+    """Old `curriculum.json` / `status.json` rows have no `fresh_episodes`; they must read as 0, not raise."""
+    old = {"Level 0-1": {"unlocked": True, "fresh_window": 50, "fresh_completion_rate": 0.1,
+                         "best_time": None, "episodes": 400}}
+    assert unlock_next(ORDER, old, unlock_after_fresh_episodes=600) is None
+    old["Level 0-1"]["fresh_completion_rate"] = 0.6
+    assert unlock_next(ORDER, old, unlock_after_fresh_episodes=600) == "Level 0-3", "the rate bar still works"
 
 
 def curriculum_file(path, *, order=ORDER, run_name="campaign_prelude", levels=None):

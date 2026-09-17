@@ -138,7 +138,7 @@ def _level_stat(stats: dict | None, level: str, first: str) -> dict:
     record = (stats or {}).get(level)
     if not isinstance(record, dict):
         return {"unlocked": level == first, "fresh_window": 0, "fresh_completion_rate": None,
-                "best_time": None, "episodes": 0}
+                "best_time": None, "episodes": 0, "fresh_episodes": 0}
     return record
 
 
@@ -176,23 +176,40 @@ def choose_level(rng: random.Random, order, stats: dict | None, *, floor: float 
     return rng.choices(levels, weights=[w for _, w in weighted], k=1)[0]
 
 
-def unlock_next(order, stats: dict | None, *, unlock_rate: float = 0.5, unlock_window: int = 20) -> str | None:
+def unlock_next(order, stats: dict | None, *, unlock_rate: float = 0.5, unlock_window: int = 20,
+                unlock_after_fresh_episodes: int = 0) -> str | None:
     """The first still-locked level whose predecessor has earned it, or None. Called once per finished episode.
 
     Unlocking is chained and stops at the first locked level, so 0-3 cannot unlock before 0-2 has: the order in
     the config is a ladder, not a menu. An empty `stats` returns None rather than raising, because `order[0]` is
     unlocked by the default record and every later level then fails the predecessor test.
+
+    **This function never locks anything.** It only names a level for the caller to latch open, so a level whose
+    rate later collapses stays unlocked and the learning in progress on it is not thrown away. That also makes
+    inserting a level into `order` safe: with the new level locked the walk stops there and never revisits the
+    already-unlocked levels behind it, which keep their own `unlocked` flag and their sampling weight.
+
+    Two ways a predecessor earns its successor:
+      - **the rate bar** (the fast path): `unlock_rate` over at least `unlock_window` of its own fresh episodes;
+      - **the safety valve** (`unlock_after_fresh_episodes`, 0 = off): that many CUMULATIVE fresh episodes,
+        whatever the rate. A campaign is a ladder, so without it one level the policy cannot crack blocks every
+        level behind it forever -- and the run has no way to tell "needs 2M more steps" from "needs a mechanic
+        nobody has built yet". Cumulative rather than windowed because `fresh_window` saturates at
+        `FRESH_WINDOW` (50) and so cannot express "600 tries". A table written before this field existed reads
+        0 and the valve simply never fires on it.
     """
     order = list(order)
     for i in range(1, len(order)):
         if _level_stat(stats, order[i], order[0]).get("unlocked"):
             continue
         previous = _level_stat(stats, order[i - 1], order[0])
-        if (previous.get("unlocked")
-                and int(previous.get("fresh_window") or 0) >= unlock_window
-                and (previous.get("fresh_completion_rate") or 0.0) >= unlock_rate):
-            return order[i]
-        return None
+        if not previous.get("unlocked"):
+            return None
+        earned = (int(previous.get("fresh_window") or 0) >= unlock_window
+                  and (previous.get("fresh_completion_rate") or 0.0) >= unlock_rate)
+        exhausted = (unlock_after_fresh_episodes > 0
+                     and int(previous.get("fresh_episodes") or 0) >= unlock_after_fresh_episodes)
+        return order[i] if earned or exhausted else None
     return None
 
 

@@ -88,7 +88,7 @@ class ProgressCallback(BaseCallback):
 
     def __init__(self, status_path: Path, target_timesteps: int, run_name: str, num_envs: int, update_every_s: float = 2.0,
                  *, levels=(), curriculum_path=None, unlock_rate: float = 0.5, unlock_window: int = 20,
-                 level_weight_floor: float = 0.1):
+                 unlock_after_fresh_episodes: int = 0, level_weight_floor: float = 0.1):
         super().__init__()
         self.status_path = Path(status_path)
         # One JSON object per finished episode, appended. Written here rather than in the env because with
@@ -133,6 +133,7 @@ class ProgressCallback(BaseCallback):
         self.curriculum_path = Path(curriculum_path) if curriculum_path else None
         self.unlock_rate = float(unlock_rate)
         self.unlock_window = int(unlock_window)
+        self.unlock_after_fresh_episodes = int(unlock_after_fresh_episodes)
         self.level_weight_floor = float(level_weight_floor)
         self.per_level: dict[str, dict] = {}
         self._curriculum_written: dict | None = None
@@ -180,6 +181,10 @@ class ProgressCallback(BaseCallback):
             record["unlocked"] = bool(old.get("unlocked")) or record["unlocked"]
             record["best_time"] = _num(old.get("best_time"))
             record["episodes"] = int(_num(old.get("episodes")) or 0)
+            # Cumulative, so it carries like `episodes` and NOT like the windows: the safety valve counts how
+            # many fresh tries a level has had in total, and a restart must not hand it a clean slate or a run
+            # that is stopped every few hours can never reach the valve at all.
+            record["fresh_episodes"] = int(_num(old.get("fresh_episodes")) or 0)
             carried = {key: _num(old.get(key)) for key in ("checkpoints_level", "gates_reached")}
             if any(v is not None for v in carried.values()):
                 record["recent"].append(carried)  # one synthetic episode, so the panel is not blank on restart
@@ -194,6 +199,7 @@ class ProgressCallback(BaseCallback):
                 "recent": deque(maxlen=EPISODE_WINDOW),  # the two early-progress signals, all episodes
                 "best_time": None,
                 "episodes": 0,
+                "fresh_episodes": 0,  # cumulative fresh starts; what `unlock_after_fresh_episodes` counts
             }
             self.per_level[level] = record
         return record
@@ -214,6 +220,7 @@ class ProgressCallback(BaseCallback):
                 "fresh_completion_rate": (sum(c for c, _ in fresh) / len(fresh)) if fresh else None,
                 "best_time": record["best_time"],
                 "episodes": int(record["episodes"]),
+                "fresh_episodes": int(record["fresh_episodes"]),
             }
         if not with_weights:
             return table
@@ -410,7 +417,9 @@ class ProgressCallback(BaseCallback):
         Only a fresh start counts toward a level's completion rate: a checkpoint respawn starts partway through
         and its official timer carries over from an earlier episode, so neither says how a whole level goes.
         Unlocking is checked once per episode, is chained, and is a latch -- a level never re-locks as its rate
-        falls, which would stall the learning that was in progress on it.
+        falls, which would stall the learning that was in progress on it. `fresh_episodes` counts the same fresh
+        starts cumulatively (the `fresh` deque only keeps the last `FRESH_WINDOW`), which is what the
+        `unlock_after_fresh_episodes` safety valve reads.
         """
         level = stats.get("level")
         if not self.order or not isinstance(level, str):
@@ -419,11 +428,14 @@ class ProgressCallback(BaseCallback):
         record["episodes"] += 1
         record["recent"].append({"checkpoints_level": stats["checkpoints_level"], "gates_reached": stats["gates_reached"]})
         if stats["fresh_start"]:
+            record["fresh_episodes"] += 1
             completed, seconds = stats["completed"] or 0.0, stats["level_seconds"]
             record["fresh"].append((completed, seconds))
             if completed and seconds is not None and (record["best_time"] is None or seconds < record["best_time"]):
                 record["best_time"] = seconds
-        nxt = unlock_next(self.order, self._level_table(), unlock_rate=self.unlock_rate, unlock_window=self.unlock_window)
+        nxt = unlock_next(self.order, self._level_table(), unlock_rate=self.unlock_rate,
+                          unlock_window=self.unlock_window,
+                          unlock_after_fresh_episodes=self.unlock_after_fresh_episodes)
         if nxt is not None:
             self._level_record(nxt)["unlocked"] = True
 

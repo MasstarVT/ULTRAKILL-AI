@@ -1,0 +1,10 @@
+{
+  "score_metric": "fresh_completion_rate, smoothed over 9 samples",
+  "score": 0.5111,
+  "penalty": 260.2835,
+  "penalty_name": "best_time",
+  "reward": 201.319,
+  "at_timesteps": 6758582.0,
+  "checkpoint": "ckpt_6755630_steps.zip",
+  "saved_at": "2026-09-17 08:36:13"
+}

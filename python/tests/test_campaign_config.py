@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import torch  # noqa: E402
 import train  # noqa: E402
-from ultrakill_ai.campaign import CAMPAIGN_LEVELS_SHIPPED  # noqa: E402
+from ultrakill_ai.campaign import CAMPAIGN_LEVELS, CAMPAIGN_LEVELS_SHIPPED  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.progress import PPO_METRICS  # noqa: E402
 from ultrakill_ai.rewards import RewardConfig  # noqa: E402
@@ -22,6 +22,7 @@ CONFIG = ROOT / "configs" / "campaign_0-1.yaml"
 PRELUDE = ROOT / "configs" / "campaign_prelude.yaml"
 LEVEL_1_1 = ROOT / "configs" / "campaign_1-1.yaml"
 GATES_PRELUDE = ROOT / "configs" / "campaign_gates_prelude.yaml"
+GATES_MAIN = ROOT / "configs" / "campaign_gates_main.yaml"
 RUN_NAME = "campaign_gates"
 MODEL_DIR = Path("models") / RUN_NAME
 RUN_DIR = Path("runs") / RUN_NAME
@@ -111,9 +112,94 @@ def test_the_gates_prelude_config_carries_the_live_run_forward():
     assert "ent_coef" in header and "6.0" in header, "the header has to carry the falsifier and the tripwire"
 
 
+def test_the_main_config_carries_the_gates_prelude_run_forward():
+    """The config the live run resumes on after integration pause #2 (2026-09-17).
+
+    The same run name and the same weights continue, so the burden is on every setting that is NOT one of the
+    four deliberate changes to be character-for-character what the prelude config had. Four things may move:
+    `levels` (and the new safety valve beside it), `max_steps`, and the two skull reward weights.
+    """
+    prelude_env, prelude_train = train.load_config(str(GATES_PRELUDE))
+    env_dict, train_cfg = train.load_config(str(GATES_MAIN))
+    prelude, cfg = EnvConfig.from_dict(prelude_env), EnvConfig.from_dict(env_dict)
+
+    allowed = {"levels", "unlock_after_fresh_episodes", "max_steps", "rewards"}
+    differing = {f.name for f in dataclasses.fields(EnvConfig)
+                 if getattr(cfg, f.name) != getattr(prelude, f.name)}
+    assert differing <= allowed, f"env settings changed besides the four: {sorted(differing - allowed)}"
+
+    # Reward weights: only the two skull terms move, and everything else is identical to what the 6.8M steps
+    # already on the clock were trained under.
+    changed = {f.name for f in dataclasses.fields(RewardConfig)
+               if getattr(cfg.rewards, f.name) != getattr(prelude.rewards, f.name)}
+    assert changed == {"item_pickup", "item_placed"}, sorted(changed)
+    assert (cfg.rewards.item_pickup, cfg.rewards.item_placed) == (10.0, 20.0)
+    assert cfg.rewards.item_placed > cfg.rewards.item_pickup, "or collect-and-abandon is worth it alone"
+    # The two bounds the skull-fixes checklist's arithmetic actually sets, which are about the DETOUR an
+    # off-route skull could buy. 0-2 ships exactly one such skull, at a secret altar whose gate reports
+    # `hops: null` and so can never become a target (verified in game, 2026-09-17).
+    #   - a bare pickup must not out-earn a route rung, or wandering off to hold a skull beats walking the
+    #     ladder: item_pickup <= gate;
+    #   - the whole puzzle is worth two rungs and no more: item_pickup + item_placed <= 2 * gate. At 30 that is
+    #     also ~100 game seconds of `time` (0.3/s), so a long detour to a skull the route does not need roughly
+    #     breaks even at best.
+    # `item_placed` alone is allowed above `gate`: it is the terminal event and has to out-weigh the pickup, and
+    # it is only ever paid at an altar the agent is already standing at, never for travel.
+    assert cfg.rewards.item_pickup <= cfg.rewards.gate
+    assert cfg.rewards.item_pickup + cfg.rewards.item_placed <= 2 * cfg.rewards.gate
+
+    # The 11 levels: mission order, Tier A + Tier B, starting where the run already is.
+    assert cfg.levels[0] == "Level 0-1", "the first rung is always unlocked, so it must be the trained level"
+    assert cfg.levels == ["Level 0-1", "Level 0-2", "Level 0-3", "Level 0-4", "Level 1-1", "Level 1-2",
+                          "Level 2-1", "Level 2-2", "Level 2-3", "Level 3-1", "Level 4-1"]
+    assert all(lv in CAMPAIGN_LEVELS_SHIPPED for lv in cfg.levels)
+    assert len(set(cfg.levels)) == len(cfg.levels)
+    order = [CAMPAIGN_LEVELS.index(lv) for lv in cfg.levels]
+    assert order == sorted(order), "mission order, so the ladder matches how the game unlocks"
+    assert set(prelude.levels) <= set(cfg.levels), "no level the run is already training may be dropped"
+
+    # The safety valve, and the truncation cap.
+    assert cfg.unlock_after_fresh_episodes == 600 and prelude.unlock_after_fresh_episodes == 0
+    assert (cfg.unlock_rate, cfg.unlock_window, cfg.level_weight_floor) == (0.5, 20, 0.1)
+    assert cfg.max_steps == 12000 and prelude.max_steps == 9000
+    assert cfg.max_steps_per_level == {}, "one cap for every level; a per-level cap is a separate decision"
+    assert cfg.stuck_seconds == prelude.stuck_seconds == 45, "a stuck episode must still end early"
+
+    # Same run, same weights, same optimiser: nothing in the train section moves at all.
+    assert train_cfg["run_name"] == RUN_NAME == prelude_train["run_name"]
+    assert train_cfg["hyperparams"] == prelude_train["hyperparams"], "ent_coef included: 0.004 stays"
+    assert train_cfg["hyperparams"]["ent_coef"] == 0.004
+    assert train_cfg["policy_kwargs"] == prelude_train["policy_kwargs"]
+    # 12 games, up from 8, on the throughput A/B measured at this pause (188.6 -> 236.5 steps/s steady state).
+    # `n_steps` in the config is the TOTAL rollout -- train.py divides it by num_envs -- so the PPO batch, and
+    # therefore the update, is unchanged by the instance count.
+    assert (train_cfg["num_envs"], prelude_train["num_envs"]) == (12, 8)
+    assert train_cfg["hyperparams"]["n_steps"] == 2048
+
+    filled = train.fill_campaign_dirs(cfg, MODEL_DIR, RUN_DIR)
+    assert filled.curriculum_path == f"runs/{RUN_NAME}/curriculum.json"
+    assert filled.explore_dir == f"models/{RUN_NAME}", "the archives stay where they are"
+    header = GATES_MAIN.read_text(encoding="utf-8")
+    assert "6854" in header, "the max_steps change has to carry the measurement it came from"
+    assert "6.0" in header, "and the entropy tripwire has to survive the config change"
+
+
+def test_the_main_config_builds_a_479_input_curriculum_env():
+    env_dict, _ = train.load_config(str(GATES_MAIN))
+    cfg = train.fill_campaign_dirs(EnvConfig.from_dict(env_dict), MODEL_DIR, RUN_DIR)
+    env = UltrakillEnv(dataclasses.replace(cfg, explore_dir="", best_runs_dir="", curriculum_path=""))
+    try:
+        assert env.observation_space.shape == (479,), "no level id enters the observation, by design"
+        assert list(env.action_space.nvec) == [3, 3, 2, 2, 2, 2, 2, 2, 6, 11, 7, 3]
+        assert env.level == "Level 0-1", "with no curriculum file to read, a worker starts on the first rung"
+        assert env._max_steps() == 12000
+    finally:
+        env.close()
+
+
 def test_every_campaign_setting_is_a_real_field():
     # EnvConfig.from_dict drops keys it does not know, so a misspelt setting would silently use its default.
-    for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE):
+    for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN):
         env_dict, _ = train.load_config(str(path))
         unknown = sorted(set(env_dict) - field_names(EnvConfig))
         assert not unknown, f"{path.name}: env keys EnvConfig does not know: {unknown}"
@@ -289,7 +375,7 @@ def test_a_campaign_checkpoint_loads_against_every_campaign_config():
     from stable_baselines3.common.vec_env import DummyVecEnv
 
     configs = {path.name: EnvConfig.from_dict(train.load_config(str(path))[0])
-               for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE)}
+               for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN)}
     envs = {}
     try:
         for name, cfg in configs.items():

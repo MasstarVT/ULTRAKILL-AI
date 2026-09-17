@@ -391,7 +391,7 @@ def test_curriculum_file_is_written_before_any_episode_and_lists_every_level():
         assert data["levels"]["Level 0-1"]["unlocked"] is True, "the ladder always has a starting rung"
         assert [data["levels"][lv]["unlocked"] for lv in CURRICULUM_LEVELS[1:]] == [False, False]
         assert data["levels"]["Level 0-3"] == {"unlocked": False, "fresh_window": 0, "fresh_completion_rate": None,
-                                               "best_time": None, "episodes": 0}
+                                               "best_time": None, "episodes": 0, "fresh_episodes": 0}
         assert cb.unlocked_levels == ["Level 0-1"]
         assert not list((run).glob("*.tmp"))
 
@@ -465,6 +465,77 @@ def test_the_unlock_latch_survives_a_restart_and_a_falling_rate():
         again._write(time.time())
         assert again.unlocked_levels == ["Level 0-1", "Level 0-3"]
         assert read_json(run / "status.json")["campaign"]["levels"]["Level 0-1"]["fresh_completion_rate"] == 0.0
+
+
+def test_the_safety_valve_opens_the_next_level_and_survives_a_restart():
+    """`unlock_after_fresh_episodes` through the callback, including across a stop: the counter is cumulative.
+
+    The realistic shape, and the reason the counter is not the `fresh` deque: a level is run 12 times with a 0.0
+    rate, the trainer is restarted (which empties every window), and the remaining tries still add up to the
+    valve. Without carrying `fresh_episodes` a run stopped every few hours could never reach it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "campaign_multi"
+        cb = curriculum_callback(Path(tmp), unlock_after_fresh_episodes=20)
+        for _ in range(12):
+            cb._record_episode(0, episode_info("Level 0-1"))  # fresh, never completed
+        cb._write(time.time())
+        assert cb.unlocked_levels == ["Level 0-1"], "12 tries is not 20"
+        assert read_json(run / "status.json")["campaign"]["levels"]["Level 0-1"]["fresh_episodes"] == 12
+
+        again = ProgressCallback(run / "status.json", 1000, "campaign_multi", 2, update_every_s=0.0,
+                                 levels=CURRICULUM_LEVELS, curriculum_path=run / "curriculum.json",
+                                 unlock_after_fresh_episodes=20)
+        again._on_training_start()
+        assert again._level_record("Level 0-1")["fresh_episodes"] == 12, "cumulative, unlike the windows"
+        for _ in range(7):
+            again._record_episode(0, episode_info("Level 0-1"))
+        assert again.unlocked_levels == ["Level 0-1"], "19"
+        again._record_episode(0, episode_info("Level 0-1"))
+        assert again.unlocked_levels == ["Level 0-1", "Level 0-3"], "the 20th fresh try opens the valve"
+        again._write(time.time())
+        assert read_json(run / "curriculum.json")["levels"]["Level 0-3"]["unlocked"] is True
+
+
+def test_the_safety_valve_is_off_by_default():
+    """Every run written before this existed must behave exactly as it did: no valve, no unlock."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cb = curriculum_callback(Path(tmp))
+        assert cb.unlock_after_fresh_episodes == 0
+        for _ in range(200):
+            cb._record_episode(0, episode_info("Level 0-1"))
+        assert cb.unlocked_levels == ["Level 0-1"]
+
+
+def test_inserting_a_level_before_an_unlocked_one_keeps_it_unlocked():
+    """The 2026-09-17 pause's own move: 0-1 and 0-3 are unlocked, then 0-2 is inserted between them.
+
+    `_restore_levels` latches by NAME, so reordering cannot re-lock anything, and `_level_table` republishes the
+    new order with both old levels still open. The inserted level is locked and waits its turn on 0-1's rate.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "campaign_multi"
+        cb = curriculum_callback(Path(tmp))
+        for i in range(20):
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=120.0 + i))
+        cb._record_episode(1, episode_info("Level 0-3"))
+        cb._write(time.time())
+        assert cb.unlocked_levels == ["Level 0-1", "Level 0-3"]
+
+        reordered = ["Level 0-1", "Level 0-2", "Level 0-3", "Level 0-4"]
+        again = ProgressCallback(run / "status.json", 1000, "campaign_multi", 2, update_every_s=0.0,
+                                 levels=reordered, curriculum_path=run / "curriculum.json")
+        again._on_training_start()
+        assert again.unlocked_levels == ["Level 0-1", "Level 0-3"], "0-3 must not re-lock behind the new 0-2"
+        table = read_json(run / "curriculum.json")
+        assert table["order"] == reordered
+        assert [lv for lv, row in table["levels"].items() if row["unlocked"]] == ["Level 0-1", "Level 0-3"]
+        # 0-1's window restarts empty, so 0-2 unlocks once the rate is re-earned -- not before.
+        for i in range(19):
+            again._record_episode(0, episode_info("Level 0-1", completed=1, seconds=200.0 + i))
+        assert again.unlocked_levels == ["Level 0-1", "Level 0-3"], "19 fresh episodes is not the window"
+        again._record_episode(0, episode_info("Level 0-1", completed=1, seconds=199.0))
+        assert again.unlocked_levels == ["Level 0-1", "Level 0-2", "Level 0-3"]
 
 
 def test_a_run_with_no_levels_writes_no_curriculum_file():

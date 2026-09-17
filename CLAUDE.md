@@ -111,6 +111,23 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     - **The curriculum** (`CAMPAIGN_LEVELS_SHIPPED`, `level_weights`, `choose_level`, `unlock_next`,
       `read_curriculum`): the 33 levels whose scene bundle this build ships, the sampling weights, the unlock
       latch, and a reader that falls back to `levels[0]` on a missing, torn, wrong-run or wrong-order file.
+      **Unlocking is one-way by construction.** `unlock_next` only ever *names* a level for `ProgressCallback`
+      to latch open — no code path anywhere sets `unlocked` back to False — so a level whose rate later collapses
+      keeps training, and `ProgressCallback._restore_levels` latches by **name**, not by position. That is what
+      makes **inserting a level into `order` safe**: with the new level locked the chained walk stops there and
+      never revisits the unlocked levels behind it, and `level_weights` reads each level's own flag, so an
+      already-unlocked later level keeps its sampling weight. Done live at integration pause #2 (0-2 inserted
+      between an unlocked 0-1 and an unlocked 0-3) and pinned by
+      `test_a_level_inserted_before_an_unlocked_one_does_not_re_lock_it` and
+      `test_inserting_a_level_before_an_unlocked_one_keeps_it_unlocked`.
+      **The safety valve, `unlock_after_fresh_episodes`** (0 = off; 600 in the live config): a level also opens
+      its successor once it has spent that many of its own **cumulative** fresh episodes, whatever its rate. The
+      ladder is strictly chained, so without it one level the policy cannot crack blocks every level behind it
+      for the rest of the run — and no metric distinguishes "needs 2M more steps" from "needs a mechanic nobody
+      has built". Cumulative, because `fresh_window` saturates at 50 and cannot express "600 tries"; the counter
+      is `fresh_episodes`, carried across restarts with `episodes` (not with the windows, which deliberately
+      start empty), published in `curriculum.json` and `status.json`, and read as 0 in any table written before
+      it existed.
     - **`altar_aim_point` and `dead_twin`** (branch `skull-fixes`): where to aim a punch at a zone (the mod's
       `aim_pos`, else 1 m below `pos`), and the relative dead-twin rule the mod now applies too, so both sides
       agree about which zone a gate is waiting on. See the branch entry under Status.
@@ -204,7 +221,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/tests/test_campaign.py`: campaign helpers: level list, rank maths, exploration archive, milestones, path progress, the fresh-start rule and best runs (no game needed).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
 - `python/tests/test_spaces.py`: layout sizes (448 / 479) and every index range of the campaign block, including the yaw-frame signs (no game needed).
-- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands). `campaign_prelude.yaml` (the multi-level curriculum 0-1 / 0-3 / 0-4 under a new run name `campaign_prelude`, kept as the reference) and `campaign_1-1.yaml` (the first skull-carry level, run `campaign_1-1`, **`item_pickup` and `item_placed` pinned at 0.0** until the three in-game checks pass). **`campaign_gates_prelude.yaml` is the live one** (2026-09-17): the same curriculum but `run_name: campaign_gates`, so the 4.8M-step weights, `best.zip` and the exploration archives carry on, with `num_envs` 8 and `ent_coef` 0.004. Every env setting and every reward weight in it is identical to `campaign_0-1.yaml`'s, and `tests/test_campaign_config.py` pins that equality so no weight can drift while the same policy continues. Every header lists its own run commands.
+- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands). `campaign_prelude.yaml` (the multi-level curriculum 0-1 / 0-3 / 0-4 under a new run name `campaign_prelude`, kept as the reference) and `campaign_1-1.yaml` (the first skull-carry level, run `campaign_1-1`, **`item_pickup` and `item_placed` pinned at 0.0** until the three in-game checks pass). `campaign_gates_prelude.yaml` carried the live run from 4.8M to 6.77M steps (curriculum 0-1 / 0-3 / 0-4, `num_envs` 8, `ent_coef` 0.004) and is kept as history and as the partial rollback. **`campaign_gates_main.yaml` is the live one** (integration pause #2, 2026-09-17): the same `run_name: campaign_gates`, so the 6.77M-step weights, `best.zip` and the exploration archives carry on, with the 11-level Tier A + Tier B ladder, `unlock_after_fresh_episodes: 600`, `max_steps` 12000, `item_pickup` 10.0 / `item_placed` 20.0, `num_envs` 12 and `ent_coef` still 0.004. Each config's header lists its own run commands, and **`tests/test_campaign_config.py` pins every setting and every reward weight that is NOT a named change equal to the config before it**, so nothing can drift while the same policy continues.
 - `docs/level-survey.md`: all 35 levels parsed offline from the scene files — exits, checkpoints, door graphs and gate ladders, altars and carryables, arenas, bosses and hazards, plus a tier table and the recommended order of sub-projects. This is what the multi-level and skull-gates design was built from; check it before assuming anything about a level nobody has trained on.
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
@@ -231,13 +248,15 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   2. `python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo_v2/best.zip` (`num_envs` 5 in config; `timesteps` is the run total, so resuming trains only the rest; drop `--resume` for a fresh run, and give it a new `run_name` so `status.json` does not inherit the old episodes)
   3. `python scripts/games.py stop`
   - `python scripts/games.py status` is safe during training (it reads netstat, it does not connect).
-- **Campaign training — the live run. `configs/campaign_gates_prelude.yaml`, run `campaign_gates`, EIGHT games**
-  (since the 2026-09-17 integration; it uses every game, so Cyber Grind stays paused). This is the same run that
-  started on 0-1: same `run_name`, same `models/campaign_gates/`, same weights, now a **curriculum** over
-  0-1 / 0-3 / 0-4 with `ent_coef` 0.004.
-  1. `python scripts/games.py launch --count 8 --monitor 1` (needs `[Logging.Disk] Enabled = false`; see the
+- **Campaign training — the live run. `configs/campaign_gates_main.yaml`, run `campaign_gates`, TWELVE games**
+  (since integration pause #2, 2026-09-17; it uses every game, so Cyber Grind stays paused). This is the same run
+  that started on 0-1: same `run_name`, same `models/campaign_gates/`, same weights, now a **curriculum** over
+  the level survey's Tier A + Tier B — 0-1, 0-2, 0-3, 0-4, 1-1, 1-2, 2-1, 2-2, 2-3, 3-1, 4-1 — with
+  `ent_coef` 0.004, `max_steps` 12000 and the skull weights live.
+  `configs/campaign_gates_prelude.yaml` is the previous config, kept as history and as the partial rollback.
+  1. `python scripts/games.py launch --count 12 --monitor 1` (needs `[Logging.Disk] Enabled = false`; see the
      instance-count gotcha. `games.py launch` refuses `--count > 5` while disk logging is on, and says why.)
-  2. `python scripts/train.py --config configs/campaign_gates_prelude.yaml --resume models/campaign_gates/latest.zip`
+  2. `python scripts/train.py --config configs/campaign_gates_main.yaml --resume models/campaign_gates/latest.zip`
      To continue a stopped run, resume from `models/campaign_gates/latest.zip` after a graceful Ctrl+C, else
      from the newest `ckpt_*_steps.zip` — and **check which of the two actually holds more steps**: `games.py stop`
      kills the trainer with a `BridgeError`, whose `finally` still writes `latest.zip`, so after that stop
@@ -247,10 +266,10 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
      checkpoint incompatible with the campaign env, and `add_look_mode.py` is the only migration path.
   3. Alongside it: `python scripts/poll_status.py --run campaign_gates`, `python scripts/keep_best.py --run campaign_gates --metric campaign` and `python scripts/dashboard.py --run campaign_gates --monitor 1`.
   4. `python scripts/games.py stop`
-  - To start all five detached on the one-display PC, each appending to its own log (this is what is running):
+  - To start all four detached on the one-display PC, each appending to its own log (this is what is running):
     ```powershell
     Start-Process -FilePath cmd.exe -WorkingDirectory F:\Github\ULTRAKILL-AI\python -WindowStyle Minimized `
-      -ArgumentList '/c', '"F:\Github\ULTRAKILL-AI\python\.venv\Scripts\python.exe" -u scripts/train.py --config configs/campaign_gates_prelude.yaml --resume models/campaign_gates/latest.zip >> runs\campaign_gates_train.log 2>&1'
+      -ArgumentList '/c', '"F:\Github\ULTRAKILL-AI\python\.venv\Scripts\python.exe" -u scripts/train.py --config configs/campaign_gates_main.yaml --resume models/campaign_gates/latest.zip >> runs\campaign_gates_train.log 2>&1'
     ```
     and the same shape for `-u scripts/poll_status.py --run campaign_gates >> runs\campaign_gates_poll.log 2>&1`
     and `-u scripts/keep_best.py --run campaign_gates --metric campaign >> runs\campaign_gates_keep_best.log 2>&1`;
@@ -274,7 +293,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     carried archive cells, `novelty` went 0.5 -> 0.2 and the run name changed, so all three need a fresh baseline
     from the new run's first 100 episodes.
 - **Starting a curriculum run under a NEW name** (`configs/campaign_prelude.yaml`, run `campaign_prelude`, the
-  same three levels) — kept as the reference config; the live run uses `campaign_gates_prelude.yaml` instead so
+  same three levels) — kept as the reference config; the live run uses `campaign_gates_main.yaml` instead so
   the weights, `best.zip` and the archives carry on. If you ever do rename:
   1. Copy `models/campaign_gates/explore_*.npz` into `models/<new run>/` **before the first start** and move any
      old `metrics_log.csv` aside (`poll_status.py` keeps an existing header and would drop `levels_unlocked`).
@@ -314,7 +333,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**14 files; 263 named tests** as of 2026-09-17, plus `test_progress.py`, which prints no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**15 files; 304 named tests** as of 2026-09-17, of which `test_progress.py`'s 19 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
 
 ## Key design decisions
@@ -382,9 +401,24 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   | 5 | 152 | — | — |
   | 7 | 183 | +20% | 31% |
   | 8 | 235 | +54% | 33% |
-  No crash, no bridge misbehaviour and no dropped worker at 7 or 8. **Scaling had not flattened at 8** (CPU still
-  around a third, memory nowhere near the 32 GB), so 10+ is worth measuring next time; 8 was the largest N in
-  this experiment's scope.
+  The second A/B (integration pause #2, same day, from the real 6.77M resume checkpoint on
+  `configs/campaign_gates_main.yaml`, ~18k new steps per leg into a scratch `campaign_smoke` run whose
+  exploration archives were seeded from the live ones):
+  | games | steps/s | vs 8 | notes |
+  |---|---|---|---|
+  | 8 | 188.6 | — | 9 rollouts, 0 bridge errors |
+  | 10 | 220.5 | +16.9% | 10 rollouts, 0 bridge errors |
+  | 12 | 236.5 | **+25.4%** | 10 rollouts, 0 bridge errors; 9.6 GB of 31.9 GB, 16.6 GB free |
+  **12 was adopted** (the bar was +10% over 8). Read these as ratios, not absolutes: the two A/Bs disagree on
+  8 games (235 vs 188.6) because the first measured SB3's cumulative `fps` on short legs that saw few level
+  loads, while this one takes the slope between rollout 1 and the last, excluding start-up. In the live run at
+  12 games the first rollouts settled at **~270 steps/s**. Scaling still had not flattened at 12.
+  **The aggregate rate IS the per-game responsiveness check**: `SubprocVecEnv` steps every env in lockstep, so
+  one slow or wedged game drags the whole vector down and would show up here as a collapse, not as a quiet loss.
+  Nothing in `games.py` needed changing for N > 8 — ports are `base_port + i`, `tile` wraps onto more rows, and
+  `status` scans 16 ports. **Seed a new port's exploration archives** from an existing port's before using it
+  (`models/campaign_gates/explore_<level>_<port>.npz`), or it re-pays novelty for ground the run has covered;
+  47808-47811 were seeded from 47800-47803 exactly as 47805-47807 were from 47802-47804.
 - **Training speed findings** (random actions, 4–5 games):
   - The PPO update is only ~0.2 s per 2048 samples on CPU, so the GPU wouldn't help. The time is in the games and resets.
   - 60 fps / frameskip 4: 138 steps/s. 30 fps / frameskip 2 (same 15 decisions per game second; game logic is deltaTime-based): 199.
@@ -1356,3 +1390,92 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
        only other term the leg earns.
     6. Then resume, and read `part_item_pickup` / `part_item_placed` against `part_gate` in `metrics_log.csv`
        for the first 400k steps before touching them again.
+
+- **Integration pause #2, 2026-09-17: `skull-fixes` merged, S4 verified in game, 12 games, the campaign opened
+  to 11 levels, run resumed.** The live run was stopped at **6,771,574 steps** (678 episodes; Level 0-1 at a
+  **0.54** fresh-start completion rate over its last 50 fresh starts, best official time **260.28 s** against the
+  human 146.58 s; Level 0-3 unlocked with 9 episodes) and resumed on the merged code as the **same run** — same
+  `run_name`, same `models/campaign_gates/`, same weights. Rollback point: `4243ad4`; merge commit `faecc29`.
+  - **It had already died on its own, four minutes before the pause.** One `SubprocVecEnv` worker raised
+    `TimeoutError` out of `protocol.recv` waiting for a level reset, and `train.py`'s `finally` still wrote
+    `latest.zip` at 6,771,574 — **more than the newest checkpoint** (`ckpt_6755630`), so `latest.zip` was again
+    the right resume file. Check both every time; this kind of stop is not the hard kill that leaves it stale.
+    The trainer then hung in teardown with its workers stuck and had to be killed by PID after `games.py stop`.
+    Worth remembering: a bridge timeout on a reset kills the whole run, and nothing restarts it.
+  - **Merge:** clean, no conflicts. Full no-game suite on `main` after the merge: 15 files, all pass; after the
+    pause's own changes **15 files, 304 named tests, all pass** (`test_progress.py`'s 19 print no count, so the
+    per-file lines add to 285). Mod rebuilt and installed at **70,144 bytes** (the pre-merge build was 69,632).
+  - **In-game readouts** (one game, port 47800, 30 fps / frameskip 2, rendering off, Violent, all gear):
+    - **0-1 regression — PASS, unchanged.** `summary: 1 PASS | 2 SKIP | 3 PASS | 4 PASS | 5 FAIL | 6 PASS`;
+      `gates: 11 ordered=True truncated=False with hops=11 (1.000)`, hops 0..9, and **`altars: 0` / `items: 0`**
+      as present-and-empty lists. S4 is still invisible on the level the policy has most of its steps on, which
+      is the thing that mattered. (Check 5 is the known standing exit FAIL on every level.)
+    - **F3, the merge's whole point — PASS, all three checks.**
+      `skull_check.py --port 47800 --from-checkpoint 46 0 388 --from-checkpoint 81 -6 231 --approach 81 -1 255
+      --altar-approach 0 -4 374 --budget 700` with its **default `--gate 20,-10,381`** prints
+      `summary: 1 pickup PASS | 2 placement PASS | 3 held skull on death PASS`. Pickup in **one** aimed punch;
+      placement in **one**, aimed at the collider centre `(0, -7.8, 381)` derived from the reported
+      `(0, -6.8, 381)`, with **no `--camera-height` and no `--altar` hack** — both are gone. And the M14 line
+      that was the blocker now reads **`gate 20,-10,381 needs_item=None open=True locked=False`** with the altar
+      `filled=True`, where before the fix it kept `needs_item='SkullRed'` forever. It survived **100 decisions of
+      punch spam through `env.step`**, so `_protect_carry`'s rekeying holds in the live game.
+    - **`altars[].aim_pos` arrives.** All 7 of 1-1's altars carry it, exactly 1.0 m below `pos`, so the Python
+      1 m fallback is no longer load-bearing. `bridge_test.py --campaign` now prints it (`aim=(x, y, z)`, or `-`
+      on an older mod). The relative dead-twin rule is visible in the same readout: with the room lit, the live
+      `0,-7,381` reads `inactive_ancestors=0` and its twin `#2` reads 1 — the exact pair the old absolute `> 1`
+      test got backwards.
+    - **0-2 — gates PASS, the off-route altar is inert as designed, one physical leg blocked.**
+      `gates: 18 ordered=True truncated=False with hops=17 (0.944)` and check 6 PASS; `altars: 2` / `items: 2`,
+      all `SkullBlue`. Running the **real** `GateProgress` against the live block from all 18 gate positions and
+      the player's own: the secret-wall gate `-60,-6,236` (`hops=None altar_only needs=SkullBlue`) **never became
+      the target from any of them**. And with the skull marked held, `wanting_altars(SkullBlue)` is non-empty
+      (`['-45,-6,236']`, so the OLD gate-blind rule **would** have dropped the punch) while the merged
+      `_protect_carry` **keeps** it — F4 confirmed on real 0-2 data, not just against `FakeLevel`.
+      **The scripted carry: pickup PASS in one aimed punch** on the loose blue skull `-4,22,173`; **placement
+      FAIL**, and the output names why — `altar -45,-6,236 ... active=False inactive_ancestors=1`. Its room is
+      switched off, the known teleport-into-a-dark-room case, not a carry-code failure. 0-2's altar is an
+      off-route secret, so nothing on the route depends on it.
+  - **12 games instead of 8**, on a second throughput A/B (table and method in the instance-count gotcha):
+    188.6 -> 220.5 -> **236.5 steps/s** at 8 / 10 / 12, zero bridge errors in every leg, 9.6 GB of 31.9 GB. The
+    live run settles around **270 steps/s** on its early rollouts. 47808-47811's exploration archives were seeded
+    from 47800-47803's.
+  - **`max_steps` 9000 -> 12000, on measurement.** Of the last 100 **fresh** episodes before the pause,
+    **24 ended at the 9000 cap** and 23 of those held **7-10 of 10 gates**, while the 41 that completed took a
+    **median 6898 decisions**. Deep runs were losing to the clock, not to the level. **This is not a reward
+    change:** a `max_steps` end is a truncation, so SB3 bootstraps `gamma * V(s_T)` and nothing pays for the
+    extra time. `stuck_seconds` stays at 45, so the early-stuck cohort still ends early and the longer cap costs
+    nothing there.
+  - **`item_pickup` 10.0 and `item_placed` 20.0**, off 0.0 at last, on the F3 PASS above. The arithmetic is in
+    the skull-fixes checklist; the two bounds now pinned by a test are `item_pickup <= gate` and
+    `item_pickup + item_placed <= 2 * gate`, which is what keeps an off-route skull from being worth the detour.
+    `item_placed` alone is allowed above `gate`: it is the terminal event, it has to out-weigh the pickup so that
+    collect-and-abandon is not worth it alone, and it is only ever paid at an altar the agent already stands at.
+  - **The curriculum opened to 11 levels** — 0-1, 0-2, 0-3, 0-4, 1-1, 1-2, 2-1, 2-2, 2-3, 3-1, 4-1, the level
+    survey's Tier A and Tier B in mission order — with **`unlock_after_fresh_episodes: 600`**, the new safety
+    valve. 0-1 and 0-3 were already unlocked and **stayed** unlocked across the reorder that inserted 0-2 between
+    them; the trainer printed `curriculum: 11 levels, unlocked ['Level 0-1', 'Level 0-3']` on start. See the
+    curriculum bullet under Layout for why that is safe by construction and which tests pin it.
+  - **`best.zip` was preserved before the pooled score changed meaning.** `keep_best --metric campaign` scores
+    the pooled rate, which is a shrunk **sum** over unlocked levels; once several levels are unlocked a policy
+    that is *worse at 0-1* but better overall can beat the stored record and take `best.zip`. That is arguably
+    the right behaviour for a campaign run, but it loses the best 0-1 policy, so the current one was copied to
+    **`models/campaign_gates/best_0-1_only_6755630.zip`** (+ `.json`, score 0.5111) first.
+  - **Resumed and running** on `configs/campaign_gates_main.yaml` from `models/campaign_gates/latest.zip`
+    (6,771,574 steps) with 12 games, `poll_status.py`, `keep_best.py --metric campaign` and the dashboard
+    alongside. `runs/campaign_gates/metrics_log.csv` was moved to `metrics_log_pre_pause2.csv` so the new
+    `fresh_episodes` and per-level columns are written — `poll_status.py` keeps an existing header and silently
+    drops columns it lacks.
+  - **Watch for, in order:**
+    1. **Per-level fresh rates**, never the pooled one. 0-1 has to refill its 20-episode window at >= 0.5 before
+       0-2 unlocks; the windows deliberately start empty after a restart, so every level reads rate None for a
+       while and the sampling weights are uniform until they refill.
+    2. **`part_item_pickup` / `part_item_placed` against `part_gate`** in `metrics_log.csv` for the first 400k
+       steps, on the skull levels only. Both are paid once per level load, so they should stay small next to
+       `gate`; a large `part_item_pickup` means skulls are being fetched that the route does not need.
+    3. **The entropy tripwire is unchanged: total entropy below 6.0** — stop and raise `ent_coef` to 0.006-0.008.
+       It read 7.68-7.83 through the resume and was flat.
+    4. **0-1's early-stuck cohort is the main cap on its rate, and it is ~25%.** Of the last 100 fresh 0-1
+       episodes, **25 reached 2 gates or fewer** and 12 of those killed nothing at all: the agent never picks the
+       revolver up, or dies in the gun room. Nothing in this pause addresses it — `max_steps` helps the *deep*
+       runs, not these — so 0-1's rate stays roughly capped near 0.75 until it is. That is the next thing to
+       attack on 0-1, and it is a separate change from anything shipped here.
