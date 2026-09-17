@@ -17,7 +17,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `Env/EpisodeController.cs`: lockstep, resets, time settings, and the `unwedge` / `unwedge_frames` config keys.
   - `Act/ActionInjector.cs`: virtual Input System keyboard and mouse; camera look via `CameraController.rotationX/Y`.
   - `Obs/ObservationBuilder.cs`: raw game-state snapshot. `ground_ray_center` (a single ray straight down from the player, outside the 8-ray ring and outside the array, so the packed size stays 479) and the raw movement flags `player.slow_mode` / `heavy_fall` / `crouching` (`crouching` is private, read with `AccessTools` and degrading to `false` with one warning).
-  - `Obs/CampaignObserver.cs`: the obs `campaign` block in the 35 main levels (exit, checkpoints, NavMesh path to the exit, locked doors, arena enemies, milestone keys, rank thresholds); room templates are skipped by `CheckPoint.defaultRooms` ancestry. Since v0.6.0 also the **route**: `campaign.gates`, the door graph built from `Door.activatedRooms` and BFS'd from the exit's room, plus `gates_ordered` / `gates_truncated` (see the gates gotcha), and a `ChooseExit` that drops secret-level pits and prefers the mission successor, frozen per level load. Since v0.7.0 (branch `next-levels`) also the **skull carry**: `campaign.altars[]`, `campaign.items[]` and `gates[].needs_item`, one shared door-key table so an altar's door key string-matches a gate key by construction, a phase-2 gate pass that appends altar-driven one-room doors as `altar_only` gates, and a `ChooseExit` that drops `Level P-` Prime Sanctum pits, counts an `Intermission*` target as leading onward and warns once per level load on a rank tie. See the branch entry under Status.
+  - `Obs/CampaignObserver.cs`: the obs `campaign` block in the 35 main levels (exit, checkpoints, NavMesh path to the exit, locked doors, arena enemies, milestone keys, rank thresholds); room templates are skipped by `CheckPoint.defaultRooms` ancestry. Since v0.6.0 also the **route**: `campaign.gates`, the door graph built from `Door.activatedRooms` and BFS'd from the exit's room, plus `gates_ordered` / `gates_truncated` (see the gates gotcha), and a `ChooseExit` that drops secret-level pits and prefers the mission successor, frozen per level load. Since v0.7.0 (branch `next-levels`) also the **skull carry**: `campaign.altars[]`, `campaign.items[]` and `gates[].needs_item`, one shared door-key table so an altar's door key string-matches a gate key by construction, a phase-2 gate pass that appends altar-driven one-room doors as `altar_only` gates, and a `ChooseExit` that drops `Level P-` Prime Sanctum pits, counts an `Intermission*` target as leading onward and warns once per level load on a rank tie. Branch `skull-fixes` adds `altars[].aim_pos` (the zone's own collider centre, which is what a placement punch has to hit) and replaces the dead-twin filter with the relative `IsDeadTwin` rule. See the branch entries under Status.
   - `Env/SafetyPatches.cs`: blocks leaderboard submissions.
   - `Env/TimePatches.cs`: frame-based hitstop during lockstep.
   - `Env/BackgroundPatches.cs`: keeps the cursor free and audio muted while the AI has control.
@@ -27,7 +27,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `mod/GamePaths.props`: local game path (gitignored; copy from `.example`). Build copies the DLL into `<game>/BepInEx/plugins/UltrakillAIBridge/` — **unless `-p:InstallPlugin=false`**, which skips the copy so the mod can be compiled while the running games hold the installed DLL open. The property defaults to `true`, so the ordinary build is unchanged.
 - `python/ultrakill_ai/`:
   - `protocol.py`: socket client; `kill()` kills the player (debug command for the in-game death check).
-  - `env.py`: `UltrakillEnv` / `EnvConfig` (`pitch_limit_deg` keeps the camera near level). `EnvConfig.from_dict` ignores keys that are no longer fields, so an old `env_config.yaml` with retired settings still loads. Campaign mode (`mode: campaign`, 479 inputs):
+  - `env.py`: `UltrakillEnv` / `EnvConfig` (`pitch_limit_deg` keeps the camera near level; `camera_height_m` 0.9 is where every ray starts, `_eye`; `max_steps_per_level` overrides `max_steps` per scene name and is empty by default). `EnvConfig.from_dict` ignores keys that are no longer fields, so an old `env_config.yaml` with retired settings still loads. Campaign mode (`mode: campaign`, 479 inputs):
     - Reset: a fresh level load or a respawn at the current checkpoint. Fresh after a completion, with no checkpoint yet in this level load, after `stuck_repeats` (3) stuck episodes in a row at one checkpoint, otherwise with probability `fresh_start_prob` (0.2).
     - **Multi-level curriculum** (branch `next-levels`): with `levels` set, a **fresh load and only a fresh load**
       picks the level, sampled from the unlocked set with weight `max(level_weight_floor, 1 - that level's fresh
@@ -110,13 +110,16 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     - **The curriculum** (`CAMPAIGN_LEVELS_SHIPPED`, `level_weights`, `choose_level`, `unlock_next`,
       `read_curriculum`): the 33 levels whose scene bundle this build ships, the sampling weights, the unlock
       latch, and a reader that falls back to `levels[0]` on a missing, torn, wrong-run or wrong-order file.
+    - **`altar_aim_point` and `dead_twin`** (branch `skull-fixes`): where to aim a punch at a zone (the mod's
+      `aim_pos`, else 1 m below `pos`), and the relative dead-twin rule the mod now applies too, so both sides
+      agree about which zone a gate is waiting on. See the branch entry under Status.
     - **Skull milestones** in `MilestoneTracker`: `item_pickup` keyed on the item **type** and only for types some
       altar in this level accepts, `item_placed` keyed on `altar_placement_key` (the item type plus the sorted
       keys of the doors that altar opens), and a `filled` false -> true edge pays only when the item now in the
       altar is the one carried on the previous step — so a pedestal that reads filled at load pays nothing.
     - **`GateProgress` sub-goals**: with a target gate carrying `needs_item T` the target becomes the nearest free
       item of type T, then the altar of type T wired to that gate, then the gate again. `best_dist` is keyed per
-      target, so shuttling between them cannot be farmed. Dead twins (`inactive_ancestors > 1`) and decorations
+      target, so shuttling between them cannot be farmed. Dead twins (`dead_twin`, the relative rule) and decorations
       (`active_self: false`) are filtered out, or the machine sends the agent to punch the skull back out of the
       altar it just filled. That altar filter is `wanting_altars(campaign, types)` — live, unfilled, accepts one of
       these types — in one place because `env._protect_carry` must use the identical test to decide a held item is
@@ -283,14 +286,17 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - Campaign in-game check (one game, nothing else connected to its port): `python scripts/games.py launch --count 1 --monitor 1`, then `python scripts/campaign_check.py` (Level 0-1) and `python scripts/campaign_check.py --level "Level 1-1"` (full arsenal), then `python scripts/games.py stop`. Six checks: level load, arsenal, checkpoint trigger, death respawn, exit, and **the gates block** (present, ordered, hop-monotone and unchanged after a respawn; SKIP rather than FAIL against a pre-0.6.0 mod). Prints PASS/FAIL/SKIP per check and a `summary:` line, exits 1 on any FAIL -- **check 5 (exit) is a known standing FAIL on both levels** (the exit's room is switched off at load, so a teleport onto its collider fires nothing; real play does trigger it, confirmed on a human run), so exit code 1 is expected today. `--fixed-fps 60 --frameskip 4` and `--render` repeat the trigger checks at other speed settings. Rerun after game updates and after mod changes to the campaign block; `python tests/test_campaign_check.py` tests the script without the game.
 - Skull-carry in-game check (one game, nothing else connected to its port). **All three checks passed on
   2026-09-17** -- see the S4 entry under Status for the readouts and for the two fixes still owed before
-  `item_pickup` / `item_placed` may leave 0.0. The command that reproduces it, on Level 1-1:
+  `item_pickup` / `item_placed` may leave 0.0 -- **both are fixed on branch `skull-fixes`**; see its entry at the
+  bottom of Status. The command that reproduces it, on Level 1-1:
   ```
   python scripts/skull_check.py --port 47808 --from-checkpoint 46 0 388 --from-checkpoint 81 -6 231 \
-      --approach 81 -1 255 --altar-approach 0 -4 374 --altar 0 -8 381 --budget 700
+      --approach 81 -1 255 --altar-approach 0 -4 374 --budget 700
   ```
   `--from-checkpoint` teleports onto a checkpoint, waits for it to activate **and then respawns there**, which is
   what actually switches the pedestal's room on; `--approach` / `--altar-approach` stage into a room already lit
-  and the last metres are still walked; `--altar 0 -8 381` is the ~1.25 m downward aim offset a placement needs.
+  and the last metres are still walked. Since branch `skull-fixes` the **`--altar 0 -8 381` offset is gone**:
+  `--altar` takes the zone's own reported position and the script aims at its collider centre (`aim_pos`, else
+  1 m below), so both hacks the first in-game run needed are unnecessary.
   `--render` is the control run, `--via X Y Z` a walked waypoint, `--camera-height` the 0.9 m eye offset the
   punch ray starts from. Check 1 failing while the pre-punch line says `active=False` means the room is still
   switched off and the **walk** failed, not the punch. `python tests/test_skull_check.py` tests it without a game.
@@ -1246,3 +1252,105 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     --approach 81 -1 255 --altar-approach 0 -4 374 --altar 0 -8 381 --budget 700`
   - **`item_pickup` / `item_placed` stay at 0.0** — the lead decides, and the `NeedsItem` mod fix and the
     `env._look_at_target` aim fix both have to land first or a raised weight buys nothing.
+
+- **Branch `skull-fixes`, 2026-09-17: the four skull blockers fixed, three of them verified in game on a ninth
+  instance.** Built in the worktree `F:\Github\ULTRAKILL-AI-skull` while `campaign_gates` kept training on
+  47800-47807; the mod compiles (`dotnet build -c Release -p:InstallPlugin=false`) but could not be installed,
+  because the running games hold the DLL. **Not merged into `main`.**
+  - **F1 -- aim from the EYE, not the feet (Python).** `Punch.ActiveFrame` (`decompiled/Punch.cs:562`) rays from
+    `cc.GetDefaultPos()`, the camera, which sits 0.9 m above `player.pos` (`NewMovement.transform.position`).
+    `env._look_at_target` (look mode 2) and `_near_subgoal`'s reach test both measured from the feet, so every
+    aim at a skull or an altar pointed over the top of it. New `EnvConfig.camera_height_m` (0.9; 0 restores the
+    old behaviour) and `env._eye`.
+    - The error is a short-range one and the correction is in the right direction everywhere: `atan(0.9/r)` is
+      **29.8 deg at 1.57 m**, 16.7 at 3 m, **5.1 at 10 m, 1.7 at 30 m**. So a gate 10-30 m away moves by a couple
+      of degrees, far inside any aim tolerance, and moves the correct way -- a camera 0.9 m up really does have to
+      look slightly down at a door sill at its own feet's height. At punch range it is the whole answer.
+    - **Look mode 1 needed no change, and that was verified rather than assumed.** `enemies[].rel` is
+      `cam.InverseTransformPoint(centre)` (`ObservationBuilder.cs:246`) -- already measured from the camera -- and
+      the only other use of `player.pitch` there is un-pitching `rel` into the yaw frame, a rotation about the
+      same origin. `test_look_mode_1_is_already_camera_relative_and_is_left_alone` pins it at three camera
+      heights: adding an eye offset there would introduce the very error mode 2 had. The mod reports **no camera
+      position**, so the 0.9 is a constant; a future `player.cam_pos` would make it exact while crouched.
+  - **F2 -- the placement offset explained, and it was NOT the decoration skull.** The `AltHit` `ItemIdentifier`
+    early-return hypothesis is **wrong for this case**: 1-1's live red altar (`4 - Altar Field/Altar/Cube`) has no
+    child skull at all. The real cause is geometric and uniform. `AltHit` calls
+    `target.GetComponents<ItemPlaceZone>()` on the transform the raycast returned, and `ItemPlaceZone.Start`
+    reads its own `GetComponent<Collider>()`, so the ray must hit **the zone's own collider** -- and that collider
+    is not centred on the transform. Read out of the scene bundles, **all 104 campaign zones are one prefab**:
+    layer 22, a single trigger `BoxCollider`, local size `(2.2, 3.5, 2.2)`, local centre `(0, -1.25, 0)`, on a
+    transform scaled `(0.9, 0.8, 0.8)`. So the box centre sits **1.0 m below `pos`** (103 of 104; one is 0.625 m)
+    and the box spans `pos.y-2.4 .. pos.y+0.4`: **`pos` is only 0.4 m under the lid, with no margin**, while the
+    centre has 1.4 m. That is the "extra ~1.25 m downward" the first in-game run found by hand.
+    - Fixed at the mod layer as the right one: `CampaignObserver.AimPoint` reports `altars[].aim_pos` =
+      `transform.TransformPoint(box.center)` (`TransformPoint`, not `Collider.bounds`, because a zone in a room
+      that has not streamed in is inactive and its bounds are meaningless). Python's `campaign.altar_aim_point`
+      prefers it and falls back to `pos` minus 1 m, and `GateProgress._subgoal` makes it the altar sub-goal's
+      `pos`, so the observation, the aim, the approach and the reach test all use one point.
+  - **F3 -- the `NeedsItem` dead-twin filter is now RELATIVE (mod).** `inactive_ancestors` is not a property of
+    the zone: it is the zone's own chain plus however much of the room above it is switched off, so it **shifts
+    when the room lights** (measured on 1-1: live/twin 1 and 2 on a fresh load, **0 and 1** after the respawn).
+    The absolute `> 1` test therefore stopped filtering the twin exactly when the player arrived. Replaced by
+    `CampaignObserver.IsDeadTwin` and `campaign.dead_twin`, applied on **both** sides and everywhere altars are
+    filtered (`NeedsItem`, `ScanGates`' phase 2, `wanting_altars`): a zone is dead when another zone with the
+    same item type, the same door set **and the same rounded position** reports strictly fewer inactive
+    ancestors. A shared room contributes equally to both halves of a pair, so the answer cannot be shifted, and
+    the minimum of each group always survives, so a lock can never be filtered away.
+    - **Re-validated offline against all 21 altar levels** (scene bundles, 104 zones, 28 wired doors). Dropped
+      zones **20 (old) -> 20 (new)**; **locks lost: 0** on every level; doors still demanding an item after the
+      puzzle is solved **1 -> 0**, and after a room lights **11 -> 0**. Position is part of the identity because
+      twins are co-located (~0.2 m, which is why the keys need `#N`); without it the rule also drops five zones
+      that are not twins but separate altars of one item type driving no door (4-2 x2, 4-3, 5-3, 7-1).
+  - **F4 -- the 0-2 carry trap, closed by construction (Python).** `_protect_carry` keyed on
+    `campaign.wanting_altars`, which does not look at gates, while `_near_subgoal` can only release on a
+    `GateProgress` sub-goal. Both now key on the sub-goal: a press is dropped only while an altar sub-goal exists
+    for something actually held, so the button can never be taken away by something that cannot give it back.
+    - **What 0-2's off-ladder altar should do: nothing, and that is now what happens.** Its door `-60,-6,236` is
+      a **"Secret Wall"** whose only `activatedRooms` entry is `-60,-11,236`, which appears nowhere on 0-2's pit
+      chain (`9 - Crushers Arena` -> `FinalRoom` -> `Pit`). It is a secret arena, off the route, which is why its
+      `hops` is null -- correct, not a mod bug. The agent keeps punch, may carry the skull or throw it away, and
+      the route loses nothing.
+  - **F5 -- `max_steps_per_level`** (a dict keyed by scene name, empty by default) so a `levels` ladder whose
+    rungs differ in size is not stuck with one cap. `max_steps` itself is unchanged.
+  - **Live verification, 2026-09-17, on a NINTH game on port 47808** started by hand with `games.py`'s own
+    arguments (PID recorded, killed by PID alone; **never `games.py launch`/`stop`, both call `stop_all()`**).
+    47800-47807 stayed listening throughout and `runs/campaign_gates/status.json` kept updating at 160-173
+    steps/s. The installed DLL is the **old** v0.7.0, so this ran F2 through the **Python fallback** -- which is
+    the stronger test, since it needed no mod at all.
+    - `skull_check.py --port 47808 --from-checkpoint 46 0 388 --from-checkpoint 81 -6 231 --approach 81 -1 255
+      --altar-approach 0 -4 374 --budget 700` -- **check 1 pickup PASS in ONE aimed punch** and **check 3 PASS**,
+      with **no `--camera-height` and no `--altar` offset**: both hacks are gone.
+    - **Check 2 placement: the altar filled and the door opened in ONE aimed punch**, aimed at the collider
+      centre `(0, -7.8, 381)` derived from the reported `(0, -6.8, 381)`. Re-run with an empty `--gate` it is a
+      clean **PASS**, including **100 decisions of punch spam through `env.step`** -- so F4's rekeying did not
+      weaken the 1-1 carry protection. With the gate assertion on it reports FAIL, and that FAIL **is F3**:
+      `altar 0,-7,381 filled=True` and `gate 20,-10,381 open=True` while `needs_item='SkullRed'` -- M14 captured
+      live, from the old DLL, and exactly what the installed fix will clear.
+    - **F4 on real 0-2 data:** the live block reports `gate -60,-6,236 hops=None altar_only=True`,
+      `wanting_altars(SkullBlue) = ['-45,-6,236']` (non-empty -- the old rule **would** have engaged) and
+      `gates.target` an ordinary gate with no sub-goal. With the skull marked held, `_protect_carry` **keeps**
+      the punch, and the old `wanting_altars` key **would have dropped** it. The physical pickup did not land
+      because the skull reads `active=False` -- its room is still switched off -- which is the known
+      teleport-into-a-dark-room case, not the carry rule.
+  - **At the next pause, in order:**
+    1. Stop training gracefully (Ctrl+C, wait for `Saved ... latest.zip`), then `games.py stop`.
+    2. Merge `skull-fixes` into `main`, then `cd mod/UltrakillAIBridge && dotnet build -c Release` to install the
+       DLL (it only fails while the games hold it).
+    3. **The F3 readout:** relaunch one game and rerun the `skull_check.py` line above **with** its default
+       `--gate 20,-10,381`. It must now print
+       `summary: 1 pickup PASS | 2 placement PASS | 3 held skull on death PASS`; the single thing that changes is
+       `gate 20,-10,381 needs_item=None` once the altar reads `filled=True`. Also confirm `altars[].aim_pos` is
+       now present (`bridge_test.py --campaign`), so the 1 m fallback stops being used.
+    4. Recommended weights: **`item_pickup` 10.0, `item_placed` 20.0** (30 for the puzzle, two `gate` rungs at
+       15). Arithmetic: `time` 0.02 per decision at 15 decisions/s is **0.3 per game second**, so 1-1's red leg
+       -- roughly 35 m to the pedestal, 133 m to the altar, 20 m back to the gate, ~190 m, 24-48 s -- costs
+       **7.2-14.4**. 30 clears that with margin and is 30% of `level_complete` (100) for a leg 1-1 cannot be
+       finished without, next to `checkpoint`/`arena_clear` at 10. Weight the terminal event higher so
+       collect-and-abandon is not worth it alone; 15/15 is the symmetric fallback. Do **not** go above ~`gate`,
+       or fetching a skull the route does not need (0-2's) becomes attractive.
+    5. Not farmable at any of these: both are paid once per level load (`MilestoneTracker`, pinned by
+       `test_a_placement_pays_once_even_when_the_skull_is_pulled_back_out`). Note `door_unlock` does **not** fire
+       for an altar door -- `ItemPlaceZone.CheckItem` calls `Door.Open()`, not `Unlock()` -- so `gate` is the
+       only other term the leg earns.
+    6. Then resume, and read `part_item_pickup` / `part_item_placed` against `part_gate` in `metrics_log.csv`
+       for the first 400k steps before touching them again.

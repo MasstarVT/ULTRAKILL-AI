@@ -439,7 +439,7 @@ namespace UltrakillAIBridge.Obs
             foreach (var altar in altars)
             {
                 if (altar.Zone == null || altar.DoorObjects == null) continue;
-                if (InactiveAncestors(altar.Zone.transform) > 1) continue;
+                if (IsDeadTwin(altar)) continue;
                 foreach (var door in altar.DoorObjects)
                 {
                     if (door == null || !doorKeys.TryGetValue(door, out var key)) continue;
@@ -659,10 +659,10 @@ namespace UltrakillAIBridge.Obs
         /// The item type an UNFILLED, non-dead altar wants before this door will open, or null. With several
         /// such altars the lowest type name wins, so the answer is deterministic.
         ///
-        /// A dead-branch altar (rule A6) is excluded because it can never fill: counting it would leave the
-        /// lock set after the live twin has already been filled, and the agent would be sent to punch the
-        /// skull back out of the altar it just filled -- which ItemPlaceZone.CheckItem answers by closing
-        /// the door again. Measured, 20 of the campaign's 104 functional zones are such dead twins.
+        /// A dead twin is excluded because it can never fill: counting it would leave the lock set after the
+        /// live twin has already been filled, and the agent would be sent to punch the skull back out of the
+        /// altar it just filled -- which ItemPlaceZone.CheckItem answers by closing the door again. Measured,
+        /// 20 of the campaign's 104 functional zones are such dead twins. See <see cref="IsDeadTwin"/>.
         /// </summary>
         private string NeedsItem(Gate gate)
         {
@@ -671,10 +671,62 @@ namespace UltrakillAIBridge.Obs
             foreach (var index in gate.Altars)
             {
                 var altar = altars[index];
-                if (altar.Zone == null || altar.Filled || altar.InactiveAncestors > 1) continue;
+                if (altar.Zone == null || altar.Filled || IsDeadTwin(altar)) continue;
                 if (needs == null || string.CompareOrdinal(altar.Item, needs) < 0) needs = altar.Item;
             }
             return needs;
+        }
+
+        /// <summary>
+        /// Whether an altar is the dead half of a duplicated ItemPlaceZone pair, judged RELATIVE to its twins:
+        /// a zone is dead when another zone with the same item type, the same door set and the same rounded
+        /// position reports STRICTLY FEWER inactive ancestors.
+        ///
+        /// The test used to be the absolute <c>InactiveAncestors &gt; 1</c>, which is the M14 bug. That number
+        /// is not a property of the zone: it is the zone's own chain PLUS however much of the room above it
+        /// happens to be switched off, so it shifts when the room lights. Measured in game on Level 1-1, the
+        /// live altar 81,-4,251 and its twin read 1 and 2 on a fresh load and 0 and 1 after the checkpoint
+        /// respawn switched that room on -- so the twin stopped being filtered exactly when the player
+        /// arrived, and the gate kept needs_item set however often the puzzle was solved.
+        ///
+        /// A shared room contributes the same count to both halves of a pair, so the relative test cannot be
+        /// shifted by one lighting up. The minimum of each group always survives, so a group can never be
+        /// filtered away entirely and a real lock can never be lost. Re-validated offline against all 21 altar
+        /// levels: it drops the same 20 of 104 zones the absolute rule did, loses no lock anywhere, and takes
+        /// the doors left stuck after a solved puzzle from 11 to 0 once a room lights.
+        ///
+        /// Position is part of the identity because twins are co-located (~0.2 m apart, which is why the keys
+        /// need the #N suffix at all). Without it the rule would also drop five zones that are not twins but
+        /// two separate altars of one item type that drive no door: 4-2 (x2), 4-3, 5-3 and 7-1.
+        /// </summary>
+        private bool IsDeadTwin(AltarInfo altar)
+        {
+            foreach (var other in altars)
+            {
+                if (ReferenceEquals(other, altar) || other.Zone == null) continue;
+                if (other.InactiveAncestors >= altar.InactiveAncestors) continue;
+                if (!string.Equals(other.Item, altar.Item, System.StringComparison.Ordinal)) continue;
+                if (!string.Equals(other.PosKey, altar.PosKey, System.StringComparison.Ordinal)) continue;
+                if (SameDoors(other.Doors, altar.Doors)) return true;
+            }
+            return false;
+        }
+
+        /// <summary>Whether two altars drive the same set of doors (both lists are 0-2 entries long).</summary>
+        private static bool SameDoors(List<DoorRef> a, List<DoorRef> b)
+        {
+            int na = a != null ? a.Count : 0, nb = b != null ? b.Count : 0;
+            if (na != nb) return false;
+            for (int i = 0; i < na; i++)
+            {
+                bool found = false;
+                for (int j = 0; j < nb && !found; j++)
+                {
+                    found = string.Equals(a[i].Key, b[j].Key, System.StringComparison.Ordinal);
+                }
+                if (!found) return false;
+            }
+            return true;
         }
 
         private static bool ControllerActive(DoorController[] controllers)
@@ -695,7 +747,11 @@ namespace UltrakillAIBridge.Obs
         {
             public ItemPlaceZone Zone;
             public string Key;
+            /// <summary>The rounded position key WITHOUT the #N suffix, i.e. what twins share (IsDeadTwin).</summary>
+            public string PosKey;
             public Vector3 Pos;
+            /// <summary>Where a punch must be aimed to fill this zone. See <see cref="AimPoint"/>.</summary>
+            public Vector3 AimPos;
             /// <summary>ItemType name: SkullBlue, SkullRed, SkullGreen, Readable, Torch, Soap, CustomKey1..3.</summary>
             public string Item;
             /// <summary>The doors this altar OPENS, as wire-ready key/pos pairs.</summary>
@@ -755,10 +811,14 @@ namespace UltrakillAIBridge.Obs
                 {
                     Zone = zone,
                     Pos = pos,
+                    AimPos = AimPoint(zone),
                     Item = zone.acceptedItemType.ToString(),
                     Doors = DoorRefs(zone.doors),
                     ReverseDoors = DoorRefs(zone.reverseDoors),
                     DoorObjects = DoorObjects(zone.doors),
+                    // Read here as well as in UpdateAltarsAndItems, because ScanGates' phase 2 runs before the
+                    // first UpdateAltarsAndItems of a scan and its dead-twin test needs the whole set.
+                    InactiveAncestors = InactiveAncestors(zone.transform),
                     Dist = Vector3.Distance(playerPos, pos),
                 });
             }
@@ -777,6 +837,7 @@ namespace UltrakillAIBridge.Obs
             {
                 var baseKey = CampaignPatches.Key(altar.Pos);
                 if (keyScratch.Contains(baseKey)) duplicates++;
+                altar.PosKey = baseKey;
                 altar.Key = UniqueKey(baseKey, keyScratch);
                 altarKeys[altar.Zone] = altar.Key;
             }
@@ -786,6 +847,38 @@ namespace UltrakillAIBridge.Obs
                 Plugin.Log.LogWarning($"{duplicates} altar position key(s) collide in {SceneHelper.CurrentScene}, suffixed with #N");
             }
             altars.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+        }
+
+        /// <summary>
+        /// Where a punch has to be aimed to fill a zone: the centre of the zone's OWN collider.
+        ///
+        /// Punch.AltHit (decompiled/Punch.cs:1335) only places when the ray hits the very GameObject that
+        /// carries the ItemPlaceZone -- it calls target.GetComponents&lt;ItemPlaceZone&gt;() on the transform
+        /// the raycast returned -- and ItemPlaceZone.Start reads its own GetComponent&lt;Collider&gt;(), so
+        /// that collider is the thing to hit. It is NOT centred on the transform: every one of the campaign's
+        /// 104 zones is the same prefab, a trigger BoxCollider of local size (2.2, 3.5, 2.2) whose local
+        /// centre is (0, -1.25, 0), on a transform scaled (0.9, 0.8, 0.8). So the box sits 1 m below
+        /// transform.position (103 of 104; the one exception is 0.625 m) and spans pos.y-2.4 .. pos.y+0.4:
+        /// the position the block reports is only 0.4 m under the lid, with no margin for aim error, while
+        /// the centre has 1.4 m of it. Measured in game on 1-1, aiming at the reported position does not
+        /// place and aiming ~1.25 m below it does.
+        ///
+        /// TransformPoint rather than Collider.bounds, because a zone in a room that has not streamed in yet
+        /// is inactive and its bounds are not meaningful, while the transform maths always is. bounds is the
+        /// fallback for a collider type with no centre of its own (no shipped zone uses one).
+        /// </summary>
+        private static Vector3 AimPoint(ItemPlaceZone zone)
+        {
+            var t = zone.transform;
+            var box = zone.GetComponent<BoxCollider>();
+            if (box != null) return t.TransformPoint(box.center);
+            var sphere = zone.GetComponent<SphereCollider>();
+            if (sphere != null) return t.TransformPoint(sphere.center);
+            var capsule = zone.GetComponent<CapsuleCollider>();
+            if (capsule != null) return t.TransformPoint(capsule.center);
+            var col = zone.GetComponent<Collider>();
+            if (col != null && zone.gameObject.activeInHierarchy) return col.bounds.center;
+            return t.position;
         }
 
         private static int CompareAltarPosition(AltarInfo a, AltarInfo b)
@@ -961,6 +1054,7 @@ namespace UltrakillAIBridge.Obs
                 {
                     ["key"] = altar.Key,
                     ["pos"] = ObservationBuilder.Vec(altar.Pos),
+                    ["aim_pos"] = ObservationBuilder.Vec(altar.AimPos),
                     ["item"] = altar.Item,
                     ["filled"] = altar.Filled,
                     ["active"] = altar.Active,
