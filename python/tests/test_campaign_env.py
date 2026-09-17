@@ -82,6 +82,12 @@ class FakeLevel:
                        0-4's `CustomKey1` standing in a level that also has skull altars
       `item_active`    False is the carryable's room still switched off: it is reported but has no collider, so
                        no punch can reach it -- what a teleport into an unactivated room leaves you with
+
+    Bridge faults are injected with `fail_resets` / `fail_steps`: each is a queue of exceptions, one popped and
+    raised per call, so a test can say "time out the next two resets, then work". That is what the live failures
+    look like from Python -- a `BridgeTimeout` on a reset, a `BridgeClosed` when the socket drops, a
+    `BridgeSceneUnknown` from a game that has not finished booting -- and `connects` counts how often the env
+    rebuilt the connection in response.
     """
 
     def __init__(self):
@@ -112,7 +118,19 @@ class FakeLevel:
         self.item_active = True
         self.picked_up = 0  # times a punch picked the skull up, and times one threw it: the physical events
         self.thrown = 0
+        # Injected bridge faults, popped one per call (see the class docstring).
+        self.fail_resets: list[BaseException] = []
+        self.fail_steps: list[BaseException] = []
+        self.connects = 0
+        self.configures = 0
+        self.closes = 0
         self._load()
+
+    def fail_next_resets(self, exc: BaseException, times: int = 1) -> None:
+        self.fail_resets.extend(type(exc)(*exc.args) for _ in range(times))
+
+    def fail_next_steps(self, exc: BaseException, times: int = 1) -> None:
+        self.fail_steps.extend(type(exc)(*exc.args) for _ in range(times))
 
     def enable_skulls(self, *, fields: bool = True, altars: bool = True, item_type: str = ALTAR_ITEM) -> None:
         """Turns the level into the skull room. Call before reset(); `fields=False` is a mod older than 0.7.0.
@@ -154,13 +172,15 @@ class FakeLevel:
     # The BridgeClient methods UltrakillEnv uses ----------------------------
 
     def connect(self, retry_seconds: float = 60.0) -> dict:
+        self.connects += 1
         return {"type": "hello", "protocol": 1, "mod_version": "0.5.0", "scene": LEVEL}
 
     def configure(self, **settings) -> None:
+        self.configures += 1
         self.settings = settings
 
     def close(self) -> None:
-        pass
+        self.closes += 1
 
     def get_obs(self) -> dict:
         return self._obs()
@@ -171,6 +191,8 @@ class FakeLevel:
         return self._obs("kill")
 
     def reset(self, scene: str | None = None, checkpoint: bool = False) -> dict:
+        if self.fail_resets:
+            raise self.fail_resets.pop(0)
         self.resets.append(checkpoint)
         self.reset_scenes.append(scene)
         switched = scene is not None and scene != self.scene_name
@@ -207,6 +229,8 @@ class FakeLevel:
             self.picked_up += 1
 
     def step(self, action: dict) -> dict:
+        if self.fail_steps:
+            raise self.fail_steps.pop(0)
         self.steps += 1
         self.last_action = dict(action)
         if self.falling:

@@ -10,16 +10,59 @@ from typing import Any
 PROTOCOL_VERSION = 1
 DEFAULT_PORT = 47800
 
+# A reset is a full Unity scene load and a step is one frame, so one socket timeout cannot serve both. They used
+# to share 120 s -- the SAME number as `EpisodeController.resetTimeoutSeconds`, which is why the mod's own
+# "reset timed out" error reply could never arrive: the mod starts its 120 s timer after the client has already
+# started its own, so the client always gave up first and the graceful path was dead code. See the timeout
+# gotcha in CLAUDE.md.
+DEFAULT_STEP_TIMEOUT = 120.0  # deliberately the old shared value: no step has ever timed out, so nothing moves
+DEFAULT_RESET_TIMEOUT = 600.0  # a scene load with a dozen games loading at once, GC and a window losing the GPU
+UNKNOWN_SCENE = "unknown scene"
+
 
 class BridgeError(RuntimeError):
     pass
 
 
+class BridgeTimeout(BridgeError):
+    """The game did not answer a request in time. The connection is unusable afterwards (see `_fail`)."""
+
+
+class BridgeClosed(BridgeError):
+    """The connection dropped, or was used after it broke."""
+
+
+class BridgeSceneUnknown(BridgeError):
+    """The mod could not find that scene.
+
+    Almost always a game that is still booting rather than a bad name: `EpisodeController.SceneExists` searches
+    `Addressables.ResourceLocators`, which stay empty until boot finishes, while the bridge port is already
+    listening. Callers should wait and ask again rather than give up.
+    """
+
+
+# Everything a caller can recover from by rebuilding the connection. `BridgeSceneUnknown` is here too because a
+# half-booted game answers every reset with it and the cure is time, not a new exception reaching the trainer.
+RECOVERABLE = (BridgeTimeout, BridgeClosed, BridgeSceneUnknown)
+
+
 class BridgeClient:
-    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT, timeout: float = 120.0):
+    """One TCP connection to one game's bridge.
+
+    `timeout` covers ordinary requests (step, get_obs, config); `reset_timeout` covers `reset`, which blocks
+    while the game loads a scene. A request that times out or drops marks the client broken and every later
+    request raises until `connect()` is called again: a late reply to the timed-out request is still sitting in
+    the socket, and reusing the stream would hand it back as the answer to the NEXT request, leaving every
+    observation from then on one request stale.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT,
+                 timeout: float = DEFAULT_STEP_TIMEOUT, reset_timeout: float = DEFAULT_RESET_TIMEOUT):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.reset_timeout = reset_timeout
+        self.broken = False
         self._sock: socket.socket | None = None
         self._reader = None
 
@@ -42,6 +85,7 @@ class BridgeClient:
         sock.settimeout(self.timeout)
         self._sock = sock
         self._reader = sock.makefile("r", encoding="utf-8", newline="\n")
+        self.broken = False  # a reconnect is the one thing that clears it
 
         hello = self.request({"type": "hello", "protocol": PROTOCOL_VERSION})
         if hello.get("protocol") != PROTOCOL_VERSION:
@@ -51,38 +95,79 @@ class BridgeClient:
     def close(self) -> None:
         if self._sock is None:
             return
+        if not self.broken:
+            try:
+                # Wait for the reply so control is released before the socket closes. Skipped on a broken
+                # client: `request` would raise straight away, and there is nothing to hand control back to.
+                self._sock.settimeout(5.0)
+                self.request({"type": "release"})
+            except (OSError, BridgeError, ValueError):
+                pass
+        self._drop()
+
+    def _drop(self) -> None:
+        """Closes the socket without the release handshake."""
         try:
-            # Wait for the reply so control is released before the socket closes.
-            self._sock.settimeout(5.0)
-            self.request({"type": "release"})
-        except (OSError, BridgeError, ValueError):
+            if self._reader is not None:
+                self._reader.close()
+            if self._sock is not None:
+                self._sock.close()
+        except OSError:
             pass
-        try:
-            self._reader.close()
-            self._sock.close()
         finally:
             self._sock = None
             self._reader = None
 
+    def _fail(self, exc: BridgeError) -> BridgeError:
+        """Marks the connection unusable and returns the error to raise.
+
+        Everything after a timeout or a drop is poisoned: the game may still write the reply this client gave
+        up on, so the next `recv` would return it instead of the answer to the next request.
+        """
+        self.broken = True
+        return exc
+
     def send(self, msg: dict[str, Any]) -> None:
         if self._sock is None:
-            raise BridgeError("Not connected")
-        self._sock.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8"))
+            raise BridgeClosed("Not connected")
+        if self.broken:
+            raise BridgeClosed("Bridge connection is broken; reconnect before using it again")
+        try:
+            self._sock.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8"))
+        except TimeoutError as exc:
+            raise self._fail(BridgeTimeout(f"timed out sending to {self.host}:{self.port}")) from exc
+        except OSError as exc:
+            raise self._fail(BridgeClosed(f"send to {self.host}:{self.port} failed: {exc}")) from exc
 
-    def recv(self) -> dict[str, Any]:
-        if self._reader is None:
-            raise BridgeError("Not connected")
-        line = self._reader.readline()
+    def recv(self, timeout: float | None = None) -> dict[str, Any]:
+        if self._reader is None or self._sock is None:
+            raise BridgeClosed("Not connected")
+        if self.broken:
+            raise BridgeClosed("Bridge connection is broken; reconnect before using it again")
+        try:
+            self._sock.settimeout(self.timeout if timeout is None else timeout)
+            line = self._reader.readline()
+        except TimeoutError as exc:
+            # socket.timeout is TimeoutError from 3.10 on, so this catches both spellings.
+            raise self._fail(BridgeTimeout(
+                f"no reply from {self.host}:{self.port} within "
+                f"{self.timeout if timeout is None else timeout:.0f}s")) from exc
+        except OSError as exc:
+            raise self._fail(BridgeClosed(f"read from {self.host}:{self.port} failed: {exc}")) from exc
         if not line:
-            raise BridgeError("Connection closed by the game")
+            raise self._fail(BridgeClosed("Connection closed by the game"))
         msg = json.loads(line)
         if msg.get("type") == "error":
-            raise BridgeError(msg.get("message", "unknown error from mod"))
+            message = msg.get("message", "unknown error from mod")
+            # An error reply leaves the stream in step, so the connection is NOT marked broken here.
+            if message.startswith(UNKNOWN_SCENE):
+                raise BridgeSceneUnknown(message)
+            raise BridgeError(message)
         return msg
 
-    def request(self, msg: dict[str, Any]) -> dict[str, Any]:
+    def request(self, msg: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
         self.send(msg)
-        return self.recv()
+        return self.recv(timeout)
 
     # Convenience wrappers -------------------------------------------------
 
@@ -93,10 +178,12 @@ class BridgeClient:
         return self.request({"type": "get_obs"})
 
     def reset(self, scene: str | None = None, checkpoint: bool = False) -> dict[str, Any]:
+        """Loads a scene (or respawns at the checkpoint). Waits `reset_timeout`, not the step timeout: this
+        blocks on a Unity scene load, which with a dozen games loading at once is minutes, not frames."""
         msg: dict[str, Any] = {"type": "reset", "checkpoint": checkpoint}
         if scene:
             msg["scene"] = scene
-        return self.request(msg)
+        return self.request(msg, timeout=self.reset_timeout)
 
     def step(self, action: dict[str, Any]) -> dict[str, Any]:
         return self.request({"type": "step", "action": action})

@@ -28,7 +28,15 @@ from ultrakill_ai.campaign import (
     safe_name,
     save_best_run,
 )
-from ultrakill_ai.protocol import DEFAULT_PORT, BridgeClient
+from ultrakill_ai.protocol import (
+    DEFAULT_PORT,
+    DEFAULT_RESET_TIMEOUT,
+    DEFAULT_STEP_TIMEOUT,
+    RECOVERABLE,
+    BridgeClient,
+    BridgeError,
+    BridgeSceneUnknown,
+)
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
 from ultrakill_ai.spaces import PITCH_BINS, YAW_BINS, ObsLayout, action_space, decode_action, pack_observation, yaw_frame
 
@@ -122,6 +130,18 @@ class EnvConfig:
     archive_save_steps: int = 20000  # env lifetime steps between exploration-archive saves
     archive_save_seconds: float = 600.0  # ... or this much wall time, whichever comes first
 
+    # Bridge resilience. One sick game used to take the whole vectorized run down with it: a TimeoutError out of
+    # a worker's socket is unhandled inside SubprocVecEnv's `_worker`, so the worker process exits, the parent's
+    # pipe reads EOF and every other game's rollout dies with it. See the timeout gotcha in CLAUDE.md.
+    step_timeout_s: float = DEFAULT_STEP_TIMEOUT  # one frame; generous, but a step is not a scene load
+    reset_timeout_s: float = DEFAULT_RESET_TIMEOUT  # a scene load, with 12 games loading at once
+    bridge_retries: int = 3  # reconnect attempts before a bridge failure is finally raised
+    bridge_backoff_s: float = 5.0  # first backoff; the nth attempt waits n times this
+    # How long `unknown scene` is tolerated on a reset before it counts as a failure. It means the game is still
+    # booting (its Addressables locators are empty while the bridge port is already up), so the cure is waiting.
+    unknown_scene_wait_s: float = 300.0
+    connect_retry_s: float = 180.0  # how long connect() keeps retrying while a relaunched game starts
+
     layout: ObsLayout = field(default_factory=ObsLayout)
     rewards: RewardConfig = field(default_factory=RewardConfig)
 
@@ -140,6 +160,18 @@ BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_vis
                   "pitch_steps", "pitch_sum", "pitch_signed_sum", "look_up_sum", "elev_steps", "elev_sum", "elev_abs_sum", "elev_over15", "pitch_err_sum",
                   "yaw_track", "yaw_track_n", "pitch_track", "pitch_track_n",
                   "look_free", "look_enemy", "look_gate", "slide_forced")
+
+
+class BridgeRecovered(Exception):
+    """Internal signal: the bridge was rebuilt in the middle of an episode.
+
+    Carries the observation of the fresh level load that replaced the lost one. `step()` turns it into a
+    truncated episode with `end_reason` "bridge_reset"; it never escapes the env.
+    """
+
+    def __init__(self, raw: dict[str, Any]):
+        super().__init__("bridge rebuilt mid-episode")
+        self.raw = raw
 
 
 def clamp_pitch_command(current_pitch: float, pitch_cmd: float, limit: float) -> float:
@@ -173,8 +205,10 @@ class UltrakillEnv(gym.Env):
         # Campaign only: the look mode is appended as a 12th dimension, so Cyber Grind checkpoints stay loadable.
         self.action_space = action_space(campaign)
 
-        self.client = BridgeClient(self.cfg.host, self.cfg.port)
+        self.client = BridgeClient(self.cfg.host, self.cfg.port,
+                                   timeout=self.cfg.step_timeout_s, reset_timeout=self.cfg.reset_timeout_s)
         self._connected = False
+        self._bridge_resets = 0  # times this env rebuilt its connection (episodes.jsonl end_reason bridge_reset)
 
         self._raw: dict[str, Any] = {}
         self._enemy_max_health: dict[int, float] = {}
@@ -236,7 +270,7 @@ class UltrakillEnv(gym.Env):
     def _ensure_connected(self) -> None:
         if self._connected:
             return
-        self.client.connect()
+        self.client.connect(retry_seconds=self.cfg.connect_retry_s)
         mod_layout = self.cfg.layout.mod_config()
         # Ask the mod for more enemies than the policy sees so damage rewards aren't missed.
         mod_layout["max_enemies"] = max(32, self.cfg.layout.max_enemies)
@@ -260,6 +294,23 @@ class UltrakillEnv(gym.Env):
         self._connected = True
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        """One bounded retry against a rebuilt connection, then the failure is real and is raised.
+
+        `_resilient_reset` already reconnects around the reset request itself; this outer layer catches the
+        rest of a reset -- `_skip_locked`'s steps, `_enter_arena`'s -- so no part of starting an episode can
+        kill a worker while the other eleven games are mid-rollout.
+        """
+        try:
+            return self._reset(seed=seed, options=options)
+        except BridgeRecovered as rebuilt:
+            self._adopt_fresh_load(rebuilt.raw)
+            return self._reset(seed=seed, options=options)
+        except RECOVERABLE as exc:
+            self._note_bridge_reset("%s while resetting: %s" % (type(exc).__name__, exc))
+            self._reconnect()
+            return self._reset(seed=seed, options=options)
+
+    def _reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
         if seed is not None:
             self._rng.seed(seed)
@@ -271,7 +322,7 @@ class UltrakillEnv(gym.Env):
         elif self._can_soft_reset():
             self._raw = self._soft_reset()
         else:
-            self._raw = self.client.reset(self.scene, checkpoint=False)
+            self._raw, _ = self._resilient_reset(checkpoint=False)
             if self.cfg.auto_enter_arena:
                 self._raw = self._enter_arena(self._raw)
             if self._raw.get("player"):
@@ -317,6 +368,23 @@ class UltrakillEnv(gym.Env):
         return self._pack(self._raw), self._info(self._raw)
 
     def step(self, action):
+        """A bridge failure ends the episode instead of the run.
+
+        Anything the bridge can throw -- a timed-out reply, a dropped socket, a game that is still booting --
+        is turned into a truncated episode whose `end_reason` is "bridge_reset", after the connection has been
+        rebuilt and the level reloaded. Before this, the exception escaped into SubprocVecEnv's `_worker`,
+        which does not catch it, so the worker process died and took all twelve games' rollouts with it.
+        """
+        try:
+            return self._step(action)
+        except BridgeRecovered as rebuilt:
+            return self._end_on_bridge_reset(rebuilt.raw)
+        except RECOVERABLE as exc:
+            self._note_bridge_reset("%s while stepping: %s" % (type(exc).__name__, exc))
+            raw, _ = self._resilient_reset(checkpoint=False, reconnect_first=True)
+            return self._end_on_bridge_reset(raw)
+
+    def _step(self, action):
         prev = self._raw
         command = decode_action(action)
         # The look mode is resolved here, against the observation the policy acted on, and popped: the wire
@@ -443,6 +511,143 @@ class UltrakillEnv(gym.Env):
             if self._connected:
                 self.client.close()
                 self._connected = False
+
+    # Bridge recovery ---------------------------------------------------
+
+    def _note_bridge_reset(self, message: str) -> None:
+        """Counts a rebuilt bridge and says so in the training log, tagged with the port that broke."""
+        self._bridge_resets += 1
+        print("UltrakillEnv[%d]: %s (bridge reset #%d)" % (self.cfg.port, message, self._bridge_resets), flush=True)
+
+    def _reconnect(self) -> None:
+        """Rebuilds this env's connection to its OWN port and re-sends its config.
+
+        `BridgeServer` accepts a new client and drops the old one, so a worker can reconnect to the game it
+        already owns without touching any other worker's game -- each worker owns exactly one port. The dead
+        socket is never reused: the reply the game was still writing when the client gave up would otherwise be
+        read as the answer to the next request.
+        """
+        try:
+            self.client.close()
+        except (OSError, BridgeError, ValueError):
+            pass
+        self._connected = False
+        self._ensure_connected()
+
+    def _resilient_reset(self, *, checkpoint: bool, reconnect_first: bool = False) -> tuple[dict[str, Any], bool]:
+        """One reset request that survives a booting game and a dead socket.
+
+        Returns `(observation, recovered)`. `recovered` is True when the connection had to be rebuilt, and then
+        the observation is a FRESH level load whatever `checkpoint` asked for: after a reconnect the game's
+        state is unknown, and a checkpoint respawn into an unknown state would leave the milestone and gate
+        trackers describing a level the player is no longer in. Callers must treat a recovered observation as a
+        fresh level load (see `_adopt_fresh_load`).
+
+        The waiting is deliberate even though a blocked worker stalls every other game (vectorized envs step in
+        lockstep): a stall of minutes costs one rollout, and the crash it replaces cost the whole run.
+        """
+        boot_deadline = time.monotonic() + self.cfg.unknown_scene_wait_s
+        boot_poll = min(5.0, max(0.0, self.cfg.bridge_backoff_s))
+        attempts = max(1, self.cfg.bridge_retries)
+        recovered = False
+        last: Exception | None = None
+
+        for attempt in range(attempts):
+            if reconnect_first or recovered:
+                try:
+                    self._reconnect()
+                    recovered = True
+                except (BridgeError, OSError) as exc:
+                    last = exc
+                    time.sleep(self.cfg.bridge_backoff_s * (attempt + 1))
+                    recovered, reconnect_first = True, True
+                    continue
+            reconnect_first = False
+            try:
+                return self._reset_while_booting(checkpoint and not recovered, boot_deadline, boot_poll), recovered
+            except RECOVERABLE as exc:
+                last = exc
+                wait = self.cfg.bridge_backoff_s * (attempt + 1)
+                self._note_bridge_reset("%s on reset: %s; reconnecting in %.0fs (attempt %d/%d)"
+                                        % (type(exc).__name__, exc, wait, attempt + 1, attempts))
+                time.sleep(wait)
+                recovered, reconnect_first = True, True
+
+        raise BridgeError("bridge on port %d did not come back after %d attempts: %s"
+                          % (self.cfg.port, attempts, last))
+
+    def _reset_while_booting(self, checkpoint: bool, deadline: float, poll: float) -> dict[str, Any]:
+        """Sends the reset, waiting out a game that has not finished booting.
+
+        A half-booted instance answers every reset `unknown scene '<level>'`, because
+        `EpisodeController.SceneExists` searches Addressables locators that stay empty until boot completes
+        while the bridge port is already listening. That is not a bad level name and not a broken connection:
+        it is a game that needs another minute, so it is asked again rather than raised at the trainer.
+        """
+        while True:
+            try:
+                return self.client.reset(self.scene, checkpoint=checkpoint)
+            except BridgeSceneUnknown as exc:
+                if time.monotonic() >= deadline:
+                    raise
+                print("UltrakillEnv[%d]: %s -- the game is still booting, retrying in %.0fs"
+                      % (self.cfg.port, exc, poll), flush=True)
+                time.sleep(poll)
+
+    def _adopt_fresh_load(self, raw: dict[str, Any]) -> None:
+        """Makes `raw`, the observation of a recovery reload, this env's state, as a fresh level load.
+
+        A recovery reload IS a fresh level load: the scene came back from the top, so every checkpoint, arena,
+        door and gate the level ships with is in its starting state. `new_level_load` re-baselines the trackers
+        on exactly that, so nothing the reload reveals can be paid a second time and nothing already paid is
+        forgotten -- the same guarantee `_campaign_reset` gives a normal fresh start. The exploration archive
+        keeps its per-game visit counts (they span episodes and carry the 1/sqrt(N) decay) and only starts a new
+        episode's first-entry set; `reset()` starts another, which is idempotent.
+        """
+        self._raw = raw
+        self._last_end_reason = "bridge_reset"
+        if self.cfg.mode != "campaign":
+            return
+        pos = (raw.get("player") or {}).get("pos")
+        self.milestones.new_level_load(raw.get("campaign"))
+        self.gates.new_level_load(raw.get("campaign"), pos)
+        self.gates.reset_episode()
+        self.gates.retarget(raw.get("campaign"), pos)
+        self.path_progress.reset()
+        self.archive.start_episode()
+        self._fresh_start = True
+        self._stuck_streak, self._stuck_checkpoint = 0, None
+        self._positions = []
+        self._episode_start_stats = dict(raw.get("stats", {}))
+        self._episode_start_seconds = (raw.get("campaign") or {}).get("seconds")
+        self._steps_since_progress = 0
+        self._wedge_run = 0
+        self._slide_latch = 0
+
+    def _end_on_bridge_reset(self, raw: dict[str, Any]):
+        """Truncates the episode the bridge failure destroyed, and hands back the fresh level load.
+
+        Pays exactly 0. The step that lost the connection has no observation to grade -- there is no `cur` to
+        compare against `prev` -- and paying nothing is also what keeps the milestone accounting honest: the
+        reload is adopted as a fresh level load, so no gate, checkpoint, arena or door is paid twice or lost.
+
+        `info` is built from the LAST GOOD frame, not from the reload, so the episode's own counters (kills,
+        gates reached, cells, deaths) still describe the episode that was lost. Grading them against the
+        reloaded scene would subtract this episode's start stats from a level that had just started again.
+        """
+        last_good = self._raw
+        info = self._info(last_good)
+        info["reward_parts"] = {}
+        info["end_reason"] = "bridge_reset"
+        info["reset_seconds"] = self._reset_seconds
+        seconds = self._steps * self.cfg.frameskip / self.cfg.fixed_fps
+        info["episode_seconds"] = seconds
+        info["kills_per_min"] = info["kills"] / seconds * 60.0 if seconds > 0 else 0.0
+        self._last_end_reason = "bridge_reset"
+        if self.cfg.mode == "campaign":
+            self._end_campaign_episode(last_good, "bridge_reset", info)
+        self._adopt_fresh_load(raw)
+        return self._pack(raw), 0.0, False, True, info
 
     # ------------------------------------------------------------------
 
@@ -878,7 +1083,13 @@ class UltrakillEnv(gym.Env):
             new_level = self._sample_level()
             if new_level != self.level:
                 self._switch_level(self.level, new_level)
-        raw = self._skip_locked(self.client.reset(self.level, checkpoint=not fresh))
+        raw, recovered = self._resilient_reset(checkpoint=not fresh)
+        if recovered:
+            # A rebuilt connection always reloads the level from the top, so this episode is a fresh start
+            # whatever `choose_fresh_start` asked for; anything else would mark milestones paid against a level
+            # load that no longer exists.
+            fresh = True
+        raw = self._skip_locked(raw)
         pos = (raw.get("player") or {}).get("pos")
         if fresh:
             self.milestones.new_level_load(raw.get("campaign"))
@@ -901,7 +1112,13 @@ class UltrakillEnv(gym.Env):
         `_campaign_reset` and nowhere else.
         """
         before = self._raw.get("stats", {})
-        raw = self._skip_locked(self.client.reset(self.level, checkpoint=True))
+        raw, recovered = self._resilient_reset(checkpoint=True)
+        if recovered:
+            # The socket was rebuilt, so the level reloaded from the top and this episode's context -- its start
+            # stats, its best-run positions, its gate approach -- describes a level load that is gone. Ending
+            # the episode is the only honest move; step()'s wrapper turns this into end_reason "bridge_reset".
+            raise BridgeRecovered(raw)
+        raw = self._skip_locked(raw)
         self.milestones.mark_paid(raw.get("campaign"))
         player = raw.get("player")
         # No reset_episode here: the episode continues, so the gate approach it has already earned stands.
@@ -1157,6 +1374,9 @@ class UltrakillEnv(gym.Env):
             info["look_gate_frac"] = b["look_gate"] / steps
             info["slide_forced_frac"] = b["slide_forced"] / steps
             info["start_checkpoint"] = self._start_checkpoint
+            # Lifetime count for this worker, so a game whose bridge keeps breaking is visible in episodes.jsonl
+            # next to end_reason "bridge_reset" rather than only in the training log.
+            info["bridge_resets"] = self._bridge_resets
             pos = player.get("pos") or self._last_pos
             info["end_pos"] = self._rounded(pos) if pos else None  # where the episode actually ended up
         return info

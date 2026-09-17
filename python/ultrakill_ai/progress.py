@@ -48,7 +48,8 @@ PPO_METRICS = (
 # Per-episode fields carried straight into runs/<run>/episodes.jsonl. `field()` routes everything through
 # _num(), which returns None for anything float() rejects, so a string checkpoint id and a [x, y, z] list have
 # to bypass it -- otherwise the two fields that say where an episode died would both be written as null.
-EPISODE_LOG_RAW = ("level", "start_checkpoint", "end_pos", "end_reason", "level_seconds", "gate_hops_best")
+EPISODE_LOG_RAW = ("level", "start_checkpoint", "end_pos", "end_reason", "level_seconds", "gate_hops_best",
+                   "bridge_resets")
 
 
 def _num(value: Any) -> float | None:

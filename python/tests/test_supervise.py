@@ -78,6 +78,12 @@ class Harness:
         self.launched: list[tuple[int, int]] = []
         self.stopped = 0
         self.slept: list[float] = []
+        # The boot health gate. By default every one of the twelve games is over the line from the first poll,
+        # so a restart test does not have to care about it; a boot test overrides `sets`.
+        self.ports = {47800 + i: 23000 + i for i in range(12)}
+        self.sets = {pid: 1000 * supervise.MB for pid in self.ports.values()}
+        self.relaunched: list[int] = []
+        self.polls = 0
 
         (tmp / "runs" / RUN).mkdir(parents=True, exist_ok=True)
         model_dir = tmp / "models" / RUN
@@ -94,15 +100,32 @@ class Harness:
             Config(**kwargs),
             processes=lambda: list(self.procs),
             now=lambda: self.time,
-            sleep=self.slept.append,
+            sleep=self._sleep,
             probe=lambda path, now: self.status,
             kill=self.killed.append,
             spawn=self._spawn,
             stop_games=self._stop,
             launch_games=self._launch,
             zip_steps=lambda path: self.latest_steps,
+            working_sets=self._working_sets,
+            port_pids=lambda: dict(self.ports),
+            relaunch_one=self._relaunch_one,
             pid=SELF_PID,
         )
+
+    def _sleep(self, seconds: float) -> None:
+        """Records the wait AND advances the fake clock, so anything that waits on a deadline terminates."""
+        self.slept.append(seconds)
+        self.time += seconds
+
+    def _working_sets(self) -> dict[int, int]:
+        self.polls += 1
+        return dict(self.sets)
+
+    def _relaunch_one(self, port: int) -> bool:
+        self.relaunched.append(port)
+        self.sets[self.ports[port]] = 1000 * supervise.MB  # the restarted copy boots properly
+        return True
 
     def _spawn(self, command: str, cwd: Path) -> int:
         self.spawned.append(command)
@@ -313,6 +336,84 @@ def test_logging_survives_the_shell_holding_the_log_file():
     with contextlib.redirect_stdout(buf):
         h.sup.log("the trainer is fine")
     assert "the trainer is fine" in buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# The boot health gate
+# ---------------------------------------------------------------------------
+
+
+def test_a_game_counts_as_booted_only_after_two_polls_over_the_line():
+    # A copy that is still loading crosses the threshold while it climbs, so one sample over the line proves
+    # nothing. The stuck instance measured on 2026-09-17 sat at 56 MB while the others sat near 1 GB.
+    gate = supervise.BootGate(600 * supervise.MB, consecutive=2)
+    gate.observe({1: 900 * supervise.MB, 2: 56 * supervise.MB})
+    assert gate.booted() == set() and gate.lagging() == {1, 2}
+    gate.observe({1: 950 * supervise.MB, 2: 56 * supervise.MB})
+    assert gate.booted() == {1} and gate.lagging() == {2}
+    assert gate.ready(1) and not gate.ready(2)
+
+
+def test_a_game_that_falls_back_under_the_line_loses_its_streak():
+    gate = supervise.BootGate(600 * supervise.MB, consecutive=2)
+    gate.observe({1: 900 * supervise.MB})
+    gate.observe({1: 100 * supervise.MB})
+    assert gate.booted() == set()
+    gate.observe({1: 900 * supervise.MB})
+    assert gate.booted() == set(), "the streak starts again, it does not resume"
+
+
+def test_a_vanished_game_is_forgotten_rather_than_counted_forever():
+    gate = supervise.BootGate(600 * supervise.MB, consecutive=1)
+    gate.observe({1: 900 * supervise.MB, 2: 900 * supervise.MB})
+    assert gate.ready(2)
+    gate.observe({1: 900 * supervise.MB})  # pid 2 exited
+    assert gate.booted() == {1} and not gate.ready(2)
+
+
+def test_a_laggard_is_named_by_its_own_port():
+    ports = {47800: 100, 47801: 200, 47802: 300}
+    assert supervise.laggard_ports(ports, {200}, ports) == [47801]
+    # A laggard that is not listening at all has no port to restart it by: games.relaunch_one identifies an
+    # instance through the pid on its port, so there is nothing to address and it is only waited out.
+    assert supervise.laggard_ports(ports, {999}, ports) == []
+
+
+def test_the_trainer_does_not_start_until_every_game_has_booted():
+    h = harness(BYSTANDERS, Status(1800.0, "stopped", 6_901_546))
+    assert h.sup.tick() == "restarted"
+    assert h.polls >= 2, "the gate needs two consecutive polls, so it cannot pass on one sample"
+    assert h.trainer_commands, "a healthy set of games still starts the trainer"
+
+
+def test_a_single_laggard_is_restarted_on_its_own_port_leaving_the_others_alone():
+    h = harness(BYSTANDERS, Status(1800.0, "stopped", 6_901_546),
+                boot_timeout_seconds=60.0, boot_poll_seconds=15.0)
+    h.sets[h.ports[47808]] = 56 * supervise.MB  # the half-booted copy from the live recovery
+    assert h.sup.tick() == "restarted"
+    assert h.relaunched == [47808], "only the laggard is restarted"
+    assert h.stopped == 1, "and stop_all ran once for the restart itself, not again for the laggard"
+    assert h.trainer_commands
+
+
+def test_a_game_that_never_boots_does_not_block_training_forever():
+    # Starting anyway is the right call now: the env waits out `unknown scene` for minutes instead of dying on
+    # it, so a cold game stalls one worker rather than killing the run. Refusing to train would be worse.
+    h = harness(BYSTANDERS, Status(1800.0, "stopped", 6_901_546),
+                boot_timeout_seconds=60.0, boot_poll_seconds=15.0, boot_relaunch_rounds=0)
+    h.sets[h.ports[47803]] = 56 * supervise.MB
+    assert h.sup.tick() == "restarted"
+    assert h.relaunched == [], "rounds 0 means wait only"
+    assert h.trainer_commands, "the trainer still starts"
+
+
+def test_await_boot_reports_whether_it_succeeded():
+    h = harness(BYSTANDERS, Status(30.0, "running", 6_901_546))
+    assert h.sup.await_boot() is True
+    h.sets[h.ports[47805]] = 10 * supervise.MB
+    h.sup.cfg.boot_timeout_seconds = 30.0
+    h.sup.cfg.boot_relaunch_rounds = 0
+    assert h.sup.await_boot() is False
 
 
 def test_the_command_line_matches_the_pattern_a_human_would_type():
