@@ -66,7 +66,9 @@ class FakeGame:
         self.restarts = 0
         self.steps = 0
 
-    def connect(self):
+    def connect(self, retry_seconds: float = 60.0):
+        # Same signature as BridgeClient.connect: the env passes `retry_seconds` so a relaunched game has time
+        # to start listening.
         return {"type": "hello", "protocol": 1, "mod_version": "0.5.0", "scene": "Main Menu"}
 
     def configure(self, **settings):

@@ -28,7 +28,32 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `mod/GamePaths.props`: local game path (gitignored; copy from `.example`). Build copies the DLL into `<game>/BepInEx/plugins/UltrakillAIBridge/` — **unless `-p:InstallPlugin=false`**, which skips the copy so the mod can be compiled while the running games hold the installed DLL open. The property defaults to `true`, so the ordinary build is unchanged.
 - `python/ultrakill_ai/`:
   - `protocol.py`: socket client; `kill()` kills the player (debug command for the in-game death check).
+    **Two timeouts, not one:** `timeout` (120 s) covers step/get_obs/config and `reset_timeout` (600 s) covers
+    `reset`, which blocks on a Unity scene load. They shared 120 s until 2026-09-17, which was also the mod's own
+    `resetTimeoutSeconds` — see the timeout gotcha. `BridgeError` now has three subclasses, so a caller can tell
+    the cases apart while every existing `except BridgeError` still catches all of them: `BridgeTimeout` (no
+    reply in time), `BridgeClosed` (socket dropped, or used after it broke) and `BridgeSceneUnknown` (the mod
+    cannot find the scene — almost always a game that is still booting). `RECOVERABLE` is the tuple of the three.
+    A timed-out or dropped request sets `client.broken` and every later request raises until `connect()` runs
+    again: the reply the game was still writing would otherwise be read as the answer to the *next* request and
+    every observation after it would be one request stale.
   - `env.py`: `UltrakillEnv` / `EnvConfig` (`pitch_limit_deg` keeps the camera near level; `camera_height_m` 0.9 is where every ray starts, `_eye`; `max_steps_per_level` overrides `max_steps` per scene name and is empty by default). `EnvConfig.from_dict` ignores keys that are no longer fields, so an old `env_config.yaml` with retired settings still loads. Campaign mode (`mode: campaign`, 479 inputs):
+    - **Bridge resilience (2026-09-17): a sick game ends its episode, never the run.** Every bridge call in
+      `reset()` and `step()` is wrapped. On a `RECOVERABLE` error the env reconnects to its **own** port (the mod
+      accepts a new client and drops the old one, so no other worker's game is touched), re-sends its config,
+      reloads the level and returns a fresh observation with the episode **truncated** and `end_reason`
+      `"bridge_reset"` — which reaches `episodes.jsonl` and `status.json`'s `end_reasons_100` like any other
+      reason, with a per-worker `bridge_resets` count beside it. A recovered step pays **0**: there is no `cur`
+      frame to grade, and paying nothing is what keeps the accounting honest. `_adopt_fresh_load` then re-baselines
+      `MilestoneTracker`, `GateProgress` and `PathProgress` on the reload exactly as a fresh level load does, so
+      nothing it reveals is paid twice and nothing already paid is lost; the exploration archive keeps its visit
+      counts (they span episodes and carry the `1/sqrt(N)` decay) and only starts a new episode. `info` for the
+      truncated step is built from the **last good frame**, so the episode's own counters still describe the
+      episode that was lost. Knobs: `step_timeout_s`, `reset_timeout_s`, `bridge_retries` (3), `bridge_backoff_s`
+      (5), `unknown_scene_wait_s` (300), `connect_retry_s` (180). `unknown scene` on a reset is **waited out**
+      rather than raised, because it means the game is still booting. Retries are bounded: after them the error is
+      raised for real. A recovery blocks the worker, and vec envs step in lockstep, so a worst case stalls every
+      game for ~5.5 min — under `supervise.py`'s 600 s `--stale-seconds`, and far cheaper than the crash it replaces.
     - Reset: a fresh level load or a respawn at the current checkpoint. Fresh after a completion, with no checkpoint yet in this level load, after `stuck_repeats` (3) stuck episodes in a row at one checkpoint, otherwise with probability `fresh_start_prob` (0.2).
     - **Multi-level curriculum** (branch `next-levels`): with `levels` set, a **fresh load and only a fresh load**
       picks the level, sampled from the unlocked set with weight `max(level_weight_floor, 1 - that level's fresh
@@ -172,7 +197,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   appends to one file. `start_checkpoint`, `end_pos`, `end_reason` and `level_seconds` bypass the numeric `field()`
   helper, which would write `null` for exactly the two fields that say where an episode died. A write failure
   warns and never stops training.
-- `python/scripts/`: `bridge_test.py` (`--drive`, `--campaign`), `random_agent.py` (`--mode campaign` prints completed / checkpoints_level / cells_new per episode), `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop training instances), `dashboard.py` (Tkinter live view of `status.json`).
+- `python/scripts/`: `bridge_test.py` (`--drive`, `--campaign`), `random_agent.py` (`--mode campaign` prints completed / checkpoints_level / cells_new per episode), `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop/**relaunch** training instances; `relaunch --port N` restarts ONE instance, found by the pid listening on that port, leaving the others running — `launch` cannot, it calls `stop_all()` first), `dashboard.py` (Tkinter live view of `status.json`).
 - `python/ultrakill_ai/windows.py`: monitor work-area lookup shared by `games.py` and `dashboard.py`.
 - `python/scripts/campaign_check.py`: in-game campaign checks on one game (difficulty, arsenal, checkpoint trigger, death respawn, exit and official time). `python/tests/test_campaign_check.py` runs the same five checks against a fake level (no game needed).
 - `python/scripts/watch_completion.py`: watches a **human** playthrough read-only (never takes control, never
@@ -213,7 +238,17 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/tests/test_look_mode_transfer.py`: the `add_look_mode.py` contract on small PPO models: the action head widened 42 -> 45 with the last three rows zero and every earlier row bit-identical, the hidden stacks identical except columns 448-455 and the folded bias, a 12-dimension action space and 479 inputs on reload, `num_timesteps` preserved, the three new logits equal on random inputs, and **mean KL(old||new) <= 0.03** on a recorded observation batch with the mean-fold strictly below the zero-only variant (no game needed).
 - `python/tests/test_campaign_config.py`: `configs/campaign_0-1.yaml` builds a 479-input env with its reward weights, every key is a real config field, and `train.fill_campaign_dirs` (no game needed).
 - `python/tests/test_keep_best.py`: `keep_best.py` scoring for both metrics on synthetic `metrics_log.csv` rows, and old `best.json` files (no game needed; `python tests/test_keep_best.py`).
-- `python/tests/test_games.py`: `games.py`'s instance-count guard — that `disk_logging_enabled` reads `Enabled` from `[Logging.Disk]` and not from the `[Logging.Console]` section above it, and that a missing file or key means BepInEx's default (on). This is what keeps `launch --count 8` from silently starting three copies whose plugin never loads (no game needed).
+- `python/tests/test_games.py`: `games.py`'s instance-count guard — that `disk_logging_enabled` reads `Enabled` from `[Logging.Disk]` and not from the `[Logging.Console]` section above it, and that a missing file or key means BepInEx's default (on). This is what keeps `launch --count 8` from silently starting three copies whose plugin never loads. Also the launch readiness verdict and the two parsers behind it: `parse_listening` (port → owning pid, ignoring ESTABLISHED rows), `parse_working_sets` (thousands separators and `N/A`) and `startup_verdict`, which is what stops the false "exited during startup" (no game needed).
+- `python/tests/test_bridge_recovery.py`: **one sick game must not kill a twelve-game run.** The protocol half
+  pins the two timeouts apart, that a timed-out request poisons its connection, that a dropped socket reads as
+  `BridgeClosed` and that `unknown scene` is its own error which leaves the connection usable. The env half
+  injects a timeout, a closed socket and `unknown scene` into `FakeLevel` (`fail_next_steps` / `fail_next_resets`,
+  queues of exceptions popped one per call) and asserts the episode dies instead of the worker: truncated with
+  `end_reason` `"bridge_reset"`, reward 0, one reconnect, config re-sent; a booting game waited out; a dead one
+  finally raising after bounded retries; a death respawn that loses the bridge ending the episode; and the four
+  consistency tests that matter — the reload re-baselines the trackers, its milestones pay again and only once,
+  the archive keeps its counts, and the truncated episode's `info` describes the episode that was lost
+  (no game needed; `python tests/test_bridge_recovery.py`).
 - `python/scripts/post_times.py`: posts a training run's best official level times to `times.md` from files the run already writes (no game, idempotent). `python/tests/test_post_times.py` covers first post, repeat post, only-faster and a missing `episodes.jsonl` (no game needed).
 - `python/scripts/supervise.py`: **the crash supervisor** — restarts the run when it dies, with no LLM and no
   tokens. Health is three things at once: a `train.py` process for this run exists (matched on the command line),
@@ -224,7 +259,12 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   port), resumes from whichever of `latest.zip` and the newest `ckpt_*_steps.zip` holds **more timesteps**
   (`latest.zip`'s count is read out of the `num_timesteps` field of the `data` member inside the zip, so it costs
   no torch import), and starts the trainer detached with the same `cmd /c ... >> log 2>&1` line a human would
-  type. `poll_status.py` and `keep_best.py` are restarted whenever they are missing, on every poll. Matching
+  type. **A boot health gate runs between the launch and the trainer** (`await_boot`): a listening port is not a
+  booted game, so it waits until every copy's working set has been over `--boot-min-mb` (600 MB; a booted copy
+  sits near 1 GB) for `--boot-polls` consecutive polls, and restarts a laggard **on its own port** with
+  `games.relaunch_one`, leaving the other eleven running. A laggard that never opened a port cannot be addressed
+  that way and is only waited out; if anything is still cold at the deadline the trainer starts anyway, because
+  the env now waits out `unknown scene` instead of dying on it. `poll_status.py` and `keep_best.py` are restarted whenever they are missing, on every poll. Matching
   rejects any command line containing `supervise.py`, `Win32_Process`, `Get-CimInstance`, `tasklist` or `wmic`,
   and the supervisor's own process tree by PID: a command line that *mentions* the trainer is not the trainer,
   which is how an earlier report script counted a PowerShell query as a running run. **`runs/<run>/SUPERVISOR_PAUSE`
@@ -234,8 +274,11 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   killer and launcher — healthy leaves everything alone, dead restarts once with the right resume file and count,
   hung kills the workers first, the pause file blocks everything, a graceful stop mid-save is not killed, the
   budget exits non-zero, the grace period stops a second trainer, helpers are started only when missing, the
-  resume choice in all three shapes (latest ahead, checkpoint ahead, latest unreadable) and the self-match trap
-  (no game, no real process; `python tests/test_supervise.py`).
+  resume choice in all three shapes (latest ahead, checkpoint ahead, latest unreadable), the self-match trap and
+  the boot health gate — `BootGate`'s two-consecutive-polls rule, a game that falls back under the line losing
+  its streak, a vanished game being forgotten, `laggard_ports` naming only laggards it can address, a single
+  laggard being restarted on its own port while the others keep running, and a game that never boots not
+  blocking training forever (no game, no real process; `python tests/test_supervise.py`).
 - `python/tests/test_times.py`: `times.md` updates against the committed file's exact text: placeholders, records, deltas, level order (no game needed; `python tests/test_times.py`).
 - `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load, and the two novelty-measure tests that pin the void exploit shut (`test_falling_off_the_map_pays_no_novelty`, `test_novelty_pays_for_new_ground_not_for_height`). `FakeLevel` reports ground rays the way the mod does, so its floor is at y 1 and `falling` makes every ray miss (no game needed). Its `enable_skulls(fields=, altars=, item_type=)` plus `item_active` cover the shapes a carryable comes in: the wired puzzle, a 0.6.x mod, 0-4's altar-free `CustomKey1`, an item no zone accepts, and an item whose room is still switched off.
 - `python/tests/test_skull_check.py`: `skull_check.py`'s three checks against `FakeLevel`'s skull room — the whole carry green, an item whose room is off named as the reason, a placement undone by the spam caught as a FAIL (run with the carry protection disabled, which is what makes it the regression test for `_protect_carry`), a pre-0.7.0 mod, `--skip-kill`, the `--render` control run and the default coordinates (no game needed).
@@ -277,6 +320,11 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   `configs/campaign_gates_prelude.yaml` is the previous config, kept as history and as the partial rollback.
   1. `python scripts/games.py launch --count 12 --monitor 1` (needs `[Logging.Disk] Enabled = false`; see the
      instance-count gotcha. `games.py launch` refuses `--count > 5` while disk logging is on, and says why.)
+     **Then check every copy is actually booted before starting the trainer**, with `games.py status`: it now
+     prints the pid and working set behind each listening port, and a copy at ~56 MB instead of ~1 GB will
+     answer every reset `unknown scene`. Restart just that one with
+     `python scripts/games.py relaunch --port 47808` — never `launch`/`stop`, which take down all twelve.
+     `supervise.py` does this gate automatically on every restart it makes.
   2. `python scripts/train.py --config configs/campaign_gates_main.yaml --resume models/campaign_gates/latest.zip`
      To continue a stopped run, resume from `models/campaign_gates/latest.zip` after a graceful Ctrl+C, else
      from the newest `ckpt_*_steps.zip` — and **check which of the two actually holds more steps**: `games.py stop`
@@ -379,7 +427,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**16 files; 323 named tests** as of 2026-09-17, of which `test_progress.py`'s 19 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and `tests/test_supervise.py` the crash supervisor. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**17 files; 336 named tests** as of 2026-09-17, of which `test_progress.py`'s 19 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, and `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
 
 ## Key design decisions
@@ -418,7 +466,37 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Stuck buttons:** virtual devices need `InputSystem.ResetDevice` before removal, or actions stay stuck pressed.
 - **Cyber Grind start:** the player spawns on a ledge (≈ z -47, y 100.5), and waves start only on entering the `EndlessGrid` trigger collider. The mod reports it as `cybergrind.start_trigger`, and the env teleports into its center (lands ≈ (2.5, 26.5, 65)). Walking off the ledge remains as a fallback.
 - **Background play:** while in control the game switches to a 640x360 window (`windowed`, `window_width/height`), unlocks the cursor every frame and after `GameStateManager.EvaluateState`, and re-mutes after every scene load, because `GameStateManager.IntroCheck` restores the volume. The original resolution and volume are restored on release and on quit.
-- **Single-client bridge:** `BridgeServer` drops its current client whenever a new one connects, so any TCP connection to a training instance's port kicks the trainer off that game and the run dies with `Connection closed by the game` in every env. `games.py status` (and the launch readiness wait) therefore read listening ports from `netstat` instead of connecting. Never poke the ports with another client while training.
+- **Single-client bridge:** `BridgeServer` drops its current client whenever a new one connects, so any TCP connection to a training instance's port kicks the trainer off that game and the run dies with `Connection closed by the game` in every env. `games.py status` (and the launch readiness wait) therefore read listening ports from `netstat` instead of connecting. Never poke the ports with another client while training. (The same behaviour is what makes recovery possible from the *inside*: a worker whose socket broke reconnects to its own port and the mod hands the game over, without touching any other worker.)
+- **The reset timeout crash, and why the mod's own escape hatch was dead code (killed the run 3x on 2026-09-17).**
+  Verified from the tracebacks in `runs/campaign_gates_train.log`: **every** `TimeoutError` bottomed out in
+  `protocol.py`'s `recv` under `client.reset`, never under `client.step`. Two were `_campaign_reset` at an episode
+  boundary; the one that looked "mid-rollout" was `_respawn` (env.py), which is also a reset request, just issued
+  from inside `step()`. The numbers are the tell: `BridgeClient.timeout` was **120.0** and
+  `EpisodeController.resetTimeoutSeconds` is **120f** — the same value. The mod starts its reset timer *after*
+  the client has already started its socket clock, so the mod's graceful `reset to '<scene>' timed out` error
+  reply can never arrive in time and that whole branch was unreachable; there was also no margin at all for a
+  slow load. What plausibly takes >120 s (inferred, not instrumented): a reset is a full Unity scene load, vec
+  envs step in lockstep so several games hit an episode boundary together and contend for one disk/CPU/GPU, the
+  curriculum now loads 11 different and often uncached scenes rather than one, the games run at
+  `BELOW_NORMAL_PRIORITY_CLASS`, and a GC pause or a window losing the GPU lands on top. **Fixed** by splitting
+  the timeouts (step 120 s unchanged, reset 600 s) and by making the env survive the error instead of dying on it
+  — see the bridge-resilience entry under `env.py`. The blast radius was the real bug: SB3's `SubprocVecEnv._worker`
+  does not catch, so the worker process exited, the parent read `BrokenPipeError`/`EOFError`, and all twelve games
+  went down together while `train.py` hung in teardown.
+- **A listening bridge port is NOT a booted game.** The plugin opens its socket early in startup, while
+  Addressables' resource locators are still empty — and `EpisodeController.SceneExists` searches exactly those
+  locators. So a half-booted instance answers *every* reset with `unknown scene 'Level 0-1'`, which used to reach
+  the trainer as a plain `BridgeError` and kill the whole vec env at `env.reset()`. Measured 2026-09-17: the
+  stuck copy sat at a **56 MB** working set while the other eleven sat near **1 GB**, and two trainer starts were
+  burned before anyone looked at memory. Two defences now: `supervise.py`'s boot health gate waits for every copy
+  to hold >600 MB for two consecutive polls (and restarts a laggard on its own port with `games.py relaunch`),
+  and the env waits `unknown scene` out for up to 5 minutes instead of raising.
+- **"Instance(s) [...] exited during startup" is a false alarm after a dirty stop.** `games.py launch` used to
+  judge readiness from the `Popen` handles it created, but the game **re-execs itself under a new pid**, so the
+  original handle reaps a dead process while the instance comes up perfectly well; the ports appear 2-3 min
+  later. It printed this twice during the 2026-09-17 recovery. Readiness is now judged by port (netstat) and by
+  whether *any* `ULTRAKILL.exe` is running (`startup_verdict`), never by the launch pids — those are only launch
+  handles and are not an instance's identity. Use `listening_pids()[port]` when you need to address one instance.
 - **Multiple instances:**
   - The game holds `Preferences/Prefs.json` open with exclusive write access, so a second copy crashes unless `InstancePatches` opens it read-only.
   - Launching the exe directly works (Facepunch `SteamClient.Init`; the launcher sets `SteamAppId`).
@@ -1553,3 +1631,22 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     because a query that *lists* the trainer contains the trainer's name — the miscount an earlier report script
     made. Measured live while building this: the probe's own Bash wrapper matched on `train.py` + the run name
     and was caught only by the ancestor-PID rule, so both halves of that guard earn their place.
+- **Bridge robustness, branch `robust-bridge` (2026-09-17). Not merged yet; the lead merges and the supervisor
+  picks it up at the next restart.** The run had died three times in one day on the same fault and a fourth time
+  on a half-booted game. Root cause, verified from the tracebacks and the two sources: **every** `TimeoutError`
+  was on a `reset` request (a Unity scene load), never on a `step`, and the client's socket timeout was the same
+  120 s as the mod's own `EpisodeController.resetTimeoutSeconds` — so the mod's graceful error reply could never
+  arrive and there was no margin for a slow load. See the two new gotchas for the full reasoning and for what is
+  inferred rather than measured (the *reason* loads run long: 12 simultaneous loads, 11 curriculum scenes,
+  below-normal priority, GC).
+  - **No observation, reward or action semantics change.** `step()`/`reset()` became thin wrappers around the
+    unchanged bodies; on the happy path every request, every reward term and every info key is byte-identical,
+    and the step timeout was deliberately left at its old 120 s. The only new reward behaviour is on a path that
+    used to crash: a recovered step pays 0 and truncates.
+  - What changed: two timeouts in `protocol.py` plus three `BridgeError` subclasses and a broken-connection
+    latch; reconnect-and-reload recovery in `env.py` with `end_reason` `"bridge_reset"`, bounded retries, and
+    `unknown scene` waited out; `games.py` readiness judged by port and process instead of the `Popen` handles,
+    a `relaunch --port N` that restarts one instance, and working-set reporting in `status`; a boot health gate
+    in `supervise.py` that will not start the trainer until every copy is over 600 MB for two polls.
+  - Verified: the full no-game suite, **17 files, 336 named tests, 0 failures**, run from the worktree with
+    `PYTHONPATH` pointed at it. Not verified in game — the live run was never touched, per the brief.

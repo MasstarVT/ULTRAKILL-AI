@@ -43,6 +43,16 @@ timesteps among `latest.zip` and the newest `ckpt_*_steps.zip`, and starts the t
 same `cmd /c ... >> log 2>&1` pattern a human would use. `poll_status.py` and `keep_best.py` are checked
 on EVERY poll, not only during a restart, and restarted if they are missing.
 
+**The boot health gate.** After the games are launched the supervisor does NOT start the trainer straight
+away. A listening bridge port does not mean a booted game: the plugin opens the socket early, while
+Addressables' resource locators are still empty, and `EpisodeController.SceneExists` searches exactly those
+locators -- so a half-booted instance answers every `reset` with `unknown scene 'Level 0-1'`. `await_boot`
+waits until every copy's working set has been over `--boot-min-mb` (default 600 MB; a booted copy sits near
+1 GB, the stuck one sat at 56 MB) for `--boot-polls` consecutive polls, and restarts a laggard on its own port
+with `games.relaunch_one`, which leaves the other eleven games running. A laggard that never opened a port at
+all cannot be addressed that way and is only waited out. If some instance is still cold at the end, the trainer
+starts anyway: the env now waits out `unknown scene` for minutes instead of dying on it.
+
 `latest.zip` only updates on a graceful stop, so it is usually BEHIND the newest checkpoint -- hence
 reading the step count out of both instead of trusting the name. `latest.zip`'s count comes from the
 `num_timesteps` field of the `data` member SB3 writes inside the zip; ties go to `latest.zip`.
@@ -69,6 +79,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 HOUR = 3600.0
+MB = 1024 * 1024
 DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 TAIL_LINES = 30
 STOP_WAIT_S = 5.0  # between closing the games and relaunching them
@@ -205,6 +216,49 @@ def choose_resume(model_dir: Path, zip_steps: Callable[[Path], int | None] = zip
     return path, steps
 
 
+class BootGate:
+    """Counts, per game, how many consecutive polls its working set has been over the boot threshold.
+
+    A listening bridge port does NOT mean a booted game. The plugin opens the socket early in startup, while
+    Addressables' resource locators are still empty -- and `EpisodeController.SceneExists` searches exactly
+    those locators, so a half-booted instance answers every `reset` with `unknown scene 'Level 0-1'`. Two
+    trainer starts were burned that way on 2026-09-17 before anyone noticed the working set: the stuck copy sat
+    at 56 MB while the other eleven sat near 1 GB.
+
+    Working set is the cheapest signal that separates them, and two consecutive polls are required because a
+    copy that is still loading crosses the line while it climbs; one sample over the line proves nothing.
+    """
+
+    def __init__(self, min_bytes: int, consecutive: int = 2):
+        self.min_bytes = min_bytes
+        self.consecutive = max(1, consecutive)
+        self.streaks: dict[int, int] = {}
+
+    def observe(self, sets: dict[int, int]) -> None:
+        """One poll. A pid that drops below the line loses its streak; a pid that vanished is forgotten."""
+        self.streaks = {pid: (self.streaks.get(pid, 0) + 1 if size >= self.min_bytes else 0)
+                        for pid, size in sets.items()}
+
+    def booted(self) -> set[int]:
+        return {pid for pid, streak in self.streaks.items() if streak >= self.consecutive}
+
+    def lagging(self) -> set[int]:
+        return {pid for pid, streak in self.streaks.items() if streak < self.consecutive}
+
+    def ready(self, expected: int) -> bool:
+        return len(self.booted()) >= expected
+
+
+def laggard_ports(port_pids: dict[int, int], lagging: set[int], wanted: Iterable[int]) -> list[int]:
+    """The wanted ports whose listening process has not booted, so each can be restarted on its own.
+
+    A laggard that is not listening at all has no port to look up and is not returned: `games.relaunch_one`
+    identifies an instance by the pid on its port, so there is nothing to address. That case falls back to the
+    whole-set relaunch the restart path already does.
+    """
+    return sorted(port for port in wanted if port_pids.get(port) in lagging)
+
+
 def shell_command(python: str, script: str, args: list[str], log_path: str) -> str:
     """The `cmd /c "<python> -u <script> ... >> <log> 2>&1"` line a human would type.
 
@@ -283,6 +337,12 @@ class Config:
     max_restarts_per_hour: int = 3
     start_grace_seconds: float = 900.0
     base_port: int = 47800
+    # The boot health gate (see BootGate). A booted copy sits near 1 GB; the stuck one sat at 56 MB.
+    boot_min_mb: int = 600
+    boot_polls: int = 2  # consecutive polls over the line before an instance counts as booted
+    boot_poll_seconds: float = 15.0
+    boot_timeout_seconds: float = 420.0  # per relaunch round
+    boot_relaunch_rounds: int = 2  # rounds of individually restarting the laggards before giving up on them
     python: str = sys.executable
     cwd: Path = field(default_factory=Path.cwd)
     runs_dir: str = "runs"
@@ -304,12 +364,18 @@ class Supervisor:
                  stop_games: Callable[[], None] | None = None,
                  launch_games: Callable[[int, int], bool] | None = None,
                  zip_steps: Callable[[Path], int | None] = zip_timesteps,
+                 working_sets: Callable[[], dict[int, int]] | None = None,
+                 port_pids: Callable[[], dict[int, int]] | None = None,
+                 relaunch_one: Callable[[int], bool] | None = None,
                  pid: int | None = None):
         self.cfg = cfg
         self.processes, self.now, self.sleep = processes, now, sleep
         self.probe, self.kill, self.spawn, self.zip_steps = probe, kill, spawn, zip_steps
         self._stop_games = stop_games or self._default_stop_games
         self._launch_games = launch_games or self._default_launch_games
+        self._working_sets = working_sets or self._default_working_sets
+        self._port_pids = port_pids or self._default_port_pids
+        self._relaunch_one = relaunch_one or self._default_relaunch_one
         self.pid = os.getpid() if pid is None else pid
 
         run_dir = cfg.cwd / cfg.runs_dir / cfg.run
@@ -373,6 +439,58 @@ class Supervisor:
         except Exception as exc:  # noqa: BLE001 - a launch failure must not kill the supervisor
             self.log("games.launch raised %s: %s" % (type(exc).__name__, exc))
             return False
+
+    def _default_working_sets(self) -> dict[int, int]:
+        import games
+
+        return games.working_sets()
+
+    def _default_port_pids(self) -> dict[int, int]:
+        import games
+
+        return games.listening_pids()
+
+    def _default_relaunch_one(self, port: int) -> bool:
+        import games
+
+        try:
+            return games.relaunch_one(port)
+        except Exception as exc:  # noqa: BLE001 - one laggard must not kill the supervisor
+            self.log("games.relaunch_one(%d) raised %s: %s" % (port, type(exc).__name__, exc))
+            return False
+
+    # -- the boot health gate ---------------------------------------------------------------------
+
+    def await_boot(self) -> bool:
+        """Blocks until every game has finished booting, restarting a laggard on its own port.
+
+        Returns True when all `count` instances booted. Returns False when some did not, and the caller starts
+        the trainer anyway: since the env now waits out `unknown scene` for minutes instead of dying on it, a
+        still-booting game costs a stalled worker rather than the run, and refusing to train at all would be
+        the worse failure. The log says plainly which ports were still cold.
+        """
+        gate = BootGate(self.cfg.boot_min_mb * MB, self.cfg.boot_polls)
+        wanted = [self.cfg.base_port + i for i in range(self.cfg.count)]
+        for attempt in range(1 + max(0, self.cfg.boot_relaunch_rounds)):
+            deadline = self.now() + self.cfg.boot_timeout_seconds
+            while self.now() < deadline:
+                gate.observe(self._working_sets())
+                if gate.ready(self.cfg.count):
+                    self.log("boot gate: all %d instances are over %d MB for %d polls; starting the trainer"
+                             % (self.cfg.count, self.cfg.boot_min_mb, self.cfg.boot_polls))
+                    return True
+                self.sleep(self.cfg.boot_poll_seconds)
+            ports = laggard_ports(self._port_pids(), gate.lagging(), wanted)
+            self.log("boot gate: %d of %d instances booted after %.0fs; laggards on ports %s"
+                     % (len(gate.booted()), self.cfg.count, self.cfg.boot_timeout_seconds, ports or "unknown"))
+            if attempt >= self.cfg.boot_relaunch_rounds or not ports:
+                break
+            for port in ports:
+                self.log("boot gate: restarting the instance on port %d, leaving the others running" % port)
+                self._relaunch_one(port)
+        self.log("boot gate: giving up waiting; starting the trainer anyway (the env retries 'unknown scene' "
+                 "for %ds, so a cold game stalls one worker instead of killing the run)" % 300)
+        return False
 
     # -- one poll ---------------------------------------------------------------------------------
 
@@ -472,6 +590,9 @@ class Supervisor:
         if not self._launch_games(self.cfg.count, self.cfg.monitor):
             self.log("games did not come up; will try again at the next poll")
             return "launch_failed"
+        # A listening port is not a booted game, and a trainer started against a half-booted one dies at its
+        # first reset with `unknown scene`. Two trainer starts were burned that way on 2026-09-17.
+        self.await_boot()
 
         command = shell_command(
             self.cfg.python, "scripts/train.py",
@@ -544,6 +665,13 @@ def main() -> None:
     ap.add_argument("--start-grace-seconds", type=float, default=900.0,
                     help="quiet period after a restart, while the games load and status.json is still old")
     ap.add_argument("--base-port", type=int, default=47800)
+    ap.add_argument("--boot-min-mb", type=int, default=600,
+                    help="working set an instance must exceed before it counts as booted (a booted copy is ~1 GB)")
+    ap.add_argument("--boot-polls", type=int, default=2, help="consecutive polls over --boot-min-mb")
+    ap.add_argument("--boot-poll-seconds", type=float, default=15.0)
+    ap.add_argument("--boot-timeout-seconds", type=float, default=420.0, help="per relaunch round")
+    ap.add_argument("--boot-relaunch-rounds", type=int, default=2,
+                    help="rounds of restarting just the laggards (0 = wait only, never relaunch)")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--runs-dir", default="runs")
     ap.add_argument("--models-dir", default="models")
@@ -554,6 +682,8 @@ def main() -> None:
                  stale_seconds=a.stale_seconds, poll_seconds=a.poll_seconds,
                  max_restarts_per_hour=a.max_restarts_per_hour, start_grace_seconds=a.start_grace_seconds,
                  base_port=a.base_port, python=a.python, cwd=Path.cwd(),
+                 boot_min_mb=a.boot_min_mb, boot_polls=a.boot_polls, boot_poll_seconds=a.boot_poll_seconds,
+                 boot_timeout_seconds=a.boot_timeout_seconds, boot_relaunch_rounds=a.boot_relaunch_rounds,
                  runs_dir=a.runs_dir, models_dir=a.models_dir, dry_run=a.dry_run)
     sys.exit(Supervisor(cfg).run())
 
