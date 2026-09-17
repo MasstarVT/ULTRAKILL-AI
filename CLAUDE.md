@@ -177,6 +177,43 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       and is keyed **per gate**, seeded once and never re-seeded, which is what stops a multi-gate tier being
       flapped A->B->A for income. An episode's total approach is bounded by the gate-to-gate polyline either way
       (723-736 m on 0-1).
+    - **Target patience, parking and the fallback** (branch `ladder-fix`, spec
+      `2026-09-17-ladder-patience-and-exit-guard.md`). `hops` is a shortest-path **lower bound** in a room graph
+      that multi-room doors over-connect, so on 0-3, 1-1, 1-2, 2-3, 4-3 and 8-1 the gate nearest the spawn already
+      sits near `hops` 0 and the monotone rule locks onto a door that cannot be walked to. A target that goes
+      `patience_steps` decisions without getting closer is **parked** for the level load; the target then becomes
+      the nearest **unreached, unparked** active gate at any hop count (sticky within `fallback_hysteresis_m`),
+      then the exit once none remain. Reaching a gate the fallback chose pays a `gate` instalment **once per new
+      `hops` value**, so the forward legs of a non-monotone route earn something while touring the other doors on
+      a rung already reached earns nothing (the `gate` income of a level load is bounded by the ladder depth under
+      both rules). Six rules keep the park from becoming a second wedge, each of them a reproduced failure:
+      - a park is only a **switch** for a LADDER pick (it needs some unreached unparked gate strictly nearer),
+        and that is what leaves 0-1 alone; a **FALLBACK** pick parks unconditionally, because `_pick` chose it as
+        the nearest candidate and the same filter can never find one nearer, so the test would make every
+        fallback target permanent and move the wedge one door over;
+      - `park_best` is the **closest the player has been at any park of that key**: kept across an un-park and
+        only ever lowered, so wandering off and stalling somewhere farther cannot buy a cheap un-park. It is NOT
+        tracked down every step, which would be beaten by one decision's travel and make the park permanent;
+      - the un-park bar **doubles per park** of that key (2, 4, 8, 16 m), so a door that has proved unreachable
+        twice needs a real change of situation;
+      - the clock runs on its own baseline, **never on `gate_approach`**, and `mark_paid` restarts it: `best_dist`
+        is episode scoped by R1, so a post-death re-walk pays nothing and a clock reading the reward would park
+        the one door the route needs;
+      - the arena / kill-or-style suspension is **bounded** at `2 * patience_steps` (600 decisions, inside
+        `stuck_seconds` 45's 675), because `arena_enemies_alive` is scoped to the whole level, not to the target's
+        arena;
+      - a **fetch or carry leg, and any gate reporting `needs_item`, is never parked at all** — parking it
+        deletes the altar sub-goal that `env._protect_carry` keys the punch-drop on, and the next punch throws
+        the skull.
+
+      Parks survive `reset_episode` and die with the level load. `patience_steps` 0 restores the pre-patience
+      tracker byte for byte, which is how the 0-1 proof is written and the per-config opt-out.
+      Config: `gate_target_patience_s` (20 s), `gate_unpark_m` (2), `gate_fallback_hysteresis_m` (10).
+    - **`ExitGuard`**: freezes `campaign.exit.pos` per level load and rewrites the block in place, so the gate
+      target, observation slots 0-4 and `exit_dist_min` all stop following a `FinalPit` that `CheckPoint.Start` /
+      `ResetRoom` banished by `x + 10000f`. A later report a whole multiple of 10,000 *below* the frozen one is
+      accepted (the banish only ever adds, so that is the live pit coming back); anything beyond
+      `exit_max_shift_m` is ignored. `env._guard_exit` runs it on every campaign observation the env adopts.
   - `progress.py`: `ProgressCallback`. **Chart history keeps `timesteps` strictly increasing**: `_restore` carries
   the whole old history over, but resuming from an *older* checkpoint rewinds `num_timesteps`, so the restored tail
   would sit ahead of the points that follow it and the dashboard would draw a line doubling back on itself (seen
@@ -282,14 +319,26 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/tests/test_times.py`: `times.md` updates against the committed file's exact text: placeholders, records, deltas, level order (no game needed; `python tests/test_times.py`).
 - `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load, and the two novelty-measure tests that pin the void exploit shut (`test_falling_off_the_map_pays_no_novelty`, `test_novelty_pays_for_new_ground_not_for_height`). `FakeLevel` reports ground rays the way the mod does, so its floor is at y 1 and `falling` makes every ray miss (no game needed). Its `enable_skulls(fields=, altars=, item_type=)` plus `item_active` cover the shapes a carryable comes in: the wired puzzle, a 0.6.x mod, 0-4's altar-free `CustomKey1`, an item no zone accepts, and an item whose room is still switched off.
 - `python/tests/test_skull_check.py`: `skull_check.py`'s three checks against `FakeLevel`'s skull room — the whole carry green, an item whose room is off named as the reason, a placement undone by the spam caught as a FAIL (run with the carry protection disabled, which is what makes it the regression test for `_protect_carry`), a pre-0.7.0 mod, `--skip-kill`, the `--render` control run and the default coordinates (no game needed).
-- `python/tests/test_campaign.py`: campaign helpers: level list, rank maths, exploration archive, milestones, path progress, the fresh-start rule and best runs (no game needed).
+- `python/tests/test_campaign.py`: campaign helpers: level list, rank maths, exploration archive, milestones, path progress, the fresh-start rule and best runs, plus target patience / parking / the fallback payment and the `ExitGuard` arithmetic (no game needed). The patience section pins each anti-wedge rule against the failure it was written for: a **fallback** target parks in its turn and hands over (and the exit takes over when nothing is left), a second door on a rung already reached pays nothing and an eight-door tour still pays one instalment, a far-off re-park cannot buy a cheap un-park and the bar doubles per park, a death respawn does not park the door the agent is walking at, an arena that never dies still parks the gate at the `2 * patience_steps` bound, a carry leg and any `needs_item` gate are never parked, and a fallback gate reporting `hops: null` or no `hops` key returns 0 instead of raising.
+- `python/tests/test_ladder_replay.py`: the A6/A7 proof obligations of the ladder-patience spec, replayed
+  against recorded game data in `python/tests/fixtures/` (gzipped probe logs, ~190 KB in total, plus
+  `ladder_golden.json`, which the PRE-patience `GateProgress` wrote). A6: patience off reproduces the golden
+  file step for step over all 32,022 recorded `Level 0-1` decisions; a monotone ladder walked inside the window
+  is untouched by patience; no gate is ever parked while an arena holds it; **6 of the 7 recorded episodes are
+  byte-identical and the seventh is asserted in full** -- per-episode `gate_approach` deltas
+  (`{5: +10.363, rest: 0.0}`), identical instalments, identical `reached` / `best_hops`, an identical target
+  ORDER in every episode, and episode 5's run lengths to the decision, so the one park's whole effect is a
+  78-decision boundary shift. A7: the 0-3 lock is broken within a few patience windows and held for at most half
+  as many decisions, every park of the high door records a strictly closer baseline (the park log is pinned
+  exactly), the target moves onto the walkable route, the forward legs pay `gate` (7 against 3) and the high door
+  is un-parked once the agent actually climbs to it (no game needed).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
 - `python/tests/test_spaces.py`: layout sizes (448 / 479) and every index range of the campaign block, including the yaw-frame signs (no game needed).
 - `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands). `campaign_prelude.yaml` (the multi-level curriculum 0-1 / 0-3 / 0-4 under a new run name `campaign_prelude`, kept as the reference) and `campaign_1-1.yaml` (the first skull-carry level, run `campaign_1-1`, **`item_pickup` and `item_placed` pinned at 0.0** until the three in-game checks pass). `campaign_gates_prelude.yaml` carried the live run from 4.8M to 6.77M steps (curriculum 0-1 / 0-3 / 0-4, `num_envs` 8, `ent_coef` 0.004) and is kept as history and as the partial rollback. **`campaign_gates_main.yaml` is the live one** (integration pause #2, 2026-09-17): the same `run_name: campaign_gates`, so the 6.77M-step weights, `best.zip` and the exploration archives carry on, with the 11-level Tier A + Tier B ladder, `unlock_after_fresh_episodes: 600`, `max_steps` 12000, `item_pickup` 10.0 / `item_placed` 20.0, `num_envs` 12 and `ent_coef` still 0.004. Each config's header lists its own run commands, and **`tests/test_campaign_config.py` pins every setting and every reward weight that is NOT a named change equal to the config before it**, so nothing can drift while the same policy continues.
 - `docs/level-survey.md`: all 35 levels parsed offline from the scene files — exits, checkpoints, door graphs and gate ladders, altars and carryables, arenas, bosses and hazards, plus a tier table and the recommended order of sub-projects. This is what the multi-level and skull-gates design was built from; check it before assuming anything about a level nobody has trained on.
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
-- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign design; `2026-09-16-campaign-gates-unwedge-design.md` is the route-gates / un-wedge / look-modes design that followed the 0-1 pilot's diagnosis (implemented in mod v0.6.0 and the `campaign_gates` run; its section 14 records the lead rulings R1-R4); `2026-09-17-multi-level-and-skull-gates-design.md` is the multi-level curriculum / gates guard / 6-2 exit / skull-carry design (implemented on branch `next-levels` and mod v0.7.0; its section 8 lists the five in-game checks, section 10 the risks and section 11 the review dispositions).
+- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign design; `2026-09-16-campaign-gates-unwedge-design.md` is the route-gates / un-wedge / look-modes design that followed the 0-1 pilot's diagnosis (implemented in mod v0.6.0 and the `campaign_gates` run; its section 14 records the lead rulings R1-R4); `2026-09-17-multi-level-and-skull-gates-design.md` is the multi-level curriculum / gates guard / 6-2 exit / skull-carry design (implemented on branch `next-levels` and mod v0.7.0; its section 8 lists the five in-game checks, section 10 the risks and section 11 the review dispositions); `2026-09-17-ladder-patience-and-exit-guard.md` is the collapsed-ladder / banished-exit design (implemented on branch `ladder-fix`, Python only; its section 3 records the five deviations from the brief that measurement forced and why the reach test was left alone, section 6 the proof obligations and the tests that discharge them, and **section 7 the disposition of the eight adversarial-review findings** — six bugs fixed, one proposed cure rejected with a reproduction of its own failure, and one claim about 0-1 rebutted by measurement).
 - `docs/superpowers/plans/`: implementation plans. `2026-09-16-campaign-foundation.md` is the 16-task plan for the campaign foundation and the 0-1 pilot (Tasks 0-13 dry-run in a scratch copy: mod builds clean, all tests pass). `2026-09-17-next-levels-integration.md` is the ordered checklist for merging branch `next-levels` into main at a training pause and verifying it in the live game (merge, build and install, the six in-game readouts, the 20k-step smoke run, how to carry the live 0-1 policy into the multi-level run, and rollback).
 - `.tools/` (gitignored): local `ilspycmd` install used to regenerate `decompiled/`.
 
@@ -426,8 +475,8 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   episode, then the completion count and the fastest run. It reads the exploration counts the first training game
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
-- Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**17 files; 336 named tests** as of 2026-09-17, of which `test_progress.py`'s 19 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, and `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
+- Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **parked/ep + exit-banished row** for the two ladder-patience mechanisms, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**18 files; 408 named tests** as of 2026-09-17, of which `test_progress.py`'s 19 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, and `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
 
 ## Key design decisions
@@ -588,6 +637,33 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   force-closes the others); and `controller_active` is what separates "walk up to it" from "a fight gates it" —
   0-1's gun-room gate reports `open: false, locked: false` at load and still cannot be opened.
   Levels beyond 1-1 are unverified apart from 0-2 and 0-5.
+
+- **`hops` is a shortest-path LOWER BOUND, not a route, and treating it as a monotone ladder collapses on six
+  levels (diagnosed live 2026-09-17).** Multi-room doors over-connect the room graph, so the gate nearest the
+  spawn can already sit near `hops` 0. Measured collapsed on **0-3, 1-1, 1-2, 2-3, 4-3 and 8-1** — four of them
+  in the live 11-level curriculum. On 0-3 the spawn-side door `0,13,330` (hops 2) is "reached" from the pit
+  **below** it — dy −4.1 to −6.0 m, dh 6.0-8.0 m, airborne, in all six probe episodes, so the 8 m / 6 m reach
+  cylinder counts it without the player ever passing it — `best_hops` locks at 2 and the target becomes
+  `-16,73,315`, **66 m straight up through a ceiling**, for 2,052-2,423 of every 2,501 decisions. 175 of 177
+  training fresh episodes ended stuck beneath it with zero checkpoints. The walkable route is
+  **2 → 3 → 4 → 5 → 6 → 3 → 2 → 1 → 0**, which is not monotone, so every forward leg paid nothing and
+  observation slots 448-455 pointed at the wrong door. 0-1 is monotone (`spawn_h == max_hops == 9`) and works,
+  which is why the bug went unseen for a whole run. Target patience (branch `ladder-fix`) is the mitigation, not
+  a cure: it parks a target that stops getting closer and falls back to the nearest unreached gate at any hop
+  count. If the falsifier under Status fails, the ladder needs a real per-level route, not another knob.
+
+- **`campaign.exit.pos` gets BANISHED +10,000 m in X on 0-2, and the proper fix is mod-side.**
+  `CheckPoint.Start` (`decompiled/CheckPoint.cs:132`) and `CheckPoint.ResetRoom` (`:681`) clone every room the
+  checkpoint owns and then move the **original** by `transform.position.x + 10000f` — x only, y and z untouched.
+  The live clone and the real `FinalPit` trigger stay put, but the mod's frozen `FinalPit` reference follows the
+  banished original, so on 0-2 the reported exit jumps (−199.0, −86.1, 277.0) → (9801.0, −86.1, 277.0) the
+  moment checkpoint `-55,-11,277` activates — which is exactly when the gate ladder hands the target to the
+  exit. `ResetRoom` runs again on every respawn, so the offset is k × 10,000 for k ≥ 1. 0-2 otherwise runs
+  cleanly to `gates_reached` 8.
+  `ExitGuard` (Python, branch `ladder-fix`) freezes the exit per level load and is a stopgap. **The real fix is
+  mod-side at the next rebuild: re-resolve the `FinalPit` on every `Scan()` instead of caching the reference,
+  so a rescan picks up the live clone** — the same rule the room-node keys already follow (rounded world
+  position, never a reference, for exactly this reason). Until then, watch `exit_banished`.
 
 - **The absorbing `slowMode` wedge, and the fix (mod v0.6.0).** A slide that ends while the player is airborne,
   or a jump out of a slide where the game's stand-up test fails, sets `NewMovement.slowMode` and leaves a state
@@ -1650,3 +1726,96 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     in `supervise.py` that will not start the trainer until every copy is over 600 MB for two polls.
   - Verified: the full no-game suite, **17 files, 336 named tests, 0 failures**, run from the worktree with
     `PYTHONPATH` pointed at it. Not verified in game — the live run was never touched, per the brief.
+- **The collapsed ladder and the banished exit, branch `ladder-fix` (2026-09-17). Python only (the DLL is
+  locked); not merged — the lead merges and the supervisor picks it up at the next restart.** Two bugs diagnosed
+  live on a private game at port 47812 and fixed here. Spec:
+  `docs/superpowers/specs/2026-09-17-ladder-patience-and-exit-guard.md`.
+  - **A, the collapsed ladder. `hops` is a shortest-path LOWER BOUND, not a route.** Multi-room doors
+    over-connect the room graph, so on **0-3, 1-1, 1-2, 2-3, 4-3 and 8-1** — four of them in the live 11-level
+    curriculum — the gate nearest the spawn already sits near `hops` 0. On 0-3 the spawn-side door `0,13,330`
+    (hops 2) is "reached" from the pit **below** it (measured dy −4.1 to −6.0 m, dh 6.0-8.0 m, airborne, in all
+    six probe episodes), `best_hops` locks at 2, and the target becomes `-16,73,315` — 66 m straight up through a
+    ceiling — for **2,052-2,423 of every 2,501 decisions**. 175 of 177 training fresh episodes ended stuck under
+    it with zero checkpoints. The walkable route is 2 → 3 → 4 → 5 → 6 → 3 → 2 → 1 → 0, non-monotone, so every
+    forward leg paid nothing and observation slots 448-455 pointed at the wrong door.
+  - **B, the banished exit.** `CheckPoint.Start` (`decompiled/CheckPoint.cs:132`) and `CheckPoint.ResetRoom`
+    (`:681`) clone each room and move the **original** by `x + 10000f`; the mod's frozen `FinalPit` reference
+    follows the original. On 0-2 `campaign.exit.pos` jumps (−199.0, −86.1, 277.0) → (9801.0, −86.1, 277.0) the
+    moment checkpoint `-55,-11,277` activates — which is exactly when the ladder hands the target to the exit.
+    `ResetRoom` runs again per respawn, so the offset is k × 10,000. The proper fix is mod-side at the next
+    rebuild; `ExitGuard` is the Python guard, and it also **recovers** from a first report that is already
+    banished, because the banish only ever adds to x.
+  - **Five deviations from the brief, each forced by measurement, all in section 3 of the spec.** (1) The
+    patience clock is suspended while `arena_enemies_alive > 0` or on a kill/style step — four stalls of up to
+    2,543 decisions in the recorded 0-1 run ran with an arena alive on **96-100%** of their steps, in front of
+    the *correct* gate, where no approach is possible however well the agent plays, and on 0-3 the arena count
+    is 0 on **100%** of the locked steps — but the suspension is **bounded** at `2 * patience_steps`.
+    (2) A **ladder** pick is parked only when some unreached, unparked gate is strictly nearer, which takes the
+    recorded 0-1 run from 0-13 parks per episode to 0-1 and leaves **6 of its 7 episodes byte-identical**; a
+    **fallback** pick is parked unconditionally, because the same filter chose it as the nearest and the test
+    would make it permanent. (3) The fallback target is sticky within 10 m, because pure "nearest" flaps between
+    two near-equidistant doors **23-59 times per 0-3 episode** (10 m: 9-20) with no `gate` instalment lost.
+    (4) The clock runs on its own baseline, not on `gate_approach`, and `mark_paid` restarts it. (5) A fetch or
+    carry leg, and any gate reporting `needs_item`, is never parked at all.
+  - **An adversarial review found eight defects in the first implementation; all eight were reproduced against
+    the code before anything changed, and section 7 of the spec is the appendix.** Six were outright bugs: a
+    **fallback target could never be parked** (the same filter picks it and tests it, so the mechanism protected
+    one hand-over and then switched itself off — 4,000 decisions aimed through a ceiling with
+    `targets_parked` reading 1); the instalment was **per door rather than per rung**, so an eight-door tour of
+    one rung collected 6 instalments against a ladder depth of 2 (780 available on 8-1's 52 gates, against
+    `level_complete` 100); the clock **read `gate_approach`**, which R1 makes episode scoped, so a post-death
+    re-walk parked the right door at decision 299 of a flawless 389 m approach; the arena suspension was
+    **unbounded and level-wide**, so an un-cleared wave anywhere froze the clock for the level load (20,000
+    decisions, zero parks, telemetry reading `targets_parked = 0` — indistinguishable from "correctly inert");
+    parking a skull gate **silently disabled the punch carry-protection**, so the next punch threw the skull and
+    lost the level load; and `_pay_fallback`'s unguarded `int(gate["hops"])` **raised out of `update`** on a
+    `hops: null` door, past `env.step`, into all twelve games. The other two were half right: the un-park bar
+    was too easily cleared (a far-off re-park re-read the baseline), but the reviewer's proposed cure — track the
+    baseline down every step — is beaten by one decision's travel and made the park permanent, failing A3; and
+    0-1's inertness *was* overstated, though the claim that relaxing the nearness test adds 45 parks there is
+    measurably wrong (**all 46 of 0-1's window expiries are on ladder targets, none on a fallback**, so 0-1 has
+    exactly one park either way).
+  - **The reach test was left alone, as A5 directs.** Adding a 3-D bound to the cylinder does reject all six of
+    0-3's corner reaches (8.49-9.27 m), but replayed over the 32,022 recorded 0-1 decisions it is **not inert**
+    (ep 5 never reaches `146,31,640` and reaches `40,11,624` 934 decisions late), so A5's precondition fails. It
+    would not have fixed bug A anyway: on 0-3 it only delays the bad reach by 66-1,069 decisions.
+  - **Result on the recorded data, after the review fixes.** 0-3: the lock on the unreachable door breaks after
+    380-841 decisions in both probe episodes and the target moves to `0,13,362` / `0,53,330`, gates on the
+    walkable route; the share of decisions spent on it falls 82-94% → **40.2% and 33.6%**, and every time it
+    comes back the agent has got strictly closer than ever before (parks at 40.87, 35.98, 26.13 m against bars
+    of 2, 4, 8 m — a monotone 24 m closing; episode 1 parks once and it never returns). A walk of the real route
+    pays **7** `gate` instalments against the monotone rule's 3, with `gate_approach` 469.5 m against 316.5.
+    0-1: 6 of 7 recorded episodes byte-identical; the seventh's single park hands over to `66,21,640` — the gate
+    the ladder was going to pick next — **78 decisions early**, for `gate_approach` +10.363 m (+1.55 reward) and
+    **zero** extra instalments, with the same target order, reached set and `best_hops`.
+  - New per-episode info, both in `CAMPAIGN_INFO_KEYS` and so in `status.json`, `episodes.jsonl`, the dashboard's
+    campaign panel and `poll_status.py`: **`targets_parked`** (parks this episode) and **`exit_banished`**.
+    `poll_status.py` keeps an existing header, so **move the live run's `metrics_log.csv` aside** to get the two
+    new columns.
+  - **What to watch once this is merged**, in this order:
+    1. `targets_parked` — expect **~0 on 0-1** (one park in seven recorded episodes) and **> 0 on 0-3, 1-1, 1-2,
+       2-3, 4-3 and 8-1**. A collapsed level reading 0 means the mechanism is not firing there, not that the
+       level is fine: that is exactly what the unbounded arena suspension used to look like, and it is also the
+       **known residual** — a ladder pick is only parked when some unreached gate is strictly nearer, so a level
+       whose unreachable rung-below door is *also* the nearest unreached gate still wedges. 0-3 is not that
+       shape; 1-1, 1-2, 2-3, 4-3 and 8-1 have no probe data either way. Do not answer it by dropping that test:
+       it is the only thing holding 0-1's other 45 window expiries.
+    2. `exit_banished` — expect **1 on 0-2** once checkpoint `-55,-11,277` activates, and **0 everywhere else**.
+       A 1 on another level means a second banish site nobody has looked at.
+    3. **0-3 and 0-2 fresh** `gates_reached` and `checkpoints_level`. Judge these on fresh starts only, on a
+       window of >= 50 episodes; a respawn episode inherits both from its level load.
+    4. `part_gate` against `part_gate_approach` in `metrics_log.csv`. `gate` is bounded by the ladder depth per
+       level load under both rules, so `part_gate` above ~10 × 15 on a prelude level means the bound has a hole.
+  - **Falsifier.** Within ~300 fresh 0-3 episodes after activation, mean `gates_reached` should rise **above 2**
+    and mean `checkpoints_level` **above 0**. If it does not, target patience is not enough and the ladder needs
+    the route-path redesign (a per-level ordering learned from where the agent has actually been, rather than
+    `hops` as a proxy for it) — not another patience knob.
+  - No observation width, no action-space change, no reward-weight change: 479 inputs either way, and every
+    existing checkpoint and `env_config.yaml` loads unchanged (`from_dict` drops unknown keys, the four new
+    settings default) — verified against the live run's own `models/campaign_gates/env_config.yaml`, 51 keys,
+    none of them new. `gate_target_patience_s: 0` restores the pre-patience tracker exactly, which is how the
+    0-1 inertness proof is written and what to set if the mechanism ever misbehaves live. 0-1's inertness is
+    **measured, not structural** — the tests in section 6 of the spec are what measure it.
+  - Verified: the full no-game suite, **18 files, 408 named tests, 0 failures**, run from the worktree with
+    `PYTHONPATH` pointed at it, plus each of the eight review findings re-run against the fixed code. Not
+    verified in game — the live run was never touched, per the brief.

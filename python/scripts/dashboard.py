@@ -175,6 +175,11 @@ def campaign_lines(campaign: dict, mean: dict, parts: dict | None = None, best: 
         ("gates/load      ", f"{fmt_float(mean.get('gates_reached'), 1)} fresh {fmt_float(fresh.get('gates_reached'), 1)}"
                              f" best {fmt_int(best.get('best_gates_reached'))} hops {fmt_int(best.get('best_gate_hops'))}"),
         ("checkpoints/load", fmt_float(mean.get("checkpoints_level"), 1)),
+        # The two mechanisms of the ladder-patience/exit-guard spec. `parked/ep` above ~0 says the ladder is
+        # collapsed on the level being played (expected on 0-3, 1-1, 1-2, 2-3, 4-3, 8-1, not on 0-1);
+        # `exit banished` above 0 says a CheckPoint clone moved the reported FinalPit and the guard caught it.
+        ("parked/ep       ", f"{fmt_float(mean.get('targets_parked'), 2)}"
+                             f"  exit banished {fmt_pct(mean.get('exit_banished'))}"),
         ("wedged/ep       ", fmt_float(mean.get("wedged_steps"), 0)),
         ("new cells/ep    ", fmt_float(mean.get("cells_new"), 0)),
         ("deaths/ep       ", fmt_float(mean.get("deaths"))),

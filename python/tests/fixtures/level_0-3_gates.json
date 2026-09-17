@@ -1,0 +1,170 @@
+{
+ "gates_ordered": true,
+ "gates_truncated": false,
+ "exit": {
+  "pos": [
+   -179.0,
+   19.9,
+   315.0
+  ],
+  "active": false
+ },
+ "gates": [
+  {
+   "key": "-82,93,315",
+   "pos": [
+    -81.5,
+    93.0,
+    315.0
+   ],
+   "hops": 0,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "-16,73,315",
+   "pos": [
+    -15.5,
+    73.0,
+    315.0
+   ],
+   "hops": 1,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "0,13,330",
+   "pos": [
+    0.0,
+    13.0,
+    330.5
+   ],
+   "hops": 2,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "0,53,330",
+   "pos": [
+    0.0,
+    53.0,
+    330.5
+   ],
+   "hops": 2,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "0,13,362",
+   "pos": [
+    0.0,
+    13.0,
+    361.5
+   ],
+   "hops": 3,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "76,53,398",
+   "pos": [
+    76.0,
+    53.0,
+    397.5
+   ],
+   "hops": 3,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "0,13,402",
+   "pos": [
+    0.0,
+    13.0,
+    402.5
+   ],
+   "hops": 4,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "10,53,413",
+   "pos": [
+    10.5,
+    53.0,
+    413.0
+   ],
+   "hops": 4,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "116,53,448",
+   "pos": [
+    116.0,
+    53.0,
+    448.5
+   ],
+   "hops": 4,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "76,53,428",
+   "pos": [
+    76.0,
+    53.0,
+    428.5
+   ],
+   "hops": 4,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "-20,8,413",
+   "pos": [
+    -20.5,
+    8.0,
+    413.0
+   ],
+   "hops": 5,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  },
+  {
+   "key": "-86,-12,413",
+   "pos": [
+    -86.5,
+    -12.0,
+    413.0
+   ],
+   "hops": 6,
+   "open": false,
+   "locked": false,
+   "active": true,
+   "controller_active": true
+  }
+ ]
+}

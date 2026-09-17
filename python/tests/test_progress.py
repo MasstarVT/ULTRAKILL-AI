@@ -112,6 +112,9 @@ class FakeCampaignEnv(gym.Env):
             # The route gates and the wedge detector (§9.7 of the design spec).
             "gates_reached": min(4, self.steps // 3),
             "gate_hops_best": max(0, 9 - self.steps // 3) if self.steps >= 3 else None,
+            # The ladder-patience and exit-guard mechanisms (2026-09-17 spec).
+            "targets_parked": self.steps // 6,
+            "exit_banished": int(self.steps % 7 == 0),
             "wedged_steps": 45 if self.steps % 5 == 0 else 0,
             "level_started": 1,
             "look_free_frac": 0.5,
@@ -308,7 +311,8 @@ def test_campaign_progress():
         m = s["mean_100"]
         assert "route_progress" not in m
         for key in ("completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "exit_dist_min",
-                    "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac"):
+                    "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac",
+                    "targets_parked", "exit_banished"):
             assert m[key] is not None, key
         assert s["mean_fresh_100"]["gates_reached"] is not None
         assert set(s["end_reasons_100"]) <= {"level_complete", "stuck", "wedged"}
@@ -327,7 +331,7 @@ def test_campaign_progress():
         for entry in lines:
             for key in ("t", "env", "timesteps", "reward", "length", "fresh_start", "start_checkpoint", "end_reason",
                         "kills", "deaths", "checkpoints_level", "gates_reached", "gate_hops_best", "level_started",
-                        "wedged_steps", "end_pos", "level_seconds", "completed"):
+                        "wedged_steps", "end_pos", "level_seconds", "completed", "targets_parked", "exit_banished"):
                 assert key in entry, key
             assert isinstance(entry["end_pos"], list) and len(entry["end_pos"]) == 3
             assert all(isinstance(v, float) for v in entry["end_pos"])
@@ -642,7 +646,8 @@ def test_dashboard_campaign_panel():
     lines = dashboard.campaign_lines(
         {"fresh_window": 50, "fresh_completion_rate": 0.62, "median_time_50": 59.9996, "best_time": 83.25},
         {"completed": 0.4, "checkpoints_level": 2.14, "cells_new": 84.4, "deaths": 1.3, "exit_dist_min": 12.2,
-         "gates_reached": 1.82, "wedged_steps": 612.4, "look_free_frac": 0.51, "look_gate_frac": 0.29},
+         "gates_reached": 1.82, "wedged_steps": 612.4, "look_free_frac": 0.51, "look_gate_frac": 0.29,
+         "targets_parked": 0.34, "exit_banished": 0.02},
         {"time": -9.0, "checkpoint": 20.0, "novelty": 5.04, "path": 0.8, "level_complete": 50.0, "death": None},
         {"best_gates_reached": 4, "best_gate_hops": 2},
         {"gates_reached": 0.91},
@@ -655,6 +660,7 @@ def test_dashboard_campaign_panel():
         "  median time      01:00.000",  # whole milliseconds, never "00:60.000"
         "  gates/load       1.8 fresh 0.9 best 4 hops 2",
         "  checkpoints/load 2.1",
+        "  parked/ep        0.34  exit banished 2%",
         "  wedged/ep        612",
         "  new cells/ep     84",
         "  deaths/ep        1.30",
@@ -668,7 +674,7 @@ def test_dashboard_campaign_panel():
     ], lines
     empty = dashboard.campaign_lines({"fresh_window": 0, "fresh_completion_rate": None, "median_time_50": None, "best_time": None}, {})
     assert empty[0] == "  fresh completed  — of last 0", empty
-    assert len(empty) == 11, empty
+    assert len(empty) == 12, empty
     assert all("—" in line for line in empty[1:]), empty
 
     # The whole window on a real campaign status (charts, games table, Campaign panel).
@@ -693,7 +699,8 @@ def test_poll_status_keeps_old_header():
         "state": "running", "timesteps": 123456, "episodes": 300, "window": 100, "steps_per_s": 190.0,
         "mean_100": {"reward": 12.5, "kills": 3.0, "deaths": 1.2, "completed": 0.4, "fresh_start": 0.2,
                      "checkpoints_level": 1.5, "cells_new": 60.0, "exit_dist_min": 20.0,
-                     "gates_reached": 1.8, "wedged_steps": 612.0, "look_gate_frac": 0.3},
+                     "gates_reached": 1.8, "wedged_steps": 612.0, "look_gate_frac": 0.3,
+                     "targets_parked": 0.34, "exit_banished": 0.02},
         "mean_fresh_100": {"gates_reached": 0.9, "checkpoints_level": 0.4, "completed": 0.0},
         "campaign": {"fresh_window": 50, "fresh_completion_rate": 0.4, "median_time_50": 95.0, "best_time": 83.25},
         "best_checkpoints_level": 3,
@@ -745,6 +752,10 @@ def test_poll_status_keeps_old_header():
         assert logged["best_gates_reached"] == "4" and logged["best_gate_hops"] == "2", logged
         assert logged["part_gate"] == "30.0" and logged["part_gate_approach"] == "8.5", logged
         assert logged["ppo_entropy_yaw"] == "2.3", logged
+        # The ladder-patience and exit-guard mechanisms. Both are absent from `old_header`, which is exactly
+        # why an existing metrics_log.csv has to be moved aside to see them.
+        assert logged["targets_parked"] == "0.34" and logged["exit_banished"] == "0.02", logged
+        assert "targets_parked" not in appended and "exit_banished" not in appended
 
 
 if __name__ == "__main__":
