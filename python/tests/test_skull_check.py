@@ -21,7 +21,9 @@ from ultrakill_ai.env import UltrakillEnv  # noqa: E402
 
 import test_campaign_env as corridor  # noqa: E402  the FakeLevel the campaign env tests are written against
 
-PEDESTAL = [f"{v:g}" for v in corridor.PEDESTAL_POS]
+# `--target` names the ITEM to pick up (items[].pos), `--altar` names the ZONE (altars[].pos); the script
+# derives the point to aim a placement at from the zone's own aim_pos. Exactly as the real run passes them.
+PEDESTAL = [f"{v:g}" for v in corridor.PEDESTAL_ITEM_POS]
 ALTAR = [f"{v:g}" for v in corridor.ALTAR_POS]
 CHECKPOINT = ["0", "1", "20"]  # corridor.CHECKPOINT_ID's position, which is also the pedestal's
 
@@ -64,10 +66,12 @@ def run(*extra: str, skulls: dict | None = None, cfg_overrides: dict | None = No
         client_cls=corridor.FakeLevel, **attrs):
     """Runs the three checks against a fresh skull room. `attrs` are set on the FakeLevel after enable_skulls."""
     script = load_script()
-    # `--camera-height 0`: the fake corridor has no camera, and its player position IS the point everything is
-    # measured from, so the real game's 0.9 m of eye offset would aim these punches under a floor-level target.
+    # The real 0.9 m eye offset, not 0: the fake corridor's altars and skulls now stand at the heights the
+    # game's do (a zone transform 1.9 m up, its collider centre a metre below that), so a punch aimed from the
+    # camera is a level shot and one aimed from `player.pos` -- or at `altars[].pos` -- is 25-27 degrees out
+    # and misses. That is the whole point: the fake has to be able to fail the way the game did.
     args = script.parse_args(["--level", corridor.LEVEL, "--target", *PEDESTAL, "--altar", *ALTAR,
-                              "--gate", corridor.SKULL_GATE_KEY, "--camera-height", "0", *extra])
+                              "--gate", corridor.SKULL_GATE_KEY, *extra])
     cfg = script.build_config(args)
     if cfg_overrides:
         cfg = replace(cfg, **cfg_overrides)

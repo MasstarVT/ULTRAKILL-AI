@@ -26,15 +26,18 @@ from ultrakill_ai.campaign import (  # noqa: E402
     GateProgress,
     MilestoneTracker,
     PathProgress,
+    altar_aim_point,
     choose_fresh_start,
     choose_level,
     compute_rank,
+    dead_twin,
     grade,
     level_weights,
     read_curriculum,
     safe_name,
     save_best_run,
     unlock_next,
+    wanting_altars,
 )
 
 RANKS = {"time": [300, 240, 180, 120], "kills": [10, 20, 30, 40], "style": [1000, 2000, 3000, 4000]}
@@ -891,7 +894,9 @@ def test_subgoal_walks_fetch_then_carry_then_the_gate():
     carried = dict(PEDESTAL, held=True, placed=False, placed_in=None)
     carry = targeted(skull_block(altars=[LIVE_ALTAR, DEAD_TWIN], items=[carried, DECORATION]))
     assert carry["subgoal"] == SUBGOAL_ALTAR and carry["key"] == f"altar:SkullRed:{GATE_KEY}"
-    assert carry["pos"] == [0.0, -6.76, 381.0], "the live altar, never the dead twin"
+    assert carry["item"] == "SkullRed", "the held type, so carry protection and release share one source"
+    assert carry["pos"] == [0.0, -7.76, 381.0], \
+        "the live altar, never the dead twin -- and its COLLIDER centre, 1 m under the reported position"
 
     placed = item("81,-2,275", (0.0, -6.86, 381.0), "SkullRed", placed_in="0,-7,381")
     done = skull_block(altars=[dict(LIVE_ALTAR, filled=True), DEAD_TWIN], items=[placed], filled_gate=True)
@@ -971,6 +976,62 @@ def test_the_dead_twin_never_becomes_the_target_after_a_placement():
     camp = skull_block(altars=[dict(LIVE_ALTAR, filled=True), DEAD_TWIN], items=[placed], needs="SkullRed")
     target = targeted(camp)
     assert target["key"] == GATE_KEY and "subgoal" not in target
+
+
+def test_an_altar_is_aimed_at_its_collider_centre_not_its_transform():
+    """F2. `Punch.AltHit` only places when the ray hits the GameObject carrying the `ItemPlaceZone`, and every
+    one of the campaign's 104 zones is the same prefab: a trigger box of local size (2.2, 3.5, 2.2) centred at
+    (0, -1.25, 0) on a transform scaled (0.9, 0.8, 0.8). The collider centre is therefore 1 m below the reported
+    position, which is itself only 0.4 m under the box lid. Aiming at the reported position did not place in
+    game; aiming ~1.25 m below it did.
+    """
+    assert altar_aim_point(LIVE_ALTAR) == [0.0, -7.76, 381.0], "no aim_pos: the measured 1 m drop"
+    exact = dict(LIVE_ALTAR, aim_pos=[0.0, -7.6, 381.0])
+    assert altar_aim_point(exact) == [0.0, -7.6, 381.0], "the mod's own figure wins, so the odd zone is right too"
+
+    carried = dict(PEDESTAL, held=True, placed=False, placed_in=None)
+    camp = skull_block(altars=[exact, DEAD_TWIN], items=[carried, DECORATION])
+    assert targeted(camp)["pos"] == [0.0, -7.6, 381.0], "and it is what the carry leg walks to and aims at"
+
+
+def test_a_dead_twin_is_judged_relative_to_its_twins_not_against_a_constant():
+    """F3/M14. `inactive_ancestors` counts the zone's chain PLUS whatever of the room above it is switched off,
+    so it shifts when the room lights: measured on 1-1, the live altar and its twin read 1/2 on a fresh load and
+    0/1 after the checkpoint respawn switched that room on. The old absolute test (`> 1`) therefore stopped
+    filtering the twin exactly when the player arrived, and the gate kept `needs_item` however often the puzzle
+    was solved. A shared room contributes equally to both halves, so the relative test cannot be shifted.
+    """
+    def pair(live_anc, twin_anc, *, live_filled=False):
+        live = dict(LIVE_ALTAR, inactive_ancestors=live_anc, filled=live_filled)
+        twin = dict(DEAD_TWIN, inactive_ancestors=twin_anc)
+        return live, twin, [live, twin]
+
+    for live_anc, twin_anc in ((1, 2), (0, 1), (2, 3)):  # fresh load, room lit, and a room off two levels deep
+        live, twin, altars = pair(live_anc, twin_anc)
+        assert not dead_twin(live, altars) and dead_twin(twin, altars), f"{live_anc}/{twin_anc}"
+
+    # The bug itself: with the live half FILLED the twin must still be filtered, or the lock never clears.
+    live, twin, altars = pair(0, 1, live_filled=True)
+    camp = {"altars": altars}
+    assert wanting_altars(camp, "SkullRed") == [], "nothing still wants a red skull: the gate is solved"
+
+    # A lone zone under a switched-off room is NOT a twin, however many inactive ancestors it reports. The old
+    # rule dropped it at 2 and would have lost the lock entirely.
+    lonely = dict(LIVE_ALTAR, inactive_ancestors=4)
+    assert not dead_twin(lonely, [lonely])
+    assert wanting_altars({"altars": [lonely]}, "SkullRed") == [lonely]
+
+    # Same item and counts but a different door set, or a different position: two puzzles, not a pair.
+    elsewhere = altar("500,0,500", (500.0, 0.0, 500.0), "SkullRed", ancestors=3)
+    assert not dead_twin(elsewhere, [LIVE_ALTAR, elsewhere]), "far away: not a co-located twin"
+    other_door = dict(DEAD_TWIN, doors=[{"key": "9,9,9", "pos": [0.0, 0.0, 0.0]}])
+    assert not dead_twin(other_door, [LIVE_ALTAR, other_door]), "drives another door: its own lock"
+
+    # An older mod sends no inactive_ancestors at all: every entry reads 0, nothing is strictly fewer, and the
+    # filter is inert.
+    bare = [{"key": "a", "pos": [0.0, 0.0, 0.0], "item": "SkullRed", "filled": False, "doors": []},
+            {"key": "a#2", "pos": [0.0, 0.0, 0.0], "item": "SkullRed", "filled": False, "doors": []}]
+    assert [dead_twin(a, bare) for a in bare] == [False, False]
 
 
 def test_subgoal_returns_the_gate_when_there_is_nothing_to_fetch():

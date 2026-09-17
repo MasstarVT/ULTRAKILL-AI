@@ -20,13 +20,13 @@ from ultrakill_ai.campaign import (
     GateProgress,
     MilestoneTracker,
     PathProgress,
+    altar_aim_point,
     choose_fresh_start,
     choose_level,
     compute_rank,
     read_curriculum,
     safe_name,
     save_best_run,
-    wanting_altars,
 )
 from ultrakill_ai.protocol import DEFAULT_PORT, BridgeClient
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
@@ -70,6 +70,10 @@ class EnvConfig:
 
     # Episodes
     max_steps: int = 4500  # 5 minutes of game time at 15 decisions/s
+    # Per-level override of `max_steps`, keyed by scene name, for a `levels` ladder whose rungs are not the same
+    # size (1-1 is ~4x 0-1). Empty -- the default -- means every level uses `max_steps`, unchanged. A level that
+    # is not named here falls back to `max_steps`, so only the exceptions have to be listed.
+    max_steps_per_level: dict[str, int] = field(default_factory=dict)
     max_wave: int = 0  # Cyber Grind curriculum: end the episode once this many waves are cleared (0 = off)
     hard_reset_above_wave: int = 5  # reload the arena once waves get this far, so training keeps seeing early waves
     auto_enter_arena: bool = True  # Cyber Grind: put the player into the arena on reset so wave 1 starts
@@ -106,6 +110,7 @@ class EnvConfig:
     gate_hops_min_frac: float = 0.5  # share of gates that must carry `hops` before the ladder is trusted at all
     # Skull carry. 0 disables both carry-protection rules; they are inert on any level with no ItemPlaceZone.
     subgoal_punch_range_m: float = 4.0  # Punch.ActiveFrame's own 4 m reach: inside it a punch can pick up or place
+    camera_height_m: float = 0.9  # metres from player.pos up to the camera, where every ray starts (see _eye)
     target_kind_slots: bool = False  # repurpose the target's `open`/`locked` slots as "is an item"/"is an altar"
     # The absorbing slowMode/heavyFall movement state: airborne forever, stamina frozen, a 0.477 m/s creep.
     wedge_seconds: float = 3.0  # game seconds wedged before the episode ends (0 = no end, the steps are still counted)
@@ -403,7 +408,7 @@ class UltrakillEnv(gym.Env):
             truncated, reason = True, "wedged"
         elif stuck:
             truncated, reason = True, "stuck"
-        elif self._steps >= self.cfg.max_steps:
+        elif self._steps >= self._max_steps():
             truncated, reason = True, "max_steps"
         self._last_end_reason = reason
 
@@ -516,6 +521,33 @@ class UltrakillEnv(gym.Env):
             return [yaw_cmd, pitch_cmd]
         return None
 
+    def _max_steps(self) -> int:
+        """`max_steps`, or this level's own cap when `max_steps_per_level` names it. Read per step, not cached,
+        because a `levels` ladder switches `self.level` between episodes."""
+        return int(self.cfg.max_steps_per_level.get(self.level, self.cfg.max_steps))
+
+    def _eye(self, player: dict[str, Any]) -> tuple[float, float, float]:
+        """Where the camera is: `cc.GetDefaultPos()`, `camera_height_m` above `player.pos`.
+
+        Everything a punch or a shot does starts here, not at the player transform. `Punch.ActiveFrame`
+        (`decompiled/Punch.cs:562`) rays from `cc.GetDefaultPos()` along camera forward for 4 m, so both the aim
+        and the reach test have to be measured from this point. `player.pos` is `NewMovement.transform.position`,
+        which sits at the feet; the mod reports no camera position of its own, so the offset is a constant here.
+        Measured in game on 1-1's red pedestal, 2026-09-17: at 1.57 m a command pitch of -3.0 picks the skull up
+        and +27.0 -- what aiming from `player.pos` asks for -- does not; at 2.71 m, +8.0 works and +11.3 does
+        not. Both solve to 0.88-0.90 m.
+
+        The error this removes is entirely a short-range one, and it is the whole answer at punch range:
+        atan(0.9/r) is 29.8 degrees at 1.57 m, 5.1 at 10 m, 1.7 at 30 m. So a gate 10-30 m off moves by a couple
+        of degrees, well inside the aim tolerance, and moves in the correct direction -- a camera 0.9 m above the
+        feet really does have to look slightly DOWN at a door sill at its own feet's height.
+
+        A future mod field (`player.cam_pos`) would make this exact for a crouched or sliding player, whose
+        camera is lower; until then `camera_height_m` overrides it and 0 restores the old feet-relative aim.
+        """
+        x, y, z = player["pos"]
+        return (x, y + self.cfg.camera_height_m, z)
+
     def _look_at_target(self, prev: dict[str, Any], wide: bool = False) -> list[float] | None:
         """Look mode 2: turn toward the route target, the same object packed into the observation's target slots.
 
@@ -524,6 +556,10 @@ class UltrakillEnv(gym.Env):
         means "off" everywhere else in this codebase, so the band falls back to the game's own clamp rather than
         welding the camera level.
 
+        The aim is taken from the camera (`_eye`), not from `player.pos`: at punch range the 0.9 m between them
+        is a ~30 degree pitch error and the ray passes clean over the target, which is why the skull leg could
+        never place before this. Yaw is unaffected -- only the height differs.
+
         `wide` takes the same exemption look mode 1 already takes for an enemy overhead: a sub-goal a metre away
         at floor level needs a steeper look than the campaign band's 45 degrees, so inside punch range the band
         is the game's own clamp instead and the ray can actually reach the cube.
@@ -531,7 +567,7 @@ class UltrakillEnv(gym.Env):
         player, target = prev.get("player"), self.gates.target
         if not player or not target or not target.get("pos"):
             return None
-        pos, tp = player["pos"], target["pos"]
+        pos, tp = self._eye(player), target["pos"]
         gx, gy, gz = yaw_frame((tp[0] - pos[0], tp[1] - pos[1], tp[2] - pos[2]), player["yaw"])
         if math.sqrt(gx * gx + gy * gy + gz * gz) <= 1e-6:
             return None
@@ -543,22 +579,26 @@ class UltrakillEnv(gym.Env):
         return [yaw_cmd, max(-PITCH_CAP, min(PITCH_CAP, target_pitch - p))]
 
     def _near_subgoal(self, prev: dict[str, Any], kinds: tuple[str, ...]) -> bool:
-        """Whether the current target is a sub-goal of one of `kinds` and the player is within punch range of it."""
+        """Whether the current target is a sub-goal of one of `kinds` and the player is within punch range of it.
+
+        Measured from the camera (`_eye`), because the 4 m the punch reaches is 4 m from `cc.GetDefaultPos()`.
+        """
         if self.cfg.mode != "campaign" or self.cfg.subgoal_punch_range_m <= 0:
             return False
         target, player = self.gates.target, prev.get("player")
         if not target or not player or target.get("subgoal") not in kinds or not target.get("pos"):
             return False
-        return math.dist(player["pos"], target["pos"]) <= self.cfg.subgoal_punch_range_m
+        return math.dist(self._eye(player), target["pos"]) <= self.cfg.subgoal_punch_range_m
 
     def _near_filled_altar(self, prev: dict[str, Any]) -> bool:
         """Whether a solved altar is within punch range: punching one takes the skull back out."""
         player = prev.get("player")
         if not player:
             return False
+        eye = self._eye(player)
         for altar in ((prev.get("campaign") or {}).get("altars") or ()):
             if (isinstance(altar, dict) and altar.get("filled") and altar.get("pos")
-                    and math.dist(player["pos"], altar["pos"]) <= self.cfg.subgoal_punch_range_m):
+                    and math.dist(eye, altar_aim_point(altar)) <= self.cfg.subgoal_punch_range_m):
                 return True
         return False
 
@@ -579,22 +619,33 @@ class UltrakillEnv(gym.Env):
         itself be sitting in some OTHER puzzle's filled altar, which is why that case is checked first). Every
         other press is dropped while a real carry is in progress or while a solved altar is in reach.
 
-        **A carry is a held item some live UNFILLED altar accepts**, not merely `any(items[].held)`. Both harms
-        above need a destination: a thrown item that nothing wants can simply be picked up again, and the
-        not-holding `ForceHold` branch is already covered by `_near_filled_altar`. Level 0-4 ships a `CustomKey1`
-        carryable and zero `ItemPlaceZone`s, so under the first rule picking the key up cost the agent its punch
-        -- parry, melee and the throw that would have given the button back -- for the rest of the carry, on a
-        level in the prelude curriculum. `campaign.wanting_altars` is the filter `GateProgress._subgoal` chooses
-        a destination with, so the two agree by construction.
+        **A carry is a held item THE CURRENT SUB-GOAL is carrying to an altar**, not merely `any(items[].held)`
+        and not "some live unfilled altar somewhere accepts it" either. Protection and release must come from
+        one source or the button can be taken away and never given back, and `GateProgress.target` is that
+        source: a press is kept when the player is within punch range of the altar sub-goal, so a press is only
+        ever DROPPED while such a sub-goal exists to walk to.
+
+        The two rejected keys, and why:
+          - `any(items[].held)`: Level 0-4 ships a `CustomKey1` carryable and zero `ItemPlaceZone`s, so picking
+            the key up cost the agent its punch -- parry, melee and the throw that would have given the button
+            back -- for the rest of the carry, on a level in the prelude curriculum;
+          - `campaign.wanting_altars` (gate-blind): Level 0-2's blue skull sits on the main route, and the only
+            zone that accepts it is behind the `altar_only` gate `-60,-6,236`, a **secret arena** whose `hops`
+            is null because it is off the exit chain entirely (checked against 0-2's door graph: its one
+            activated room `-60,-11,236` is nowhere on the pit chain). `_choose_target` skips `hops is None`
+            gates, so no sub-goal can ever exist for it -- and yet picking the skull up dropped the punch button
+            for the rest of the level, with `_near_subgoal` structurally unable to release it. Under the rule
+            here 0-2 simply never protects that carry: the agent keeps punch, may carry the skull or throw it
+            away freely, and loses nothing the route needs.
 
         The release is the spec's: within `subgoal_punch_range_m` of the sub-goal altar. That is deliberately
         narrower than "any altar that accepts this", because the SOURCE pedestal is itself an unfilled zone that
         accepts the item, and releasing next to it would let the very first press after the pickup throw the
         skull straight back down.
 
-        Inert with nothing carried and no filled altar nearby, so a level with no `ItemPlaceZone` -- and any mod
-        that sends no `altars`/`items` -- behaves exactly as before, and punch stays available as an attack and
-        a parry everywhere else. A removed press is not charged `RewardConfig.punch` either: the command the
+        Inert with no altar sub-goal and no filled altar nearby, so a level with no `ItemPlaceZone` -- and any
+        mod that sends no `altars`/`items` -- behaves exactly as before, and punch stays available as an attack
+        and a parry everywhere else. A removed press is not charged `RewardConfig.punch` either: the command the
         game receives is what the reward is computed from, here as for the slide latch.
         """
         if self.cfg.mode != "campaign" or self.cfg.subgoal_punch_range_m <= 0:
@@ -604,9 +655,10 @@ class UltrakillEnv(gym.Env):
         campaign = prev.get("campaign") or {}
         held = {i.get("item") for i in (campaign.get("items") or ())
                 if isinstance(i, dict) and i.get("held")}
-        if held and not wanting_altars(campaign, held):
-            return  # something is held, but nothing in the level accepts it: there is no carry to protect
-        carrying = bool(held)
+        target = self.gates.target or {}
+        # The one source of truth: an altar sub-goal for something actually held. `_near_subgoal` releases on
+        # the same target, so protection can never outlive the thing that would lift it.
+        carrying = bool(held) and target.get("subgoal") == SUBGOAL_ALTAR and target.get("item") in held
         keep = self._near_subgoal(prev, (SUBGOAL_ALTAR,)) if carrying else self._near_subgoal(prev, (SUBGOAL_ITEM,))
         if keep or not (carrying or self._near_filled_altar(prev)):
             return

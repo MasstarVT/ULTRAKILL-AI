@@ -461,40 +461,110 @@ SUBGOAL_ALTAR = "altar"
 
 
 def _live(entry: dict, *, need_active_self: bool = True) -> bool:
-    """Whether an `items[]` or `altars[]` entry is a real one rather than a decoration or a dead branch.
+    """Whether an `items[]` entry is a real carryable rather than a decoration or a dead branch.
 
     Measured on the scene files: a carryable source has `active_self` true and at most ONE inactive ancestor
     (its own room switch); two means it sits under a permanently disabled node. 1-1 ships three `ItemIdentifier`s
-    with `active_self` true, one of which is such a phantom, and every duplicate `ItemPlaceZone` pair is one live
-    zone plus one dead twin -- 20 of the campaign's 104 zones. A dead zone can never activate, so its `CheckItem`
-    never runs and it reads `filled: false` forever: counting one would leave a gate's lock set after the puzzle
-    was solved and send the agent to punch the skull back out of the altar it had just filled, closing the gate
-    again. Altars are tested with `need_active_self=False`, since a zone's own GameObject may legitimately be
-    switched off with its room.
+    with `active_self` true, one of which is such a phantom.
 
-    An older mod sends neither field, so both default to "usable" and nothing here changes its behaviour.
+    Altars are NOT tested with this any more -- see `dead_twin`, which replaced the absolute threshold after it
+    was measured shifting under the mod's feet. An older mod sends neither field, so both default to "usable"
+    and nothing here changes its behaviour.
     """
     if need_active_self and not entry.get("active_self", True):
         return False
     return int(entry.get("inactive_ancestors", 0) or 0) <= 1
 
 
+def _altar_identity(altar: dict) -> tuple:
+    """What makes two `altars[]` entries the same puzzle slot: item type, door set and rounded position.
+
+    The mod's own key is the rounded world position, with `#2`, `#3` ... appended when several zones round to
+    it, so stripping the suffix recovers the shared position key without re-rounding anything here.
+    """
+    doors = frozenset(d.get("key") for d in (altar.get("doors") or ()) if isinstance(d, dict))
+    return (altar.get("item"), doors, str(altar.get("key", "")).split("#")[0])
+
+
+def dead_twin(altar: dict, altars) -> bool:
+    """Whether `altar` is the dead half of a duplicated `ItemPlaceZone` pair, judged RELATIVE to its twins.
+
+    Every duplicate zone pair in the campaign is one live zone plus one dead twin -- 20 of the 104 zones. A dead
+    zone can never activate, so its `CheckItem` never runs and it reads `filled: false` forever: counting one
+    would leave a gate's lock set after the puzzle was solved and send the agent to punch the skull back out of
+    the altar it had just filled, closing the gate again.
+
+    The test used to be the absolute `inactive_ancestors > 1`, and that is the M14 bug: the number is not a
+    property of the zone, it is the zone's chain plus however much of the room above it happens to be switched
+    off, so it SHIFTS when the room lights. Measured in game on 1-1: on a fresh load the live altar `81,-4,251`
+    read 1 and its twin read 2, and after the checkpoint respawn switched that room on they read 0 and 1 -- so
+    the twin stopped being filtered exactly when the player arrived, and the gate kept `needs_item` forever
+    however many times the puzzle was solved.
+
+    The relative rule is immune to that shift, because a shared room contributes the same count to both halves
+    of a pair: a zone is dead when another zone with the same item type, the same door set and the same rounded
+    position reports STRICTLY FEWER inactive ancestors. The minimum of each group always survives, so a group
+    can never be filtered away entirely and a real lock can never be lost. Re-validated offline against all 21
+    altar levels: it drops the same 20 of 104 zones the old rule did, loses no lock on any level, and takes the
+    doors left stuck after a solved puzzle from 11 to 0 once a room lights (see CLAUDE.md).
+
+    Position is part of the identity because twins are co-located (~0.2 m apart, which is why the mod suffixes
+    the key at all). Without it the rule also drops five zones that are not twins at all but merely two separate
+    altars of one item type that drive no door -- 4-2 ×2, 4-3, 5-3 and 7-1.
+
+    An older mod sends no `inactive_ancestors`, so every entry reads 0, no zone is strictly fewer than another,
+    and nothing is filtered -- the unchanged behaviour.
+    """
+    ident = _altar_identity(altar)
+    mine = int(altar.get("inactive_ancestors", 0) or 0)
+    return any(other is not altar and _altar_identity(other) == ident
+               and int(other.get("inactive_ancestors", 0) or 0) < mine
+               for other in altars if isinstance(other, dict))
+
+
+ALTAR_AIM_DROP_M = 1.0
+"""Fallback metres BELOW `altars[].pos` to aim a punch, when the mod sends no `aim_pos`.
+
+`Punch.AltHit` only places when the ray hits the very GameObject that carries the `ItemPlaceZone`, and every
+one of the campaign's 104 zones is the same prefab: a trigger BoxCollider of local size (2.2, 3.5, 2.2) whose
+local centre is (0, -1.25, 0), on a transform scaled (0.9, 0.8, 0.8). So the collider's world centre sits
+1.25 * 0.8 = 1.0 m below `zone.transform.position` (103 of 104 zones; the one exception is 0.625 m), and the
+box spans `pos.y - 2.4 .. pos.y + 0.4` -- the reported position is only 0.4 m under the lid, with no margin,
+while the centre has 1.4 m of it. Measured in game on 1-1: aiming at the reported position does not place and
+aiming ~1.25 m below it does.
+"""
+
+
+def altar_aim_point(altar: dict) -> list[float]:
+    """Where to point a punch to fill `altar`: the zone's own collider centre.
+
+    Prefers the mod's `aim_pos` (computed from the real collider, so it is right even for the odd zone whose
+    scale differs) and falls back to ALTAR_AIM_DROP_M below `pos` against a mod that does not send it.
+    """
+    aim = altar.get("aim_pos")
+    if aim and len(aim) == 3:
+        return [float(v) for v in aim]
+    x, y, z = altar["pos"]
+    return [float(x), float(y) - ALTAR_AIM_DROP_M, float(z)]
+
+
 def wanting_altars(campaign: dict | None, items) -> list[dict]:
     """The live, unfilled `altars[]` entries that accept one of `items` (a type name or a set of them).
 
-    This is the filter a carry destination is chosen with, in one place because two callers must agree on it:
-    `GateProgress._subgoal` narrows it further to the altars wired to the gate it is trying to open, while
-    `UltrakillEnv._protect_carry` uses it as it stands -- a punch that throws what is held is only worth
-    dropping the button for when something, anywhere in the level, would accept the thing. Empty means the held
-    item has no destination at all (Level 0-4's `CustomKey1`, delivered by walking it into an `ItemTrigger`).
+    This is the filter a carry destination is chosen with, and it applies the same dead-twin rule the mod's
+    `CampaignObserver.NeedsItem` applies, so the two sides agree about which zone a gate is waiting on.
+    `GateProgress._subgoal` narrows it further to the altars wired to the gate it is trying to open. Empty
+    means the held item has no destination at all (Level 0-4's `CustomKey1`, delivered by walking it into an
+    `ItemTrigger`).
 
     An `altars` list the mod never sent reads as empty, so a 0.6.x mod, and every level with no `ItemPlaceZone`,
     gets the empty list and with it the unprotected, unchanged behaviour.
     """
     wanted = {items} if isinstance(items, str) else set(items)
-    return [a for a in ((campaign or {}).get("altars") or ())
-            if isinstance(a, dict) and a.get("pos") and a.get("item") in wanted
-            and not a.get("filled") and _live(a, need_active_self=False)]
+    altars = [a for a in ((campaign or {}).get("altars") or ()) if isinstance(a, dict)]
+    return [a for a in altars
+            if a.get("pos") and a.get("item") in wanted
+            and not a.get("filled") and not dead_twin(a, altars)]
 
 
 class GateProgress:
@@ -767,13 +837,17 @@ class GateProgress:
                 return gate  # no reachable source: fall back to the gate rather than pointing at nothing
             target, kind = self._nearest(free, pos), SUBGOAL_ITEM  # 1. fetch
         key = f"{kind}:{need}" if kind == SUBGOAL_ITEM else f"{kind}:{need}:{gate.get('key')}"
+        # An altar is aimed at, approached and range-tested at its COLLIDER centre, never at the transform
+        # position the mod reports as `pos`: `Punch.AltHit` has to hit the zone's own collider, and that
+        # position sits 0.4 m under its lid. See `altar_aim_point`. An item is aimed at where it is.
+        pos = altar_aim_point(target) if kind == SUBGOAL_ALTAR else list(target["pos"])
         # `open` and `locked` are 0.0 for every non-gate target, so with target_kind_slots on they carry "this is
         # an item" / "this is an altar" instead -- the width-preserving escape hatch, off by default because
         # turning it on changes what two learned input columns mean.
         kinds = self.target_kind_slots
-        return {"key": key, "pos": list(target["pos"]), "hops": gate.get("hops"),
+        return {"key": key, "pos": pos, "hops": gate.get("hops"),
                 "open": bool(kinds and kind == SUBGOAL_ITEM), "locked": bool(kinds and kind == SUBGOAL_ALTAR),
-                "active": True, "subgoal": kind, "gate_key": gate.get("key")}
+                "active": True, "subgoal": kind, "gate_key": gate.get("key"), "item": need}
 
 
 class PathProgress:

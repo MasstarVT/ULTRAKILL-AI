@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # campaign_check / wal
 import campaign_check  # noqa: E402
 import walk_to_exit  # noqa: E402
 
+from ultrakill_ai.campaign import altar_aim_point  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.spaces import BUTTONS, noop_action  # noqa: E402
 
@@ -65,7 +66,10 @@ go_to, wrap, heading_to, elevation_to = walk_to_exit.go_to, walk_to_exit.wrap, w
 
 CONFIG = ROOT / "configs" / "campaign_1-1.yaml"
 PEDESTAL = (81.0, -2.2, 275.0)   # Level 1-1's red skull, section 8 check 1's target
-ALTAR = (0.0, -6.76, 381.0)      # the altar it opens, section 8 check 2's target
+# The altar it opens, section 8 check 2's target: the zone's own transform position, as `altars[].pos` reports
+# it. The punch is NOT aimed here -- `altar_aim_point` moves it to the zone's collider centre a metre below,
+# which is why this no longer needs the hand-tuned `--altar 0 -8 381` the first in-game run used.
+ALTAR = (0.0, -6.76, 381.0)
 GATE_KEY = "20,-10,381"          # the door that altar unlocks
 PUNCH_RANGE = 4.0                # Punch.ActiveFrame's own reach, and EnvConfig.subgoal_punch_range_m's default
 PITCH_LIMIT = 85.0               # env.MODE1_PITCH_LIMIT: the game's own clamp, which section 6.7 rule 2 uses here
@@ -76,7 +80,9 @@ AIM_TOL = 8.0                    # degrees of aim error a 4 m ray still lands a 
 # pedestal, 2026-09-17: at 1.57 m of flat range a command pitch of -3.0 picks it up and +27.0 (what aiming from
 # `player.pos` asks for) does not; at 2.71 m, +8.0 works and +11.3 does not. Both solve to 0.88-0.90 m, and the
 # band is only a couple of degrees wide at 2.7 m, so this is not a detail that can be left approximate.
-CAMERA_HEIGHT = 0.9
+# Taken from the env, which aims look mode 2 from the same point: check 2's punch spam runs through env.step,
+# so the two must agree or the script and the thing it is checking are not measuring the same geometry.
+CAMERA_HEIGHT = EnvConfig.camera_height_m
 CREEP_RANGE = 2.0                # stop walking this close and only aim, so the last step cannot overshoot
 CHECKPOINT_STEPS = 40            # decisions to wait on a checkpoint we teleported onto (under 3 game seconds)
 CHECKPOINT_RADIUS = 3.0          # metres within which a checkpoints[] entry is the one --from-checkpoint means
@@ -128,7 +134,8 @@ def build_config(args: argparse.Namespace) -> EnvConfig:
     """
     env = dict((yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}).get("env", {}))
     env.update(level=args.level, port=args.port, fresh_start_prob=1.0, explore_dir="", best_runs_dir="",
-               render=bool(args.render), soft_death=False, max_steps=10_000_000)
+               render=bool(args.render), soft_death=False, max_steps=10_000_000,
+               camera_height_m=args.camera_height)
     if args.fixed_fps:
         env["fixed_fps"] = args.fixed_fps
     if args.frameskip:
@@ -321,17 +328,25 @@ def check_placement(env: UltrakillEnv, args: argparse.Namespace, key: str | None
     if key is None:
         return SKIP, "needs the skull picked up in check 1"
     target = list(args.altar)
+    # Walk to and aim at the zone's COLLIDER CENTRE, not the transform position `--altar` names: a placement
+    # punch has to hit the zone's own collider, and that position sits 0.4 m under its lid (altar_aim_point).
+    # Looked up before the drive, because the altars array is sent every step whatever the distance.
+    found, _ = nearest_entry(env._raw, "altars", target)
+    aim = altar_aim_point(found) if found else list(target)
+    args.altar_aim = aim  # check 3 takes the skull back out at the same point
     staged = stage(env, args.altar_approach) if args.altar_approach else ""
-    raw, used, done = drive(env, "altar", target, args)
+    raw, used, done = drive(env, "altar", aim, args)
     if done:
-        return FAIL, f"the level ended while carrying the skull to {vec(target)}"
+        return FAIL, f"the level ended while carrying the skull to {vec(aim)}"
     altar, dist = nearest_entry(raw, "altars", target)
     if altar is None:
         return FAIL, (f"walked {used} decisions; no altars[] entry within {MATCH_RADIUS:.0f} m of {vec(target)} "
                       f"(nearest is {dist:.1f} m away, of {len(entries(raw, 'altars'))} in the level)"
                       + (f"\n      {staged}" if staged else ""))
     altar_key = altar.get("key")
-    raw, fired, filled = face_and_punch(env, target, lambda r: bool((by_key(r, "altars", altar_key) or {}).get("filled")),
+    aim = altar_aim_point(altar)
+    args.altar_aim = aim
+    raw, fired, filled = face_and_punch(env, aim, lambda r: bool((by_key(r, "altars", altar_key) or {}).get("filled")),
                                         height=args.camera_height)
 
     def state(r: dict[str, Any]) -> str:
@@ -345,7 +360,7 @@ def check_placement(env: UltrakillEnv, args: argparse.Namespace, key: str | None
         text += f", item: {describe_item(by_key(r, 'items', key))}"
         return text
 
-    at_place = state(raw)
+    at_place = state(raw) + f"\n      aimed at the collider centre {vec(aim)}, reported pos {vec(target)}"
     gate = gate_by_key(raw, args.gate) if args.gate else None
     ok = filled and (gate is None or not gate.get("needs_item"))
     detail = f"walked {used} decisions, {fired} aimed punches\n      at the placement: {at_place}"
@@ -394,7 +409,8 @@ def check_death(env: UltrakillEnv, args: argparse.Namespace, key: str | None) ->
     kind = (item or {}).get("item")
     # Re-acquire by punching the filled altar: AltHit's not-holding branch ForceHolds whatever it hits, including
     # a skull resting in a zone. Driven through env.client, so the env's own gating does not block the probe.
-    raw, fired, held = face_and_punch(env, list(args.altar), lambda r: bool((by_key(r, "items", key) or {}).get("held")),
+    raw, fired, held = face_and_punch(env, list(getattr(args, "altar_aim", None) or args.altar),
+                                      lambda r: bool((by_key(r, "items", key) or {}).get("held")),
                                       height=args.camera_height)
     if not held:
         return SKIP, (f"could not take the skull back out of the altar in {fired} aimed punches, so there was "

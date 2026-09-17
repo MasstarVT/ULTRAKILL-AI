@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 import tempfile
 from pathlib import Path
@@ -35,8 +36,15 @@ WEDGE_HOLD = 45  # wedge_seconds 3.0 at 30 fps / frameskip 2 = 15 decisions/s
 # skull that starts INSIDE an ItemPlaceZone (every ItemIdentifier on 1-1 does).
 SKULL_GATE_KEY, SKULL_GATE_POS = "0,1,50", (0.0, 1.0, 50.0)
 SKULL_GATES = ((SKULL_GATE_KEY, SKULL_GATE_POS, 0),)
-PEDESTAL_KEY, PEDESTAL_POS = "0,1,20", (0.0, 1.0, 20.0)
-ALTAR_KEY, ALTAR_POS = "0,1,40", (0.0, 1.0, 40.0)
+# The altars stand like the game's. `pos` is the zone's transform, 1.9 m above this corridor's floor (y 1);
+# `aim_pos` is its collider centre, the metre below that a placement punch has to hit, which for a player on
+# the floor is exactly eye height (1 + camera_height_m). A skull on a pedestal, or resting in an altar, sits at
+# that same centre -- so every one of these legs is a level shot, as it is in the real game.
+PEDESTAL_KEY, PEDESTAL_POS = "0,1,20", (0.0, 2.9, 20.0)
+ALTAR_KEY, ALTAR_POS = "0,1,40", (0.0, 2.9, 40.0)
+ALTAR_AIM_POS = (0.0, 1.9, 40.0)
+PEDESTAL_ITEM_POS = (0.0, 1.9, 20.0)  # where the source skull actually is, which is what a pickup aims at
+ALTAR_ITEM_POS = (0.0, 1.9, 40.0)     # and where it sits once placed
 DEAD_TWIN_KEY = "0,1,40#2"
 ALTAR_ITEM = "SkullRed"  # what every ItemPlaceZone in the skull room accepts; FakeLevel.item_type is what exists
 PUNCH_RANGE = 4.0  # Punch.ActiveFrame's own reach, and EnvConfig.subgoal_punch_range_m's default
@@ -98,6 +106,8 @@ class FakeLevel:
         self.skulls = False
         self.skull_fields = True
         self.altars_present = True
+        self.altar_aim_pos = True  # False is a mod that sends no aim_pos: the Python fallback drop is used
+        self.skull_gate_offladder = False  # 0-2's shape: the altar gate is off the exit chain, so hops is null
         self.item_type = ALTAR_ITEM
         self.item_active = True
         self.picked_up = 0  # times a punch picked the skull up, and times one threw it: the physical events
@@ -129,7 +139,7 @@ class FakeLevel:
         self.skull_key = "skull"
         self.skull_held = False
         self.skull_in: str | None = PEDESTAL_KEY if self._zone_accepts() else None
-        self.skull_pos = list(PEDESTAL_POS)
+        self.skull_pos = list(PEDESTAL_ITEM_POS)
         self.seconds = 0.0
         self.kills = 0
         self.restarts = 0
@@ -176,7 +186,7 @@ class FakeLevel:
             self.skull_key = f"skull#{self.restarts}"
             self.skull_held = False
             self.skull_in = PEDESTAL_KEY if self._zone_accepts() else None
-            self.skull_pos = list(PEDESTAL_POS)
+            self.skull_pos = list(PEDESTAL_ITEM_POS)
         else:
             self._load()
         self.enemy_alive = True  # a fresh load or a checkpoint respawn both re-create the room's enemy
@@ -187,7 +197,7 @@ class FakeLevel:
         """What `Punch.AltHit` does: place if holding and in reach of a zone, else throw; pick up if not holding."""
         if self.skull_held:
             if self._zone_accepts() and abs(self.z - ALTAR_POS[2]) <= PUNCH_RANGE:
-                self.skull_held, self.skull_in, self.skull_pos = False, ALTAR_KEY, list(ALTAR_POS)
+                self.skull_held, self.skull_in, self.skull_pos = False, ALTAR_KEY, list(ALTAR_ITEM_POS)
             else:  # ActiveStart throws whatever it is holding when the active frame did not place it
                 self.skull_held, self.skull_in, self.skull_pos = False, None, [0.0, self.y, self.z]
                 self.thrown += 1
@@ -229,7 +239,9 @@ class FakeLevel:
         if not self.gates_present:
             return {}
         gates = [{
-            "key": key, "pos": list(pos), "hops": hops if self.gates_ordered else None,
+            "key": key, "pos": list(pos),
+            "hops": None if (not self.gates_ordered or (self.skull_gate_offladder and key == SKULL_GATE_KEY))
+            else hops,
             "open": abs(self.z - pos[2]) <= 8.0,  # the DoorController proximity trigger
             "locked": False, "active": True, "controller_active": True,
         } for key, pos, hops in self.gates]
@@ -246,16 +258,19 @@ class FakeLevel:
         """`campaign.altars` and `campaign.items`, or nothing at all against a mod older than 0.7.0."""
         if not self.skulls or not self.skull_fields:
             return {}
-        def zone(key, pos, filled, doors, ancestors=1):
-            return {"key": key, "pos": list(pos), "item": ALTAR_ITEM, "filled": filled, "active": True,
-                    "inactive_ancestors": ancestors, "reverse_doors": [],
-                    "doors": [{"key": k, "pos": list(SKULL_GATE_POS)} for k in doors]}
+        def zone(key, pos, filled, doors, ancestors=1, aim=None):
+            z = {"key": key, "pos": list(pos), "item": ALTAR_ITEM, "filled": filled, "active": True,
+                 "inactive_ancestors": ancestors, "reverse_doors": [],
+                 "doors": [{"key": k, "pos": list(SKULL_GATE_POS)} for k in doors]}
+            if aim is not None and self.altar_aim_pos:
+                z["aim_pos"] = list(aim)
+            return z
         altars = [
             # The pedestal drives no door and reads filled the moment its room switches on (31 zones
             # campaign-wide do); the live destination altar opens the gate; the dead twin never can.
             zone(PEDESTAL_KEY, PEDESTAL_POS, self.skull_in == PEDESTAL_KEY, ()),
-            zone(ALTAR_KEY, ALTAR_POS, self.skull_in == ALTAR_KEY, (SKULL_GATE_KEY,)),
-            zone(DEAD_TWIN_KEY, ALTAR_POS, False, (SKULL_GATE_KEY,), ancestors=2),
+            zone(ALTAR_KEY, ALTAR_POS, self.skull_in == ALTAR_KEY, (SKULL_GATE_KEY,), aim=ALTAR_AIM_POS),
+            zone(DEAD_TWIN_KEY, ALTAR_POS, False, (SKULL_GATE_KEY,), ancestors=2, aim=ALTAR_AIM_POS),
         ]
         return {
             "altars": altars if self.altars_present else [],
@@ -929,7 +944,9 @@ def test_look_mode_gate_turns_toward_the_target():
     env, fake = make_env()
     env.reset(seed=0)
     env.step(action(look_mode=2))
-    assert fake.last_action["look"] == [0.0, 0.0]  # the hops 2 gate is straight ahead
+    # The hops-2 gate is straight ahead; the pitch is the camera's own 0.9 m over the sill 15 m away, which is
+    # 3.4 degrees down. See test_look_mode_2_aims_from_the_camera_not_from_the_feet.
+    assert fake.last_action["look"][0] == 0.0 and abs(fake.last_action["look"][1] + 3.43) < 0.01
     fake.yaw = 90.0  # facing +x, so the gate along +z is on the left
     settle(env)
     env.step(action(look_mode=2))
@@ -947,6 +964,57 @@ def test_look_mode_gate_turns_toward_the_target():
     banded.step(action(look_mode=2))
     assert abs(fake.last_action["look"][1] - 5.0) < 1e-6
     banded.close()
+
+
+def test_look_mode_2_aims_from_the_camera_not_from_the_feet():
+    """F1. `Punch.ActiveFrame` rays from `cc.GetDefaultPos()` -- the camera, 0.9 m above `player.pos` -- so an
+    aim computed from the player transform points the ray straight over a target at its own feet's height.
+
+    At punch range that is the whole answer: atan(0.9/1.5) is 31 degrees, and it is why the skull leg could
+    never place. In the far field it is small and in the RIGHT direction: a camera 0.9 m up really does have to
+    look slightly down at a door sill on its own floor -- atan(0.9/10) = 5.1 degrees, atan(0.9/30) = 1.7.
+    """
+    env, fake = make_env()
+    env.reset(seed=0)
+    env.step(action(look_mode=2))  # the hops-2 gate: same y, 15 m down the corridor
+    far = fake.last_action["look"]
+    assert far[0] == 0.0, "yaw is unaffected: only the height of the ray's origin changed"
+    assert abs(far[1] - -math.degrees(math.atan2(0.9, 15.0))) < 1e-9 and abs(far[1] + 3.43) < 0.01
+    env.close()
+
+    # The same geometry at punch range, and the same aim taken from the feet, for the size of what was wrong.
+    # gate_reach_m is shrunk only so standing 3 m from the gate is not "reaching" it and retargeting.
+    near, fake = make_env(gate_reach_m=0.5, gate_reach_v_m=0.5)
+    near.reset(seed=0)
+    fake.z = 12.0  # 3 m short of the gate, close enough to punch and inside one decision's 20 degrees
+    settle(near)
+    near.step(action(look_mode=2))
+    assert abs(fake.last_action["look"][1] + math.degrees(math.atan2(0.9, 3.0))) < 1e-9
+    assert abs(fake.last_action["look"][1] + 16.70) < 0.01, "16.7 degrees at 3 m, and 31 at 1.5 m (PITCH_CAP 20)"
+    near.close()
+
+    feet, fake = make_env(camera_height_m=0.0, gate_reach_m=0.5, gate_reach_v_m=0.5)  # the override
+    feet.reset(seed=0)
+    fake.z = 12.0
+    settle(feet)
+    feet.step(action(look_mode=2))
+    assert fake.last_action["look"] == [0.0, 0.0], "aimed from the feet the gate is exactly level: the old bug"
+    feet.close()
+
+
+def test_look_mode_1_is_already_camera_relative_and_is_left_alone():
+    """F1, the other half: verified rather than assumed. `enemies[].rel` is `cam.InverseTransformPoint(centre)`
+    (ObservationBuilder.cs:246), i.e. already measured FROM the camera, so mode 1 needs no eye correction and
+    must not be given one -- adding 0.9 m there would introduce the very error mode 2 had.
+    """
+    for height in (0.0, 0.9, 5.0):
+        env, fake = make_env(camera_height_m=height)
+        env.reset(seed=0)
+        fake.enemy_rel = [0.0, 0.0, 5.0]  # dead ahead in camera space, 5 m out
+        settle(env)
+        env.step(action(look_mode=1))
+        assert fake.last_action["look"] == [0.0, 0.0], f"camera_height_m {height} must not move mode 1"
+        env.close()
 
 
 def test_look_mode_is_popped_from_the_command():
@@ -997,6 +1065,32 @@ def test_look_mode_counters_record_the_mode_that_applied():
     assert fake.last_action["look"] == [90.0, 0.0], "the geometry aimed this step"
     assert abs(info["look_enemy_frac"] - 10 / 11) < 1e-9 and abs(info["look_free_frac"] - 1 / 11) < 1e-9
     assert info["yaw_track"] == 0.0, "an aimed step would score ~1.0 by construction, so it is not a sample"
+    env.close()
+
+
+def test_max_steps_can_be_set_per_level():
+    """F5. A `levels` ladder's rungs are not the same size, so one cap for all of them is either too short for
+    the long level or too generous for the short one. Empty (the default) is the unchanged single cap.
+    """
+    env, _ = make_env(max_steps=4)
+    env.reset(seed=0)
+    assert env._max_steps() == 4, "no override: max_steps, exactly as before"
+    for _ in range(4):
+        _, _, _, truncated, info = env.step(forward())
+    assert truncated and info["end_reason"] == "max_steps"
+    env.close()
+
+    env, _ = make_env(max_steps=4, max_steps_per_level={LEVEL: 8})
+    env.reset(seed=0)
+    assert env._max_steps() == 8
+    for _ in range(4):
+        _, _, _, truncated, _ = env.step(forward())
+    assert not truncated, "this level's own cap is what applies"
+    env.close()
+
+    env, _ = make_env(max_steps=4, max_steps_per_level={"Level 9-9": 8})
+    env.reset(seed=0)
+    assert env._max_steps() == 4, "a level the table does not name falls back to max_steps"
     env.close()
 
 
@@ -1271,13 +1365,61 @@ def test_look_mode_2_is_forced_within_punch_range_of_a_subgoal():
     env, fake = skull_env(max_steps=40)
     env.reset(seed=0)
     fake.yaw = 90.0  # facing +x, so the sub-goal down the corridor is a left turn
-    for _ in range(8):  # decisions taken from z 0..14, all more than 4 m from the pedestal at z 20
+    for _ in range(8):  # decisions taken from z 0..14, all more than 4 m from the pedestal skull at z 20
         env.step(action(move=True, yaw=30.0))
     assert fake.last_action["look"] == [30.0, 0.0], "look mode 0: the sampled bins drove the camera"
     _, _, _, _, info = env.step(action(move=True, yaw=30.0))  # taken from z 16, inside 4 m
     assert fake.last_action["look"][0] < 0.0, "the env took the camera regardless of the sampled look mode"
     assert info["look_gate_frac"] > 0.0
     env.close()
+
+
+def test_the_carry_leg_aims_at_the_altars_collider_centre():
+    """F2. A placement punch has to hit the zone's own collider, and the position the block reports sits 0.4 m
+    under its lid with no margin. The mod's `aim_pos` is the collider centre; without it the measured 1 m drop
+    is used. Both the aim and the range test have to use it, or the agent stands at a spot the punch cannot
+    reach and points over the top of the altar from there.
+    """
+    env, fake = skull_env(max_steps=40)
+    env.reset(seed=0)
+    walk(env, 10, punch=True)  # picked up on the way past the pedestal
+    assert fake.skull_held
+    target = env.gates.target
+    assert target["subgoal"] == "altar" and target["pos"] == list(ALTAR_AIM_POS), "the collider centre, not pos"
+    env.close()
+
+    old_mod, fake = skull_env(max_steps=40, skulls=dict())
+    fake.altar_aim_pos = False  # a mod that sends no aim_pos at all
+    old_mod.reset(seed=0)
+    walk(old_mod, 10, punch=True)
+    assert old_mod.gates.target["pos"] == [ALTAR_POS[0], ALTAR_POS[1] - 1.0, ALTAR_POS[2]], "the fallback drop"
+    old_mod.close()
+
+
+def test_an_off_ladder_altar_never_takes_the_punch_button_away():
+    """F4, Level 0-2's trap. Its blue skull sits on the main route; the only zone that accepts it is behind the
+    `altar_only` gate `-60,-6,236`, a SECRET ARENA whose `hops` is null because it is off the exit chain (its
+    one activated room `-60,-11,236` appears nowhere in 0-2's pit chain). `_choose_target` skips `hops is None`
+    gates, so no sub-goal can ever exist for it.
+
+    The old key was `campaign.wanting_altars`, which does not look at gates at all: picking the skull up dropped
+    the punch button, and `_near_subgoal` could never give it back, because releasing needs a sub-goal target
+    that 0-2 cannot produce. Punch is parry, melee and the throw that would have got rid of the skull, so it was
+    gone for the rest of the level. Keying both halves on the sub-goal makes that unrepresentable.
+    """
+    env, fake = skull_env(max_steps=60)
+    fake.skull_gate_offladder = True
+    env.reset(seed=0)
+    assert env.gates.target is None, "no targetable gate: 0-2 has nothing to build a sub-goal from"
+    assert env._raw["campaign"]["altars"], "and yet the level does ship an altar that accepts the skull"
+
+    kept = 0
+    for _ in range(14):  # walks z 0 -> 28, over the skull at z 20, pressing punch on every decision
+        env.step(action(move=True, buttons=("punch",)))
+        kept += "punch" in fake.last_action["buttons"]
+    env.close()
+    assert kept == 14, "every press reached the game: nothing was ever protected, so nothing can be stuck"
+    assert fake.picked_up >= 1 and fake.thrown >= 1, "picked up by punching and thrown away by punching"
 
 
 def test_a_subgoal_target_packs_through_the_unchanged_479_observation():
