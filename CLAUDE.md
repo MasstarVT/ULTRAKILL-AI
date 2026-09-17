@@ -2182,3 +2182,28 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     between them means workers disagree); **`targets_parked` on 0-1 must read 0**; 0-1's fresh completion
     recovering toward **0.55+** on a window of >= 50 fresh starts while 0-3 holds `gates_reached` near 4.5;
     and `ent_coef_live` against `|entropy_loss|` — 0.004 while entropy is above 6, climbing only under 5.
+- **Full-campaign config live (2026-09-17 16:51, resumed at 11,626,642 steps).** `route-fallback` merged (`8d2c4c5`): 14
+  room-trunk route files under `python/ultrakill_ai/routes/` (12 for levels gates cannot route, plus 0-3 and 4-3 shipped
+  but unused while `prefer_route_when_collapsed` is false), level-conditional target patience (`gate_patience_mode:
+  collapsed`: nearest-gate hops <= max_hops / 2 at level load; COLLAPSED on 0-3, 1-1, 1-2, 2-3, 4-3, 8-1, healthy on the
+  other twelve gates levels), and the adaptive entropy floor (`ent_floor` 5.0, base `ent_coef` 0.004, x1.10 per rollout
+  below the floor up to 0.02, x0.95 back toward the base above floor + 1). The run is now
+  `configs/campaign_gates_full.yaml`: 30 levels in mission order (everything shipped except the unrouted 1-3, 5-4, 6-2),
+  12 games, supervised by `supervise.py --config configs/campaign_gates_full.yaml`.
+  - **Why conditional patience:** the unconditional version (live 9.59M-11.63M) fixed 0-3 (fresh gates 1.0 -> 4.5,
+    checkpoints 0 -> 1.1) but REGRESSED 0-1 from 0.55 to 0.30 fresh completion: 34% of fresh 0-1 episodes parked a correct
+    target during long arena fights and 12 of 32 stuck episodes ended at (40,0,480) with exactly 2 gates. The offline
+    replay had called 0-1 inert because its recordings came from a much older policy. Lesson: a replay proves a
+    mechanism only for the policy that was recorded.
+  - State at the switch: 0-1 best 3:03.628 (rank A), 0-2 best 2:43.211 with ~0.6 fresh completion since the exit guard,
+    0-3 no completion yet, 233+ completions all-time, ~231 steps/s.
+  - Watch after activation: `targets_parked` on 0-1 must read 0 and its fresh rate should recover toward 0.55+;
+    `ladder_collapsed` 0 on 0-1 / 1 on 0-3; `ent_coef_live` and total entropy holding >= ~5; 0-3 gates_reached still
+    rising (if it plateaus without completions, set `prefer_route_when_collapsed: true` to move 0-3 onto its room trunk);
+    `route_source` 2 on the first rooms-routed level to unlock (0-5).
+  - **Gotcha, planned pauses since the bridge-recovery merge:** `games.py stop` no longer ends the trainer (each env now
+    retries its lost game for minutes instead of raising), so `latest.zip` is NOT written. For a planned pause: create
+    `runs/<run>/SUPERVISOR_PAUSE`, stop the supervisor, `games.py stop`, kill the `train.py` processes, and resume from
+    the newest `ckpt_*_steps.zip` (at most 50k steps old; the supervisor picks the file with the most steps by itself).
+    Also: PowerShell's safety check rejects a long combined command that mixes `Remove-Item` with a `cmd /c` argument
+    list; run those as separate commands.
