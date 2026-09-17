@@ -45,7 +45,7 @@ PPO_FIELDS = ["entropy_loss", "approx_kl", "clip_fraction", "explained_variance"
               "entropy_yaw", "entropy_pitch", "entropy_look_mode"]
 PART_FIELDS = ["aim_yaw", "aim_pitch", "aim_locked", "aim", "kill", "damage_dealt", "damage_taken", "death", "wave", "style", "step",
                "time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path", "level_complete", "punch",
-               "gate", "gate_approach"]
+               "gate", "gate_approach", "item_pickup", "item_placed"]
 
 
 def row(status: dict) -> dict:
@@ -66,6 +66,13 @@ def row(status: dict) -> dict:
     out.update({k: m.get(k) for k in FIELDS})
     out.update({f"{k}_fresh": fresh.get(k) for k in FRESH_FIELDS})
     out.update({k: campaign.get(k) for k in CAMPAIGN_FIELDS})
+    # A multi-level run only: how many levels are unlocked, so `fresh_completion_rate` (a shrunk SUM over them,
+    # not a rate) can be read against the right denominator. Deliberately one column and not one per level: a
+    # column per level would break this file's "keep the existing header" rule the moment a level unlocked, and
+    # the per-level numbers live in status.json's campaign.levels table.
+    levels = campaign.get("levels")
+    out["levels_unlocked"] = (sum(1 for row in levels.values() if isinstance(row, dict) and row.get("unlocked"))
+                              if isinstance(levels, dict) else None)
     out.update({k: status.get(k) for k in BEST_FIELDS})
     out.update({f"ppo_{k}": ppo.get(k) for k in PPO_FIELDS})
     out.update({f"part_{k}": parts.get(k) for k in PART_FIELDS})

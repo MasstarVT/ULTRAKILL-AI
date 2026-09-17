@@ -17,18 +17,38 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `Env/EpisodeController.cs`: lockstep, resets, time settings, and the `unwedge` / `unwedge_frames` config keys.
   - `Act/ActionInjector.cs`: virtual Input System keyboard and mouse; camera look via `CameraController.rotationX/Y`.
   - `Obs/ObservationBuilder.cs`: raw game-state snapshot. `ground_ray_center` (a single ray straight down from the player, outside the 8-ray ring and outside the array, so the packed size stays 479) and the raw movement flags `player.slow_mode` / `heavy_fall` / `crouching` (`crouching` is private, read with `AccessTools` and degrading to `false` with one warning).
-  - `Obs/CampaignObserver.cs`: the obs `campaign` block in the 35 main levels (exit, checkpoints, NavMesh path to the exit, locked doors, arena enemies, milestone keys, rank thresholds); room templates are skipped by `CheckPoint.defaultRooms` ancestry. Since v0.6.0 also the **route**: `campaign.gates`, the door graph built from `Door.activatedRooms` and BFS'd from the exit's room, plus `gates_ordered` / `gates_truncated` (see the gates gotcha), and a `ChooseExit` that drops secret-level pits and prefers the mission successor, frozen per level load.
+  - `Obs/CampaignObserver.cs`: the obs `campaign` block in the 35 main levels (exit, checkpoints, NavMesh path to the exit, locked doors, arena enemies, milestone keys, rank thresholds); room templates are skipped by `CheckPoint.defaultRooms` ancestry. Since v0.6.0 also the **route**: `campaign.gates`, the door graph built from `Door.activatedRooms` and BFS'd from the exit's room, plus `gates_ordered` / `gates_truncated` (see the gates gotcha), and a `ChooseExit` that drops secret-level pits and prefers the mission successor, frozen per level load. Since v0.7.0 (branch `next-levels`) also the **skull carry**: `campaign.altars[]`, `campaign.items[]` and `gates[].needs_item`, one shared door-key table so an altar's door key string-matches a gate key by construction, a phase-2 gate pass that appends altar-driven one-room doors as `altar_only` gates, and a `ChooseExit` that drops `Level P-` Prime Sanctum pits, counts an `Intermission*` target as leading onward and warns once per level load on a rank tie. See the branch entry under Status.
   - `Env/SafetyPatches.cs`: blocks leaderboard submissions.
   - `Env/TimePatches.cs`: frame-based hitstop during lockstep.
   - `Env/BackgroundPatches.cs`: keeps the cursor free and audio muted while the AI has control.
-  - `Env/TrainingSpeed.cs`: soft death (Harmony prefix on `NewMovement.GetHurt` heals instead of a lethal hit, counted in obs `player.soft_deaths`), camera disabling, and enemy Animators set to `AlwaysAnimate`. Also `UnwedgePatch`, a separate Harmony class (so a game update renaming the private method it binds cannot take soft death down with it): a postfix on the private `NewMovement.HandleSlideState` that breaks the absorbing airborne `slowMode` state. See the wedge gotcha.
+  - `Env/TrainingSpeed.cs`: soft death (Harmony prefix on `NewMovement.GetHurt` heals instead of a lethal hit, counted in obs `player.soft_deaths`), camera disabling, and enemy Animators set to `AlwaysAnimate`. Since v0.7.0 `ForcePlayerAnimators` also forces `AlwaysAnimate` on every Animator under `FistControl` and `CameraController` while rendering is disabled, because `Punch.ActiveStart` / `ActiveEnd` are Unity **AnimationEvents** with no C# caller: a culled fist Animator means nothing can ever be picked up under `render: false`. Its cache is keyed on the two singleton instance ids **plus every direct child's**, and it re-walks when any forced Animator has become null, because `FistControl.ResetFists` replaces the arms mid-level (an arm pickup) without changing the child count. Also `UnwedgePatch`, a separate Harmony class (so a game update renaming the private method it binds cannot take soft death down with it): a postfix on the private `NewMovement.HandleSlideState` that breaks the absorbing airborne `slowMode` state. See the wedge gotcha.
   - `Env/InstancePatches.cs`: training instances (`-aibridge-port N`) open prefs read-only and skip prefs and save writes; save writes are also skipped whenever the AI has control.
   - `Env/CampaignPatches.cs`: campaign config held in memory while the AI has control (`difficulty` override; `unlock_all_gear` makes every weapon, variant and arm read as owned); arena clears (`ActivateNextWave.EndWaves`) and door unlocks (`Door.Unlock`) recorded as rounded-position keys, cleared on every scene load; and every `StatsManager.Restart` not made by the bridge blocked while the AI has control (the game restarts by itself when a dead player presses Fire1, which would respawn mid-step without Python seeing the death).
-- `mod/GamePaths.props`: local game path (gitignored; copy from `.example`). Build copies the DLL into `<game>/BepInEx/plugins/UltrakillAIBridge/`.
+- `mod/GamePaths.props`: local game path (gitignored; copy from `.example`). Build copies the DLL into `<game>/BepInEx/plugins/UltrakillAIBridge/` — **unless `-p:InstallPlugin=false`**, which skips the copy so the mod can be compiled while the running games hold the installed DLL open. The property defaults to `true`, so the ordinary build is unchanged.
 - `python/ultrakill_ai/`:
   - `protocol.py`: socket client; `kill()` kills the player (debug command for the in-game death check).
   - `env.py`: `UltrakillEnv` / `EnvConfig` (`pitch_limit_deg` keeps the camera near level). `EnvConfig.from_dict` ignores keys that are no longer fields, so an old `env_config.yaml` with retired settings still loads. Campaign mode (`mode: campaign`, 479 inputs):
     - Reset: a fresh level load or a respawn at the current checkpoint. Fresh after a completion, with no checkpoint yet in this level load, after `stuck_repeats` (3) stuck episodes in a row at one checkpoint, otherwise with probability `fresh_start_prob` (0.2).
+    - **Multi-level curriculum** (branch `next-levels`): with `levels` set, a **fresh load and only a fresh load**
+      picks the level, sampled from the unlocked set with weight `max(level_weight_floor, 1 - that level's fresh
+      completion rate)`. `self.level` is mutable from then on; `_switch_level` saves the outgoing archive under the
+      **outgoing** level's path before moving (both names are arguments so an implementation cannot write the old
+      counts under the new name), keeps one `ExplorationArchive` per level visited, and clears the level-scoped
+      stuck streak. `levels` is validated against `CAMPAIGN_LEVELS_SHIPPED`, so a curriculum cannot stall a worker
+      on 9-1/9-2, whose scene bundles this build does not ship. Empty `levels` is today's behaviour exactly: no
+      curriculum file is opened and the level never changes.
+    - **Carry protection** (`subgoal_punch_range_m`, default 4.0 = `Punch.ActiveFrame`'s own reach): inside punch
+      range of a sub-goal the camera uses the game's own pitch clamp instead of the 45 degree band, and outside it
+      `punch` is dropped while a **carry** is in progress or a filled altar is in reach. Only two presses survive —
+      the one that places and the one that picks up — because `Punch.ActiveStart` **throws** a held item and
+      punching a filled altar `ForceHold`s the skull back out, closing the door it opened. A dropped press is not
+      charged `punch` either. A carry is a **held item some live unfilled altar accepts**, not merely
+      `any(items[].held)`: `campaign.wanting_altars` is the one filter, shared with `GateProgress._subgoal`, so the
+      two agree by construction. Both harms need a destination — an item nothing wants can be thrown and picked up
+      again, and the not-holding `ForceHold` branch is covered by the filled-altar test on its own. The release
+      stays the spec's (within range of the **sub-goal** altar), deliberately narrower than "any altar that accepts
+      this", because the source pedestal is itself an unfilled zone that accepts the item and releasing beside it
+      would let the first press after the pickup throw the skull straight back down.
     - Input-locked frames (landing, cutscenes) are stepped through with an empty action and never reach the policy (`max_locked_skip_s`).
     - A death pays `death`, respawns at the checkpoint (or reloads the level when there is none) and the episode continues. Doors, arenas and checkpoints a respawn itself changes pay nothing.
     - Ends, in this precedence: `level_complete` (terminated), `wedged`, `stuck`, `max_steps` (all truncated).
@@ -82,11 +102,26 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       the look mode as a 12th dim, 45 logits. `action_space(campaign=)`, `decode_action` infers the width from
       `len(a)`, and `noop_action(campaign=)` uses explicit indices (the old negative ones addressed the wrong
       slots at width 12). Look mode 1 is an auto-aim and is deliberately **not** available in Cyber Grind.
-  - `rewards.py`: reward weights and computation; `aim_errors` gives the 3-D, yaw and pitch angles off an enemy, `horizon_elevation` the enemy elevation above the horizontal (diagnostics, convention-free). Campaign terms (`time` per decision, `checkpoint`, `arena_clear`, `door_unlock`, `gate`, `gate_approach`, `novelty`, `path`, all 0 by default) are paid only when the env passes a `CampaignStep` to `compute_reward`, and are paid even on a step without a player because the env has already marked those milestones paid. `level_complete` (default 100) pays once on the rising edge in both modes, and is paid **before** the missing-player
+  - `rewards.py`: reward weights and computation; `aim_errors` gives the 3-D, yaw and pitch angles off an enemy, `horizon_elevation` the enemy elevation above the horizontal (diagnostics, convention-free). Campaign terms (`time` per decision, `checkpoint`, `arena_clear`, `door_unlock`, `gate`, `gate_approach`, `item_pickup`, `item_placed`, `novelty`, `path`, all 0 by default) are paid only when the env passes a `CampaignStep` to `compute_reward`, and are paid even on a step without a player because the env has already marked those milestones paid. `level_complete` (default 100) pays once on the rising edge in both modes, and is paid **before** the missing-player
     early return so a completion on a player-less frame still scores. `punch` is charged per decision that presses the
     punch button: the button is an independent coin flip with no cost and, outside a parry, no effect, so nothing ever
     taught the policy to stop pressing it. The human-route terms `route_point` and `stuck` are gone.
-  - `campaign.py`: campaign helpers: `CAMPAIGN_LEVELS` (the 35 main scene names in mission order), `safe_name`, the game's rank maths (`grade`, `compute_rank`; P needs 12 with no restarts), `ExplorationArchive` (per-game visit counts over 4 m cells: novelty `1/sqrt(N+1)` on a cell's first entry per episode, the 9-value exploration map around the player, atomic `.npz` save/load; the archive itself is position-agnostic — `env._ground_point` is what decides that the position handed to `visit`/`features` is the ground under the player, not the player), `MilestoneTracker` (pays each checkpoint, arena clear and door unlock once per level load; `mark_paid` absorbs what a reset or respawn reveals), `PathProgress` (metres of new best complete NavMesh path to the exit; gains count once they exceed 1 m), `choose_fresh_start` (level reload or checkpoint respawn for the next episode) and `save_best_run` (keeps the fastest run per level as JSON, written atomically).
+  - `campaign.py`: campaign helpers: `CAMPAIGN_LEVELS` (the 35 main scene names in mission order), `safe_name`, the game's rank maths (`grade`, `compute_rank`; P needs 12 with no restarts), `ExplorationArchive` (per-game visit counts over 4 m cells: novelty `1/sqrt(N+1)` on a cell's first entry per episode, the 9-value exploration map around the player, atomic `.npz` save/load; the archive itself is position-agnostic — `env._ground_point` is what decides that the position handed to `visit`/`features` is the ground under the player, not the player), `MilestoneTracker` (pays each checkpoint, arena clear and door unlock once per level load; `mark_paid` absorbs what a reset or respawn reveals), `PathProgress` (metres of new best complete NavMesh path to the exit; gains count once they exceed 1 m), `choose_fresh_start` (level reload or checkpoint respawn for the next episode) and `save_best_run` (keeps the fastest run per level as JSON, written atomically). Branch `next-levels` adds:
+    - **The curriculum** (`CAMPAIGN_LEVELS_SHIPPED`, `level_weights`, `choose_level`, `unlock_next`,
+      `read_curriculum`): the 33 levels whose scene bundle this build ships, the sampling weights, the unlock
+      latch, and a reader that falls back to `levels[0]` on a missing, torn, wrong-run or wrong-order file.
+    - **Skull milestones** in `MilestoneTracker`: `item_pickup` keyed on the item **type** and only for types some
+      altar in this level accepts, `item_placed` keyed on `altar_placement_key` (the item type plus the sorted
+      keys of the doors that altar opens), and a `filled` false -> true edge pays only when the item now in the
+      altar is the one carried on the previous step — so a pedestal that reads filled at load pays nothing.
+    - **`GateProgress` sub-goals**: with a target gate carrying `needs_item T` the target becomes the nearest free
+      item of type T, then the altar of type T wired to that gate, then the gate again. `best_dist` is keyed per
+      target, so shuttling between them cannot be farmed. Dead twins (`inactive_ancestors > 1`) and decorations
+      (`active_self: false`) are filtered out, or the machine sends the agent to punch the skull back out of the
+      altar it just filled. That altar filter is `wanting_altars(campaign, types)` — live, unfilled, accepts one of
+      these types — in one place because `env._protect_carry` must use the identical test to decide a held item is
+      a carry worth silencing the punch button for. The **usability guard** drops a whole ladder when fewer than half its phase-1 gates
+      carry a `hops` value (7-2 is 1 of 4, 8-3 1 of 32), falling back to the exit vector.
     - `GateProgress` walks the `hops` ladder of `campaign.gates`. `retarget()` picks a target and pays **nothing**
       (it runs before every observation is packed, including `reset()`'s, so slot 452 reads 1.0 on the first
       decision of every episode and look mode 2 is never dead on step 1); `update()` returns (new hop values
@@ -103,8 +138,16 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   that is continuing. `dashboard.py` applies the same rule when building each chart series, because it is a viewer
   and has to render a `status.json` written before this fix. It writes live training stats to
   `runs/<run_name>/status.json` (atomic, every 2 s; `state` running/finished/stopped). Campaign runs add a `campaign` block (completion rate and median official time over the last 50 fresh starts, best time over all of them), `best_checkpoints_level`, `best_gates_reached` (max) and `best_gate_hops` (**min** -- lower is better, so it has its own comparison); all of them survive a restart through `_restore`. `mean_fresh_100` carries `gates_reached`, `checkpoints_level`, `completed` and `wedged_steps` over **fresh starts only**, because a respawn episode inherits them from its level load -- that inheritance is what produced the false "peak by depth" reading of the pre-fix run.
+  On a **multi-level** run (branch `next-levels`) it also writes `runs/<run_name>/curriculum.json` atomically
+  (per-level fresh window, completion rate, best time, `unlocked` latch), which is the only shared state the
+  `SubprocVecEnv` workers read at a fresh start; `status.json` gains `campaign.levels`, and
+  `campaign.fresh_completion_rate` becomes a **shrunk sum over the unlocked levels, not a rate** — it can exceed
+  1.0. That shape is forced by `keep_best.py`, which only replaces `best.zip` on a strict improvement and is
+  deliberately not edited: a plain mean drops at every unlock (~0.52 -> ~0.26), which would freeze `best.zip` on a
+  single-level policy forever. With one unlocked level at `fresh_window >= 20` it is exactly the rate it has
+  always been, and a single-level run's block is byte-identical to before the curriculum existed.
   It also writes **`runs/<run_name>/episodes.jsonl`**, one JSON object per finished episode, appended and flushed
-  per line: it is written by the callback rather than the env because five `SubprocVecEnv` workers would interleave
+  per line (with the `level` the episode actually ran on): it is written by the callback rather than the env because five `SubprocVecEnv` workers would interleave
   appends to one file. `start_checkpoint`, `end_pos`, `end_reason` and `level_seconds` bypass the numeric `field()`
   helper, which would write `null` for exactly the two fields that say where an episode died. A write failure
   warns and never stops training.
@@ -119,7 +162,23 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   level's checkpoints in nearest-neighbour order, shooting what gets in the way) and reports whether the level
   reports complete. Kept for the diagnosis it produced rather than for routine use: it cannot leave 0-1's sealed
   starting room, and its teleport ancestor showed that teleporting never activates rooms at all. Both failures
-  are documented in the pilot entry under Status.
+  are documented in the pilot entry under Status. Its `go_to` mover is now also `skull_check.py`'s, and steps
+  through input-locked frames (the opening drop, a cutscene, a respawn) with an empty action instead of counting
+  them as a stall.
+- `python/scripts/skull_check.py` (branch `next-levels`): the in-game skull-carry probe, section 8 checks 1-3 of
+  the multi-level/skull spec — the three that gate raising `item_pickup` / `item_placed` off 0.0. On one game,
+  taking control at the training settings with rendering **off**, it **walks** (never teleports; a bare teleport
+  into a switched-off room activates nothing) to 1-1's red pedestal `(81.0, -2.2, 275.0)`, faces it inside the
+  game's own 85 degree pitch clamp and punches; carries to `(0.0, -6.76, 381.0)` and punches; then takes the
+  skull back out and dies holding it. Reports 1 pickup (`items[].held`, and `items[].active` **before** the punch,
+  so "the room is still switched off" is never mistaken for "the punch does not work"), 2 placement
+  (`altars[].filled`, gate `20,-10,381`'s `needs_item`, then 100 decisions of punch spam pressed **through
+  `env.step`**, so `_protect_carry` is what is under test — every decision is inspected, not just the last, since
+  an unprotected punch pulls the skull out and the next one puts it back), 3 what a held skull does across a
+  death. `--target/--altar/--gate/--via/--level/--render/--teleport-assist/--skip-kill`; PASS/FAIL/SKIP per check,
+  a `summary:` line and exit 1 on any FAIL, like `campaign_check.py`, whose helpers it reuses.
+  `python/tests/test_skull_check.py` runs all three against `FakeLevel`'s skull room, so the script is proven
+  before a game is ever launched.
 - `python/scripts/transfer_weights.py`: campaign starting weights from a Cyber Grind checkpoint. Widens the 448 inputs to 479 (first-layer columns 0-442 copied, 443-478 zero, so Cyber Grind inputs give the same hidden features), scales the action head by `--action-scale` (default 0.5) to raise entropy, and keeps a fresh final value layer and optimizer. It now also builds the destination with the **campaign** action space and zero-pads the three new logit rows, so the documented Cyber Grind -> campaign path still produces a model `train.py --resume` can load. Output: `models/campaign_ppo/transfer_init.zip` (committed).
 - `python/scripts/add_look_mode.py`: migrates a **campaign** checkpoint across the look-mode action dimension and the re-used target slots, so the run continues instead of restarting. Appends three zero action rows (all modes equally likely), zeroes first-layer columns 448-455 in both hidden stacks and **folds the removed inputs' mean into the first-layer bias** -- the fold is required, not optional: it roughly halves the displacement. Carries `num_timesteps`, `_n_updates` and the full Adam state (zero rows for the new logits, zeroed moments for the changed columns, `step` preserved). `--stats <run_raw.jsonl>` recomputes MU and measures the displacement on real observations. Output: `models/campaign_gates/look_init.zip` (committed). **This is the only migration path**: the action-space change makes every earlier campaign checkpoint unloadable. Cyber Grind is untouched.
 - `python/ultrakill_ai/times.py`: reads and updates `times.md` (`record` is pure, `record_file` edits in place). Level cells use the short form (`0-1`), times are `mm:ss.mmm`, the leaderboard is sorted by campaign order and only a faster time replaces a row.
@@ -130,19 +189,21 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/tests/test_campaign_config.py`: `configs/campaign_0-1.yaml` builds a 479-input env with its reward weights, every key is a real config field, and `train.fill_campaign_dirs` (no game needed).
 - `python/tests/test_keep_best.py`: `keep_best.py` scoring for both metrics on synthetic `metrics_log.csv` rows, and old `best.json` files (no game needed; `python tests/test_keep_best.py`).
 - `python/tests/test_times.py`: `times.md` updates against the committed file's exact text: placeholders, records, deltas, level order (no game needed; `python tests/test_times.py`).
-- `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load, and the two novelty-measure tests that pin the void exploit shut (`test_falling_off_the_map_pays_no_novelty`, `test_novelty_pays_for_new_ground_not_for_height`). `FakeLevel` reports ground rays the way the mod does, so its floor is at y 1 and `falling` makes every ray miss (no game needed).
+- `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load, and the two novelty-measure tests that pin the void exploit shut (`test_falling_off_the_map_pays_no_novelty`, `test_novelty_pays_for_new_ground_not_for_height`). `FakeLevel` reports ground rays the way the mod does, so its floor is at y 1 and `falling` makes every ray miss (no game needed). Its `enable_skulls(fields=, altars=, item_type=)` plus `item_active` cover the shapes a carryable comes in: the wired puzzle, a 0.6.x mod, 0-4's altar-free `CustomKey1`, an item no zone accepts, and an item whose room is still switched off.
+- `python/tests/test_skull_check.py`: `skull_check.py`'s three checks against `FakeLevel`'s skull room — the whole carry green, an item whose room is off named as the reason, a placement undone by the spam caught as a FAIL (run with the carry protection disabled, which is what makes it the regression test for `_protect_carry`), a pre-0.7.0 mod, `--skip-kill`, the `--render` control run and the default coordinates (no game needed).
 - `python/tests/test_campaign.py`: campaign helpers: level list, rank maths, exploration archive, milestones, path progress, the fresh-start rule and best runs (no game needed).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
 - `python/tests/test_spaces.py`: layout sizes (448 / 479) and every index range of the campaign block, including the yaw-frame signs (no game needed).
-- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands).
+- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands). Branch `next-levels` adds `campaign_prelude.yaml` (the multi-level curriculum 0-1 / 0-3 / 0-4, run `campaign_prelude`) and `campaign_1-1.yaml` (the first skull-carry level, run `campaign_1-1`, **`item_pickup` and `item_placed` pinned at 0.0** until the three in-game checks pass). Every header lists its own run commands.
+- `docs/level-survey.md`: all 35 levels parsed offline from the scene files — exits, checkpoints, door graphs and gate ladders, altars and carryables, arenas, bosses and hazards, plus a tier table and the recommended order of sub-projects. This is what the multi-level and skull-gates design was built from; check it before assuming anything about a level nobody has trained on.
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
-- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign design; `2026-09-16-campaign-gates-unwedge-design.md` is the route-gates / un-wedge / look-modes design that followed the 0-1 pilot's diagnosis (implemented in mod v0.6.0 and the `campaign_gates` run; its section 14 records the lead rulings R1-R4).
-- `docs/superpowers/plans/`: implementation plans. `2026-09-16-campaign-foundation.md` is the 16-task plan for the campaign foundation and the 0-1 pilot (Tasks 0-13 dry-run in a scratch copy: mod builds clean, all tests pass).
+- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign design; `2026-09-16-campaign-gates-unwedge-design.md` is the route-gates / un-wedge / look-modes design that followed the 0-1 pilot's diagnosis (implemented in mod v0.6.0 and the `campaign_gates` run; its section 14 records the lead rulings R1-R4); `2026-09-17-multi-level-and-skull-gates-design.md` is the multi-level curriculum / gates guard / 6-2 exit / skull-carry design (implemented on branch `next-levels` and mod v0.7.0; its section 8 lists the five in-game checks, section 10 the risks and section 11 the review dispositions).
+- `docs/superpowers/plans/`: implementation plans. `2026-09-16-campaign-foundation.md` is the 16-task plan for the campaign foundation and the 0-1 pilot (Tasks 0-13 dry-run in a scratch copy: mod builds clean, all tests pass). `2026-09-17-next-levels-integration.md` is the ordered checklist for merging branch `next-levels` into main at a training pause and verifying it in the live game (merge, build and install, the six in-game readouts, the 20k-step smoke run, how to carry the live 0-1 policy into the multi-level run, and rollback).
 - `.tools/` (gitignored): local `ilspycmd` install used to regenerate `decompiled/`.
 
 ## Commands
-- Build and install the mod: `cd mod/UltrakillAIBridge && dotnet build -c Release`. The game must be closed, or the DLL is locked.
+- Build and install the mod: `cd mod/UltrakillAIBridge && dotnet build -c Release`. The game must be closed, or the DLL is locked. To **compile without installing** (a syntax check while training runs), add `-p:InstallPlugin=false`. `dotnet` is not on `PATH` in every shell here; `& "C:\Program Files\dotnet\dotnet.exe"` works.
 - **Which checkpoint to resume from:** `best.zip` (see `best.json` for its score and source). `latest.zip` only
   updates on a GRACEFUL stop (Ctrl+C); every hard kill leaves it stale, and it sat at 1.18M steps for a whole
   night while the run reached 6.5M. Helpers to keep running alongside training, both read-only and safe:
@@ -154,7 +215,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   that only have `deaths` still load). It refuses to start when `best.json` was written by the other metric, so
   forgetting `--metric campaign` cannot overwrite the campaign `best.zip`.
 - Python env: `cd python && .venv\Scripts\activate` (created with `pip install torch` + `pip install -e .`).
-- Bridge check (game open, in a level): `python scripts/bridge_test.py --drive`. In a campaign level, `python scripts/bridge_test.py --campaign` prints the `campaign` block (exit, checkpoints, path, locked doors, arena state, ranks, weapons per slot) without taking control, so its `difficulty` is the game's own setting: the override applies only while the AI has control. Never run it against a game a trainer is using.
+- Bridge check (game open, in a level): `python scripts/bridge_test.py --drive`. In a campaign level, `python scripts/bridge_test.py --campaign` prints the `campaign` block (exit, checkpoints, path, locked doors, arena state, ranks, weapons per slot, and on branch `next-levels` every **gate** with its hops and the hops-coverage ratio the usability guard tests, every **altar** with its wiring and every **item** with its live flags) without taking control, so its `difficulty` is the game's own setting: the override applies only while the AI has control. It **cannot load a level** — pair it with a `campaign_check.py --level X` run, which does, and read the block while that scene is still up. Never run it against a game a trainer is using.
 - Parallel training:
   1. `python scripts/games.py launch --count 5` (monitor 3 by default; BepInEx supports at most 5 copies)
   2. `python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo_v2/best.zip` (`num_envs` 5 in config; `timesteps` is the run total, so resuming trains only the rest; drop `--resume` for a fresh run, and give it a new `run_name` so `status.json` does not inherit the old episodes)
@@ -184,16 +245,38 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     on `novelty`/`cells_new`/`oob_frac` against the old run's numbers -- the centre ground ray re-keys ~23% of the
     carried archive cells, `novelty` went 0.5 -> 0.2 and the run name changed, so all three need a fresh baseline
     from the new run's first 100 episodes.
+- **Multi-level campaign training** (branch `next-levels`, not yet merged; `configs/campaign_prelude.yaml`, run
+  `campaign_prelude`, levels 0-1 / 0-3 / 0-4). Same five games and the same commands as above with the config
+  swapped, plus three things a curriculum run needs:
+  1. Copy `models/campaign_gates/explore_*.npz` into `models/campaign_prelude/` **before the first start** and
+     move any old `metrics_log.csv` aside (`poll_status.py` keeps an existing header and would drop the new
+     `levels_unlocked` column).
+  2. `python scripts/train.py --config configs/campaign_prelude.yaml --resume models/campaign_gates/best.zip`.
+     The 0-1 policy carries unchanged: 479 inputs, the same action space, the same reward weights, and only
+     `Level 0-1` unlocked at the start — so early on this **is** the 0-1 run continuing.
+  3. Judge it on the dashboard's per-level `levels` rows and `status.json`'s `campaign.levels` table, **never on
+     the pooled numbers**: `max_steps` is one value for every level, so a longer level is truncated by
+     construction, and `campaign.fresh_completion_rate` is a shrunk sum over the unlocked levels, not a rate.
+  The full merge-and-verify checklist is `docs/superpowers/plans/2026-09-17-next-levels-integration.md`.
 - TensorBoard: `tensorboard --logdir runs`.
 - Campaign in-game check (one game, nothing else connected to its port): `python scripts/games.py launch --count 1 --monitor 1`, then `python scripts/campaign_check.py` (Level 0-1) and `python scripts/campaign_check.py --level "Level 1-1"` (full arsenal), then `python scripts/games.py stop`. Six checks: level load, arsenal, checkpoint trigger, death respawn, exit, and **the gates block** (present, ordered, hop-monotone and unchanged after a respawn; SKIP rather than FAIL against a pre-0.6.0 mod). Prints PASS/FAIL/SKIP per check and a `summary:` line, exits 1 on any FAIL -- **check 5 (exit) is a known standing FAIL on both levels** (the exit's room is switched off at load, so a teleport onto its collider fires nothing; real play does trigger it, confirmed on a human run), so exit code 1 is expected today. `--fixed-fps 60 --frameskip 4` and `--render` repeat the trigger checks at other speed settings. Rerun after game updates and after mod changes to the campaign block; `python tests/test_campaign_check.py` tests the script without the game.
+- Skull-carry in-game check (branch `next-levels`, one game, nothing else connected to its port, and the **only**
+  thing that unblocks raising `item_pickup` / `item_placed` off 0.0):
+  `python scripts/games.py launch --count 1 --monitor 1`, then `python scripts/skull_check.py`
+  (Level 1-1, rendering **off**, which is the point of check 1), then `python scripts/games.py stop`. Add
+  `--render` for the control run, and `--via X Y Z` (repeatable) when the direct line to the pedestal does not
+  walk. Check 1 failing while the pre-punch line says `active=False` means the Skull Field room is still switched
+  off and the **walk** failed, not the punch -- route it with `--via` before concluding anything about
+  `ActiveStart`. `python tests/test_skull_check.py` tests the script without the game.
 - Campaign eval (one game on port 47800, e.g. `python scripts/games.py launch --count 1 --monitor 1`):
   `python scripts/eval.py models/campaign_gates/best.zip --level "Level 0-1" --episodes 10`. Fresh level loads,
   deterministic actions, real deaths; prints completed, official time, rank, kills, style, restarts and deaths per
   episode, then the completion count and the fastest run. It reads the exploration counts the first training game
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
-- Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (12 files, 189 named tests, ~2 min).
+- Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (13 files; 258 named tests on branch `next-levels`, plus `test_progress.py`, which prints no count; ~2 min). `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
+  **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
 
 ## Key design decisions
 - **Lockstep:** the mod blocks Unity's main thread between steps. `Time.captureDeltaTime = 1/60` fixes game time per frame, and uncapped FPS makes training faster than real time. Game speed is not controlled through `Time.timeScale`, which `TimeController` owns for hitstop.
@@ -850,3 +933,76 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     checked live); `controller_active` is false for a door with no `DoorController` at all, which reads as "a
     fight gates it" but never fires on 0-1..1-1; and the spawn-room climb that costs ~27% of fresh loads is
     unrelated to the wedge and still unaddressed.
+
+- **Branch `next-levels` (mod v0.7.0) — implemented and green offline, NOT merged and NOT verified in the game,
+  2026-09-17.** Worktree `F:\Github\ULTRAKILL-AI-next`, branched from `7da1204`. Four pieces from
+  `docs/superpowers/specs/2026-09-17-multi-level-and-skull-gates-design.md`, built while the `campaign_gates` 0-1
+  run stayed live and untouched:
+  - **S1 multi-level curriculum.** Optional ordered `env.levels`; a level changes only on a **fresh** load and is
+    sampled from the unlocked set with weight `max(floor, 1 - that level's fresh completion rate)`, floor 0.1.
+    Level k+1 unlocks when level k's fresh completion rate over its last 20+ fresh episodes reaches
+    `unlock_rate` (0.5); `levels[0]` is always unlocked and the unlock is a latch that survives `_restore`. The
+    workers are `SubprocVecEnv` subprocesses, so the only shared state is `runs/<run>/curriculum.json`, written
+    atomically by `ProgressCallback` and re-read at each fresh start; missing, torn, wrong-run or wrong-order
+    falls back to `levels[0]` with one warning per worker. **No level id enters the observation** — generalisation
+    by design. Per-level exploration archives, `best_runs/`, `episodes.jsonl` rows, `status.json`'s
+    `campaign.levels` table and the dashboard's `levels` block all key on the level name.
+  - **S2 gates usability guard** (Python only): a ladder whose phase-1 gates carry a `hops` value on fewer than
+    half of them is ignored entirely and `GateProgress` falls back to the exit vector. 7-2 reports
+    `gates_ordered: true` with 1 of 4 and 8-3 with 1 of 32, where the old code locked onto that single ordered
+    door — 892 m from the start on 8-3 — and never retargeted.
+  - **S3 6-2 exit tie-break** (mod): `Scan` discards a `FinalPit` targeting `Level P-` (a Prime Sanctum) as it
+    already did `-S`, `ChooseExit` counts an `Intermission*` target as leading onward (an act finale's real exit
+    drops into an intermission, and `Intermission2` does not parse as `Level a-b`), and a rank tie is logged once
+    per level load. Before this, 6-2's three candidates ranked equally and the exit was whichever
+    `FindObjectsOfType` returned first.
+  - **S4 skull-carry gates** (mod + Python): `campaign.altars[]`, `campaign.items[]` and `gates[].needs_item`;
+    one shared door-key table so an altar's door key string-matches a gate key by construction; a phase-2 gate
+    pass appending altar-driven one-room doors as `altar_only` gates (adding no node and no edge, so no existing
+    `hops` moves); a `GateProgress` sub-goal machine walking fetch -> carry -> open through observation slots
+    448-455; two once-per-level-load milestones `item_pickup` / `item_placed`; and env-side carry protection.
+  - **The action space did not have to change, and this was the one thing S4 could have broken.**
+    `Punch.AltHit` does both pick-up (`ForceHold`) and place (`PlaceHeldObject`) off the existing `punch` button,
+    which `ActionInjector` already binds to the game's own `input.Punch`. So no new button, **no weight surgery
+    and no `add_look_mode.py`-style migration**: `models/campaign_gates/best.zip` loads into the new env as is.
+  - **Verified:** `dotnet build -c Release -p:InstallPlugin=false` at 0 warnings / 0 errors, and all twelve
+    no-game test files pass (248 named tests). Degradation is tested in both directions — new Python reads a
+    missing `altars`/`items`/`needs_item` as "no altars", an old Python ignores the new fields.
+  - **Not verified: anything in the game.** No game was launched and no port opened while this branch was built.
+    The merge-and-verify checklist is `docs/superpowers/plans/2026-09-17-next-levels-integration.md`; it splits
+    the branch into a shippable half (S1+S2+S3, which the prelude curriculum's altar-free levels exercise) and a
+    dormant half (S4, whose two weights ship at 0.0).
+  - **The S4 tooling blocker is cleared: `scripts/skull_check.py` exists** (2026-09-17). It was the one gap — the
+    spec's in-game checks 1-3 need an AI-driven punch at 1-1's red pedestal **with rendering off**, which a human
+    playthrough cannot test (`render: false` only applies while the AI has control) and which no existing script
+    could do (`walk_to_exit.py`'s waypoints are the level's checkpoints and it never punches; `campaign_check.py`
+    teleports and no-ops; `bridge_test.py --campaign` is read-only). It walks rather than teleports, reads
+    `items[].active` before punching so a switched-off room is never mistaken for a broken `ActiveStart`, and is
+    green against `FakeLevel`'s skull room in `tests/test_skull_check.py`, so the pause only has to run it. **It
+    has still never been pointed at the game**, and check 1 remains the kill switch: if the fist Animator is
+    culled under `render: false` **with** `TrainingSpeed.ForcePlayerAnimators` applied, S4 is inert under training
+    settings and nothing else in it matters.
+  - **Known, deliberate deviation from the brief:** `keep_best --metric campaign` was asked to score the **mean**
+    fresh completion rate over unlocked levels. It scores a **shrunk sum** instead, and `keep_best.py` is not
+    edited at all. A mean drops at every unlock (~0.52 -> ~0.26 when the second level joins), and `keep_best.py`
+    only replaces `best.zip` on a strict improvement — so a mean would freeze `best.zip` on a single-level policy
+    and print the "15% below best" warning forever. A sum cannot drop, since a new level contributes 0 and grows;
+    with one unlocked level at `fresh_window >= 20` it is exactly the rate that field has always been. The
+    per-level means are all in `status.json`'s `campaign.levels`.
+  - **Fixed 2026-09-17: `_protect_carry` was gating on "anything held".** It dropped `punch` on any step where any
+    `items[]` entry read `held: true`, so on 0-4 — in the prelude curriculum, shipping a `CustomKey1` and **zero**
+    `ItemPlaceZone`s — picking the key up cost the agent the button for the rest of the carry, including the throw
+    that would have given it back (throwing is itself a punch). It now gates on a **carry**: a held item some live
+    unfilled altar accepts, through `campaign.wanting_altars`, the same filter `GateProgress._subgoal` chooses a
+    destination with. Both harms the rule exists for need a destination, so where nothing accepts the item there is
+    nothing to protect. Pinned by `test_punch_passes_through_while_carrying_an_item_no_altar_wants` (0-4's shape)
+    and `..._the_altars_do_not_accept` (the type filter, which is what 1-1's two skull colours need); the wired
+    case still gates, unchanged. **The forced look mode 2 was checked and is not over-broad**: it keys on the
+    target carrying a `subgoal` field, which only `_subgoal` sets and only for a gate with `needs_item` and a live
+    wired altar, so it is already inert on 0-4 — asserted in the same test.
+  - Also carried: S3 fixes 6-2 only. 3-2 keeps two `Intermission1` pits at an identical position and 2-4 two
+    `Level 3-1` pits 1.4 m apart, and 8-4's `EarlyAccessEnd` pit parses as neither a level nor an intermission and
+    is still picked by uniqueness alone — all three now visible through the rank-tie warning rather than silent.
+    Gate phase 2 gives a usable `hops` on only three levels (1-1, 5-3, 8-1); elsewhere the widened door's rooms
+    are outside the room graph, so `needs_item` exists but nothing on the route carries it. That is the
+    out-of-scope checkpoint-chain fallback, not a defect.

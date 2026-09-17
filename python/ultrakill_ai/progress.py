@@ -22,6 +22,8 @@ from typing import Any
 
 from stable_baselines3.common.callbacks import BaseCallback
 
+from ultrakill_ai.campaign import CURRICULUM_VERSION, level_weights, unlock_next
+
 EPISODE_WINDOW = 100
 FRESH_WINDOW = 50  # campaign completion rate and median time are over this many fresh-start episodes
 RATE_WINDOW_S = 45.0  # steps/s is measured over this much recent wall time
@@ -46,7 +48,7 @@ PPO_METRICS = (
 # Per-episode fields carried straight into runs/<run>/episodes.jsonl. `field()` routes everything through
 # _num(), which returns None for anything float() rejects, so a string checkpoint id and a [x, y, z] list have
 # to bypass it -- otherwise the two fields that say where an episode died would both be written as null.
-EPISODE_LOG_RAW = ("start_checkpoint", "end_pos", "end_reason", "level_seconds", "gate_hops_best")
+EPISODE_LOG_RAW = ("level", "start_checkpoint", "end_pos", "end_reason", "level_seconds", "gate_hops_best")
 
 
 def _num(value: Any) -> float | None:
@@ -84,7 +86,9 @@ class ProgressCallback(BaseCallback):
     `model.num_timesteps + timesteps`).
     """
 
-    def __init__(self, status_path: Path, target_timesteps: int, run_name: str, num_envs: int, update_every_s: float = 2.0):
+    def __init__(self, status_path: Path, target_timesteps: int, run_name: str, num_envs: int, update_every_s: float = 2.0,
+                 *, levels=(), curriculum_path=None, unlock_rate: float = 0.5, unlock_window: int = 20,
+                 level_weight_floor: float = 0.1):
         super().__init__()
         self.status_path = Path(status_path)
         # One JSON object per finished episode, appended. Written here rather than in the env because with
@@ -122,6 +126,17 @@ class ProgressCallback(BaseCallback):
         self.history: list[dict] = []
         self.ppo_metrics: dict[str, float] = {}
         self.previous_elapsed_s = 0.0
+
+        # The multi-level curriculum. Empty `levels` is a single-level run: nothing below is written, and the
+        # campaign block stays byte-identical to what it was before the curriculum existed.
+        self.order: list[str] = [str(lv) for lv in levels]
+        self.curriculum_path = Path(curriculum_path) if curriculum_path else None
+        self.unlock_rate = float(unlock_rate)
+        self.unlock_window = int(unlock_window)
+        self.level_weight_floor = float(level_weight_floor)
+        self.per_level: dict[str, dict] = {}
+        self._curriculum_written: dict | None = None
+        self._curriculum_warned = False
         self._restore()
 
     def _restore(self) -> None:
@@ -142,8 +157,102 @@ class ProgressCallback(BaseCallback):
         if isinstance(old.get("campaign"), dict):
             self.campaign = True
             self.best_time = _num(old["campaign"].get("best_time"))
+            self._restore_levels(old["campaign"].get("levels"))
         self.previous_elapsed_s = _num(old.get("elapsed_s")) or 0.0
         self.ppo_metrics = {k: v for k, v in (old.get("ppo") or {}).items() if isinstance(v, (int, float))}
+
+    def _restore_levels(self, levels) -> None:
+        """Carries the per-level table over from an earlier run of the same name.
+
+        `unlocked` is a latch and is the whole point: without it every level re-locks on a restart and the
+        levels that were already being trained stall. `best_time` and `episodes` are cumulative, so they carry
+        too. The fresh-episode windows deliberately do NOT, exactly as the pooled `fresh_recent` deque does not:
+        a rate carried without the episodes behind it would let `unlock_next` unlock a level on evidence that is
+        no longer in the window. Every level therefore reads rate None for a while after a restart, which makes
+        the sampling weights uniform until the windows refill -- wasteful but self-correcting and honest.
+        """
+        if not isinstance(levels, dict):
+            return
+        for name, old in levels.items():
+            if not isinstance(old, dict):
+                continue
+            record = self._level_record(str(name))
+            record["unlocked"] = bool(old.get("unlocked")) or record["unlocked"]
+            record["best_time"] = _num(old.get("best_time"))
+            record["episodes"] = int(_num(old.get("episodes")) or 0)
+            carried = {key: _num(old.get(key)) for key in ("checkpoints_level", "gates_reached")}
+            if any(v is not None for v in carried.values()):
+                record["recent"].append(carried)  # one synthetic episode, so the panel is not blank on restart
+
+    def _level_record(self, level: str) -> dict:
+        """This level's record, created (locked, unless it is the first) the first time it is asked for."""
+        record = self.per_level.get(level)
+        if record is None:
+            record = {
+                "unlocked": bool(self.order) and level == self.order[0],
+                "fresh": deque(maxlen=FRESH_WINDOW),  # (completed, level_seconds) of its own fresh starts
+                "recent": deque(maxlen=EPISODE_WINDOW),  # the two early-progress signals, all episodes
+                "best_time": None,
+                "episodes": 0,
+            }
+            self.per_level[level] = record
+        return record
+
+    def _level_table(self, *, with_weights: bool = False) -> dict[str, dict]:
+        """The per-level stats `curriculum.json` and `status.json` both publish, for every level in `order`.
+
+        Every level in `order` is listed even before it has produced an episode, so no reader has to invent a
+        record: `campaign._level_stat` exists for readers of a table written by an older version.
+        """
+        table: dict[str, dict] = {}
+        for level in self.order or sorted(self.per_level):
+            record = self._level_record(level)
+            fresh = record["fresh"]
+            table[level] = {
+                "unlocked": bool(record["unlocked"]),
+                "fresh_window": len(fresh),
+                "fresh_completion_rate": (sum(c for c, _ in fresh) / len(fresh)) if fresh else None,
+                "best_time": record["best_time"],
+                "episodes": int(record["episodes"]),
+            }
+        if not with_weights:
+            return table
+        times = {level: [s for c, s in self._level_record(level)["fresh"] if c and s is not None] for level in table}
+        weights = dict(level_weights(list(table), table, floor=self.level_weight_floor))
+        total = sum(weights.values())
+        for level, row in table.items():
+            row["weight"] = (weights[level] / total) if level in weights and total else 0.0
+            row["median_time_50"] = statistics.median(times[level]) if times[level] else None
+            for key in ("checkpoints_level", "gates_reached"):
+                row[key] = _mean(ep.get(key) for ep in self._level_record(level)["recent"])
+        return table
+
+    def write_curriculum(self) -> None:
+        """Publishes the per-level table for the SubprocVecEnv workers to sample from.
+
+        One writer (this process, in the trainer's main thread), N readers, no lock: `write_json_atomic` replaces
+        the file in one operation, so a worker either reads the old whole file or the new one, and a worker that
+        catches a torn or missing read keeps its last good copy. Workers never write it, which is what makes the
+        lockless design correct. Skipped entirely when the run has no `levels`.
+        """
+        if not self.order or self.curriculum_path is None:
+            return
+        table = self._level_table()
+        if table == self._curriculum_written:
+            return
+        data = {"version": CURRICULUM_VERSION, "updated_at": time.time(), "run_name": self.run_name,
+                "order": list(self.order), "levels": table}
+        try:
+            write_json_atomic(self.curriculum_path, data)
+            self._curriculum_written = table
+        except OSError as exc:  # a curriculum file must never stop training; the workers fall back to levels[0]
+            if not self._curriculum_warned:
+                self._curriculum_warned = True
+                print(f"ProgressCallback: could not write {self.curriculum_path}: {exc}")
+
+    @property
+    def unlocked_levels(self) -> list[str]:
+        return [level for level in self.order if self._level_record(level)["unlocked"]]
 
     # -- SB3 hooks ---------------------------------------------------------------------------
 
@@ -157,6 +266,9 @@ class ProgressCallback(BaseCallback):
         self._rate_samples.clear()
         self._rate_samples.append((now, self.num_timesteps))
         self._next_history = now + HISTORY_EVERY_S
+        if self.order:
+            self._level_record(self.order[0])["unlocked"] = True  # the ladder always has a starting rung
+            self.write_curriculum()
         self._write(now)
 
     def _on_step(self) -> bool:
@@ -253,6 +365,9 @@ class ProgressCallback(BaseCallback):
             "end_reason": info.get("end_reason"),
             "reset_seconds": _num(info.get("reset_seconds")),
             "reward_parts": parts,
+            # The level the episode RAN on, not the one the env is about to reset into. A string, so it goes
+            # through info directly rather than through field()/_num().
+            "level": info.get("level"),
         }
         self.episodes += 1
         self.episodes_recent.append(stats)
@@ -275,7 +390,9 @@ class ProgressCallback(BaseCallback):
                 hops = _num(info.get("gate_hops_best"))
                 if hops is not None and (self.best_gate_hops is None or hops < self.best_gate_hops):
                     self.best_gate_hops = hops
+        self._record_level_episode(stats)
         self.per_env[env_index] = {
+            "level": stats["level"],
             "reward": stats["reward"],
             "length": stats["length"],
             "kills": stats["kills"],
@@ -286,6 +403,29 @@ class ProgressCallback(BaseCallback):
             "episodes": self.per_env.get(env_index, {}).get("episodes", 0) + 1,
         }
         self._log_episode(env_index, info, stats)
+
+    def _record_level_episode(self, stats: dict) -> None:
+        """Folds one finished episode into its level's record, then unlocks the next level if it has been earned.
+
+        Only a fresh start counts toward a level's completion rate: a checkpoint respawn starts partway through
+        and its official timer carries over from an earlier episode, so neither says how a whole level goes.
+        Unlocking is checked once per episode, is chained, and is a latch -- a level never re-locks as its rate
+        falls, which would stall the learning that was in progress on it.
+        """
+        level = stats.get("level")
+        if not self.order or not isinstance(level, str):
+            return
+        record = self._level_record(level)
+        record["episodes"] += 1
+        record["recent"].append({"checkpoints_level": stats["checkpoints_level"], "gates_reached": stats["gates_reached"]})
+        if stats["fresh_start"]:
+            completed, seconds = stats["completed"] or 0.0, stats["level_seconds"]
+            record["fresh"].append((completed, seconds))
+            if completed and seconds is not None and (record["best_time"] is None or seconds < record["best_time"]):
+                record["best_time"] = seconds
+        nxt = unlock_next(self.order, self._level_table(), unlock_rate=self.unlock_rate, unlock_window=self.unlock_window)
+        if nxt is not None:
+            self._level_record(nxt)["unlocked"] = True
 
     def _log_episode(self, env_index: int, info: dict, stats: dict) -> None:
         """Appends one line to runs/<run>/episodes.jsonl: what happened, and where it ended.
@@ -337,12 +477,32 @@ class ProgressCallback(BaseCallback):
     def _campaign_stats(self) -> dict:
         n = len(self.fresh_recent)
         times = [seconds for completed, seconds in self.fresh_recent if completed and seconds is not None]
-        return {
+        stats = {
             "fresh_window": n,
             "fresh_completion_rate": sum(completed for completed, _ in self.fresh_recent) / n if n else None,
             "median_time_50": statistics.median(times) if times else None,
             "best_time": self.best_time,
         }
+        if not self.order:
+            return stats  # single level: byte-identical to what this block has always been
+        # Multi-level. Only `fresh_completion_rate` changes meaning, and it becomes a SCORE, not a rate: the sum
+        # over unlocked levels of each one's completions shrunk by max(its window, unlock_window). That shape is
+        # forced by keep_best.py, which only ever replaces best.zip on a strict improvement and is never edited
+        # for this: a plain mean over unlocked levels DROPS at every unlock (~0.52 -> ~0.26 at the second level),
+        # which would freeze best.zip on a single-level policy and print the "15% below best" warning forever.
+        # A shrunk sum cannot drop -- a newly unlocked level contributes 0 -- and with one unlocked level at
+        # window >= unlock_window it is exactly the rate this field has always been. `fresh_window` stays the
+        # POOLED deque length so keep_best's MIN_FRESH_WINDOW guard keeps passing; a per-level minimum would
+        # stall forever, since the slowest window to refill after a restart is the mastered level at weight 0.1.
+        table = self._level_table(with_weights=True)
+        contributing = [row for row in table.values() if row["unlocked"] and row["fresh_window"]]
+        if contributing:
+            stats["fresh_completion_rate"] = sum(
+                row["fresh_completion_rate"] * row["fresh_window"] / max(row["fresh_window"], self.unlock_window)
+                for row in contributing)
+        stats["order"] = list(self.order)
+        stats["levels"] = table
+        return stats
 
     def _add_history(self, point: dict) -> None:
         # Keep `timesteps` strictly increasing. `_restore` carries the whole old history over, but resuming from
@@ -442,6 +602,7 @@ class ProgressCallback(BaseCallback):
 
     def _write(self, now: float) -> None:
         self._next_write = now + self.update_every_s
+        self.write_curriculum()  # same 2 s cadence, and only when the table actually changed
         try:
             write_json_atomic(self.status_path, self._snapshot(now))
         except OSError as exc:  # a status file must never stop training

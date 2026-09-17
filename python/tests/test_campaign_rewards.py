@@ -32,6 +32,25 @@ def test_campaign_step_defaults_to_nothing_happened():
     step = CampaignStep()
     assert (step.checkpoints, step.arenas, step.doors, step.novelty, step.path_gain) == (0, 0, 0, 0.0, 0.0)
     assert (step.gates, step.gate_approach) == (0, 0.0)
+    assert (step.item_pickups, step.item_placements) == (0, 0)
+
+
+def test_item_terms_default_to_zero_and_scale_by_their_weights():
+    """The skull-carry milestones ship at 0.0 and stay there until the in-game checks pass (§8 of the spec)."""
+    cfg = RewardConfig()
+    assert cfg.item_pickup == 0.0 and cfg.item_placed == 0.0
+    off = compute_reward(cfg, snapshot(), snapshot(), {}, campaign=CampaignStep(item_pickups=1, item_placements=1))
+    assert "item_pickup" not in off.parts and "item_placed" not in off.parts
+    on = RewardConfig(**GATES_WEIGHTS, item_pickup=15.0, item_placed=15.0)
+    parts = compute_reward(on, snapshot(), snapshot(), {}, campaign=CampaignStep(item_pickups=2, item_placements=1)).parts
+    assert abs(parts["item_pickup"] - 30.0) < 1e-9 and abs(parts["item_placed"] - 15.0) < 1e-9
+
+
+def test_item_terms_are_paid_on_a_step_without_a_player():
+    """Like the other milestones: the env has already marked them paid, so a player-less frame must not drop them."""
+    cfg = RewardConfig(item_pickup=15.0, item_placed=15.0)
+    parts = compute_reward(cfg, {}, {}, {}, campaign=CampaignStep(item_pickups=1, item_placements=1)).parts
+    assert abs(parts["item_pickup"] - 15.0) < 1e-9 and abs(parts["item_placed"] - 15.0) < 1e-9
 
 
 def test_gate_terms_default_to_zero():

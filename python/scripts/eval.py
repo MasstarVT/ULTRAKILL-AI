@@ -32,10 +32,14 @@ from ultrakill_ai.times import TimeEntry, format_time, record_file  # noqa: E402
 TIMES_MD = Path(__file__).resolve().parents[2] / "times.md"
 
 
-def report_campaign(args: argparse.Namespace, cfg: EnvConfig, model, results: list[tuple[float, dict]]) -> None:
-    """Completion summary for a campaign eval, and the times.md entry for its fastest completion."""
+def report_campaign(args: argparse.Namespace, level: str, model, results: list[tuple[float, dict]]) -> None:
+    """Completion summary for a campaign eval, and the times.md entry for its fastest completion.
+
+    `level` is read from the env, never from the config: `--record-times` writes a row only a FASTER time can
+    ever replace, so recording it against the wrong level would be permanent.
+    """
     completions = sum(1 for _, info in results if info.get("completed"))
-    print(f"completed {completions}/{len(results)} fresh runs of {cfg.level}")
+    print(f"completed {completions}/{len(results)} fresh runs of {level}")
     timed = [info for _, info in results if info.get("completed") and info.get("level_seconds") is not None]
     if not timed:
         if args.record_times:
@@ -47,7 +51,7 @@ def report_campaign(args: argparse.Namespace, cfg: EnvConfig, model, results: li
     if not args.record_times:
         return
     entry = TimeEntry(
-        level=cfg.level,
+        level=level,
         seconds=best["level_seconds"],
         rank=best.get("rank") or "",
         generation=f"{Path(args.model).parent.name}@{model.num_timesteps / 1e6:.2f}M",
@@ -78,8 +82,14 @@ def main() -> None:
         parser.error(f"--level and --record-times need a campaign model; the env config next to it gives mode {cfg.mode!r}")
     if args.level and args.level not in CAMPAIGN_LEVELS:
         parser.error(f"--level {args.level!r} is not a campaign scene name (Level 0-1 .. Level 9-2)")
-    if args.level:
-        cfg.level = args.level
+    if cfg.mode == "campaign":
+        # A curriculum config trains on a list; an eval runs exactly one level, or --record-times writes a row
+        # for whichever level the sampler happened to draw. Clearing `levels` is what pins it.
+        if args.level:
+            cfg.level, cfg.levels = args.level, []
+        elif cfg.levels:
+            cfg.level, cfg.levels = cfg.levels[0], []
+            print(f"the env config lists several levels; evaluating {cfg.level} (pass --level to choose another)")
     if args.realtime:
         cfg.unlimited_fps = False
         cfg.mute = False
@@ -92,6 +102,7 @@ def main() -> None:
         cfg.fresh_start_prob = 1.0
         cfg.explore_dir = ""
         cfg.best_runs_dir = ""
+        cfg.curriculum_path = ""  # never read, let alone perturb, a live run's curriculum
 
     if args.algo == "rppo":
         from sb3_contrib import RecurrentPPO as cls
@@ -105,7 +116,7 @@ def main() -> None:
         # episodes. A fresh archive would show the policy an all-unexplored map it never trained on, so eval reads the
         # counts the first training game (the config's base port) saved next to the model. explore_dir stays empty,
         # so the env never writes them back. A missing file gives an empty archive, and the count below shows it.
-        archive_path = Path(args.model).parent / f"explore_{safe_name(cfg.level)}_{cfg.port}.npz"
+        archive_path = Path(args.model).parent / f"explore_{safe_name(env.level)}_{cfg.port}.npz"
         env.archive = ExplorationArchive.load(archive_path, cfg.cell_size)
         print(f"exploration counts: {len(env.archive.counts)} cells from {archive_path}")
     results = []
@@ -140,7 +151,7 @@ def main() -> None:
 
     print(f"mean reward {np.mean([r for r, _ in results]):.1f} over {len(results)} episodes")
     if cfg.mode == "campaign":
-        report_campaign(args, cfg, model, results)
+        report_campaign(args, env.level, model, results)
 
 
 if __name__ == "__main__":

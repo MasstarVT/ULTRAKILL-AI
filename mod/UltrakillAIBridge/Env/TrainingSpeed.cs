@@ -13,7 +13,8 @@ namespace UltrakillAIBridge.Env
     /// including pits (DeathZone) and instakills.
     ///
     /// No rendering: cameras are disabled because the agent never sees pixels. Enemy Animators are forced
-    /// to AlwaysAnimate so animation-driven attacks don't freeze when nothing is rendered.
+    /// to AlwaysAnimate so animation-driven attacks don't freeze when nothing is rendered, and so are the
+    /// player's own fist and camera Animators (see ForcePlayerAnimators).
     /// </summary>
     [HarmonyPatch]
     internal static class TrainingSpeed
@@ -25,6 +26,54 @@ namespace UltrakillAIBridge.Env
         internal static bool LastSoftDeathInstakill { get; private set; }
 
         private static readonly List<Camera> disabledCameras = new List<Camera>();
+
+        /// <summary>
+        /// Player Animators forced to AlwaysAnimate, with the culling mode each had, so RestoreRendering puts
+        /// them back exactly as disabledCameras does for the cameras.
+        /// </summary>
+        private static readonly List<Animator> forcedAnimators = new List<Animator>();
+        private static readonly List<AnimatorCullingMode> forcedAnimatorModes = new List<AnimatorCullingMode>();
+
+        /// <summary>
+        /// Identity of the Animator set that was last walked: the FistControl/CameraController instance ids
+        /// folded together with the instance id of every DIRECT child of each, so the walk itself runs once
+        /// per player and once per arm change rather than once per step.
+        ///
+        /// Child instance ids, not a child count. FistControl.ResetFists destroys every spawned arm and
+        /// immediately instantiates the replacements as children of the same FistControl
+        /// (decompiled/FistControl.cs:217-256; the Instantiate calls are at :231, :283, :300, :307). Prefs do
+        /// not change mid-level, so the arm set is normally rebuilt one for one: the count goes N -> N over an
+        /// entirely new set of Animators and a count comparison never invalidates. The new arm's Punch
+        /// Animator would then keep its authored culling mode, Unity would cull it because every camera is
+        /// disabled, the "ActiveStart" AnimationEvent would stop firing and Punch.AltHit would never run --
+        /// i.e. picking up or placing an item becomes silently impossible for the rest of the level load.
+        ///
+        /// ResetFists runs mid-level, not just at spawn: WeaponPickUp.cs:104 (walking over an arm pickup),
+        /// PlayerLoadout.SetLoadout, PlayerLoadoutTarget.CommitLoadout, VariationInfo.cs:199,247 and
+        /// FistControl.TutorialCheckForArmThatCanPunch (a UnityEvent target with no C# caller). The loadout
+        /// paths can also swap which arm prefabs exist without changing the count.
+        /// </summary>
+        private static int forcedAnimatorsId;
+
+        /// <summary>
+        /// Whether forcedAnimatorsId describes a walk that has actually happened. A separate flag rather than
+        /// "id == 0", because the hash of a live pair can legitimately be 0 and that must not read as "already
+        /// walked" after a restore.
+        /// </summary>
+        private static bool forcedAnimatorsValid;
+
+        /// <summary>
+        /// The two singleton instance ids alone, so a re-walk can tell "a new player" (every level load) from
+        /// "the same player's arms were rebuilt" (ResetFists). Only the second is worth a log line.
+        /// </summary>
+        private static int forcedPlayerId;
+
+        /// <summary>
+        /// Re-walks caused by an arm rebuild rather than a new player, counted once per run. A diagnostic, not
+        /// sent in obs: the whole point of this class's fist handling is that its failure is silent, so the
+        /// first few rebuilds are logged and the counter makes the rest visible if anything ever needs it.
+        /// </summary>
+        internal static int ArmRebuilds { get; private set; }
 
         [HarmonyPrefix]
         [HarmonyPatch(typeof(NewMovement), nameof(NewMovement.GetHurt))]
@@ -60,11 +109,127 @@ namespace UltrakillAIBridge.Env
         internal static void ApplyRendering()
         {
             if (!EpisodeController.InControl || !RenderingDisabled) return;
+            ForcePlayerAnimators();
             if (Camera.allCamerasCount == 0) return;
             foreach (var cam in Camera.allCameras)
             {
                 cam.enabled = false;
                 disabledCameras.Add(cam);
+            }
+        }
+
+        /// <summary>
+        /// Keeps the player's fist and camera Animators running while every camera is disabled.
+        ///
+        /// Punch.ActiveFrame is the only caller of Punch.AltHit, which is the only way an item is picked up
+        /// or placed on an altar, and it only runs while Punch.activeFrames is positive -- which nothing but
+        /// the "ActiveStart" AnimationEvent sets (grepped: no C# caller exists for ActiveStart or ActiveEnd).
+        /// Unity culls an Animator whose renderers are never drawn, so with rendering off the fist animation
+        /// would not advance, the event would never fire and skull carrying would be silently impossible.
+        /// Enemy Animators are already handled the same way in OnEnemyAdded.
+        ///
+        /// The hierarchy walk runs once per player, and again whenever the set of arms changes: both singletons
+        /// are NoAutoInstance, so reading Instance is a static field read that returns null (and never creates
+        /// anything) before the player exists, and a hash over their instance ids and their direct children,
+        /// plus a scan of the forced list for destroyed entries, is all this compares per step. The walk itself
+        /// only runs when one of those says the set has changed.
+        /// </summary>
+        private static void ForcePlayerAnimators()
+        {
+            var fists = MonoSingleton<FistControl>.Instance;
+            var camera = MonoSingleton<CameraController>.Instance;
+            if (fists == null && camera == null) return;
+            int id = AnimatorSetId(fists, camera);
+            if (forcedAnimatorsValid && id == forcedAnimatorsId && !AnyForcedAnimatorDestroyed()) return;
+
+            int playerId = PlayerId(fists, camera);
+            if (forcedAnimatorsValid && playerId == forcedPlayerId)
+            {
+                ArmRebuilds++;
+                if (ArmRebuilds <= 4)
+                {
+                    Plugin.Log.LogInfo(
+                        $"Fist Animators rebuilt mid-level (ResetFists), re-forcing AlwaysAnimate (#{ArmRebuilds})");
+                }
+            }
+            forcedAnimatorsValid = true;
+            forcedAnimatorsId = id;
+            forcedPlayerId = playerId;
+            // The previous player's Animators are a different (usually destroyed) set: put them back and drop
+            // them, so a run that loads thousands of levels doesn't accumulate a list of dead references.
+            RestoreForcedAnimators();
+            ForceAnimators(fists);
+            ForceAnimators(camera);
+        }
+
+        /// <summary>
+        /// Hash of the Animator set's identity: the two singletons and every direct child of each, so a child
+        /// added, removed, or destroyed and replaced one for one all change it (see forcedAnimatorsId). Order
+        /// dependent and allocation free; the two transforms have a handful of children each, and
+        /// ApplyRendering already reads Camera.allCameras every step.
+        /// </summary>
+        private static int AnimatorSetId(Component fists, Component camera)
+        {
+            unchecked
+            {
+                return FoldChildren(FoldChildren(17, fists), camera);
+            }
+        }
+
+        private static int PlayerId(Component fists, Component camera)
+        {
+            unchecked
+            {
+                return (fists != null ? fists.GetInstanceID() : 0) * 31
+                       + (camera != null ? camera.GetInstanceID() : 0);
+            }
+        }
+
+        private static int FoldChildren(int hash, Component root)
+        {
+            unchecked
+            {
+                if (root == null) return hash * 31;
+                hash = hash * 31 + root.GetInstanceID();
+                var t = root.transform;
+                int count = t.childCount;
+                for (int i = 0; i < count; i++)
+                {
+                    hash = hash * 31 + t.GetChild(i).GetInstanceID();
+                }
+                return hash;
+            }
+        }
+
+        /// <summary>
+        /// True when any Animator this last forced has since been destroyed. UnityEngine.Object's == reports a
+        /// destroyed object as null, so a destroy-and-respawn is caught here whatever the ids hash to, and at
+        /// any depth rather than only among direct children. It also cleans up after the frame where Unity has
+        /// instantiated the new arms but not yet processed the Destroy of the old ones: those doomed Animators
+        /// get forced, and are dropped on the next step.
+        ///
+        /// Only Animators that were NOT already AlwaysAnimate are in the list (ForceAnimators skips the rest),
+        /// which is why the id hash is kept as well: a loadout swap whose old arms were all authored
+        /// AlwaysAnimate would destroy nothing this scan can see.
+        /// </summary>
+        private static bool AnyForcedAnimatorDestroyed()
+        {
+            for (int i = 0; i < forcedAnimators.Count; i++)
+            {
+                if (forcedAnimators[i] == null) return true;
+            }
+            return false;
+        }
+
+        private static void ForceAnimators(Component root)
+        {
+            if (root == null) return;
+            foreach (var animator in root.GetComponentsInChildren<Animator>(true))
+            {
+                if (animator == null || animator.cullingMode == AnimatorCullingMode.AlwaysAnimate) continue;
+                forcedAnimators.Add(animator);
+                forcedAnimatorModes.Add(animator.cullingMode);
+                animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
             }
         }
 
@@ -75,6 +240,21 @@ namespace UltrakillAIBridge.Env
                 if (cam != null) cam.enabled = true;
             }
             disabledCameras.Clear();
+            RestoreForcedAnimators();
+            forcedAnimatorsId = 0;
+            forcedPlayerId = 0;
+            forcedAnimatorsValid = false;
+        }
+
+        private static void RestoreForcedAnimators()
+        {
+            for (int i = 0; i < forcedAnimators.Count; i++)
+            {
+                var animator = forcedAnimators[i];
+                if (animator != null) animator.cullingMode = forcedAnimatorModes[i];
+            }
+            forcedAnimators.Clear();
+            forcedAnimatorModes.Clear();
         }
 
         internal static void OnEnemyAdded(EnemyIdentifier eid)

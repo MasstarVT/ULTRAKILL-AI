@@ -132,7 +132,9 @@ def load_config(path: str | None) -> tuple[dict, dict]:
 def fill_campaign_dirs(cfg: EnvConfig, model_dir: Path, run_dir: Path) -> EnvConfig:
     """Campaign runs keep their exploration archives beside the checkpoints and their best runs beside the logs.
 
-    Only empty settings are filled, so a config can still point either one elsewhere. Cyber Grind is returned as is.
+    Only empty settings are filled, so a config can still point either one elsewhere. Cyber Grind is returned as
+    is. `curriculum_path` is filled only for a multi-level run: with no `levels` it stays empty and no worker
+    ever opens a curriculum file.
     """
     if cfg.mode != "campaign":
         return cfg
@@ -140,6 +142,7 @@ def fill_campaign_dirs(cfg: EnvConfig, model_dir: Path, run_dir: Path) -> EnvCon
         cfg,
         explore_dir=cfg.explore_dir or model_dir.as_posix(),
         best_runs_dir=cfg.best_runs_dir or (run_dir / "best_runs").as_posix(),
+        curriculum_path=cfg.curriculum_path or ((run_dir / "curriculum.json").as_posix() if cfg.levels else ""),
     )
 
 
@@ -208,7 +211,17 @@ def main() -> None:
     # timesteps is the total for the run. learn() adds its argument to the loaded step count when
     # resuming, so only the remaining steps are requested.
     remaining = max(0, timesteps - model.num_timesteps) if args.resume else timesteps
-    progress = ProgressCallback(Path("runs") / run_name / "status.json", timesteps, run_name, num_envs)
+    progress = ProgressCallback(Path("runs") / run_name / "status.json", timesteps, run_name, num_envs,
+                                levels=env_cfg.levels, curriculum_path=env_cfg.curriculum_path,
+                                unlock_rate=env_cfg.unlock_rate, unlock_window=env_cfg.unlock_window,
+                                level_weight_floor=env_cfg.level_weight_floor)
+    if env_cfg.levels:
+        # Written before learn(), because SB3's _setup_learn calls env.reset() before _on_training_start ever
+        # runs: without this the workers' first fresh start would read whatever happened to be on disk. The
+        # unlock set is printed because _restore bails when status.json's run_name differs, so a run rename
+        # silently re-locks every level and this is where that shows.
+        progress.write_curriculum()
+        print(f"curriculum: {len(env_cfg.levels)} levels, unlocked {progress.unlocked_levels or [env_cfg.levels[0]]}")
     callbacks = CallbackList([
         CheckpointCallback(save_freq=max(1, train_cfg.get("save_every", 50_000) // num_envs), save_path=str(model_dir), name_prefix="ckpt"),
         EpisodeStatsCallback(),

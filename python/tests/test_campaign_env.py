@@ -29,6 +29,19 @@ GATES = (("0,1,15", (0.0, 1.0, 15.0), 2), ("0,1,35", (0.0, 1.0, 35.0), 1), ("0,1
 TIER_GATES = (("0,1,15", (0.0, 1.0, 15.0), 2), ("60,1,15", (60.0, 1.0, 15.0), 2), ("0,1,55", (0.0, 1.0, 55.0), 1))
 GATE_BLOCK = 443 + 5  # absolute index of the campaign block's target slots (448-455)
 WEDGE_HOLD = 45  # wedge_seconds 3.0 at 30 fps / frameskip 2 = 15 decisions/s
+# The skull room (FakeLevel.enable_skulls): one altar-locked gate at z 50, its source on a pedestal at z 20 and
+# its destination altar at z 40, so the whole fetch-carry-place leg is walkable straight down the corridor. The
+# shape is Level 1-1's red leg: a live destination altar, a dead twin of it that can never fill, and a source
+# skull that starts INSIDE an ItemPlaceZone (every ItemIdentifier on 1-1 does).
+SKULL_GATE_KEY, SKULL_GATE_POS = "0,1,50", (0.0, 1.0, 50.0)
+SKULL_GATES = ((SKULL_GATE_KEY, SKULL_GATE_POS, 0),)
+PEDESTAL_KEY, PEDESTAL_POS = "0,1,20", (0.0, 1.0, 20.0)
+ALTAR_KEY, ALTAR_POS = "0,1,40", (0.0, 1.0, 40.0)
+DEAD_TWIN_KEY = "0,1,40#2"
+ALTAR_ITEM = "SkullRed"  # what every ItemPlaceZone in the skull room accepts; FakeLevel.item_type is what exists
+PUNCH_RANGE = 4.0  # Punch.ActiveFrame's own reach, and EnvConfig.subgoal_punch_range_m's default
+# The two-level curriculum tests. Both names must be in CAMPAIGN_LEVELS_SHIPPED or UltrakillEnv refuses them.
+LEVELS = ["Level 0-1", "Level 0-3"]
 
 
 class FakeLevel:
@@ -51,10 +64,22 @@ class FakeLevel:
       `gates_present`  False drops the whole gates block, same reason
       `gates_ordered`  False is a level whose door graph has no goal room (0-5)
       `ground_center`  overrides the centre ground ray, which the ring minimum can disagree with
+      `skulls`         the skull room: an altar-locked gate, a pedestal source, a destination altar and its
+                       dead twin, with `punch` picking up, placing and throwing exactly as `Punch.AltHit` does
+      `skull_fields`   False keeps the skull room but drops `altars`, `items` and `needs_item`, as a mod older
+                       than 0.7.0 does
+      `altars_present` False is Level 0-4's shape: a carryable and not one `ItemPlaceZone` in the level, so the
+                       gate is an ordinary door and the only thing a punch can do with the item is throw it
+      `item_type`      what the carryable is. Anything but ALTAR_ITEM is an item no zone here accepts, which is
+                       0-4's `CustomKey1` standing in a level that also has skull altars
+      `item_active`    False is the carryable's room still switched off: it is reported but has no collider, so
+                       no punch can reach it -- what a teleport into an unactivated room leaves you with
     """
 
     def __init__(self):
         self.resets: list[bool] = []  # the checkpoint flag of every reset
+        self.reset_scenes: list[str | None] = []  # the scene name of every reset, so a level switch is visible
+        self.scene_name = LEVEL
         self.steps = 0
         self.kill_next = False  # the next step returns a dead player
         self.kill_enemy_next = False  # the next step removes the room's enemy, if alive, and pays a kill
@@ -70,11 +95,41 @@ class FakeLevel:
         self.yaw = 0.0
         self.enemy_rel = [0.0, 0.0, 5.0]
         self.last_action: dict | None = None  # the command dict the env last sent
+        self.skulls = False
+        self.skull_fields = True
+        self.altars_present = True
+        self.item_type = ALTAR_ITEM
+        self.item_active = True
+        self.picked_up = 0  # times a punch picked the skull up, and times one threw it: the physical events
+        self.thrown = 0
         self._load()
+
+    def enable_skulls(self, *, fields: bool = True, altars: bool = True, item_type: str = ALTAR_ITEM) -> None:
+        """Turns the level into the skull room. Call before reset(); `fields=False` is a mod older than 0.7.0.
+
+        `altars=False` and `item_type` are the two ways a level can hold a carryable that nothing accepts; see
+        the class docstring.
+        """
+        self.skulls = True
+        self.skull_fields = fields
+        self.altars_present = altars
+        self.item_type = item_type
+        self.gates = SKULL_GATES
+        self._load()
+
+    def _zone_accepts(self) -> bool:
+        """Whether this level has an ItemPlaceZone that takes the item it ships (`ItemPlaceZone.CheckItem`)."""
+        return self.altars_present and self.item_type == ALTAR_ITEM
 
     def _load(self) -> None:
         self.z = 0.0
         self.y = 1.0
+        # A level load puts the skull back on its pedestal. A checkpoint respawn does too, but under a fresh key:
+        # CheckPoint.ResetRoom destroys and re-instantiates the room, which is why nothing may key on an instance.
+        self.skull_key = "skull"
+        self.skull_held = False
+        self.skull_in: str | None = PEDESTAL_KEY if self._zone_accepts() else None
+        self.skull_pos = list(PEDESTAL_POS)
         self.seconds = 0.0
         self.kills = 0
         self.restarts = 0
@@ -100,19 +155,46 @@ class FakeLevel:
     def get_obs(self) -> dict:
         return self._obs()
 
+    def kill(self) -> dict:
+        """The protocol's debug kill. soft_death is not modelled here, so this is always a real death."""
+        self.dead = True
+        return self._obs("kill")
+
     def reset(self, scene: str | None = None, checkpoint: bool = False) -> dict:
         self.resets.append(checkpoint)
-        if checkpoint and self.checkpoint:
+        self.reset_scenes.append(scene)
+        switched = scene is not None and scene != self.scene_name
+        if scene is not None:
+            self.scene_name = scene
+        if checkpoint and self.checkpoint and not switched:
             self.z = 20.0
             self.dead = False
             self.restarts += 1
             if RESPAWN_DOOR_KEY not in self.doors:
                 self.doors.append(RESPAWN_DOOR_KEY)
+            # The respawn re-instantiates the room, so its skull comes back under a new key.
+            self.skull_key = f"skull#{self.restarts}"
+            self.skull_held = False
+            self.skull_in = PEDESTAL_KEY if self._zone_accepts() else None
+            self.skull_pos = list(PEDESTAL_POS)
         else:
             self._load()
         self.enemy_alive = True  # a fresh load or a checkpoint respawn both re-create the room's enemy
         self.enemy_health = ENEMY_MAX_HP
         return self._obs("reset")
+
+    def _punch(self) -> None:
+        """What `Punch.AltHit` does: place if holding and in reach of a zone, else throw; pick up if not holding."""
+        if self.skull_held:
+            if self._zone_accepts() and abs(self.z - ALTAR_POS[2]) <= PUNCH_RANGE:
+                self.skull_held, self.skull_in, self.skull_pos = False, ALTAR_KEY, list(ALTAR_POS)
+            else:  # ActiveStart throws whatever it is holding when the active frame did not place it
+                self.skull_held, self.skull_in, self.skull_pos = False, None, [0.0, self.y, self.z]
+                self.thrown += 1
+        elif self.item_active and abs(self.z - self.skull_pos[2]) <= PUNCH_RANGE:
+            # Including out of a filled altar: AltHit's !holding branch is ForceHold whatever the skull sits in.
+            self.skull_held, self.skull_in = True, None
+            self.picked_up += 1
 
     def step(self, action: dict) -> dict:
         self.steps += 1
@@ -128,6 +210,10 @@ class FakeLevel:
             elif not self.locked and action.get("move", [0, 0])[1] > 0:
                 self.z = min(EXIT_Z, self.z + 2.0)
             self.seconds += 2.0 / 15.0
+        if self.skulls and not self.dead and not self.locked and "punch" in (action.get("buttons") or ()):
+            self._punch()
+        if self.skull_held:
+            self.skull_pos = [0.0, self.y, self.z]  # a carried skull moves with the player
         if self.enemy_alive and self.kill_enemy_next:
             # A one-shot kill: the enemy vanishes without a health drop first, same as the mod reports it.
             self.enemy_alive, self.kill_enemy_next = False, False
@@ -147,7 +233,38 @@ class FakeLevel:
             "open": abs(self.z - pos[2]) <= 8.0,  # the DoorController proximity trigger
             "locked": False, "active": True, "controller_active": True,
         } for key, pos, hops in self.gates]
+        if self.skulls and self.skull_fields and self.altars_present:
+            for g in gates:
+                if g["key"] == SKULL_GATE_KEY:
+                    # A skull-locked door reports exactly like a walk-up door; needs_item is the only difference.
+                    # It clears from the LIVE altar only -- the dead twin can never fill (M14/X1).
+                    g["needs_item"] = None if self.skull_in == ALTAR_KEY else ALTAR_ITEM
+                    g["altar_only"] = True
         return {"gates_ordered": self.gates_ordered, "gates_truncated": False, "gates": gates}
+
+    def _skull_block(self) -> dict:
+        """`campaign.altars` and `campaign.items`, or nothing at all against a mod older than 0.7.0."""
+        if not self.skulls or not self.skull_fields:
+            return {}
+        def zone(key, pos, filled, doors, ancestors=1):
+            return {"key": key, "pos": list(pos), "item": ALTAR_ITEM, "filled": filled, "active": True,
+                    "inactive_ancestors": ancestors, "reverse_doors": [],
+                    "doors": [{"key": k, "pos": list(SKULL_GATE_POS)} for k in doors]}
+        altars = [
+            # The pedestal drives no door and reads filled the moment its room switches on (31 zones
+            # campaign-wide do); the live destination altar opens the gate; the dead twin never can.
+            zone(PEDESTAL_KEY, PEDESTAL_POS, self.skull_in == PEDESTAL_KEY, ()),
+            zone(ALTAR_KEY, ALTAR_POS, self.skull_in == ALTAR_KEY, (SKULL_GATE_KEY,)),
+            zone(DEAD_TWIN_KEY, ALTAR_POS, False, (SKULL_GATE_KEY,), ancestors=2),
+        ]
+        return {
+            "altars": altars if self.altars_present else [],
+            "items": [{
+                "key": self.skull_key, "pos": list(self.skull_pos), "item": self.item_type, "held": self.skull_held,
+                "placed": self.skull_in is not None, "placed_in": self.skull_in, "active": self.item_active,
+                "active_self": True, "inactive_ancestors": 1,
+            }],
+        }
 
     def _ground_rays(self) -> list[float]:
         # The mod measures down from the player to the floor (y = 1 in this corridor) and writes
@@ -177,7 +294,7 @@ class FakeLevel:
         obs = {
             "type": "obs",
             "step": self.steps,
-            "scene": LEVEL,
+            "scene": self.scene_name,
             "ready": not self.dead,
             "player": player,
             "enemies": enemies,
@@ -197,6 +314,7 @@ class FakeLevel:
                 "unlocked_doors": list(self.doors),
                 "ranks": RANKS,
                 **self._gates_block(),
+                **self._skull_block(),
             },
         }
         if event:
@@ -930,6 +1048,427 @@ def test_episode_info_has_the_new_keys():
     _, _, _, _, info = env.step(forward())
     assert info["start_checkpoint"] == CHECKPOINT_ID
     env.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# S4: the skull-carry leg
+# ---------------------------------------------------------------------------------------------
+
+SKULL_REWARDS = RewardConfig(time=0.01, checkpoint=10.0, arena_clear=10.0, door_unlock=3.0, novelty=0.5,
+                             gate=15.0, gate_approach=0.15, item_pickup=15.0, item_placed=15.0, punch=0.01)
+
+
+def skull_env(*, skulls: dict | None = None, **overrides) -> tuple[UltrakillEnv, FakeLevel]:
+    env, fake = make_env(rewards=SKULL_REWARDS, **overrides)
+    fake.enable_skulls(**(skulls or {}))
+    return env, fake
+
+
+def walk(env, steps: int, *, punch: bool = False, parts: dict | None = None):
+    """`steps` forward decisions, optionally pressing punch on every one of them."""
+    info = None
+    for _ in range(steps):
+        _, _, terminated, truncated, info = env.step(action(move=True, buttons=("punch",) if punch else ()))
+        if parts is not None:
+            add_parts(parts, info)
+        if terminated or truncated:
+            break
+    return info
+
+
+def test_the_skull_leg_pays_pickup_and_placement_once_each():
+    """Fetch, carry, place: the whole leg, with punch held down the entire way as the live policy does.
+
+    The gate at z 50 is a dead end without this -- `needs_item` is the only field that separates "kill eleven
+    enemies" from "fetch a skull", and an agent that cannot tell them apart pays gate_approach to reach a door
+    it can never pass.
+    """
+    env, fake = skull_env(max_steps=40)
+    env.reset(seed=0)
+    assert env.gates.target["subgoal"] == "item", "the locked gate sends us to its source first"
+    parts: dict[str, float] = {}
+    walk(env, 40, punch=True, parts=parts)
+    env.close()
+    assert fake.picked_up == 1 and fake.thrown == 0, "the carry survived a punch on every decision"
+    assert fake.skull_in == ALTAR_KEY
+    assert parts["item_pickup"] == 15.0 and parts["item_placed"] == 15.0
+    assert parts["gate_approach"] > 0.0
+    assert parts["gate"] == 15.0, "and the rung pays once, after the placement cleared the lock"
+
+
+def test_walking_up_to_a_locked_gate_without_the_skull_pays_no_rung():
+    """A door that cannot be passed is not 'reached', however close the agent stands.
+
+    Paying the rung for arriving at a sealed door was worse than the stray +15: `best_hops` moved past the
+    lock, so `_choose_target` dropped to the rung below -- which carries no `needs_item`, so `_subgoal` handed
+    it straight back -- and the fetch/carry machine never fired again for the rest of the level load.
+    """
+    env, fake = skull_env(max_steps=40)
+    env.reset(seed=0)
+    parts: dict[str, float] = {}
+    info = walk(env, 26, parts=parts)  # no punch, so the skull is never picked up and the lock never clears
+    assert fake.skull_in == PEDESTAL_KEY and not fake.skull_held
+    assert fake.z >= SKULL_GATE_POS[2], "the agent really did walk through where the gate stands"
+    assert info["gates_reached"] == 0 and info["gate_hops_best"] is None
+    assert "gate" not in parts, "the locked rung paid nothing"
+    assert env.gates.target["subgoal"] == "item", "and the sub-goal still points at the skull"
+    env.close()
+
+
+def test_punch_at_a_solved_altar_is_dropped_so_the_gate_stays_open():
+    """`AltHit`'s not-holding branch is ForceHold on whatever it hits, INCLUDING a skull resting in an altar,
+    and `ForceHold` re-runs `CheckItem`, whose empty branch calls Close() on the doors that altar opened.
+
+    Without this the puzzle is undone on the very next decision and the gate re-locks, which is the §8 check 2
+    guarantee. The env drops only presses that can do nothing but harm; the policy still chooses to press.
+    """
+    env, fake = skull_env(max_steps=80)
+    env.reset(seed=0)
+    walk(env, 19, punch=True)  # picked up at z 16, carried, placed at z 38
+    assert fake.skull_in == ALTAR_KEY and fake.picked_up == 1
+    for _ in range(40):  # stand on the altar and hammer punch
+        fake.z = ALTAR_POS[2]
+        env.step(action(buttons=("punch",)))
+        assert "punch" not in fake.last_action["buttons"]
+    assert fake.skull_in == ALTAR_KEY and fake.picked_up == 1
+    assert env._raw["campaign"]["gates"][0]["needs_item"] is None, "the gate stayed open"
+    env.close()
+
+
+def test_a_placement_pays_once_even_when_the_skull_is_pulled_back_out():
+    """With the protection off the puzzle really can be undone and redone; the milestone keys stay spent."""
+    env, fake = skull_env(max_steps=80, subgoal_punch_range_m=0.0)
+    env.reset(seed=0)
+    parts: dict[str, float] = {}
+    walk(env, 10, punch=True, parts=parts)  # z 20: picked up
+    assert fake.skull_held
+    for z in (40.0,) * 12:  # teleport to the altar and hammer punch: in, out, in, out ...
+        fake.z = z
+        _, _, _, _, info = env.step(action(buttons=("punch",)))
+        add_parts(parts, info)
+    env.close()
+    assert fake.picked_up > 1, "the fake level really did let it be pulled back out"
+    assert parts["item_pickup"] == 15.0 and parts["item_placed"] == 15.0, "both keys are spent for this level load"
+
+
+def test_punch_is_dropped_while_carrying_outside_range_and_kept_inside():
+    """Punch held down the whole way: exactly the two useful presses survive, and nothing is ever thrown."""
+    env, fake = skull_env(max_steps=40)
+    env.reset(seed=0)
+    picked = placed = carried_and_dropped = 0
+    for _ in range(20):
+        was_held = fake.skull_held
+        env.step(action(move=True, buttons=("punch",)))
+        kept = "punch" in fake.last_action["buttons"]
+        if not was_held and fake.skull_held:
+            picked += 1
+            assert kept, "the pickup press is the one press that helps: it is never dropped"
+        elif was_held and fake.skull_in == ALTAR_KEY:
+            placed += 1
+            assert kept, "nor is the placing press"
+        elif was_held:
+            assert not kept, f"a press while carrying, {abs(fake.z - ALTAR_POS[2]):.0f} m from the altar"
+            carried_and_dropped += 1
+    env.close()
+    assert (picked, placed) == (1, 1) and carried_and_dropped >= 5
+    assert fake.thrown == 0 and fake.picked_up == 1
+
+
+def test_punch_passes_through_while_carrying_an_item_no_altar_wants():
+    """Level 0-4's shape: a `CustomKey1` carryable and not one `ItemPlaceZone` in the level.
+
+    The protection exists to stop a punch throwing an item that has somewhere to go. Where nothing accepts what
+    is held there is nothing to protect, and the button is not free: dropping it costs the parry, the melee and
+    the throw itself, for the whole carry, on a level 0-4's key is carried across. The first version tested
+    `any(items[].held)`, so picking the key up silenced punch until the key was delivered -- and it could not
+    even be thrown away to get the button back, because throwing is a punch.
+    """
+    env, fake = skull_env(max_steps=40, skulls=dict(altars=False))
+    env.reset(seed=0)
+    assert env._raw["campaign"]["altars"] == [] and env._raw["campaign"]["items"], "items, and no altars at all"
+    assert "needs_item" not in env._raw["campaign"]["gates"][0], "so the gate is an ordinary walk-up door"
+    assert "subgoal" not in env.gates.target, "and the forced look mode is inert: it needs a sub-goal target"
+    kept = 0
+    for _ in range(12):  # walks from z 0 to z 24, over the key at z 20, pressing punch every decision
+        env.step(action(move=True, buttons=("punch",)))
+        kept += "punch" in fake.last_action["buttons"]
+    env.close()
+    assert kept == 12, f"every press must reach the game; {12 - kept} were dropped"
+    assert fake.picked_up >= 1 and fake.thrown >= 1, "it was picked up by punching and thrown by punching"
+
+
+def test_punch_passes_through_while_carrying_an_item_the_altars_do_not_accept():
+    """The test is the held item's TYPE, not "something is held": 1-1 carries two skull colours at once."""
+    env, fake = skull_env(max_steps=60, skulls=dict(item_type="CustomKey1"))
+    env.reset(seed=0)
+    assert env._raw["campaign"]["gates"][0]["needs_item"] == ALTAR_ITEM, "the gate still wants a red skull"
+    assert env.gates.target["key"] == SKULL_GATE_KEY and "subgoal" not in env.gates.target, \
+        "no source of the wanted type exists, so the fetch machine never starts"
+    walk(env, 8)  # z 16, within punch range of the loose key at z 20
+    env.step(action(buttons=("punch",)))
+    assert fake.skull_held and "punch" in fake.last_action["buttons"], "the pickup press reached the game"
+    kept = 0
+    for _ in range(6):
+        env.step(action(move=True, buttons=("punch",)))
+        kept += "punch" in fake.last_action["buttons"]
+    env.close()
+    assert kept == 6, "an unwanted carry never gates the button, however far from an altar it goes"
+
+
+def test_carry_protection_can_be_turned_off_and_then_the_punch_throws_it():
+    env, fake = skull_env(max_steps=40, subgoal_punch_range_m=0.0)
+    env.reset(seed=0)
+    walk(env, 10)  # z 20, standing on the pedestal, nothing punched yet
+    assert not fake.skull_held
+    env.step(action(buttons=("punch",)))
+    assert fake.skull_held and fake.picked_up == 1
+    env.step(action(move=True, buttons=("punch",)))  # z 22, nowhere near the altar
+    assert "punch" in fake.last_action["buttons"] and fake.thrown == 1 and not fake.skull_held
+    env.close()
+
+
+def test_throwing_the_skull_retargets_and_pays_no_second_approach():
+    """Pick up, throw, pick up again: each leg's approach budget is seeded once an episode and never re-seeded."""
+    env, fake = skull_env(max_steps=60, subgoal_punch_range_m=0.0)
+    env.reset(seed=0)
+    parts: dict[str, float] = {}
+    walk(env, 10, parts=parts)  # z 20, on the pedestal
+    _, _, _, _, info = env.step(action(buttons=("punch",)))
+    add_parts(parts, info)
+    assert fake.skull_held and env.gates.target["key"].startswith("altar:")
+    walk(env, 6, parts=parts)  # z 32, closing on the altar
+    earned = parts["gate_approach"]
+    _, _, _, _, info = env.step(action(buttons=("punch",)))  # throw it at our feet
+    add_parts(parts, info)
+    assert fake.thrown == 1 and env.gates.target["key"] == "item:SkullRed", "the machine drops back to fetch"
+    for _ in range(4):  # stand on it, pick it up again, drop it again
+        _, _, _, _, info = env.step(action(buttons=("punch",)))
+        add_parts(parts, info)
+    env.close()
+    assert fake.picked_up >= 2 and parts["gate_approach"] == earned, "shuttling earned nothing"
+    assert parts["item_pickup"] == 15.0
+
+
+def test_dying_while_holding_the_skull_cannot_pay_the_pickup_twice():
+    """A checkpoint respawn re-instantiates the room, so the skull comes back under a brand-new key."""
+    env, fake = skull_env(max_steps=80)
+    env.reset(seed=0)
+    parts: dict[str, float] = {}
+    walk(env, 11, punch=True, parts=parts)  # z 22: checkpoint reached and the skull picked up
+    assert fake.skull_held and parts["item_pickup"] == 15.0
+    fake.kill_next = True
+    _, _, terminated, truncated, info = env.step(idle())
+    add_parts(parts, info)
+    assert not terminated and not truncated and info["deaths"] == 1
+    assert fake.skull_key == "skull#1" and not fake.skull_held, "a fresh instance back on its pedestal"
+    walk(env, 4, punch=True, parts=parts)
+    env.close()
+    assert fake.picked_up == 2, "it really was picked up a second time"
+    assert parts["item_pickup"] == 15.0, "type-keyed, so a re-instantiated skull cannot re-pay"
+
+
+def test_look_mode_2_is_forced_within_punch_range_of_a_subgoal():
+    env, fake = skull_env(max_steps=40)
+    env.reset(seed=0)
+    fake.yaw = 90.0  # facing +x, so the sub-goal down the corridor is a left turn
+    for _ in range(8):  # decisions taken from z 0..14, all more than 4 m from the pedestal at z 20
+        env.step(action(move=True, yaw=30.0))
+    assert fake.last_action["look"] == [30.0, 0.0], "look mode 0: the sampled bins drove the camera"
+    _, _, _, _, info = env.step(action(move=True, yaw=30.0))  # taken from z 16, inside 4 m
+    assert fake.last_action["look"][0] < 0.0, "the env took the camera regardless of the sampled look mode"
+    assert info["look_gate_frac"] > 0.0
+    env.close()
+
+
+def test_a_subgoal_target_packs_through_the_unchanged_479_observation():
+    env, fake = skull_env()
+    obs, _ = env.reset(seed=0)
+    assert obs.shape == (479,) and env.observation_space.contains(obs)
+    assert env.gates.target["subgoal"] == "item"
+    assert obs[GATE_BLOCK + 4] == 1.0  # target mask
+    assert abs(obs[GATE_BLOCK + 2] - PEDESTAL_POS[2] / 50.0) < 1e-6, "the gate scales, via the inherited hops"
+    assert obs[GATE_BLOCK + 5] == 0.0 and obs[GATE_BLOCK + 6] == 0.0, "open/locked stay 0 with target_kind_slots off"
+    assert obs[GATE_BLOCK + 7] == 0.0  # the gate's own hops (0), inherited
+    env.close()
+
+    kinds, _ = make_env(rewards=SKULL_REWARDS, target_kind_slots=True)
+    kinds.client.enable_skulls()
+    obs, _ = kinds.reset(seed=0)
+    assert obs[GATE_BLOCK + 5] == 1.0 and obs[GATE_BLOCK + 6] == 0.0, "the escape hatch: 'the target is an item'"
+    kinds.close()
+
+
+def test_old_mod_without_altars_still_runs():
+    """New Python against a 0.6.x mod: no altars, no items, no needs_item. Byte-identical to today."""
+    env, fake = skull_env(max_steps=40)
+    fake.skull_fields = False
+    obs, _ = env.reset(seed=0)
+    assert "altars" not in env._raw["campaign"] and "needs_item" not in env._raw["campaign"]["gates"][0]
+    assert env.gates.target["key"] == SKULL_GATE_KEY and "subgoal" not in env.gates.target
+    parts: dict[str, float] = {}
+    info = walk(env, 40, punch=True, parts=parts)
+    env.close()
+    assert info["end_reason"] == "level_complete"
+    assert "item_pickup" not in parts and "item_placed" not in parts
+    assert parts["punch"] < 0.0, "with nothing held, no press is ever dropped, so every one is charged"
+
+
+def test_new_mod_fields_ignored_by_old_rules():
+    """New mod against pre-S4 Python: `_choose_target` is the old rule, and the new fields do not disturb it."""
+    env, fake = skull_env()
+    env.reset(seed=0)
+    campaign = env._raw["campaign"]
+    assert campaign["gates"][0]["needs_item"] == "SkullRed" and campaign["altars"] and campaign["items"]
+    old_target = env.gates._choose_target(campaign, [0.0, 1.0, 0.0])
+    assert old_target["key"] == SKULL_GATE_KEY and "subgoal" not in old_target
+    assert env.gates._gates(campaign) == campaign["gates"], "an altar_only gate is just another gate"
+    env.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# S1: the multi-level curriculum
+# ---------------------------------------------------------------------------------------------
+
+def write_curriculum(path: Path, *, order=LEVELS, run_name=None, favour=None, text=None) -> None:
+    """A curriculum file whose weights make `favour` the only level a fresh load can draw (with floor 0)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if text is not None:
+        path.write_text(text, encoding="utf-8")
+        return
+    levels = {level: {"unlocked": True, "fresh_window": 50, "best_time": None, "episodes": 0,
+                      "fresh_completion_rate": 0.0 if level == favour else 1.0} for level in order}
+    path.write_text(json.dumps({"version": 1, "updated_at": 1.0, "run_name": run_name or path.parent.name,
+                                "order": list(order), "levels": levels}), encoding="utf-8")
+
+
+def curriculum_env(tmp: str, **overrides) -> tuple[UltrakillEnv, FakeLevel, Path]:
+    run = Path(tmp) / "runs" / "campaign_multi"
+    path = run / "curriculum.json"
+    env, fake = make_env(levels=LEVELS, curriculum_path=str(path), level_weight_floor=0.0,
+                         explore_dir=str(Path(tmp) / "models"), best_runs_dir=str(run / "best_runs"),
+                         **overrides)
+    return env, fake, path
+
+
+def test_a_fresh_start_switches_level_and_a_respawn_never_does():
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, path = curriculum_env(tmp, fresh_start_prob=0.0, max_steps=40)
+        write_curriculum(path, favour=LEVELS[0])
+        _, info = env.reset(seed=0)
+        assert env.level == LEVELS[0] and info["level"] == LEVELS[0]
+        assert fake.reset_scenes == [LEVELS[0]]
+        info = walk(env, 40)  # to the exit: a completion forces the next episode to be a fresh load
+        assert info["end_reason"] == "level_complete" and info["level"] == LEVELS[0]
+
+        write_curriculum(path, favour=LEVELS[1])  # re-read at the next fresh start, not cached from startup
+        _, info = env.reset()
+        assert env.level == LEVELS[1] and info["level"] == LEVELS[1] and info["fresh_start"] == 1
+        assert fake.reset_scenes[-1] == LEVELS[1] and fake.z == 0.0
+
+        write_curriculum(path, favour=LEVELS[0])  # the curriculum now wants 0-1 again ...
+        walk(env, 11)  # ... but this episode ends at a checkpoint, so the next reset is a respawn
+        run_until_end(env)
+        _, info = env.reset()
+        assert info["fresh_start"] == 0 and fake.resets[-1] is True
+        assert env.level == LEVELS[1] and info["level"] == LEVELS[1], "a respawn never re-samples"
+        env.close()
+
+
+def test_a_no_checkpoint_death_reloads_the_level_it_is_on():
+    """`_respawn` reloads the whole level when there is no checkpoint, and that must NOT be a re-sample.
+
+    Sampling there would change the scene mid-episode and leave info["level"], the best run's positions and the
+    exploration archive all disagreeing with each other.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, path = curriculum_env(tmp, max_steps=60)
+        write_curriculum(path, favour=LEVELS[1])
+        env.reset(seed=0)
+        assert env.level == LEVELS[1]
+        walk(env, 5)  # z 10, short of the checkpoint
+        write_curriculum(path, favour=LEVELS[0])
+        fake.kill_next = True
+        _, _, terminated, truncated, info = env.step(idle())
+        assert not terminated and not truncated and info["deaths"] == 1
+        assert fake.z == 0.0 and fake.resets[-1] is True  # StatsManager.Restart reloaded the level
+        assert env.level == LEVELS[1] and fake.reset_scenes[-1] == LEVELS[1]
+        env.close()
+
+
+def test_each_level_keeps_its_own_archive_and_best_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, path = curriculum_env(tmp, max_steps=40)
+        models = Path(tmp) / "models"
+        write_curriculum(path, favour=LEVELS[0])
+        env.reset(seed=0)
+        walk(env, 40)  # a completion on 0-1
+        first = dict(env.archive.counts)
+        assert first
+
+        write_curriculum(path, favour=LEVELS[1])
+        env.reset()
+        assert env.level == LEVELS[1]
+        assert env.archive.counts != first and len(env.archive.counts) <= 1, "0-3 starts from its own empty archive"
+        assert (models / f"explore_Level_0-1_{env.cfg.port}.npz").exists(), "the outgoing archive was saved first"
+        walk(env, 40)  # a completion on 0-3 too
+
+        write_curriculum(path, favour=LEVELS[0])
+        env.reset()
+        assert env.level == LEVELS[0]
+        assert set(first) <= set(env.archive.counts), "switching back restores 0-1's own counts"
+        env.close()
+
+        best = Path(tmp) / "runs" / "campaign_multi" / "best_runs"
+        assert sorted(p.name for p in best.glob("*.json")) == ["Level_0-1.json", "Level_0-3.json"]
+        for name, level in (("Level_0-1.json", LEVELS[0]), ("Level_0-3.json", LEVELS[1])):
+            assert json.loads((best / name).read_text(encoding="utf-8"))["level"] == level
+        assert sorted(p.name for p in models.glob("*.npz")) == [
+            f"explore_Level_0-1_{env.cfg.port}.npz", f"explore_Level_0-3_{env.cfg.port}.npz"]
+
+
+def test_an_unusable_curriculum_file_leaves_the_worker_on_the_first_level():
+    """Missing, torn, another run's name, another run's order: all four mean "the first level only"."""
+    broken = {
+        "missing": None,
+        "torn": '{"version": 1, "order": ["Level 0-1", "Level 0-3"], "lev',
+        "empty": "{}",
+        "wrong_run": json.dumps({"version": 1, "run_name": "someone_else", "order": LEVELS,
+                                 "levels": {LEVELS[0]: {"unlocked": True, "fresh_window": 50, "fresh_completion_rate": 1.0},
+                                            LEVELS[1]: {"unlocked": True, "fresh_window": 50, "fresh_completion_rate": 0.0}}}),
+        "wrong_order": json.dumps({"version": 1, "run_name": "campaign_multi", "order": ["Level 0-3", "Level 0-1"],
+                                   "levels": {LEVELS[1]: {"unlocked": True, "fresh_window": 50, "fresh_completion_rate": 0.0}}}),
+    }
+    for name, text in broken.items():
+        with tempfile.TemporaryDirectory() as tmp:
+            env, fake, path = curriculum_env(tmp, max_steps=6)
+            if text is not None:
+                write_curriculum(path, text=text)
+            for _ in range(3):
+                _, info = env.reset(seed=0)
+                assert env.level == LEVELS[0] and info["level"] == LEVELS[0], name
+                run_until_end(env, limit=10)
+            env.close()
+
+
+def test_a_single_level_config_never_opens_a_curriculum_file():
+    env, fake = make_env(curriculum_path="F:/nowhere/curriculum.json")  # no `levels`, so it is never read
+    assert env.cfg.levels == [] and env.level == LEVEL
+    _, info = env.reset(seed=0)
+    assert info["level"] == LEVEL and fake.reset_scenes == [LEVEL]
+    env.close()
+
+
+def test_levels_must_be_scenes_this_build_ships():
+    for bad in (["Level 9-1"], ["Level 0-1", "Level 9-2"], ["Level 0-0"]):
+        try:
+            UltrakillEnv(EnvConfig(mode="campaign", levels=bad))
+        except ValueError as exc:
+            assert "cannot load" in str(exc), exc
+        else:
+            raise AssertionError(f"{bad} should have been refused")
+    ok = UltrakillEnv(EnvConfig(mode="campaign", levels=LEVELS, level="Level 4-1"))
+    assert ok.level == LEVELS[0], "`levels` wins over `level` and levels[0] is the start"
+    ok.close()
 
 
 def test_human_routes_are_retired():
