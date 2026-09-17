@@ -293,6 +293,8 @@ def test_campaign_progress():
         assert len(fresh) > progress_mod.FRESH_WINDOW and fresh_times, "the fake run is too short"
 
         c = s["campaign"]
+        assert set(c) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time"}, \
+            "a single-level run's campaign block is exactly what it has always been"
         assert c["fresh_window"] == progress_mod.FRESH_WINDOW
         assert 0.0 <= c["fresh_completion_rate"] <= 1.0
         assert abs(c["fresh_completion_rate"] - sum(ep["completed"] for ep in window) / len(window)) < 1e-9
@@ -345,6 +347,213 @@ def test_campaign_progress():
         assert r["best_checkpoints_level"] == s["best_checkpoints_level"]
         assert r["best_gates_reached"] == s["best_gates_reached"]
         assert r["best_gate_hops"] == s["best_gate_hops"], "a minimum must survive a resume too"
+
+
+# ---------------------------------------------------------------------------------------------
+# The multi-level curriculum
+# ---------------------------------------------------------------------------------------------
+
+CURRICULUM_LEVELS = ["Level 0-1", "Level 0-3", "Level 0-4"]
+
+
+def episode_info(level, *, fresh=1, completed=0, seconds=None, checkpoints=2, gates=3):
+    """One finished campaign episode as the env reports it."""
+    return {
+        "episode": {"r": 1.0, "l": 100.0}, "level": level, "kills": 0, "deaths": 0, "wave": 0, "style": 0,
+        "completed": completed, "fresh_start": fresh, "level_seconds": seconds,
+        "checkpoints_level": checkpoints, "cells_new": 10, "oob_frac": 0.0, "exit_dist_min": 5.0,
+        "gates_reached": gates, "gate_hops_best": 1, "wedged_steps": 0, "level_started": 1,
+        "look_free_frac": 0.5, "look_enemy_frac": 0.2, "look_gate_frac": 0.3, "slide_forced_frac": 0.0,
+        "start_checkpoint": None, "end_pos": [0.0, 1.0, 2.0],
+        "end_reason": "level_complete" if completed else "stuck", "reward_parts": {"gate": 15.0},
+    }
+
+
+def curriculum_callback(tmp: Path, **overrides) -> ProgressCallback:
+    run = tmp / "runs" / "campaign_multi"
+    cb = ProgressCallback(run / "status.json", 1000, "campaign_multi", 2, update_every_s=0.0,
+                          levels=CURRICULUM_LEVELS, curriculum_path=run / "curriculum.json", **overrides)
+    cb._on_training_start()
+    return cb
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def test_curriculum_file_is_written_before_any_episode_and_lists_every_level():
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "campaign_multi"
+        cb = curriculum_callback(Path(tmp))
+        data = read_json(run / "curriculum.json")
+        assert data["run_name"] == "campaign_multi" and data["order"] == CURRICULUM_LEVELS
+        assert list(data["levels"]) == CURRICULUM_LEVELS, "every level is listed before it has any episodes"
+        assert data["levels"]["Level 0-1"]["unlocked"] is True, "the ladder always has a starting rung"
+        assert [data["levels"][lv]["unlocked"] for lv in CURRICULUM_LEVELS[1:]] == [False, False]
+        assert data["levels"]["Level 0-3"] == {"unlocked": False, "fresh_window": 0, "fresh_completion_rate": None,
+                                               "best_time": None, "episodes": 0}
+        assert cb.unlocked_levels == ["Level 0-1"]
+        assert not list((run).glob("*.tmp"))
+
+
+def test_a_level_unlocks_the_next_one_and_the_score_never_drops():
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "campaign_multi"
+        cb = curriculum_callback(Path(tmp))
+        for i in range(19):  # 19 fresh completions: one short of the window, so nothing unlocks yet
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=100.0 + i))
+        cb._write(time.time())
+        assert cb.unlocked_levels == ["Level 0-1"], "19 fresh episodes is not evidence"
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=90.0))
+        cb._write(time.time())
+        assert cb.unlocked_levels == ["Level 0-1", "Level 0-3"]
+        assert read_json(run / "curriculum.json")["levels"]["Level 0-3"]["unlocked"] is True
+
+        s = read_json(run / "status.json")["campaign"]
+        assert s["order"] == CURRICULUM_LEVELS
+        assert abs(s["fresh_completion_rate"] - 1.0) < 1e-9, "one unlocked level at the window IS today's rate"
+        assert s["best_time"] == 90.0 and s["fresh_window"] == 20
+        table = s["levels"]
+        assert table["Level 0-1"]["fresh_completion_rate"] == 1.0 and table["Level 0-1"]["best_time"] == 90.0
+        assert table["Level 0-1"]["episodes"] == 20 and table["Level 0-1"]["checkpoints_level"] == 2.0
+        assert table["Level 0-1"]["gates_reached"] == 3.0
+        # A mastered level falls to the floor weight; the newly unlocked one takes the rest.
+        assert abs(table["Level 0-1"]["weight"] - 0.1 / 1.1) < 1e-9
+        assert abs(table["Level 0-3"]["weight"] - 1.0 / 1.1) < 1e-9
+        assert table["Level 0-4"]["weight"] == 0.0
+
+        # The unlock itself, and then a level that completes nothing, must never lower the headline: keep_best
+        # only ever replaces best.zip on a strict improvement, so a score that drops would freeze it forever.
+        before = s["fresh_completion_rate"]
+        for _ in range(20):
+            cb._record_episode(1, episode_info("Level 0-3"))
+            cb._write(time.time())
+            now = read_json(run / "status.json")["campaign"]["fresh_completion_rate"]
+            assert now >= before - 1e-9, (before, now)
+        for i in range(10):
+            cb._record_episode(1, episode_info("Level 0-3", completed=1, seconds=200.0 + i))
+        cb._write(time.time())
+        s = read_json(run / "status.json")["campaign"]
+        # A SCORE, not a rate: each level contributes completions / max(its window, unlock_window). 0-1 is
+        # 20/20 = 1.0 and 0-3 is now 10 completions over 30 fresh episodes.
+        assert abs(s["fresh_completion_rate"] - (1.0 + 10 / 30)) < 1e-9, s["fresh_completion_rate"]
+        assert s["fresh_completion_rate"] > 1.0, "it can exceed 1.0, which is why the dashboard calls it a score"
+        assert s["best_time"] == 90.0, "the global minimum, as it has always been"
+        assert s["fresh_window"] == progress_mod.FRESH_WINDOW, "the POOLED deque, so keep_best's guard keeps passing"
+
+
+def test_the_unlock_latch_survives_a_restart_and_a_falling_rate():
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "campaign_multi"
+        cb = curriculum_callback(Path(tmp))
+        for i in range(20):
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=120.0 + i))
+        cb._write(time.time())
+        assert cb.unlocked_levels == ["Level 0-1", "Level 0-3"]
+
+        again = ProgressCallback(run / "status.json", 1000, "campaign_multi", 2, update_every_s=0.0,
+                                 levels=CURRICULUM_LEVELS, curriculum_path=run / "curriculum.json")
+        assert again.unlocked_levels == ["Level 0-1", "Level 0-3"], "without the latch every level re-locks"
+        again._on_training_start()
+        table = read_json(run / "status.json")["campaign"]["levels"]
+        assert table["Level 0-1"]["best_time"] == 120.0 and table["Level 0-1"]["episodes"] == 20
+        assert table["Level 0-1"]["fresh_window"] == 0, "the windows start empty, exactly as the pooled deque does"
+        assert table["Level 0-1"]["checkpoints_level"] == 2.0, "the early-progress signals are carried"
+        # A collapsing rate must not re-lock 0-3 and stall the learning in progress on it.
+        for _ in range(25):
+            again._record_episode(0, episode_info("Level 0-1"))
+        again._write(time.time())
+        assert again.unlocked_levels == ["Level 0-1", "Level 0-3"]
+        assert read_json(run / "status.json")["campaign"]["levels"]["Level 0-1"]["fresh_completion_rate"] == 0.0
+
+
+def test_a_run_with_no_levels_writes_no_curriculum_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "single"
+        cb = ProgressCallback(run / "status.json", 1000, "single", 1, update_every_s=0.0,
+                              curriculum_path=run / "curriculum.json")
+        cb._on_training_start()
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=100.0))
+        cb._write(time.time())
+        assert not (run / "curriculum.json").exists()
+        s = read_json(run / "status.json")["campaign"]
+        assert set(s) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time"}
+
+
+def test_episodes_jsonl_carries_the_level_it_ran_on():
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "campaign_multi"
+        cb = curriculum_callback(Path(tmp))
+        cb._record_episode(0, episode_info("Level 0-1"))
+        cb._record_episode(1, episode_info("Level 0-3", completed=1, seconds=42.0))
+        lines = [json.loads(line) for line in (run / "episodes.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert [line["level"] for line in lines] == ["Level 0-1", "Level 0-3"]
+        assert "level" in progress_mod.EPISODE_LOG_RAW, "a string field must bypass _num()"
+        cb._write(time.time())
+        envs = read_json(run / "status.json")["envs"]
+        assert [e.get("level") for e in envs] == ["Level 0-1", "Level 0-3"]
+
+
+def test_dashboard_renders_the_per_level_block():
+    dashboard = _load_dashboard()
+    campaign = {
+        "fresh_window": 50, "fresh_completion_rate": 1.34, "median_time_50": 152.0, "best_time": 141.2,
+        "order": CURRICULUM_LEVELS,
+        "levels": {
+            "Level 0-1": {"unlocked": True, "fresh_window": 50, "fresh_completion_rate": 0.62, "best_time": 141.2,
+                          "episodes": 812, "weight": 0.38, "checkpoints_level": 4.1, "gates_reached": 3.2},
+            "Level 0-3": {"unlocked": True, "fresh_window": 23, "fresh_completion_rate": 0.13, "best_time": None,
+                          "episodes": 188, "weight": 0.62, "checkpoints_level": 1.0, "gates_reached": 0.4},
+            "Level 0-4": {"unlocked": False, "fresh_window": 0, "fresh_completion_rate": None, "best_time": None,
+                          "episodes": 0, "weight": 0.0, "checkpoints_level": None, "gates_reached": None},
+        },
+    }
+    lines = dashboard.campaign_lines(campaign, {"completed": 0.4, "checkpoints_level": 2.14})
+    assert lines[0] == "  fresh score      1.34 / 2 levels", lines[0]
+    assert "  levels" in lines
+    block = lines[lines.index("  levels") + 1:]
+    assert block[:2] == [
+        "    0-1  fresh 62% (50)  best 02:21.200  cp 4.1  w 0.38",
+        "    0-3  fresh 13% (23)  best —  cp 1.0  w 0.62",
+    ], block
+    assert not any("0-4" in line for line in block), "a locked level has no rows to show"
+    # A single-level run keeps the old headline and grows no block at all.
+    single = dashboard.campaign_lines({"fresh_window": 50, "fresh_completion_rate": 0.62}, {})
+    assert single[0] == "  fresh completed  62% of last 50"
+    assert "  levels" not in single
+
+    # The whole window against a real multi-level status, so the games table's level column renders too.
+    with tempfile.TemporaryDirectory() as tmp:
+        status_path = Path(tmp) / "status.json"
+        cb = curriculum_callback(Path(tmp) / "unused")
+        for i in range(25):
+            cb._record_episode(i % 2, episode_info(CURRICULUM_LEVELS[i % 2], completed=i % 3 == 0, seconds=90.0 + i))
+        cb.status_path = status_path
+        cb._write(time.time())
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        assert status["campaign"]["levels"] and any(e.get("level") for e in status["envs"])
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "dashboard.py"), "--file", str(status_path), "--smoke-test"],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_poll_status_logs_the_unlocked_level_count():
+    dashboard_free = {
+        "state": "running", "timesteps": 10, "episodes": 5, "window": 5, "steps_per_s": 100.0,
+        "mean_100": {"reward": 1.0}, "campaign": {"fresh_window": 50, "fresh_completion_rate": 1.34,
+                                                  "levels": {"a": {"unlocked": True}, "b": {"unlocked": True},
+                                                             "c": {"unlocked": False}}},
+        "reward_parts_mean_100": {"item_pickup": 15.0, "item_placed": 15.0},
+    }
+    spec = importlib.util.spec_from_file_location("poll_status", ROOT / "scripts" / "poll_status.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    row = module.row(dashboard_free)
+    assert row["levels_unlocked"] == 2
+    assert row["part_item_pickup"] == 15.0 and row["part_item_placed"] == 15.0
+    assert module.row({"mean_100": {}})["levels_unlocked"] is None, "a single-level run has no such column value"
 
 
 def test_episode_log_write_failure_does_not_stop_training():

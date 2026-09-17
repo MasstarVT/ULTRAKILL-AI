@@ -47,6 +47,11 @@ class RewardConfig:
     # once `complete` in 2.9M logged steps. `gate` is the milestone, `gate_approach` the shaping between them.
     gate: float = 0.0  # per new lower `hops` value reached, once per level load
     gate_approach: float = 0.0  # per metre of new best 3-D closeness to the current target
+    # Skull carry: the two rungs below a gate whose door is held shut by an unfilled altar. Both are once per
+    # level load and keyed on the item TYPE (pickup) or the puzzle (placement), never on an object instance, so
+    # neither a respawn's re-instantiated skull nor a level's duplicate props can pay twice. See MilestoneTracker.
+    item_pickup: float = 0.0  # per accepted item type first picked up in a level load
+    item_placed: float = 0.0  # per altar puzzle first solved in a level load
 
 
 @dataclass
@@ -60,6 +65,8 @@ class CampaignStep:
     path_gain: float = 0.0  # metres of new best NavMesh distance to the exit
     gates: int = 0  # new lower `hops` values reached this step (GateProgress.update)
     gate_approach: float = 0.0  # metres of new best closeness to the current gate/exit target
+    item_pickups: int = 0  # accepted item types picked up for the first time this level load
+    item_placements: int = 0  # altar puzzles solved for the first time this level load
 
 
 @dataclass
@@ -162,6 +169,8 @@ def compute_reward(
         r.add("path", cfg.path * campaign.path_gain)
         r.add("gate", cfg.gate * campaign.gates)
         r.add("gate_approach", cfg.gate_approach * campaign.gate_approach)
+        r.add("item_pickup", cfg.item_pickup * campaign.item_pickups)
+        r.add("item_placed", cfg.item_placed * campaign.item_placements)
 
     pp, cp = prev.get("player"), cur.get("player")
     if not pp or not cp:

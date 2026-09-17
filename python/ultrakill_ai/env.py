@@ -13,12 +13,17 @@ import gymnasium as gym
 import numpy as np
 
 from ultrakill_ai.campaign import (
+    CAMPAIGN_LEVELS_SHIPPED,
+    SUBGOAL_ALTAR,
+    SUBGOAL_ITEM,
     ExplorationArchive,
     GateProgress,
     MilestoneTracker,
     PathProgress,
     choose_fresh_start,
+    choose_level,
     compute_rank,
+    read_curriculum,
     safe_name,
     save_best_run,
 )
@@ -77,6 +82,13 @@ class EnvConfig:
     # policy drifted to the +90° clamp and stared at the sky, so no yaw ever put an enemy near the crosshair
 
     # Campaign (docs/superpowers/specs/2026-09-16-campaign-foundation-design.md)
+    # Multi-level curriculum. Empty `levels` is the single-level setting above and today's behaviour exactly:
+    # nothing below is read, no curriculum file is opened and the level never changes.
+    levels: list[str] = field(default_factory=list)  # ordered ladder; levels[0] is always unlocked and the start
+    curriculum_path: str = ""  # runs/<run>/curriculum.json, written by ProgressCallback ("" = no curriculum)
+    unlock_rate: float = 0.5  # fresh completion rate a level needs before the next one unlocks
+    unlock_window: int = 20  # ... over at least this many of its own fresh episodes
+    level_weight_floor: float = 0.1  # a mastered level keeps this much of the sampling weight, so it is not forgotten
     difficulty: int = -1  # difficulty the game reads while the AI has control (3 = Violent, -1 = leave the game's own)
     unlock_all_gear: bool = False  # every weapon and variant while the AI has control, in memory only
     fresh_start_prob: float = 0.2  # chance of a fresh level load when a checkpoint respawn would also do
@@ -90,6 +102,10 @@ class EnvConfig:
     gate_reach_m: float = 8.0  # horizontal radius at which a gate counts as reached (2x while it is open)
     gate_reach_v_m: float = 6.0  # vertical half-height of the same test, so a roof over a door is not "reached"
     gate_min_gain_m: float = 0.5  # metres of new best closeness below which gate_approach pays nothing
+    gate_hops_min_frac: float = 0.5  # share of gates that must carry `hops` before the ladder is trusted at all
+    # Skull carry. 0 disables both carry-protection rules; they are inert on any level with no ItemPlaceZone.
+    subgoal_punch_range_m: float = 4.0  # Punch.ActiveFrame's own 4 m reach: inside it a punch can pick up or place
+    target_kind_slots: bool = False  # repurpose the target's `open`/`locked` slots as "is an item"/"is an altar"
     # The absorbing slowMode/heavyFall movement state: airborne forever, stamina frozen, a 0.477 m/s creep.
     wedge_seconds: float = 3.0  # game seconds wedged before the episode ends (0 = no end, the steps are still counted)
     wedge_creep_mps: float = 1.5  # movement below this counts as not moving, in the wedge test only
@@ -132,6 +148,13 @@ class UltrakillEnv(gym.Env):
         if self.cfg.mode not in ("cybergrind", "campaign"):
             raise ValueError(f"Unknown mode {self.cfg.mode!r}")
         campaign = self.cfg.mode == "campaign"
+        unknown = [lv for lv in self.cfg.levels if lv not in CAMPAIGN_LEVELS_SHIPPED]
+        if unknown:
+            # Caught here rather than at the first reset, where it would strand a worker waiting for a scene the
+            # game cannot load. `Level 9-1` and `Level 9-2` ship no scene bundle in this build.
+            raise ValueError(f"levels contains scenes this game build cannot load: {unknown}")
+        # The level is mutable from here on: a curriculum run changes it at a fresh load and nowhere else.
+        self.level = (self.cfg.levels[0] if self.cfg.levels else self.cfg.level) if campaign else self.cfg.level
         if self.cfg.layout.campaign != campaign:
             # The layout follows the mode (Cyber Grind 448 inputs, campaign 479). Replaced, not edited in place:
             # train.py builds each game's config with dataclasses.replace, so they all share one layout object.
@@ -157,13 +180,19 @@ class UltrakillEnv(gym.Env):
         self._episode_start_stats: dict[str, Any] = {}
 
         # Campaign state. The exploration archive counts, per game and per level, how many earlier episodes
-        # entered each cell, so the novelty reward fades where this game has already been.
+        # entered each cell, so the novelty reward fades where this game has already been. A curriculum run keeps
+        # one archive per level it has visited: `archive` is the current level's, `_archives` holds them all so a
+        # switch back does not re-read from disk, and every one of them is saved.
         if campaign and self.cfg.explore_dir:
-            self.archive = ExplorationArchive.load(self._archive_path(), self.cfg.cell_size)
+            self.archive = ExplorationArchive.load(self._archive_path(self.level), self.cfg.cell_size)
         else:
             self.archive = ExplorationArchive(self.cfg.cell_size)
+        self._archives: dict[str, ExplorationArchive] = {self.level: self.archive}
+        self._curriculum: dict = {}  # last curriculum table read successfully, kept as the fallback
+        self._curriculum_warned = False
         self.milestones = MilestoneTracker()
-        self.gates = GateProgress(self.cfg.gate_reach_m, self.cfg.gate_reach_v_m, self.cfg.gate_min_gain_m)
+        self.gates = GateProgress(self.cfg.gate_reach_m, self.cfg.gate_reach_v_m, self.cfg.gate_min_gain_m,
+                                  self.cfg.gate_hops_min_frac, self.cfg.target_kind_slots)
         self.path_progress = PathProgress()
         self._rng = random.Random()
         self._stuck_streak = 0  # episodes in a row that ended stuck at the same current checkpoint
@@ -193,7 +222,7 @@ class UltrakillEnv(gym.Env):
 
     @property
     def scene(self) -> str:
-        return CYBERGRIND_SCENE if self.cfg.mode == "cybergrind" else self.cfg.level
+        return CYBERGRIND_SCENE if self.cfg.mode == "cybergrind" else self.level
 
     def _ensure_connected(self) -> None:
         if self._connected:
@@ -285,7 +314,15 @@ class UltrakillEnv(gym.Env):
         # `action` message is unchanged and the mod never sees it.
         look_mode = int(command.pop("look_mode", 0))
         raw_pitch_cmd = command["look"][1]
-        resolved = self._look_at_enemy(prev) if look_mode == 1 else self._look_at_target(prev) if look_mode == 2 else None
+        # Skull carry (§6.7 of the multi-level/skull spec): within punch range of a sub-goal the env takes the
+        # camera, because the punch that picks up or places is a 4 m raycast along camera forward and the policy
+        # volunteers a useful aim on ~3% of steps. Inert without a sub-goal, so 0-1 is untouched.
+        decisive = self._near_subgoal(prev, (SUBGOAL_ITEM, SUBGOAL_ALTAR))
+        if decisive:
+            look_mode = 2
+        self._protect_carry(prev, command)
+        resolved = (self._look_at_enemy(prev) if look_mode == 1
+                    else self._look_at_target(prev, wide=decisive) if look_mode == 2 else None)
         # A mode that found nothing to aim at behaves exactly as mode 0, so mode 0 is what applied this step. The
         # diagnostics record the applied mode, never the requested one: mode 1 falls back whenever nothing is
         # visible (~30% of steps at the measured enemy_visible_frac) and mode 2 falls back on every step of an
@@ -478,13 +515,17 @@ class UltrakillEnv(gym.Env):
             return [yaw_cmd, pitch_cmd]
         return None
 
-    def _look_at_target(self, prev: dict[str, Any]) -> list[float] | None:
+    def _look_at_target(self, prev: dict[str, Any], wide: bool = False) -> list[float] | None:
         """Look mode 2: turn toward the route target, the same object packed into the observation's target slots.
 
         Movement stays camera-relative, as the game computes it, so turning toward a gate also turns "forward"
         toward it -- which is the point. Returns None (mode 0) without a player or a target. `pitch_limit_deg` 0
         means "off" everywhere else in this codebase, so the band falls back to the game's own clamp rather than
         welding the camera level.
+
+        `wide` takes the same exemption look mode 1 already takes for an enemy overhead: a sub-goal a metre away
+        at floor level needs a steeper look than the campaign band's 45 degrees, so inside punch range the band
+        is the game's own clamp instead and the ray can actually reach the cube.
         """
         player, target = prev.get("player"), self.gates.target
         if not player or not target or not target.get("pos"):
@@ -494,11 +535,64 @@ class UltrakillEnv(gym.Env):
         if math.sqrt(gx * gx + gy * gy + gz * gz) <= 1e-6:
             return None
         p = player["pitch"]
-        band = self.cfg.pitch_limit_deg or MODE1_PITCH_LIMIT
+        band = MODE1_PITCH_LIMIT if wide else (self.cfg.pitch_limit_deg or MODE1_PITCH_LIMIT)
         yaw_cmd = max(-YAW_CAP, min(YAW_CAP, math.degrees(math.atan2(gx, gz))))
         elevation = math.degrees(math.atan2(gy, math.hypot(gx, gz)))
         target_pitch = max(-band, min(band, elevation))
         return [yaw_cmd, max(-PITCH_CAP, min(PITCH_CAP, target_pitch - p))]
+
+    def _near_subgoal(self, prev: dict[str, Any], kinds: tuple[str, ...]) -> bool:
+        """Whether the current target is a sub-goal of one of `kinds` and the player is within punch range of it."""
+        if self.cfg.mode != "campaign" or self.cfg.subgoal_punch_range_m <= 0:
+            return False
+        target, player = self.gates.target, prev.get("player")
+        if not target or not player or target.get("subgoal") not in kinds or not target.get("pos"):
+            return False
+        return math.dist(player["pos"], target["pos"]) <= self.cfg.subgoal_punch_range_m
+
+    def _near_filled_altar(self, prev: dict[str, Any]) -> bool:
+        """Whether a solved altar is within punch range: punching one takes the skull back out."""
+        player = prev.get("player")
+        if not player:
+            return False
+        for altar in ((prev.get("campaign") or {}).get("altars") or ()):
+            if (isinstance(altar, dict) and altar.get("filled") and altar.get("pos")
+                    and math.dist(player["pos"], altar["pos"]) <= self.cfg.subgoal_punch_range_m):
+                return True
+        return False
+
+    def _protect_carry(self, prev: dict[str, Any], command: dict[str, Any]) -> None:
+        """Drops a punch that can only undo a skull puzzle. Never adds one; the policy still chooses to press.
+
+        Two ways a punch destroys progress, both from `Punch`:
+          - `ActiveStart` THROWS whatever is held when the active frame did not place it. The live policy
+            presses punch on ~35% of decisions, about five a second, so an unprotected carry across 1-1's 134 m
+            red leg survives a fraction of a second;
+          - `AltHit`'s not-holding branch is `ForceHold` on whatever `ItemIdentifier` it hits, including one
+            resting in a FILLED altar, and `ForceHold` re-runs `ItemPlaceZone.CheckItem`, whose empty branch
+            calls `Close()` on the doors that altar had opened. So a punch next to a solved altar re-locks the
+            gate it just opened.
+
+        So exactly two presses are kept: the one that places (holding, within range of the altar we are heading
+        for) and the one that picks up (not holding, within range of the item we are heading for -- which may
+        itself be sitting in some OTHER puzzle's filled altar, which is why that case is checked first). Every
+        other press is dropped while something is held or while a solved altar is in reach.
+
+        Inert with nothing held and no filled altar nearby, so a level with no `ItemPlaceZone` -- and any mod
+        that sends no `altars`/`items` -- behaves exactly as before, and punch stays available as an attack and
+        a parry everywhere else. A removed press is not charged `RewardConfig.punch` either: the command the
+        game receives is what the reward is computed from, here as for the slide latch.
+        """
+        if self.cfg.mode != "campaign" or self.cfg.subgoal_punch_range_m <= 0:
+            return
+        if "punch" not in command["buttons"]:
+            return
+        holding = any(isinstance(i, dict) and i.get("held")
+                      for i in ((prev.get("campaign") or {}).get("items") or ()))
+        keep = self._near_subgoal(prev, (SUBGOAL_ALTAR,)) if holding else self._near_subgoal(prev, (SUBGOAL_ITEM,))
+        if keep or not (holding or self._near_filled_altar(prev)):
+            return
+        command["buttons"] = [b for b in command["buttons"] if b != "punch"]
 
     def _hold_slide(self, prev: dict[str, Any], command: dict[str, Any]) -> None:
         """Keeps slide held for `slide_min_hold` decisions once pressed. Never removes a slide, only adds one.
@@ -592,15 +686,63 @@ class UltrakillEnv(gym.Env):
 
     # Campaign ----------------------------------------------------------
 
-    def _archive_path(self) -> Path:
-        return Path(self.cfg.explore_dir) / f"explore_{safe_name(self.cfg.level)}_{self.cfg.port}.npz"
+    def _archive_path(self, level: str | None = None) -> Path:
+        return Path(self.cfg.explore_dir) / f"explore_{safe_name(level or self.level)}_{self.cfg.port}.npz"
 
     def _save_archive(self) -> None:
+        """Saves every level's archive this env has touched, not only the current one."""
         if self.cfg.mode != "campaign" or not self.cfg.explore_dir:
             return
-        path = self._archive_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.archive.save(path)
+        self._archives[self.level] = self.archive  # eval.py assigns env.archive directly; keep the map honest
+        for level, archive in self._archives.items():
+            path = self._archive_path(level)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            archive.save(path)
+
+    def _switch_level(self, previous_level: str, new_level: str) -> None:
+        """Moves this env to `new_level`, saving the outgoing archive under the OUTGOING level's path first.
+
+        Both names are arguments on purpose: an implementation that assigns `self.level` and then builds the save
+        path from it writes the outgoing counts under the incoming level's filename and corrupts both archives.
+        `_stuck_streak` / `_stuck_checkpoint` are level-scoped and are cleared, so a streak on the level being
+        left cannot force a reload on the level being entered.
+        """
+        self._archives[previous_level] = self.archive
+        if self.cfg.explore_dir:
+            try:
+                path = self._archive_path(previous_level)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self.archive.save(path)
+            except OSError as exc:
+                print(f"UltrakillEnv: could not save the exploration archive for {previous_level!r}: {exc}")
+        self.level = new_level
+        archive = self._archives.get(new_level)
+        if archive is None:
+            archive = (ExplorationArchive.load(self._archive_path(new_level), self.cfg.cell_size)
+                       if self.cfg.explore_dir else ExplorationArchive(self.cfg.cell_size))
+            self._archives[new_level] = archive
+        self.archive = archive
+        self._stuck_streak, self._stuck_checkpoint = 0, None
+
+    def _sample_level(self) -> str:
+        """The level the next fresh load uses, from the curriculum the trainer writes.
+
+        A file that is missing, torn, from another run or listing another order leaves `stats` empty, and
+        `choose_level` then returns `levels[0]` -- the first level only, which is the safe fallback. The warning
+        fires once per worker so a silently disabled curriculum is visible in the training log.
+        """
+        stats = self._curriculum
+        if self.cfg.curriculum_path:
+            table = read_curriculum(self.cfg.curriculum_path, order=list(self.cfg.levels),
+                                    run_name=Path(self.cfg.curriculum_path).parent.name)
+            if table is None:
+                if not self._curriculum_warned and Path(self.cfg.curriculum_path).exists():
+                    self._curriculum_warned = True
+                    print(f"UltrakillEnv: ignoring {self.cfg.curriculum_path} (wrong run or level order); "
+                          f"this game will train on {self.cfg.levels[0]!r} only")
+            else:
+                self._curriculum = stats = table
+        return choose_level(self._rng, list(self.cfg.levels), stats, floor=self.cfg.level_weight_floor)
 
     def _save_archive_on_schedule(self) -> None:
         """Saves the exploration archive every `archive_save_steps` or `archive_save_seconds`, whichever is first.
@@ -648,14 +790,22 @@ class UltrakillEnv(gym.Env):
             self._stuck_streak, self._stuck_checkpoint = 0, None
         fresh = choose_fresh_start(
             self._rng,
-            in_level=prev.get("scene") == self.cfg.level and prev.get("player") is not None,
+            # Judged against the OUTGOING level: this decides whether a respawn is even possible, and a respawn
+            # is only possible in the level the game is already in.
+            in_level=prev.get("scene") == self.level and prev.get("player") is not None,
             level_over=bool(camp.get("level_over")),
             has_checkpoint=current is not None,
             stuck_streak=self._stuck_streak,
             stuck_limit=self.cfg.stuck_repeats,
             fresh_prob=self.cfg.fresh_start_prob,
         )
-        raw = self._skip_locked(self.client.reset(self.cfg.level, checkpoint=not fresh))
+        if fresh and self.cfg.levels:
+            # The only place a level is ever sampled. A fresh load is the only moment the scene can change
+            # without corrupting the episode's info, its best-run positions and its archive.
+            new_level = self._sample_level()
+            if new_level != self.level:
+                self._switch_level(self.level, new_level)
+        raw = self._skip_locked(self.client.reset(self.level, checkpoint=not fresh))
         pos = (raw.get("player") or {}).get("pos")
         if fresh:
             self.milestones.new_level_load(raw.get("campaign"))
@@ -670,9 +820,15 @@ class UltrakillEnv(gym.Env):
         return raw
 
     def _respawn(self) -> dict[str, Any]:
-        """Respawns after a death inside the same episode. Milestones the respawn itself changes pay nothing."""
+        """Respawns after a death inside the same episode. Milestones the respawn itself changes pay nothing.
+
+        This never re-samples the level, even though `StatsManager.Restart` reloads the whole level when there is
+        no checkpoint yet: a switch here would change the scene mid-episode and make `info["level"]`, the best
+        run's positions and the exploration archive all disagree with each other. Sampling lives in
+        `_campaign_reset` and nowhere else.
+        """
         before = self._raw.get("stats", {})
-        raw = self._skip_locked(self.client.reset(self.cfg.level, checkpoint=True))
+        raw = self._skip_locked(self.client.reset(self.level, checkpoint=True))
         self.milestones.mark_paid(raw.get("campaign"))
         player = raw.get("player")
         # No reset_episode here: the episode continues, so the gate approach it has already earned stands.
@@ -769,7 +925,7 @@ class UltrakillEnv(gym.Env):
     def _campaign_progress(self, prev: dict[str, Any], raw: dict[str, Any]) -> CampaignStep:
         """What the level did this step. Any progress restarts the stuck clock."""
         camp = raw.get("campaign") or {}
-        checkpoints, arenas, doors = self.milestones.update(raw.get("campaign"))
+        checkpoints, arenas, doors, pickups, placements = self.milestones.update(raw.get("campaign"))
         novelty = 0.0
         player = raw.get("player")
         pos = player["pos"] if player else None
@@ -796,12 +952,13 @@ class UltrakillEnv(gym.Env):
         # and ULTRAKILL enemies damage each other, so a crossfire tail would simply never truncate.
         stats, before = raw.get("stats", {}), prev.get("stats", {})
         fought = stats.get("kills", 0) > before.get("kills", 0) or stats.get("style", 0) > before.get("style", 0)
-        if checkpoints or arenas or doors or novelty > 0 or path_gain > 0 or gates_new or approach > 0 or fought:
+        if (checkpoints or arenas or doors or pickups or placements
+                or novelty > 0 or path_gain > 0 or gates_new or approach > 0 or fought):
             self._steps_since_progress = 0
         else:
             self._steps_since_progress += 1
         return CampaignStep(checkpoints=checkpoints, arenas=arenas, doors=doors, novelty=novelty, path_gain=path_gain,
-                            gates=gates_new, gate_approach=approach)
+                            gates=gates_new, gate_approach=approach, item_pickups=pickups, item_placements=placements)
 
     def _level_result(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Official time, kills, style, restarts and rank as the game's results screen would count them."""
@@ -829,7 +986,7 @@ class UltrakillEnv(gym.Env):
                 try:
                     self._save_best_run(raw)
                 except OSError as exc:
-                    print(f"UltrakillEnv: could not save the best run for {self.cfg.level!r}: {exc}")
+                    print(f"UltrakillEnv: could not save the best run for {self.level!r}: {exc}")
         self._episodes += 1
         if self._episodes % 20 == 0:
             try:
@@ -842,7 +999,7 @@ class UltrakillEnv(gym.Env):
             return
         result = self._level_result(raw)
         run = {
-            "level": self.cfg.level,
+            "level": self.level,
             "seconds": result["seconds"],
             "kills": result["kills"],
             "style": result["style"],
@@ -853,7 +1010,7 @@ class UltrakillEnv(gym.Env):
             "positions": self._positions,
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        path = Path(self.cfg.best_runs_dir) / f"{safe_name(self.cfg.level)}.json"
+        path = Path(self.cfg.best_runs_dir) / f"{safe_name(self.level)}.json"  # one file per level, always
         path.parent.mkdir(parents=True, exist_ok=True)
         save_best_run(path, run)
 
@@ -902,6 +1059,10 @@ class UltrakillEnv(gym.Env):
         info["enemy_close_frac"] = b["close"] / steps  # nearest visible enemy within 5 m
         info["yaw_per_step_mean"] = b["yaw_sum"] / steps  # degrees turned per decision
         if self.cfg.mode == "campaign":
+            # The level this episode RAN on: `info` is built in step() before SubprocVecEnv calls reset(), so a
+            # switch episode's row still carries the level it played. Deliberately not in CAMPAIGN_INFO_KEYS,
+            # which go through Monitor(info_keywords=...) and ProgressCallback._num and must all be numeric.
+            info["level"] = self.level
             info["fresh_start"] = int(self._fresh_start)
             info["checkpoints_level"] = self.milestones.checkpoints_reached  # distinct checkpoints this level load
             info["cells_new"] = self._cells_new  # cells entered for the first time this episode

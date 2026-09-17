@@ -63,6 +63,41 @@ def summarize_campaign(obs: dict) -> str:
         lines.append("path: none")
     else:
         lines.append(f"path: {path['status']} length={path['length']:.1f}m next_corner=({vec(path['next_corner'])})")
+    gates = c.get("gates")
+    if gates is None:
+        lines.append("gates: - (a mod older than 0.6.0)")
+    else:
+        ordered, truncated = c.get("gates_ordered"), c.get("gates_truncated")
+        with_hops = sum(1 for g in gates if g.get("hops") is not None)
+        # The ratio is what GateProgress's usability guard tests: below 0.5 the ladder is ignored entirely.
+        ratio = f"{with_hops / len(gates):.3f}" if gates else "-"
+        lines.append(f"gates: {len(gates)} ordered={ordered} truncated={truncated} with hops={with_hops} ({ratio})")
+        for g in gates:
+            flags = "".join(f" {name}" for name in ("open", "locked", "active", "controller_active") if g.get(name))
+            flags += " altar_only" if g.get("altar_only") else ""
+            needs = f" needs={g['needs_item']}" if g.get("needs_item") else ""
+            lines.append(f"  {g['key']} at ({vec(g['pos'])}) hops={g.get('hops')}{flags}{needs}")
+    # Skull carry (mod 0.7.0). `-` is a mod that does not send them at all; an empty list is a level with none.
+    altars = c.get("altars")
+    if altars is None:
+        lines.append("altars: - (a mod older than 0.7.0)")
+    else:
+        lines.append(f"altars: {len(altars)}")
+        for a in altars:
+            doors = ", ".join(str(d.get("key")) for d in a.get("doors") or ()) or "none"
+            reverse = ", ".join(str(d.get("key")) for d in a.get("reverse_doors") or ()) or "none"
+            lines.append(f"  {a['key']} at ({vec(a['pos'])}) {a.get('item')} filled={a.get('filled')}"
+                         f" active={a.get('active')} inactive_ancestors={a.get('inactive_ancestors')}"
+                         f" opens=[{doors}] closes=[{reverse}]")
+    items = c.get("items")
+    if items is None:
+        lines.append("items: - (a mod older than 0.7.0)")
+    else:
+        lines.append(f"items: {len(items)}")
+        for i in items:
+            lines.append(f"  {i['key']} at ({vec(i['pos'])}) {i.get('item')} held={i.get('held')}"
+                         f" placed={i.get('placed')} in={i.get('placed_in')} active={i.get('active')}"
+                         f" active_self={i.get('active_self')} inactive_ancestors={i.get('inactive_ancestors')}")
     doors = c.get("locked_doors", [])
     lines.append("locked doors: " + (", ".join(f"({vec(d['pos'])}) {d['dist']:.1f}m" for d in doors) or "none"))
     lines.append(f"arena enemies alive: {c['arena_enemies_alive']}")

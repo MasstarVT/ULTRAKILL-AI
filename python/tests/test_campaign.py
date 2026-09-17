@@ -17,17 +17,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ultrakill_ai.campaign import (  # noqa: E402
     CAMPAIGN_LEVELS,
+    CAMPAIGN_LEVELS_SHIPPED,
     GATE_EXIT_KEY,
     RANK_LETTERS,
+    SUBGOAL_ALTAR,
+    SUBGOAL_ITEM,
     ExplorationArchive,
     GateProgress,
     MilestoneTracker,
     PathProgress,
     choose_fresh_start,
+    choose_level,
     compute_rank,
     grade,
+    level_weights,
+    read_curriculum,
     safe_name,
     save_best_run,
+    unlock_next,
 )
 
 RANKS = {"time": [300, 240, 180, 120], "kills": [10, 20, 30, 40], "style": [1000, 2000, 3000, 4000]}
@@ -39,6 +46,128 @@ def test_campaign_levels():
     assert CAMPAIGN_LEVELS[4] == "Level 0-5" and CAMPAIGN_LEVELS[5] == "Level 1-1"
     assert CAMPAIGN_LEVELS[14] == "Level 3-2"
     assert CAMPAIGN_LEVELS[-1] == "Level 9-2"
+
+
+def test_shipped_levels_exclude_the_two_with_no_scene_bundle():
+    assert len(CAMPAIGN_LEVELS_SHIPPED) == 33
+    assert CAMPAIGN_LEVELS_SHIPPED < set(CAMPAIGN_LEVELS)
+    assert "Level 9-1" not in CAMPAIGN_LEVELS_SHIPPED and "Level 9-2" not in CAMPAIGN_LEVELS_SHIPPED
+    assert "Level 0-1" in CAMPAIGN_LEVELS_SHIPPED and "Level 8-4" in CAMPAIGN_LEVELS_SHIPPED
+
+
+# ---------------------------------------------------------------------------
+# The multi-level curriculum
+# ---------------------------------------------------------------------------
+
+ORDER = ["Level 0-1", "Level 0-3", "Level 0-4"]
+
+
+def record(*, unlocked=True, window=50, rate=None, best=None, episodes=0):
+    return {"unlocked": unlocked, "fresh_window": window, "fresh_completion_rate": rate,
+            "best_time": best, "episodes": episodes}
+
+
+def draws(stats, n=4000, seed=0, floor=0.1):
+    """The share of fresh draws each level gets, so the weights can be checked through choose_level itself."""
+    rng = random.Random(seed)
+    counts: dict[str, int] = {}
+    for _ in range(n):
+        level = choose_level(rng, ORDER, stats, floor=floor)
+        counts[level] = counts.get(level, 0) + 1
+    return {level: count / n for level, count in counts.items()}
+
+
+def test_choose_level_gives_an_unseen_level_the_full_weight():
+    # 0-1 mastered (rate 1.0 -> floor 0.1), 0-3 just unlocked and never played (rate None -> weight 1.0).
+    stats = {"Level 0-1": record(rate=1.0), "Level 0-3": record(window=0), "Level 0-4": record(unlocked=False)}
+    assert dict(level_weights(ORDER, stats)) == {"Level 0-1": 0.1, "Level 0-3": 1.0}
+    share = draws(stats)
+    assert "Level 0-4" not in share, "a locked level is never drawn"
+    assert abs(share["Level 0-3"] - 1.0 / 1.1) < 0.03 and abs(share["Level 0-1"] - 0.1 / 1.1) < 0.03
+
+
+def test_choose_level_is_uniform_once_every_level_is_mastered():
+    stats = {level: record(rate=1.0) for level in ORDER}
+    assert [w for _, w in level_weights(ORDER, stats)] == [0.1, 0.1, 0.1]
+    share = draws(stats)
+    assert all(abs(share[level] - 1 / 3) < 0.03 for level in ORDER), share
+
+
+def test_choose_level_always_has_the_first_level_in_the_pool():
+    # Empty stats, and a table that explicitly locks order[0]: both still draw it, so a fresh run can start.
+    for stats in ({}, {"Level 0-1": record(unlocked=False)}, None):
+        assert choose_level(random.Random(0), ORDER, stats) == "Level 0-1"
+
+
+def test_unlock_next_does_not_raise_on_an_empty_table():
+    assert unlock_next(ORDER, {}) is None
+    assert unlock_next(ORDER, None) is None
+    assert unlock_next([], {}) is None
+    assert unlock_next(["Level 0-1"], {}) is None
+
+
+def test_unlock_next_needs_the_rate_and_the_window():
+    below_rate = {"Level 0-1": record(window=50, rate=0.49)}
+    assert unlock_next(ORDER, below_rate) is None
+    below_window = {"Level 0-1": record(window=19, rate=1.0)}
+    assert unlock_next(ORDER, below_window) is None, "19 fresh episodes is not evidence"
+    earned = {"Level 0-1": record(window=20, rate=0.5)}
+    assert unlock_next(ORDER, earned) == "Level 0-3", "order[0] is unlocked by the default record"
+
+
+def test_unlock_next_is_chained_and_stops_at_the_first_locked_level():
+    stats = {"Level 0-1": record(rate=0.9), "Level 0-3": record(unlocked=False), "Level 0-4": record(unlocked=False)}
+    assert unlock_next(ORDER, stats) == "Level 0-3"
+    stats["Level 0-3"] = record(rate=0.1)  # now unlocked but nowhere near the bar
+    assert unlock_next(ORDER, stats) is None, "0-4 must not unlock before 0-3 has earned it"
+    stats["Level 0-3"] = record(rate=0.6)
+    assert unlock_next(ORDER, stats) == "Level 0-4"
+    stats["Level 0-4"] = record(rate=0.0)
+    assert unlock_next(ORDER, stats) is None  # everything is unlocked
+
+
+def test_unlock_is_a_latch_the_caller_holds():
+    """`unlock_next` never returns an already-unlocked level, so a falling rate cannot re-lock one.
+
+    Without the latch a level re-locks as its completion rate falls and the learning in progress on it stalls.
+    """
+    stats = {"Level 0-1": record(rate=0.9), "Level 0-3": record(unlocked=True, rate=0.0, window=50)}
+    assert unlock_next(ORDER, stats) is None
+    assert "Level 0-3" in dict(level_weights(ORDER, stats))
+
+
+def curriculum_file(path, *, order=ORDER, run_name="campaign_prelude", levels=None):
+    data = {"version": 1, "updated_at": 1.0, "run_name": run_name, "order": list(order),
+            "levels": levels if levels is not None else {level: record() for level in order}}
+    Path(path).write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_read_curriculum_rejects_anything_it_cannot_trust():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "curriculum.json"
+        assert read_curriculum(path, order=ORDER) is None, "missing"
+        path.write_text('{"version": 1, "order": ["Level 0-1"], "lev', encoding="utf-8")
+        assert read_curriculum(path, order=ORDER) is None, "torn"
+        path.write_text("[]", encoding="utf-8")
+        assert read_curriculum(path, order=ORDER) is None, "not an object"
+        curriculum_file(path, levels="nope")
+        assert read_curriculum(path, order=ORDER) is None, "levels is not a table"
+        curriculum_file(path, order=["Level 0-1", "Level 0-4"])
+        assert read_curriculum(path, order=ORDER) is None, "another run's level order"
+        curriculum_file(path)
+        assert read_curriculum(path, order=ORDER, run_name="other_run") is None, "another run's name"
+        assert set(read_curriculum(path, order=ORDER, run_name="campaign_prelude")) == set(ORDER)
+        assert read_curriculum(path) is not None, "with no order to check against, the file is usable"
+
+
+def test_read_curriculum_drops_rows_that_are_not_records():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "curriculum.json"
+        curriculum_file(path, levels={"Level 0-1": record(), "Level 0-3": 5, "Level 0-4": None})
+        table = read_curriculum(path, order=ORDER)
+        assert list(table) == ["Level 0-1"]
+        # The default record is what keeps the two dropped rows usable anyway.
+        assert choose_level(random.Random(0), ORDER, table) in ("Level 0-1",)
 
 
 def test_safe_name():
@@ -243,34 +372,43 @@ def test_archive_load_cell_size_mismatch_is_empty():
     assert loaded.counts == {} and loaded.cell_size == 2.0
 
 
-def milestones_block(checkpoints=(), arenas=(), doors=()):
-    """A campaign block holding only the milestone keys. `checkpoints` holds (id, activated, current) tuples."""
-    return {
+def milestones_block(checkpoints=(), arenas=(), doors=(), altars=(), items=()):
+    """A campaign block holding only the milestone keys. `checkpoints` holds (id, activated, current) tuples.
+
+    `altars` and `items` are passed through as the mod sends them (see `altar` and `item` below); a mod older
+    than 0.7.0 sends neither key at all, which is what leaving them out reproduces.
+    """
+    block = {
         "checkpoints": [{"id": cid, "pos": [0.0, 0.0, 0.0], "activated": act, "current": cur} for cid, act, cur in checkpoints],
         "cleared_arenas": list(arenas),
         "unlocked_doors": list(doors),
     }
+    if altars:
+        block["altars"] = list(altars)
+    if items:
+        block["items"] = list(items)
+    return block
 
 
 def test_milestones_pay_a_checkpoint_once_per_level_load():
     m = MilestoneTracker()
     m.new_level_load(milestones_block(checkpoints=[("0,1,20", False, False)]))
-    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)])) == (1, 0, 0)
-    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)])) == (0, 0, 0)
+    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)])) == (1, 0, 0, 0, 0)
+    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)])) == (0, 0, 0, 0, 0)
     assert m.checkpoints_reached == 1
     further = milestones_block(checkpoints=[("0,1,20", True, False), ("0,1,80", True, True)], arenas=["0,1,30"], doors=["5,0,40"])
-    assert m.update(further) == (1, 1, 1)
-    assert m.update(further) == (0, 0, 0)
+    assert m.update(further) == (1, 1, 1, 0, 0)
+    assert m.update(further) == (0, 0, 0, 0, 0)
     assert m.checkpoints_reached == 2
-    assert m.update(None) == (0, 0, 0)  # a step without the block pays nothing and forgets nothing
-    assert m.update(further) == (0, 0, 0)
+    assert m.update(None) == (0, 0, 0, 0, 0)  # a step without the block pays nothing and forgets nothing
+    assert m.update(further) == (0, 0, 0, 0, 0)
 
 
 def test_milestones_level_load_baseline_pays_nothing():
     m = MilestoneTracker()
     loaded = milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"], doors=["0,0,25"])
     m.new_level_load(loaded)
-    assert m.update(loaded) == (0, 0, 0)
+    assert m.update(loaded) == (0, 0, 0, 0, 0)
     assert m.checkpoints_reached == 1
     m.new_level_load(None)
     assert m.checkpoints_reached == 0
@@ -279,21 +417,21 @@ def test_milestones_level_load_baseline_pays_nothing():
 def test_milestones_mark_paid_absorbs_a_respawn_unlock():
     m = MilestoneTracker()
     m.new_level_load(milestones_block())
-    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"])) == (1, 1, 0)
+    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"])) == (1, 1, 0, 0, 0)
     # Restart() at the checkpoint unlocked a door: absorbed, never paid
     respawned = milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"], doors=["0,0,25"])
     m.mark_paid(respawned)
-    assert m.update(respawned) == (0, 0, 0)
+    assert m.update(respawned) == (0, 0, 0, 0, 0)
     later = milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"], doors=["0,0,25", "9,0,50"])
-    assert m.update(later) == (0, 0, 1)
+    assert m.update(later) == (0, 0, 1, 0, 0)
     assert m.checkpoints_reached == 1
 
 
 def test_milestones_current_counts_as_activated():
     m = MilestoneTracker()
     m.new_level_load(milestones_block(checkpoints=[("0,1,20", False, False), ("0,1,80", False, False)]))
-    assert m.update(milestones_block(checkpoints=[("0,1,20", False, True), ("0,1,80", False, False)])) == (1, 0, 0)
-    assert m.update(milestones_block(checkpoints=[("0,1,20", True, False), ("0,1,80", False, False)])) == (0, 0, 0)
+    assert m.update(milestones_block(checkpoints=[("0,1,20", False, True), ("0,1,80", False, False)])) == (1, 0, 0, 0, 0)
+    assert m.update(milestones_block(checkpoints=[("0,1,20", True, False), ("0,1,80", False, False)])) == (0, 0, 0, 0, 0)
     assert m.checkpoints_reached == 1
 
 
@@ -301,10 +439,131 @@ def test_milestones_new_level_load_pays_again():
     m = MilestoneTracker()
     m.new_level_load(milestones_block())
     reached = milestones_block(checkpoints=[("0,1,20", True, True)], arenas=["0,1,30"], doors=["5,0,40"])
-    assert m.update(reached) == (1, 1, 1)
+    assert m.update(reached) == (1, 1, 1, 0, 0)
     m.new_level_load(milestones_block(checkpoints=[("0,1,20", False, False)]))
     assert m.checkpoints_reached == 0
-    assert m.update(reached) == (1, 1, 1)
+    assert m.update(reached) == (1, 1, 1, 0, 0)
+
+
+# -- the two skull-carry milestones ---------------------------------------------------------
+
+def zone(key, kind, *, filled=False, doors=("20,-10,381",)):
+    return {"key": key, "pos": [0.0, 0.0, 0.0], "item": kind, "filled": filled, "active": True,
+            "inactive_ancestors": 1, "doors": [{"key": k, "pos": [0.0, 0.0, 0.0]} for k in doors],
+            "reverse_doors": []}
+
+
+def carryable(key, kind, *, held=False, placed_in=None):
+    """An `items[]` entry. `placed_in` is the altar key it is resting in, which is what a placement is read from."""
+    return {"key": key, "pos": [0.0, 0.0, 0.0], "item": kind, "held": held, "placed": placed_in is not None,
+            "placed_in": placed_in, "active": True, "active_self": True, "inactive_ancestors": 1}
+
+
+def skull_milestones(altars, items):
+    return milestones_block(altars=altars, items=items)
+
+
+def test_item_pickup_pays_once_per_type_and_only_for_accepted_types():
+    m = MilestoneTracker()
+    altars = [zone("a", "SkullRed")]
+    m.new_level_load(skull_milestones(altars, [carryable("s1", "SkullRed")]))
+    assert m.update(skull_milestones(altars, [carryable("s1", "SkullRed", held=True)]))[3] == 1
+    assert m.update(skull_milestones(altars, [carryable("s1", "SkullRed", held=True)]))[3] == 0
+    # A respawn re-instantiates the skull under a new mod-side key: type-keyed, so it cannot pay again.
+    assert m.update(skull_milestones(altars, [carryable("s1#2", "SkullRed", held=True)]))[3] == 0
+    # 8-2 ships 22 CustomKey1 props and 6-1 eleven; no altar accepts them, so picking them up is not a milestone.
+    props = [carryable("p", "CustomKey1", held=True), carryable("t", "Torch", held=True)]
+    assert m.update(skull_milestones(altars, props))[3] == 0
+
+
+def test_item_placed_pays_once_per_puzzle_not_once_per_zone():
+    """Coincident duplicate zones 0.2 m apart drive the same door; one puzzle pays once.
+
+    A placement is physical: `Punch.PlaceHeldObject` reparents the skull to the zone and clears `pickedUp` in
+    one call, so on the paying step the item reads `held: false, placed_in: <that zone>` and the step before it
+    read `held: true`. The item never reads held while the altar it is in reads filled.
+    """
+    m = MilestoneTracker()
+    twins = [zone("0,-7,381", "SkullRed"), zone("0,-7,381#2", "SkullRed")]
+    m.new_level_load(skull_milestones(twins, [carryable("s1", "SkullRed", held=True)]))
+    filled_one = [zone("0,-7,381", "SkullRed", filled=True), twins[1]]
+    assert m.update(skull_milestones(filled_one, [carryable("s1", "SkullRed", placed_in="0,-7,381")]))[4] == 1
+    # Punch it back out and place it in the twin: the same puzzle, the same key, nothing more to earn.
+    m.update(skull_milestones(twins, [carryable("s1", "SkullRed", held=True)]))
+    both = [twins[0], zone("0,-7,381#2", "SkullRed", filled=True)]
+    assert m.update(skull_milestones(both, [carryable("s1", "SkullRed", placed_in="0,-7,381#2")]))[4] == 0, \
+        "punching it out and into the twin earns nothing"
+    # A different puzzle (another door) is its own key and does pay.
+    blue_altar = zone("9,9,9", "SkullBlue", doors=("81,-6,240",))
+    red_done = carryable("s1", "SkullRed", placed_in="0,-7,381#2")
+    carrying = [carryable("s2", "SkullBlue", held=True), red_done]
+    assert m.update(skull_milestones(both + [blue_altar], carrying))[3] == 1  # the blue skull is picked up
+    placed = both + [zone("9,9,9", "SkullBlue", filled=True, doors=("81,-6,240",))]
+    assert m.update(skull_milestones(placed, [carryable("s2", "SkullBlue", placed_in="9,9,9"), red_done]))[4] == 1
+
+
+def test_an_altar_that_fills_with_nothing_ever_held_pays_nothing():
+    """M11: 31 source pedestals campaign-wide read filled: true the moment their room switches on.
+
+    `mark_paid` cannot catch those -- it only runs at a reset or a respawn, never when a room activates
+    mid-episode -- so the payment rule itself has to require that the agent put the item there.
+    """
+    m = MilestoneTracker()
+    altars = [zone("81,-2,275", "SkullRed", doors=())]
+    m.new_level_load(skull_milestones(altars, [carryable("s1", "SkullRed")]))
+    switched_on = [zone("81,-2,275", "SkullRed", filled=True, doors=())]
+    assert m.update(skull_milestones(switched_on, [carryable("s1", "SkullRed", placed_in="81,-2,275")]))[4] == 0
+    # And it is absorbed, not merely skipped: it can never pay later either.
+    m.update(skull_milestones(switched_on, [carryable("s1", "SkullRed", held=True)]))
+    assert m.update(skull_milestones(switched_on, [carryable("s1", "SkullRed", held=True)]))[4] == 0
+
+
+def test_a_pedestal_switching_on_mid_carry_pays_nothing():
+    """The other half of M11, and the one a type-keyed rule cannot see.
+
+    Shaped like 1-4: four blue source pedestals whose rooms stream in one at a time. "Something of this type
+    was held a step ago" is true for the whole duration of any legitimate carry, so every pre-filled pedestal
+    the agent walks past while carrying a skull paid +15 for nothing -- three on 1-4, three on 5-1 and 7-1,
+    and up to 31 zones campaign-wide. The payment has to follow the instance, not the type.
+    """
+    m = MilestoneTracker()
+    target = zone("target", "SkullBlue", doors=("99,9,99",))
+    sources = {k: zone(k, "SkullBlue", filled=False, doors=()) for k in ("srcA", "srcB", "srcC")}
+    resting = [carryable(f"skull{k[-1]}", "SkullBlue", placed_in=k) for k in sources]
+
+    def block(filled, items):
+        altars = [target] + [zone(k, "SkullBlue", filled=(k in filled), doors=()) for k in sources]
+        return skull_milestones(altars, items)
+
+    m.new_level_load(block({"srcA"}, resting))  # A's room is on at load; B and C are still switched off
+    carrying = [carryable("skullA", "SkullBlue", held=True)] + resting[1:]
+    assert m.update(block(set(), carrying))[3] == 1, "A's skull is picked up"
+    assert m.update(block({"srcB"}, carrying))[4] == 0, "B's room switches on while the agent carries A's skull"
+    assert m.update(block({"srcB", "srcC"}, carrying))[4] == 0, "and C's"
+    # The real placement, into the altar that drives a door, still pays.
+    done = [carryable("skullA", "SkullBlue", placed_in="target")] + resting[1:]
+    altars = [zone("target", "SkullBlue", filled=True, doors=("99,9,99",)),
+              zone("srcA", "SkullBlue", doors=()), zone("srcB", "SkullBlue", filled=True, doors=()),
+              zone("srcC", "SkullBlue", filled=True, doors=())]
+    assert m.update(skull_milestones(altars, done))[4] == 1
+
+
+def test_a_respawns_item_keys_are_absorbed_not_paid():
+    m = MilestoneTracker()
+    altars = [zone("a", "SkullRed", filled=True)]
+    held = [carryable("s1", "SkullRed", held=True)]
+    m.new_level_load(skull_milestones(altars, held))  # the level load absorbs everything it already reports
+    assert m.update(skull_milestones(altars, held)) == (0, 0, 0, 0, 0)
+    m.mark_paid(skull_milestones(altars, held))
+    assert m.update(skull_milestones(altars, held)) == (0, 0, 0, 0, 0)
+    m.new_level_load(skull_milestones([zone("a", "SkullRed")], [carryable("s1", "SkullRed")]))
+    assert m.update(skull_milestones([zone("a", "SkullRed")], held))[3] == 1, "a fresh load pays again"
+
+
+def test_item_milestones_are_silent_against_a_mod_that_sends_neither_array():
+    m = MilestoneTracker()
+    m.new_level_load(milestones_block())
+    assert m.update(milestones_block(checkpoints=[("0,1,20", True, True)])) == (1, 0, 0, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +751,317 @@ def test_empty_gates_have_no_target():
         p.retarget(camp, (0.0, 0.0, 0.0))
         assert p.target is None
         assert p.update(camp, (0.0, 0.0, 5.0)) == (0, 0.0)
+
+
+# -- S2: the gates usability guard ----------------------------------------------------------
+
+def ratio_block(with_hops: int, total: int, *, altar_only: int = 0, altar_only_hops: int = 0):
+    """A gate array where exactly `with_hops` of `total` phase-1 gates carry a hops value, the rest null.
+
+    `altar_only` appends that many phase-2 gates -- the altar-driven one-room doors the mod started appending
+    once skull gates existed -- of which `altar_only_hops` carry a hops value. Measured, only 1-1, 5-3 and 8-1
+    have one whose room is in the door graph; everywhere else the extra gates are null-hops.
+    """
+    gates = [gate(f"0,0,{20 * i}", (0.0, 0.0, 20.0 * i), i if i < with_hops else None) for i in range(total)]
+    gates += [dict(gate(f"9,9,{i}", (9.0, 9.0, float(i)), 0 if i < altar_only_hops else None), altar_only=True)
+              for i in range(altar_only)]
+    return gates_block(gates)
+
+
+def usable(camp, *, hops_min_frac=0.5) -> bool:
+    return bool(GateProgress(hops_min_frac=hops_min_frac)._gates(camp))
+
+
+def test_gates_guard_keeps_the_levels_whose_ladder_is_usable():
+    """Measured ratios from the level survey, each with the phase-2 gates that level's altars add.
+
+    The guard's threshold was calibrated on the phase-1 array, but the mod now also appends altar-driven
+    one-room doors, which carry `hops: null` on every level but 1-1, 5-3 and 8-1. Counted in the ratio those
+    would push 6-1 from 6/12 = 0.500 to 6/13 = 0.462 and drop the ladder the threshold exists to keep, and
+    5-1 from 1.000 to 3/6 = 0.500. The ratio is therefore taken over the phase-1 gates alone, and each case
+    below carries its measured phase-2 count.
+
+    `gates_ordered` is true on 7-2 (1 of 4) and 8-3 (1 of 32), where the old code locked onto that single
+    ordered door -- 892 m from the start on 8-3 -- and never retargeted, so the ladder was worse than none.
+    """
+    kept = ((11, 11, 0, 0, "0-1"), (24, 25, 1, 0, "8-2"), (3, 5, 0, 0, "4-3"), (28, 52, 1, 1, "8-1"),
+            (6, 12, 1, 0, "6-1"), (3, 3, 3, 0, "5-1"), (13, 13, 1, 1, "1-1"), (20, 20, 2, 1, "5-3"))
+    for with_hops, total, extra, extra_hops, level in kept:
+        assert usable(ratio_block(with_hops, total, altar_only=extra, altar_only_hops=extra_hops)), level
+    for with_hops, total, extra, level in ((1, 4, 1, "7-2"), (1, 32, 1, "8-3")):
+        assert not usable(ratio_block(with_hops, total, altar_only=extra)), level
+
+
+def test_gates_guard_ignores_phase_two_gates_in_the_ratio_but_still_returns_them():
+    """A phase-2 gate adds no node and no edge, so it cannot make the ladder it is appended to less trustworthy.
+
+    6-1 is the case that decides this: its 6-of-12 ladder sits exactly on the threshold, and its one altar door
+    is enough to drop it if counted.
+    """
+    assert usable(ratio_block(6, 12, altar_only=1)), "6-1: the altar door must not drop the ladder"
+    assert usable(ratio_block(3, 3, altar_only=3)), "5-1: three altar doors against a perfect ladder"
+    both = GateProgress()._gates(ratio_block(6, 12, altar_only=1))
+    assert len(both) == 13 and sum(1 for g in both if g.get("altar_only")) == 1, "kept ladders return every gate"
+    # A phase-1 gate with no hops still counts against the ratio: only the phase-2 ones are exempt.
+    assert not usable(ratio_block(3, 7, altar_only=4, altar_only_hops=4)), "3 of 7 is still under the threshold"
+    # 7-1 has four altar-driven doors and no phase-1 gate at all: with no ladder to dilute, the whole array is
+    # the ratio, which is the unchanged rule. All four carry hops: null, so it is dropped as it always was.
+    assert not usable(ratio_block(0, 0, altar_only=4)), "7-1: four altar doors, none with hops"
+    assert usable(ratio_block(0, 0, altar_only=4, altar_only_hops=4)), \
+        "but an altar-only array that IS ordered is judged by the same ratio, not discarded unread"
+
+
+def test_gates_guard_keeps_both_older_guards():
+    assert not usable(None), "no campaign block at all (a scene load, or the mod's build threw)"
+    assert not usable({}), "a campaign block with no gates key (a 0.5.x mod)"
+    assert not usable(gates_block([gate("a", (0.0, 0.0, 10.0), 3)], ordered=False)), "gates_ordered false"
+    assert not usable(gates_block([])), "an empty array must not divide by zero"
+    assert not usable(gates_block([{"key": "a", "hops": 0}])), "a gate with no pos is not a gate"
+
+
+def test_gates_guard_threshold_is_configurable():
+    quarter = ratio_block(1, 4)
+    assert not usable(quarter) and usable(quarter, hops_min_frac=0.25)
+    assert not usable(ratio_block(6, 12), hops_min_frac=0.6), "the first knob if 6-1 ever wedges"
+    assert not usable(ratio_block(6, 12, altar_only=1), hops_min_frac=0.6), "and it still bites with a phase-2 gate"
+
+
+def test_a_dropped_ladder_pays_nothing_and_has_no_target():
+    camp = ratio_block(1, 32)  # 8-3
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, 0.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    assert p.target is None and p.best_hops is None
+    assert p.update(camp, (0.0, 0.0, 1.0)) == (0, 0.0) and p.gates_reached == 0
+
+
+# -- S4: the skull-carry sub-goal ----------------------------------------------------------
+#
+# Modelled on Level 1-1's red leg as parsed from the scene bundle: the gate at 20,-10,381 (hops 2) is held shut
+# by the altar at 0,-7,381, whose only live source is the pedestal skull 133.5 m away at (81, -2.2, 275). The
+# level also ships a dead twin of the altar, a phantom item under a permanently disabled node, and a decoration
+# skull inside the destination altar -- all three must be ignored.
+
+GATE_KEY = "20,-10,381"
+
+
+def altar(key, pos, item, *, filled=False, doors=(GATE_KEY,), ancestors=1, reverse=()):
+    return {"key": key, "pos": list(pos), "item": item, "filled": filled, "active": True,
+            "inactive_ancestors": ancestors,
+            "doors": [{"key": k, "pos": [0.0, 0.0, 0.0]} for k in doors],
+            "reverse_doors": [{"key": k, "pos": [0.0, 0.0, 0.0]} for k in reverse]}
+
+
+def item(key, pos, kind, *, held=False, placed=True, placed_in=None, ancestors=1, active_self=True):
+    return {"key": key, "pos": list(pos), "item": kind, "held": held, "placed": placed,
+            "placed_in": placed_in, "active": True, "active_self": active_self, "inactive_ancestors": ancestors}
+
+
+def skull_block(*, altars, items, filled_gate=False, needs="SkullRed"):
+    """A one-gate level whose gate needs an item. `needs` None is a mod that sends no needs_item at all."""
+    g = gate(GATE_KEY, (0.0, 0.0, 100.0), 2)
+    if needs is not None:
+        g["needs_item"] = None if filled_gate else needs
+    block = gates_block([g])
+    block["altars"], block["items"] = list(altars), list(items)
+    return block
+
+
+PEDESTAL = item("81,-2,275", (81.0, -2.2, 275.0), "SkullRed", placed_in="81,-2,275")
+DECORATION = item("0,-7,381", (0.0, -6.86, 381.0), "SkullRed", placed_in="0,-7,381", ancestors=2, active_self=False)
+LIVE_ALTAR = altar("0,-7,381", (0.0, -6.76, 381.0), "SkullRed")
+DEAD_TWIN = altar("0,-7,381#2", (0.0, -6.6, 381.0), "SkullRed", ancestors=2)
+
+
+def targeted(camp, pos=(0.0, 0.0, 0.0)):
+    p = GateProgress()
+    p.new_level_load(camp, pos)
+    p.reset_episode()
+    p.retarget(camp, pos)
+    return p.target
+
+
+def test_subgoal_walks_fetch_then_carry_then_the_gate():
+    fetch = targeted(skull_block(altars=[LIVE_ALTAR, DEAD_TWIN], items=[PEDESTAL, DECORATION]))
+    assert fetch["subgoal"] == SUBGOAL_ITEM and fetch["gate_key"] == GATE_KEY
+    assert fetch["key"] == "item:SkullRed" and fetch["pos"] == [81.0, -2.2, 275.0]
+    assert fetch["hops"] == 2, "the sub-goal inherits the gate's hops, so it packs through the gate branch"
+
+    carried = dict(PEDESTAL, held=True, placed=False, placed_in=None)
+    carry = targeted(skull_block(altars=[LIVE_ALTAR, DEAD_TWIN], items=[carried, DECORATION]))
+    assert carry["subgoal"] == SUBGOAL_ALTAR and carry["key"] == f"altar:SkullRed:{GATE_KEY}"
+    assert carry["pos"] == [0.0, -6.76, 381.0], "the live altar, never the dead twin"
+
+    placed = item("81,-2,275", (0.0, -6.86, 381.0), "SkullRed", placed_in="0,-7,381")
+    done = skull_block(altars=[dict(LIVE_ALTAR, filled=True), DEAD_TWIN], items=[placed], filled_gate=True)
+    assert targeted(done)["key"] == GATE_KEY and "subgoal" not in targeted(done)
+
+
+# Level 1-1's full ladder as parsed from the scene bundle: both middle rungs are skull-locked.
+L11_BLUE_GATE, L11_RED_GATE = "81,-6,240", "20,-10,381"
+
+
+def level_1_1():
+    gates = [
+        dict(gate("81,-6,188", (81.0, -6.0, 188.5), 0), needs_item=None),
+        dict(gate(L11_BLUE_GATE, (81.0, -6.0, 239.5), 1, controller=False), needs_item="SkullBlue",
+             altar_only=True),
+        dict(gate(L11_RED_GATE, (20.5, -9.5, 381.0), 2, controller=False), needs_item="SkullRed"),
+        dict(gate("16,20,427", (15.5, 20.5, 427.0), 3), needs_item=None),
+    ]
+    block = gates_block(gates, exit_pos=(81.0, -76.1, 91.0))
+    block["altars"] = [altar("81,-4,251", (81.0, -3.76, 251.0), "SkullBlue", doors=(L11_BLUE_GATE,)),
+                       altar("0,-7,381", (0.0, -6.76, 381.0), "SkullRed", doors=(L11_RED_GATE,))]
+    block["items"] = [item("-15,27,427", (-15.0, 26.64, 427.0), "SkullBlue", placed_in="-15,27,427"),
+                      item("81,-2,275", (81.0, -2.2, 275.0), "SkullRed", placed_in="81,-2,275")]
+    return block
+
+
+def test_standing_at_a_skull_locked_gate_is_not_reaching_it():
+    """A door the agent physically cannot pass must not pay `gate` or move `best_hops`.
+
+    It did both, and the consequence was worse than the stray +15: with `best_hops` at 1, `_choose_target`
+    picks the rung BELOW the lock (`81,-6,188`, which carries no `needs_item`), `_subgoal` returns it
+    unchanged, and the fetch/carry machine never fires again for the rest of the level load -- including every
+    checkpoint-respawn episode, since `best_hops` and `reached` are level-load scoped.
+    """
+    camp = level_1_1()
+    p = GateProgress()
+    spawn = (0.0, 105.0, 253.0)
+    p.new_level_load(camp, spawn)
+    p.reset_episode()
+    p.retarget(camp, spawn)
+    assert p.target["key"] == "item:SkullBlue", "the sub-goal engages at spawn"
+
+    paid, _ = p.update(camp, (81.0, -6.0, 243.0))  # 3.5 m from the blue-locked door
+    assert paid == 0 and p.best_hops is None and p.hops_reached == set()
+    assert p.reached == set() and p.gates_reached == 0
+    assert p.target["key"] == "item:SkullBlue", "and it still points at the skull, not past the lock"
+
+    # Once the altar is filled the mod drops needs_item, and the gate reaches and pays exactly as any other.
+    opened = level_1_1()
+    opened["gates"][1]["needs_item"] = None
+    opened["altars"][0]["filled"] = True
+    q = GateProgress()
+    q.new_level_load(opened, spawn)
+    q.reset_episode()
+    assert q.update(opened, (81.0, -6.0, 243.0))[0] == 1 and q.best_hops == 1
+
+
+def test_a_skull_locked_gate_does_not_block_the_rest_of_the_ladder():
+    """Only the locked gate is unreachable: an ordinary gate at any rung still counts and still retargets."""
+    camp = level_1_1()
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 105.0, 253.0))
+    p.reset_episode()
+    assert p.update(camp, (15.5, 20.5, 427.0))[0] == 1  # the hops-3 walk-up door
+    assert p.best_hops == 3
+    assert p.target["key"] == "item:SkullRed", "the hops-2 rung is red-locked, so the target is the red skull"
+
+
+def test_the_dead_twin_never_becomes_the_target_after_a_placement():
+    """X1 of the design spec: a dead zone can never fill, so counting it would undo the puzzle.
+
+    The machine would drop back to "carry", find the just-placed skull, send the agent to punch it out of the
+    altar -- and `ItemPlaceZone.CheckItem`'s empty branch calls Close() on the door it had opened.
+    """
+    placed = item("81,-2,275", (0.0, -6.86, 381.0), "SkullRed", placed_in="0,-7,381")
+    # The mod still reports needs_item here only if it counted the dead twin; Python must not target it either.
+    camp = skull_block(altars=[dict(LIVE_ALTAR, filled=True), DEAD_TWIN], items=[placed], needs="SkullRed")
+    target = targeted(camp)
+    assert target["key"] == GATE_KEY and "subgoal" not in target
+
+
+def test_subgoal_returns_the_gate_when_there_is_nothing_to_fetch():
+    plain = gates_block([gate(GATE_KEY, (0.0, 0.0, 100.0), 2)])
+    assert targeted(plain)["key"] == GATE_KEY, "no needs_item: an old mod, or an ordinary door"
+    assert targeted(skull_block(altars=[], items=[]))["key"] == GATE_KEY, "no altars"
+    assert targeted(skull_block(altars=[LIVE_ALTAR], items=[]))["key"] == GATE_KEY, "no items"
+    wrong_gate = altar("9,9,9", (5.0, 0.0, 5.0), "SkullRed", doors=("0,0,0",))
+    assert targeted(skull_block(altars=[wrong_gate], items=[PEDESTAL]))["key"] == GATE_KEY, "wired to another door"
+    reverse = altar("9,9,9", (5.0, 0.0, 5.0), "SkullRed", doors=(), reverse=(GATE_KEY,))
+    assert targeted(skull_block(altars=[reverse], items=[PEDESTAL]))["key"] == GATE_KEY, "a reverse door closes it"
+    other_type = skull_block(altars=[altar("a", (5.0, 0.0, 5.0), "SkullBlue")], items=[PEDESTAL], needs="SkullBlue")
+    assert targeted(other_type)["key"] == GATE_KEY, "no source of the type the altar accepts"
+
+
+def test_subgoal_rejects_the_phantom_and_the_decoration_but_takes_the_pedestal():
+    phantom = item("x", (1.0, 0.0, 1.0), "SkullRed", placed_in="x", ancestors=2)  # under a disabled Altar node
+    camp = skull_block(altars=[LIVE_ALTAR], items=[phantom, DECORATION, PEDESTAL])
+    target = targeted(camp)
+    assert target["subgoal"] == SUBGOAL_ITEM and target["pos"] == [81.0, -2.2, 275.0], \
+        "the phantom is 1 m away and the pedestal 290 m, so only the liveness filter can be choosing"
+    # "Not held and not placed" finds nothing on 1-1: every ItemIdentifier starts inside an ItemPlaceZone.
+    assert PEDESTAL["placed"] and PEDESTAL["placed_in"] == "81,-2,275"
+    in_the_target_altar = item("y", (1.0, 0.0, 1.0), "SkullRed", placed_in=LIVE_ALTAR["key"])
+    assert targeted(skull_block(altars=[LIVE_ALTAR], items=[in_the_target_altar]))["key"] == GATE_KEY
+
+
+def test_subgoal_needs_a_player_and_keeps_an_existing_sub_goal():
+    camp = skull_block(altars=[LIVE_ALTAR], items=[PEDESTAL])
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, 0.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    assert p.target["subgoal"] == SUBGOAL_ITEM
+    p.retarget(camp, None)  # a frame with no player keeps the target as it was
+    assert p.target["subgoal"] == SUBGOAL_ITEM and p.target["key"] == "item:SkullRed"
+
+
+def test_subgoal_keys_are_by_type_so_a_re_keyed_instance_cannot_re_seed_the_budget():
+    """`best_dist` is seeded once per key per episode and never re-seeded; a respawn re-instantiates skulls.
+
+    With instance keys, dying next to the skull would hand back the whole ~20-point approach every time.
+    """
+    camp = skull_block(altars=[LIVE_ALTAR], items=[PEDESTAL])
+    p = GateProgress()
+    p.new_level_load(camp, (0.0, 0.0, 0.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 0.0))
+    seeded = dict(p.best_dist)
+    assert set(seeded) == {"item:SkullRed"}
+    # Same skull, brand-new mod-side key and object: the target key, and so the budget, is unchanged.
+    rekeyed = skull_block(altars=[LIVE_ALTAR], items=[dict(PEDESTAL, key="81,-2,275#7")])
+    p.retarget(rekeyed, (0.0, 0.0, 0.0))
+    assert dict(p.best_dist) == seeded and p.target["key"] == "item:SkullRed"
+
+
+def test_subgoal_keys_cannot_collide_with_a_gate_or_the_exit():
+    for key in ("item:SkullRed", f"altar:SkullRed:{GATE_KEY}"):
+        assert not key.replace(":", "").isdigit() and key != GATE_EXIT_KEY
+        assert ":" in key, "a real Door key is always x,y,z with no colon"
+
+
+def test_target_kind_slots_are_off_by_default():
+    camp = skull_block(altars=[LIVE_ALTAR], items=[PEDESTAL])
+    off = GateProgress()
+    off.new_level_load(camp, (0.0, 0.0, 0.0))
+    off.retarget(camp, (0.0, 0.0, 0.0))
+    assert off.target["open"] is False and off.target["locked"] is False
+
+    on = GateProgress(target_kind_slots=True)
+    on.new_level_load(camp, (0.0, 0.0, 0.0))
+    on.retarget(camp, (0.0, 0.0, 0.0))
+    assert on.target["open"] is True and on.target["locked"] is False  # "the target is an item"
+    carried = skull_block(altars=[LIVE_ALTAR], items=[dict(PEDESTAL, held=True, placed=False, placed_in=None)])
+    on.retarget(carried, (0.0, 0.0, 0.0))
+    assert on.target["open"] is False and on.target["locked"] is True  # "the target is an altar"
+
+
+def test_shuttling_between_the_skull_and_the_altar_pays_each_leg_once():
+    free = skull_block(altars=[LIVE_ALTAR], items=[PEDESTAL])
+    carried = skull_block(altars=[LIVE_ALTAR], items=[dict(PEDESTAL, held=True, placed=False, placed_in=None)])
+    p = GateProgress()
+    p.new_level_load(free, (0.0, 0.0, 0.0))
+    p.reset_episode()
+    p.retarget(free, (0.0, 0.0, 0.0))
+    # Walk to the skull, pick it up, walk back, drop it, walk to the skull again.
+    out = sum(p.update(free, (x, -2.2, 275.0 * x / 81.0))[1] for x in (20.0, 40.0, 60.0, 81.0))
+    back = sum(p.update(carried, (x, -6.76, 381.0))[1] for x in (60.0, 30.0, 0.0))
+    again = sum(p.update(free, (x, -2.2, 275.0))[1] for x in (30.0, 60.0, 81.0))
+    assert out > 0 and back > 0
+    assert again == 0.0, "the fetch leg's budget was spent the first time; shuttling earns nothing"
 
 
 def test_open_gate_counts_as_reached_at_double_range():

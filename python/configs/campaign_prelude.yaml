@@ -1,0 +1,56 @@
+# The Prelude as a curriculum: one run over the levels the level survey marks fully usable today, in mission
+# order. `levels` replaces `level`: a fresh level load samples from the unlocked set with weight
+# max(0.1, 1 - that level's fresh completion rate), and level k+1 unlocks once level k completes half of its
+# last 20+ fresh starts. No level id enters the observation -- the policy has to generalise, by design.
+#
+# Why these three: 0-1, 0-3 and 0-4 are Tier A (12/12 and 7/7 gate ladders, walkable, no key items). 0-2 is
+# held back because it needs the skull carry of configs/campaign_1-1.yaml, and 0-5 because its door graph has
+# no goal room at all (the Cerberus kill opens the exit), so it has no route signal to train against.
+#
+# From python/ (on a one-display PC add --monitor 1 to games.py and dashboard.py):
+#   python scripts/games.py launch --count 5
+#   python scripts/train.py --config configs/campaign_prelude.yaml --resume models/campaign_gates/best.zip
+#   python scripts/poll_status.py --run campaign_prelude
+#   python scripts/keep_best.py --run campaign_prelude --metric campaign
+#   python scripts/dashboard.py --run campaign_prelude
+#   python scripts/games.py stop
+#
+# Before the first run, copy models/campaign_gates/explore_*.npz into models/campaign_prelude/ (explore_dir
+# follows run_name, and those counts carry the 1/sqrt(N) decay that makes the agent push outward at all), and
+# move any old metrics_log.csv aside so poll_status.py writes the levels_unlocked column. A new run_name is
+# required when moving from a single-level config: `fresh_completion_rate` becomes a shrunk SUM over the
+# unlocked levels -- a score, not a rate -- and the pooled mean_100 numbers stop being comparable across levels.
+# Judge this run per level, on the dashboard's `levels` rows and status.json's campaign.levels table, never on
+# the pooled numbers (max_steps is one value for every level, so a longer level is truncated by construction).
+env:
+  mode: campaign
+  levels: ["Level 0-1", "Level 0-3", "Level 0-4"]
+  unlock_rate: 0.5
+  unlock_window: 20
+  level_weight_floor: 0.1
+  difficulty: 3
+  unlock_all_gear: true
+  fixed_fps: 30
+  frameskip: 2
+  render: false
+  soft_death: false
+  window_width: 368
+  window_height: 207
+  max_steps: 9000
+  fresh_start_prob: 0.2
+  stuck_seconds: 45
+  stuck_repeats: 3
+  cell_size: 4.0
+  pitch_limit_deg: 45.0
+  rewards: {time: 0.02, level_complete: 100.0, checkpoint: 10.0, arena_clear: 10.0, door_unlock: 15.0,
+            gate: 15.0, gate_approach: 0.15, novelty: 0.2, path: 0.0, kill: 0.5, damage_dealt: 0.5,
+            damage_taken: 0.01, death: 5.0, style: 0.0, punch: 0.01}
+train:
+  algo: ppo
+  num_envs: 5
+  run_name: campaign_prelude
+  timesteps: 30000000
+  save_every: 50000
+  policy_kwargs: {net_arch: [512, 512]}
+  hyperparams: {learning_rate: 0.0002, n_steps: 2048, batch_size: 512, n_epochs: 5, gamma: 0.998,
+                gae_lambda: 0.95, ent_coef: 0.01, target_kl: 0.03}

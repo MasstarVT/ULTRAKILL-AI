@@ -12,6 +12,12 @@
     <UltrakillDir Condition="'$(UltrakillDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL</UltrakillDir>
     <ManagedDir>$(UltrakillDir)\ULTRAKILL_Data\Managed</ManagedDir>
     <PluginDir>$(UltrakillDir)\BepInEx\plugins\UltrakillAIBridge</PluginDir>
+    <!--
+      The build installs the DLL into the game by default (unchanged behaviour). A running game holds that
+      file open, so `dotnet build -c Release -p:InstallPlugin=false` compiles without touching it: that is
+      the mod-side test while training is live.
+    -->
+    <InstallPlugin Condition="'$(InstallPlugin)' == ''">true</InstallPlugin>
     <RestoreAdditionalProjectSources>
       https://api.nuget.org/v3/index.json;
       https://nuget.bepinex.dev/v3/index.json
@@ -38,7 +44,7 @@
     <Reference Include="UnityEngine.InputLegacyModule"><HintPath>$(ManagedDir)\UnityEngine.InputLegacyModule.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 
-  <Target Name="CopyToPlugins" AfterTargets="Build" Condition="Exists('$(UltrakillDir)\BepInEx')">
+  <Target Name="CopyToPlugins" AfterTargets="Build" Condition="'$(InstallPlugin)' == 'true' AND Exists('$(UltrakillDir)\BepInEx')">
     <MakeDir Directories="$(PluginDir)" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(PluginDir)" />
     <Message Importance="high" Text="Copied $(TargetFileName) to $(PluginDir)" />

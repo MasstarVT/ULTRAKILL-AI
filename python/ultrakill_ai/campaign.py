@@ -72,6 +72,12 @@ CAMPAIGN_LEVELS: tuple[str, ...] = (
     "Level 9-1", "Level 9-2",
 )
 
+# The 33 of those whose scene bundle ships in this game build. `Level 9-1` and `Level 9-2` have no bundle, so
+# the game cannot load them at all: a curriculum that lists one would stall a worker on a scene that never
+# arrives. `EnvConfig.levels` validates against this set; `CAMPAIGN_LEVELS` still carries all 35, because
+# times.md orders its rows by it and eval's --level check has always accepted every name.
+CAMPAIGN_LEVELS_SHIPPED: frozenset[str] = frozenset(CAMPAIGN_LEVELS) - {"Level 9-1", "Level 9-2"}
+
 RANK_LETTERS = ("D", "C", "B", "A", "S")
 
 
@@ -109,6 +115,109 @@ def compute_rank(seconds: float, kills: int, style: int, restarts: int, ranks: d
     if total == 12:
         return "P"
     return RANK_LETTERS[math.floor(total / 3 + 0.5)]
+
+
+# ---------------------------------------------------------------------------
+# The multi-level curriculum
+# ---------------------------------------------------------------------------
+#
+# One trainer process writes runs/<run>/curriculum.json; the SubprocVecEnv workers read it at every fresh level
+# load and nowhere else. The two functions below are the whole policy, kept pure so they are tested offline.
+
+CURRICULUM_VERSION = 1
+
+
+def _level_stat(stats: dict | None, level: str, first: str) -> dict:
+    """One level's record, or the default one for a level that has never finished an episode.
+
+    `ProgressCallback.per_level` only gains an entry once a level produces an episode, and a hand-written or
+    truncated curriculum.json can be missing any level, so every read goes through this: it is what keeps
+    `choose_level` and `unlock_next` from raising on a sparse table. `first` (order[0]) is unlocked by default,
+    so the unlock chain always has a starting point.
+    """
+    record = (stats or {}).get(level)
+    if not isinstance(record, dict):
+        return {"unlocked": level == first, "fresh_window": 0, "fresh_completion_rate": None,
+                "best_time": None, "episodes": 0}
+    return record
+
+
+def level_weights(order, stats: dict | None, *, floor: float = 0.1) -> list[tuple[str, float]]:
+    """(level, weight) for every unlocked level, in `order`. Weight is max(floor, 1 - fresh completion rate).
+
+    A level with no data has rate None and so weight 1.0 (maximum attention); a mastered level falls to `floor`,
+    which is what keeps a completed level in the mix so the policy does not forget it. Shared by `choose_level`
+    (which samples from these) and the dashboard (which shows the normalised share).
+    """
+    order = list(order)
+    if not order:
+        return []
+    first = order[0]
+    out = []
+    for level in order:
+        record = _level_stat(stats, level, first)
+        if level != first and not record.get("unlocked"):
+            continue
+        out.append((level, max(floor, 1.0 - (record.get("fresh_completion_rate") or 0.0))))
+    return out
+
+
+def choose_level(rng: random.Random, order, stats: dict | None, *, floor: float = 0.1) -> str:
+    """The level the next fresh load uses, sampled from the unlocked set by `level_weights`.
+
+    The weight controls fresh *draws*, not episodes: a worker only re-draws at a fresh start, and
+    `choose_fresh_start` keeps it on the level it reached a checkpoint in for about 1/fresh_start_prob
+    episodes. The number to read is the per-level `episodes` count, not the weight.
+    """
+    weighted = level_weights(order, stats, floor=floor)
+    if not weighted:
+        raise ValueError("choose_level needs a non-empty level order")
+    levels = [level for level, _ in weighted]
+    return rng.choices(levels, weights=[w for _, w in weighted], k=1)[0]
+
+
+def unlock_next(order, stats: dict | None, *, unlock_rate: float = 0.5, unlock_window: int = 20) -> str | None:
+    """The first still-locked level whose predecessor has earned it, or None. Called once per finished episode.
+
+    Unlocking is chained and stops at the first locked level, so 0-3 cannot unlock before 0-2 has: the order in
+    the config is a ladder, not a menu. An empty `stats` returns None rather than raising, because `order[0]` is
+    unlocked by the default record and every later level then fails the predecessor test.
+    """
+    order = list(order)
+    for i in range(1, len(order)):
+        if _level_stat(stats, order[i], order[0]).get("unlocked"):
+            continue
+        previous = _level_stat(stats, order[i - 1], order[0])
+        if (previous.get("unlocked")
+                and int(previous.get("fresh_window") or 0) >= unlock_window
+                and (previous.get("fresh_completion_rate") or 0.0) >= unlock_rate):
+            return order[i]
+        return None
+    return None
+
+
+def read_curriculum(path, *, order=None, run_name: str | None = None) -> dict | None:
+    """The per-level table from `path`, or None when the file cannot be trusted.
+
+    None means "use the first level only". That covers a missing file (the trainer has not written one yet), a
+    torn or truncated read, a table that is not a dict, an `order` that disagrees with this worker's config, and
+    a `run_name` that disagrees with the run directory the file sits in (a leftover from a renamed run).
+    The write itself is atomic, so a reader only ever sees a whole file; the checks here are about *which* file.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    levels = data.get("levels")
+    if not isinstance(levels, dict):
+        return None
+    if order is not None and [str(v) for v in (data.get("order") or ())] != list(order):
+        return None
+    if run_name is not None and data.get("run_name") != run_name:
+        return None
+    return {name: record for name, record in levels.items() if isinstance(record, dict)}
 
 
 # ---------------------------------------------------------------------------
@@ -224,45 +333,120 @@ def _dist3(a, b) -> float:
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2)
 
 
+def altar_placement_key(altar: dict) -> str:
+    """The key `item_placed` is paid on: the altar's item type plus the sorted keys of the doors it opens.
+
+    Several levels ship coincident duplicate `ItemPlaceZone`s ~0.2 m apart wired to the same door (1-1 has
+    three such pairs). Keying on the puzzle -- the type and the doors it unlocks -- instead of on the zone means
+    punching the skull back out of one and placing it in its twin cannot earn a second payment. An altar that
+    drives no door falls back to its own key, so the two never collide.
+    """
+    doors = sorted(str(d.get("key")) for d in (altar.get("doors") or ()) if isinstance(d, dict) and d.get("key"))
+    item = str(altar.get("item"))
+    return f"{item}|{'|'.join(doors)}" if doors else f"{item}@{altar.get('key')}"
+
+
 class MilestoneTracker:
-    """Pays each checkpoint, arena clear and door unlock once per level load.
+    """Pays each checkpoint, arena clear, door unlock, item pickup and item placement once per level load.
 
     The mod reports arenas and doors as rounded-position keys. A checkpoint respawn re-instantiates rooms at the
     same position, so an arena cleared again after a death gives the same key and cannot pay twice. Keys that
     show up during a reset or respawn (Restart() unlocks the checkpoint's doors) are absorbed with `mark_paid`
     instead of paid. A checkpoint counts once it is activated or current.
+
+    The two item milestones are keyed so that neither the game's duplicate objects nor a respawn can pay twice:
+
+      - `item_pickup` is keyed on the item TYPE, and only for types some altar in this level accepts. A respawn
+        re-instantiates skulls under fresh mod-side keys, so an instance key would re-pay after every death;
+        and without the accepted-type filter, 8-2's 22 `CustomKey1` props and 6-1's 11 would be a side quest
+        with no route value.
+      - `item_placed` is keyed on `altar_placement_key`, and a `filled` false -> true transition only pays when
+        the item now sitting in that altar is the one the agent was carrying on the previous step. Thirty-one
+        source pedestals campaign-wide read `filled: true` the moment their room switches on, with no agent
+        action (ItemPlaceZone.CheckItem runs on room activation), and `mark_paid` cannot catch those: it only
+        runs at a reset or a respawn, never when a room activates mid-episode. Matching the *instance* --
+        `items[].placed_in` against the altar's own key, and that item's key against the previous step's held
+        set -- is what separates a real placement from a pedestal streaming in. Type-matching alone is not
+        enough: "something of this type was held a step ago" is true for the whole duration of any legitimate
+        carry, so on 1-4 (four blue sources, rooms switching on one at a time) every source pedestal the agent
+        walks past while carrying would pay for nothing.
     """
 
     def __init__(self):
         self._checkpoints: set[str] = set()
         self._arenas: set[str] = set()
         self._doors: set[str] = set()
+        self._item_pickups: set[str] = set()
+        self._item_placements: set[str] = set()
+        self._held_keys: set[str] = set()  # item keys held in the block seen on the previous update
 
     @staticmethod
-    def _keys(campaign: dict | None) -> tuple[set[str], set[str], set[str]]:
+    def _keys(campaign: dict | None) -> tuple[set[str], set[str], set[str], set[str], dict[str, set[str]]]:
+        """(checkpoints, arenas, doors, pickup types, {placement key: the filled altars' own keys}) here.
+
+        The placements come back as a dict rather than a set because paying one needs to know which zone
+        actually holds an item, which is what `items[].placed_in` is matched against. Coincident duplicate zones
+        share one placement key, so the value is a set.
+        """
         if not campaign:
-            return set(), set(), set()
+            return set(), set(), set(), set(), {}
         checkpoints = {str(cp["id"]) for cp in campaign.get("checkpoints") or () if cp.get("activated") or cp.get("current")}
-        return checkpoints, set(campaign.get("cleared_arenas") or ()), set(campaign.get("unlocked_doors") or ())
+        altars = [a for a in (campaign.get("altars") or ()) if isinstance(a, dict) and a.get("item")]
+        items = [i for i in (campaign.get("items") or ()) if isinstance(i, dict) and i.get("item")]
+        accepted = {str(a["item"]) for a in altars}
+        pickups = {str(i["item"]) for i in items if i.get("held") and str(i["item"]) in accepted}
+        placements: dict[str, set[str]] = {}
+        for a in altars:
+            if a.get("filled"):
+                placements.setdefault(altar_placement_key(a), set()).add(str(a.get("key")))
+        return checkpoints, set(campaign.get("cleared_arenas") or ()), set(campaign.get("unlocked_doors") or ()), pickups, placements
+
+    @staticmethod
+    def _held_now(campaign: dict | None) -> set[str]:
+        """The keys of the items reading `held: true` in this block (rule A4: unique within a step)."""
+        return {str(i["key"]) for i in ((campaign or {}).get("items") or ())
+                if isinstance(i, dict) and i.get("item") and i.get("held") and i.get("key") is not None}
+
+    def _just_placed(self, campaign: dict | None) -> set[str]:
+        """The altar keys that now hold an item the agent was carrying on the previous step.
+
+        `Punch.PlaceHeldObject` is synchronous -- it reparents the item to the zone, clears `pickedUp` and calls
+        `CheckItem()` in one call -- so the step that reports the altar `filled` is the same step that reports
+        the item `placed_in` it, and the step before it reported the item `held`. A one-step lookback is
+        therefore exact, and (unlike an "ever held this load" set) it cannot be fooled by rule A4 handing a
+        re-instantiated skull the key a destroyed one used to have.
+        """
+        return {str(i["placed_in"]) for i in ((campaign or {}).get("items") or ())
+                if isinstance(i, dict) and i.get("placed_in") and str(i.get("key")) in self._held_keys}
 
     def new_level_load(self, campaign: dict | None) -> None:
         """Starts a level load: forgets what was paid, then absorbs whatever the fresh level already reports."""
         self._checkpoints.clear()
         self._arenas.clear()
         self._doors.clear()
+        self._item_pickups.clear()
+        self._item_placements.clear()
+        self._held_keys.clear()
         self.mark_paid(campaign)
 
     def mark_paid(self, campaign: dict | None) -> None:
         """Absorbs the block's current keys without paying for them."""
         self.update(campaign)
 
-    def update(self, campaign: dict | None) -> tuple[int, int, int]:
-        """(new checkpoints, new arena clears, new door unlocks): keys not yet paid or absorbed this level load."""
-        checkpoints, arenas, doors = self._keys(campaign)
-        new = (len(checkpoints - self._checkpoints), len(arenas - self._arenas), len(doors - self._doors))
+    def update(self, campaign: dict | None) -> tuple[int, int, int, int, int]:
+        """New checkpoints, arena clears, door unlocks, item pickups and item placements for this step."""
+        checkpoints, arenas, doors, pickups, placements = self._keys(campaign)
+        placed_in = self._just_placed(campaign)
+        new_placements = sum(1 for key, altars in placements.items()
+                             if key not in self._item_placements and altars & placed_in)
+        new = (len(checkpoints - self._checkpoints), len(arenas - self._arenas), len(doors - self._doors),
+               len(pickups - self._item_pickups), new_placements)
         self._checkpoints |= checkpoints
         self._arenas |= arenas
         self._doors |= doors
+        self._item_pickups |= pickups
+        self._item_placements |= set(placements)  # a transition that paid nothing is still absorbed
+        self._held_keys = self._held_now(campaign)
         return new
 
     @property
@@ -272,6 +456,27 @@ class MilestoneTracker:
 
 
 GATE_EXIT_KEY = "exit"  # the sentinel target key for campaign.exit; a real Door key is always "x,y,z"
+SUBGOAL_ITEM = "item"  # the sub-goal kinds, and the prefixes of their best_dist keys ("item:SkullRed")
+SUBGOAL_ALTAR = "altar"
+
+
+def _live(entry: dict, *, need_active_self: bool = True) -> bool:
+    """Whether an `items[]` or `altars[]` entry is a real one rather than a decoration or a dead branch.
+
+    Measured on the scene files: a carryable source has `active_self` true and at most ONE inactive ancestor
+    (its own room switch); two means it sits under a permanently disabled node. 1-1 ships three `ItemIdentifier`s
+    with `active_self` true, one of which is such a phantom, and every duplicate `ItemPlaceZone` pair is one live
+    zone plus one dead twin -- 20 of the campaign's 104 zones. A dead zone can never activate, so its `CheckItem`
+    never runs and it reads `filled: false` forever: counting one would leave a gate's lock set after the puzzle
+    was solved and send the agent to punch the skull back out of the altar it had just filled, closing the gate
+    again. Altars are tested with `need_active_self=False`, since a zone's own GameObject may legitimately be
+    switched off with its room.
+
+    An older mod sends neither field, so both default to "usable" and nothing here changes its behaviour.
+    """
+    if need_active_self and not entry.get("active_self", True):
+        return False
+    return int(entry.get("inactive_ancestors", 0) or 0) <= 1
 
 
 class GateProgress:
@@ -304,10 +509,13 @@ class GateProgress:
     without it -- or without `gates` at all -- simply produces no target and pays nothing.
     """
 
-    def __init__(self, reach_m: float = 8.0, reach_v_m: float = 6.0, min_gain_m: float = 0.5):
+    def __init__(self, reach_m: float = 8.0, reach_v_m: float = 6.0, min_gain_m: float = 0.5,
+                 hops_min_frac: float = 0.5, target_kind_slots: bool = False):
         self.reach_h = float(reach_m)
         self.reach_v = float(reach_v_m)
         self.min_gain = float(min_gain_m)
+        self.hops_min_frac = float(hops_min_frac)
+        self.target_kind_slots = bool(target_kind_slots)
         # Per level load
         self.best_hops: int | None = None  # lowest hops reached
         self.paid_hops: int | None = None  # lowest hops already paid or absorbed
@@ -342,7 +550,7 @@ class GateProgress:
     def retarget(self, campaign: dict | None, player_pos=None) -> None:
         """Chooses the current target. Pays nothing; call it before packing any observation."""
         self._note_reached(campaign, player_pos)
-        self.target = self._choose_target(campaign, player_pos)
+        self.target = self._subgoal(campaign, self._choose_target(campaign, player_pos), player_pos)
         key = self._key_of(self.target)
         if key is not None and player_pos is not None and key not in self.best_dist:
             self.best_dist[key] = _dist3(player_pos, self.target["pos"])  # seeded once, never re-seeded
@@ -381,12 +589,52 @@ class GateProgress:
 
     # -- helpers -----------------------------------------------------------------------------
 
-    @staticmethod
-    def _gates(campaign: dict | None) -> list[dict]:
-        """The ordered gate array, or nothing at all when the mod did not order this level (0-5, or a 0.5.x mod)."""
+    def _gates(self, campaign: dict | None) -> list[dict]:
+        """The usable gate array, or nothing at all when this level's ladder cannot be trusted.
+
+        Three guards, all needed:
+
+          - no `campaign` block at all. `env._campaign_progress` passes `raw.get("campaign")`, which is absent
+            on every frame of a scene load and whenever the mod's own build of the block throws;
+          - `gates_ordered` false: the door graph has no goal room (0-5 and six others), so every `hops` is null;
+          - fewer than `hops_min_frac` of the LADDER gates carry a `hops` value. `gates_ordered` is true on 7-2
+            (1 of 4) and 8-3 (1 of 32), where `_choose_target` locks onto that single ordered door -- 892 m from
+            the start on 8-3 -- and never retargets, so the ladder is worse than no ladder. Measured across the
+            campaign the ratio is 1.000 on fourteen levels, then 0.960 (8-2), 0.600 (4-3), 0.538 (8-1),
+            0.500 (6-1), 0.250 (7-2), 0.031 (8-3): a `<` test at 0.5 keeps 6-1 exactly on the threshold and drops
+            the two degenerate levels. 6-1 is kept by the threshold, not by evidence that its reachable half is
+            the half on the route, so this is the first knob if 6-1 ever wedges.
+
+        The ratio is taken over the **phase-1** gates only, i.e. those without `altar_only`. Those measured
+        ratios were taken before the mod began appending altar-driven one-room doors as extra gates, and such a
+        door carries `hops: null` on all but three levels (1-1, 5-3, 8-1) because its room is outside the door
+        graph. Counting them would move 6-1 from 6/12 = 0.500 to 6/13 = 0.462 and silently drop the ladder the
+        threshold was chosen to keep, and 5-1 from 1.000 to 3/6 = 0.500 -- one more altar door from the same
+        fate. A phase-2 gate adds no node and no edge to the graph, so it cannot make the ladder it was appended
+        to any less trustworthy; it is additive route information and is returned with the rest on success.
+        A level whose gates are ALL `altar_only` has no phase-1 ladder to dilute, so the ratio falls back to the
+        whole array and the rule is the unchanged one. The only such level that ships is 7-1, whose four altar
+        doors all carry `hops: null`; it scores 0.000 and is dropped either way, exactly as it was before the
+        widening, when it had no gates at all. Phase-1-only and whole-array are indistinguishable on all 33
+        shipped levels; the fallback exists so that a level whose route genuinely runs through altar doors is
+        judged by the same ratio as any other rather than discarded unread.
+
+        Evaluated on every call rather than cached: a mid-load `Scan()` can change the ratio as rooms activate,
+        and filtering at most 64 dicts is nothing next to a step. The ladder is taken from the array as sent, so
+        on a level with more than 64 gates the mod's nearest-first truncation would make the ratio depend on
+        where the player stands; the largest array that ships is 8-1's 52 phase-1 gates plus one phase-2 door,
+        so that is latent rather than handled.
+        """
         if not campaign or not campaign.get("gates_ordered"):
             return []
-        return [g for g in (campaign.get("gates") or ()) if isinstance(g, dict) and g.get("pos")]
+        gates = [g for g in (campaign.get("gates") or ()) if isinstance(g, dict) and g.get("pos")]
+        ladder = [g for g in gates if not g.get("altar_only")] or gates
+        if not ladder:
+            return []
+        with_hops = sum(1 for g in ladder if g.get("hops") is not None)
+        if with_hops / len(ladder) < self.hops_min_frac:
+            return []
+        return gates
 
     @staticmethod
     def _key_of(target: dict | None) -> str | None:
@@ -404,9 +652,19 @@ class GateProgress:
     def _is_reached(self, gate: dict, pos) -> bool:
         """A cylinder, not a sphere: 8 m horizontal (the DoorController trigger plus the door's height over the
         floor), 6 m vertical so standing on the roof above a door is not "passing" it. An open door doubles
-        both; `open` alone never counts, because enemies open doors too."""
+        both; `open` alone never counts, because enemies open doors too.
+
+        A gate that still reports `needs_item` is never reached, however close the player stands. Reaching is
+        a proxy for *passing*, and a skull-locked door cannot be passed until its altar is filled -- at which
+        point the mod drops `needs_item` and the gate becomes reachable like any other. Without this test the
+        ladder rewards walking up to a sealed door and then, because `best_hops` has moved past it,
+        `_choose_target` picks the rung BELOW the lock (which carries no `needs_item`, so `_subgoal` returns it
+        unchanged) and the fetch/carry machine never fires again. `best_hops` and `reached` are level-load
+        scoped, so that state persists through every checkpoint-respawn episode of the load. An old mod sends no
+        `needs_item`, so `.get` is None and every 0.5.x level -- 0-1 included -- behaves byte for byte as before.
+        """
         hops, gate_pos = gate.get("hops"), gate.get("pos")
-        if hops is None or not gate.get("active") or not gate_pos:
+        if hops is None or not gate.get("active") or not gate_pos or gate.get("needs_item"):
             return False
         margin = 2.0 if gate.get("open") else 1.0
         return (math.hypot(pos[0] - gate_pos[0], pos[2] - gate_pos[2]) <= margin * self.reach_h
@@ -441,6 +699,65 @@ class GateProgress:
         if not lower:
             return self._exit(campaign) or self.target
         return self._nearest([g for g in active if int(g["hops"]) == max(lower)], pos)
+
+    def _subgoal(self, campaign: dict | None, gate: dict | None, pos) -> dict | None:
+        """The chosen gate, or the rung below it when a skull has to be fetched to open it.
+
+        A skull-locked door reports exactly like a walk-up door -- `ItemPlaceZone.ColorDoors` deactivates its
+        `DoorController`s, so it reads `open: false, locked: false, controller_active: false`, the same signature
+        an arena-held door has. `needs_item` is the only field that separates "kill 11 enemies" from "fetch a
+        skull", and without it the gate is a dead end the agent pays `gate_approach` to reach and can never pass.
+
+        Three states, all derived from this step's block alone, so there is nothing to keep in sync and a respawn
+        re-derives them for free:
+
+          1. fetch  -- the gate needs type T and nothing of type T is held: target the nearest live free T item;
+          2. carry  -- something of type T is held: target the nearest unfilled wired T altar;
+          3. open   -- every wired altar is filled: target the gate again.
+
+        The sub-goal's `best_dist` key is the item TYPE and the gate, never the instance: the anti-farm rule is
+        "seed a key once per episode and never re-seed it", which only holds while the key string is stable, and
+        `CheckPoint.ResetRoom` re-instantiates skulls under new mod-side keys. Two sources of one type therefore
+        share one approach budget within an episode, which is strictly anti-farm. `hops` is inherited from the
+        gate so the sub-goal packs through `campaign_block`'s existing gate branch with no layout change -- which
+        does mean slot 455 reports the gate's hops while the target is a fetch or carry leg, and is not a route
+        distance then.
+
+        Against a mod that sends no `needs_item`/`altars`/`items` this returns the gate untouched.
+        """
+        campaign = campaign or {}
+        if not gate or gate.get("subgoal"):
+            return gate  # already a sub-goal: a target kept from a frame with no player
+        need = gate.get("needs_item")
+        if not need or pos is None:
+            return gate
+        altars = [a for a in (campaign.get("altars") or ())
+                  if isinstance(a, dict) and a.get("pos") and a.get("item") == need and not a.get("filled")
+                  and _live(a, need_active_self=False)
+                  and any(isinstance(d, dict) and d.get("key") == gate.get("key") for d in (a.get("doors") or ()))]
+        if not altars:
+            return gate  # 3. every wired altar is filled (or only dead twins are left): the lock is open
+        items = [i for i in (campaign.get("items") or ())
+                 if isinstance(i, dict) and i.get("pos") and i.get("item") == need]
+        if any(i.get("held") for i in items):
+            target, kind = self._nearest(altars, pos), SUBGOAL_ALTAR  # 2. carrying
+        else:
+            altar_keys = {a.get("key") for a in altars}
+            # "Not held and not placed" finds nothing on 1-1, where every ItemIdentifier starts inside an
+            # ItemPlaceZone -- a source skull sits on a pedestal, which is a zone. The test is "not already in
+            # one of the altars we are trying to fill".
+            free = [i for i in items if not i.get("held") and _live(i) and i.get("placed_in") not in altar_keys]
+            if not free:
+                return gate  # no reachable source: fall back to the gate rather than pointing at nothing
+            target, kind = self._nearest(free, pos), SUBGOAL_ITEM  # 1. fetch
+        key = f"{kind}:{need}" if kind == SUBGOAL_ITEM else f"{kind}:{need}:{gate.get('key')}"
+        # `open` and `locked` are 0.0 for every non-gate target, so with target_kind_slots on they carry "this is
+        # an item" / "this is an altar" instead -- the width-preserving escape hatch, off by default because
+        # turning it on changes what two learned input columns mean.
+        kinds = self.target_kind_slots
+        return {"key": key, "pos": list(target["pos"]), "hops": gate.get("hops"),
+                "open": bool(kinds and kind == SUBGOAL_ITEM), "locked": bool(kinds and kind == SUBGOAL_ALTAR),
+                "active": True, "subgoal": kind, "gate_key": gate.get("key")}
 
 
 class PathProgress:

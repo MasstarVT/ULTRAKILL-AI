@@ -13,11 +13,14 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import torch  # noqa: E402
 import train  # noqa: E402
+from ultrakill_ai.campaign import CAMPAIGN_LEVELS_SHIPPED  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.progress import PPO_METRICS  # noqa: E402
 from ultrakill_ai.rewards import RewardConfig  # noqa: E402
 
 CONFIG = ROOT / "configs" / "campaign_0-1.yaml"
+PRELUDE = ROOT / "configs" / "campaign_prelude.yaml"
+LEVEL_1_1 = ROOT / "configs" / "campaign_1-1.yaml"
 RUN_NAME = "campaign_gates"
 MODEL_DIR = Path("models") / RUN_NAME
 RUN_DIR = Path("runs") / RUN_NAME
@@ -59,13 +62,115 @@ def test_campaign_env_has_479_inputs_and_the_yaml_settings():
         env.close()
 
 
+def test_the_0_1_config_is_still_a_single_level_run():
+    """The live campaign_gates run must be untouched: no levels list, so nothing in S1 or S4 can reach it."""
+    env_dict, _ = train.load_config(str(CONFIG))
+    cfg = EnvConfig.from_dict(env_dict)
+    assert cfg.levels == [] and cfg.curriculum_path == ""
+    assert cfg.rewards.item_pickup == 0.0 and cfg.rewards.item_placed == 0.0
+    assert cfg.gate_hops_min_frac == 0.5  # 0-1 is 11/11 gates with hops, so the guard never fires on it
+    filled = train.fill_campaign_dirs(cfg, MODEL_DIR, RUN_DIR)
+    assert filled.curriculum_path == "", "a single-level run never opens a curriculum file"
+
+
 def test_every_campaign_setting_is_a_real_field():
     # EnvConfig.from_dict drops keys it does not know, so a misspelt setting would silently use its default.
-    env_dict, _ = train.load_config(str(CONFIG))
-    unknown = sorted(set(env_dict) - field_names(EnvConfig))
-    assert not unknown, f"env keys EnvConfig does not know: {unknown}"
-    unknown = sorted(set(env_dict["rewards"]) - field_names(RewardConfig))
-    assert not unknown, f"reward keys RewardConfig does not know: {unknown}"
+    for path in (CONFIG, PRELUDE, LEVEL_1_1):
+        env_dict, _ = train.load_config(str(path))
+        unknown = sorted(set(env_dict) - field_names(EnvConfig))
+        assert not unknown, f"{path.name}: env keys EnvConfig does not know: {unknown}"
+        unknown = sorted(set(env_dict["rewards"]) - field_names(RewardConfig))
+        assert not unknown, f"{path.name}: reward keys RewardConfig does not know: {unknown}"
+
+
+def test_prelude_config_builds_a_479_input_curriculum_env():
+    env_dict, train_cfg = train.load_config(str(PRELUDE))
+    cfg = EnvConfig.from_dict(env_dict)
+    assert cfg.mode == "campaign"
+    # The survey's Tier A Prelude, in mission order. 0-2 needs the skull carry and 0-5 has no goal room at all.
+    assert cfg.levels == ["Level 0-1", "Level 0-3", "Level 0-4"]
+    assert cfg.levels[0] == "Level 0-1" and all(lv in CAMPAIGN_LEVELS_SHIPPED for lv in cfg.levels)
+    assert (cfg.unlock_rate, cfg.unlock_window, cfg.level_weight_floor) == (0.5, 20, 0.1)
+    assert cfg.curriculum_path == ""  # train.py fills it per run
+    assert train_cfg["run_name"] == "campaign_prelude", "a new run name: the campaign block changes meaning"
+    env = UltrakillEnv(cfg)
+    try:
+        assert env.observation_space.shape == (479,), "no level id enters the observation, by design"
+        assert list(env.action_space.nvec) == [3, 3, 2, 2, 2, 2, 2, 2, 6, 11, 7, 3]
+        assert env.level == "Level 0-1"
+    finally:
+        env.close()
+
+
+def test_level_1_1_config_ships_the_skull_weights_at_zero():
+    env_dict, train_cfg = train.load_config(str(LEVEL_1_1))
+    cfg = EnvConfig.from_dict(env_dict)
+    assert cfg.level == "Level 1-1" and cfg.levels == []
+    # Both stay 0.0 until the three in-game checks pass: a skull that cannot physically be picked up turns S4
+    # from a fix into a 134 m detour the agent still pays ~20 gate_approach to start.
+    assert cfg.rewards.item_pickup == 0.0 and cfg.rewards.item_placed == 0.0
+    assert cfg.subgoal_punch_range_m == 4.0  # Punch.ActiveFrame's own reach
+    assert train_cfg["run_name"] == "campaign_1-1"
+    header = LEVEL_1_1.read_text(encoding="utf-8")
+    assert "15.0" in header and "§8" in header, "the header has to say when and why the weights go up"
+    env = UltrakillEnv(cfg)
+    try:
+        assert env.observation_space.shape == (479,) and env.level == "Level 1-1"
+    finally:
+        env.close()
+
+
+def test_fill_campaign_dirs_fills_the_curriculum_path_only_for_a_levels_run():
+    multi = EnvConfig(mode="campaign", levels=["Level 0-1", "Level 0-3"])
+    filled = train.fill_campaign_dirs(multi, Path("models") / "campaign_prelude", Path("runs") / "campaign_prelude")
+    assert filled.curriculum_path == "runs/campaign_prelude/curriculum.json"
+    assert multi.curriculum_path == "", "the config passed in is not modified"
+    assert train.fill_campaign_dirs(EnvConfig(mode="campaign"), MODEL_DIR, RUN_DIR).curriculum_path == ""
+    custom = EnvConfig(mode="campaign", levels=["Level 0-1"], curriculum_path="D:/elsewhere.json")
+    assert train.fill_campaign_dirs(custom, MODEL_DIR, RUN_DIR).curriculum_path == "D:/elsewhere.json"
+    # The parent directory name is what the workers check the file's run_name against, so it must be the run.
+    assert Path(filled.curriculum_path).parent.name == "campaign_prelude"
+
+
+def test_eval_pins_one_level_from_a_curriculum_config():
+    """`--record-times` writes a row only a FASTER time can replace, so an eval must never sample a level."""
+    eval_path = ROOT / "scripts" / "eval.py"
+    source = eval_path.read_text(encoding="utf-8")
+    assert "cfg.levels = []" in source or "cfg.levels" in source
+
+    def resolve(cfg: EnvConfig, level: str | None) -> EnvConfig:
+        """The block eval.main runs, applied to a copy so this test needs neither a model nor a game."""
+        cfg = dataclasses.replace(cfg)
+        if level:
+            cfg.level, cfg.levels = level, []
+        elif cfg.levels:
+            cfg.level, cfg.levels = cfg.levels[0], []
+        cfg.curriculum_path = ""
+        return cfg
+
+    import tempfile
+
+    env_dict, _ = train.load_config(str(PRELUDE))
+    with tempfile.TemporaryDirectory() as tmp:
+        # A temp model directory, because close() saves this env's exploration archives into `explore_dir` and
+        # a test must not write into the repo's models/.
+        base = train.fill_campaign_dirs(EnvConfig.from_dict(env_dict), Path(tmp) / "models", Path(tmp) / "runs")
+        assert base.curriculum_path and base.levels
+
+        default = UltrakillEnv(resolve(base, None))
+        try:
+            assert default.level == "Level 0-1" and default.cfg.levels == [] and default.cfg.curriculum_path == ""
+        finally:
+            default.close()
+
+        chosen = UltrakillEnv(resolve(base, "Level 0-4"))
+        try:
+            assert chosen.level == "Level 0-4" and chosen.cfg.levels == []
+        finally:
+            chosen.close()
+        # Nothing was written anywhere but the temp directory.
+        assert sorted(p.name for p in (Path(tmp) / "models").glob("*.npz")) == [
+            "explore_Level_0-1_47800.npz", "explore_Level_0-4_47800.npz"]
 
 
 def test_train_section_matches_the_spec():
@@ -130,6 +235,53 @@ def test_action_entropy_callback_measures_each_look_dimension():
     assert abs(callback.entropies["pitch"] - math.log(len(PITCH_BINS))) < 0.01
     for name in ("yaw", "pitch", "look_mode"):
         assert f"train/entropy_{name}" in PPO_METRICS, name  # so they reach status.json and the dashboard
+
+
+def test_a_campaign_checkpoint_loads_against_every_campaign_config():
+    """The live campaign_gates run's weights must keep loading: 479 inputs, 12 action dimensions, unchanged.
+
+    S1 adds no observation value (no level id, deliberately) and S4 adds none either (a sub-goal rides the
+    existing target slots), so a checkpoint saved before either one loads into a curriculum run untouched.
+    Built here rather than read from models/, so this needs no checkpoint on disk and cannot disturb a live run.
+    """
+    import tempfile
+
+    import gymnasium as gym
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv
+
+    configs = {path.name: EnvConfig.from_dict(train.load_config(str(path))[0]) for path in (CONFIG, PRELUDE, LEVEL_1_1)}
+    envs = {}
+    try:
+        for name, cfg in configs.items():
+            envs[name] = UltrakillEnv(cfg)
+        spaces = {(env.observation_space.shape, tuple(env.action_space.nvec)) for env in envs.values()}
+        assert len(spaces) == 1, f"the configs disagree on the spaces: {spaces}"
+        shape, nvec = spaces.pop()
+        assert shape == (479,) and nvec == (3, 3, 2, 2, 2, 2, 2, 2, 6, 11, 7, 3)
+
+        class Fake(gym.Env):
+            def __init__(self, env):
+                self.observation_space, self.action_space = env.observation_space, env.action_space
+
+            def reset(self, *, seed=None, options=None):
+                return self.observation_space.sample(), {}
+
+            def step(self, action):
+                return self.observation_space.sample(), 0.0, False, False, {}
+
+        model = PPO("MlpPolicy", DummyVecEnv([lambda: Fake(envs[CONFIG.name])]), n_steps=64, batch_size=32,
+                    n_epochs=1, policy_kwargs={"net_arch": [16]}, device="cpu", verbose=0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gates.zip"
+            model.save(path)
+            for name, env in envs.items():
+                loaded = PPO.load(path, env=DummyVecEnv([lambda env=env: Fake(env)]), device="cpu")
+                assert loaded.observation_space.shape == (479,), name
+                assert list(loaded.action_space.nvec) == list(nvec), name
+    finally:
+        for env in envs.values():
+            env.close()
 
 
 def test_fill_campaign_dirs_leaves_cybergrind_alone():

@@ -11,8 +11,8 @@ namespace UltrakillAIBridge.Obs
 {
     /// <summary>
     /// Builds the obs "campaign" block in the 35 main levels: the exit, checkpoints, a NavMesh path hint to
-    /// the exit, locked doors, arena enemies, the door-graph route ("gates"), milestone keys and rank
-    /// thresholds (keys in docs/protocol.md).
+    /// the exit, locked doors, arena enemies, the door-graph route ("gates"), the skull altars and carryable
+    /// items that lock parts of it, milestone keys and rank thresholds (keys in docs/protocol.md).
     ///
     /// The exit and later checkpoints can sit in rooms that start inactive, so scene objects are found with
     /// FindObjectsOfType(includeInactive). That also returns the disabled room templates CheckPoint.Start
@@ -35,6 +35,15 @@ namespace UltrakillAIBridge.Obs
         /// the gates nearest the player (the ones the agent needs first) and sets "gates_truncated".
         /// </summary>
         private const int MaxGates = 64;
+
+        /// <summary>
+        /// Most altars (ItemPlaceZone with a real accepted item) and carryable items reported per level.
+        /// Both are wire-size guards only: the largest measured counts are 7 altars (1-1) and 30
+        /// ItemIdentifiers (8-2), and 12 of the 33 shipped levels have neither. A level that exceeded one
+        /// would keep the entries nearest the player, the same rule the gates array uses.
+        /// </summary>
+        private const int MaxAltars = 64;
+        private const int MaxItems = 64;
         // The player end is snapped too, and ULTRAKILL is played in the air: jumping, dashing and falling are
         // most of a run. At 6 m an airborne player can miss the mesh, and a missed sample reports the whole
         // path as "none", withholding the path reward and the policy's next-corner input until they land.
@@ -82,7 +91,26 @@ namespace UltrakillAIBridge.Obs
         // with. Keys are stable across re-instantiation, so a key that has ever had a hops value keeps it
         // until the scene changes.
         private readonly Dictionary<string, int> hopsByKey = new Dictionary<string, int>();
-        private bool duplicateKeysWarned;
+        private bool duplicateDoorKeysWarned;
+        private bool duplicateAltarKeysWarned;
+        private bool exitTieWarned;
+
+        // One key per Door in the level, gates and altars[].doors both read out of it, so the strings match
+        // by construction (rule A2 of the spec). Built in Scan() over every non-template door, not only the
+        // gate candidates, because a skull-locked door is usually a one-room door that is no gate at all.
+        private readonly Dictionary<Door, string> doorKeys = new Dictionary<Door, string>();
+        private readonly List<(Door door, Vector3 pos)> doorKeyOrder = new List<(Door, Vector3)>();
+
+        // Altars (ItemPlaceZone) and carryable items (ItemIdentifier). Everything but the per-step flags in
+        // AltarInfo/ItemInfo is decided in Scan().
+        private readonly List<AltarInfo> altars = new List<AltarInfo>();
+        private readonly List<ItemInfo> items = new List<ItemInfo>();
+        private readonly Dictionary<ItemPlaceZone, string> altarKeys = new Dictionary<ItemPlaceZone, string>();
+        // Item keys memoized by instance id, so a carried skull keeps its key while it moves (rule A4).
+        // Level-load scoped, like hopsByKey: CheckPoint.ResetRoom re-instantiates items on a respawn.
+        private readonly Dictionary<int, string> itemKeys = new Dictionary<int, string>();
+        private readonly List<int> staleItemKeys = new List<int>();
+        private readonly HashSet<int> liveItemIds = new HashSet<int>();
 
         // Scratch for the room graph, reused across scans.
         private readonly HashSet<string> roomNodes = new HashSet<string>();
@@ -90,7 +118,9 @@ namespace UltrakillAIBridge.Obs
         private readonly Dictionary<string, int> roomHops = new Dictionary<string, int>();
         private readonly Queue<string> bfs = new Queue<string>();
         private readonly HashSet<int> roomIds = new HashSet<int>();
-        private readonly HashSet<string> gateKeys = new HashSet<string>();
+        private readonly HashSet<string> keyScratch = new HashSet<string>();
+        private readonly HashSet<Door> gateDoors = new HashSet<Door>();
+        private readonly Dictionary<Door, int> gateIndexByDoor = new Dictionary<Door, int>();
 
         // The FinalPit chosen for this level load. Rule 4 of the spec: the preference order is
         // time-varying (a pit's room activates mid-run) and every hops value depends on which pit was
@@ -132,8 +162,11 @@ namespace UltrakillAIBridge.Obs
                 builds = 0;
                 pathCached = false;
                 hopsByKey.Clear();
+                itemKeys.Clear();
                 chosenExit = null;
-                duplicateKeysWarned = false;
+                duplicateDoorKeysWarned = false;
+                duplicateAltarKeysWarned = false;
+                exitTieWarned = false;
             }
             else if (sm.restarts != lastRestarts)
             {
@@ -155,6 +188,9 @@ namespace UltrakillAIBridge.Obs
             var exit = ChooseExit();
             if (!pathCached || builds % PathEvery == 0) UpdatePath(playerPos, exit);
             builds++;
+            // The live flags of the altars and items, read once here because BuildGates (needs_item),
+            // BuildAltars and BuildItems all read the same ones.
+            UpdateAltarsAndItems();
 
             var prefs = MonoSingleton<PrefsManager>.Instance;
             var gsm = GameStateManager.Instance;
@@ -180,6 +216,8 @@ namespace UltrakillAIBridge.Obs
                 ["gates_ordered"] = gatesOrdered,
                 ["gates_truncated"] = gatesTruncated,
                 ["gates"] = BuildGates(),
+                ["altars"] = BuildAltars(),
+                ["items"] = BuildItems(),
                 ["ranks"] = new JObject
                 {
                     ["time"] = Ints(sm.timeRanks),
@@ -217,11 +255,16 @@ namespace UltrakillAIBridge.Obs
             foreach (var pit in Object.FindObjectsOfType<FinalPit>(true))
             {
                 if (pit == null || pit.fakeEnd || pit.secondPit || pit.rankless || IsTemplate(pit.transform)) continue;
-                // A pit with no target, or one that drops into a secret level ("Level 0-S"), is never the
-                // mission exit. Measured on 0-2 and 1-1, which each carry both kinds; after this filter
-                // exactly one pit is left on every level checked (0-1..0-5, 1-1).
+                // A pit with no target, one that drops into a secret level ("Level 0-S") and one that drops
+                // into a Prime Sanctum ("Level P-1", "Level P-2") is never the mission exit. Measured on
+                // 0-2 and 1-1, which each carry a secret pit; 6-2 carries two Prime Sanctum pits and would
+                // otherwise tie them against its real Intermission2 exit and pick by FindObjectsOfType
+                // order. Campaign-wide only 3-1 and 6-2 ship a "Level P-" pit and no main level's real
+                // successor starts with it.
                 var target = pit.targetLevelName;
-                if (string.IsNullOrEmpty(target) || target.EndsWith("-S", StringComparison.OrdinalIgnoreCase)) continue;
+                if (string.IsNullOrEmpty(target)
+                    || target.EndsWith("-S", StringComparison.OrdinalIgnoreCase)
+                    || target.StartsWith("Level P-", StringComparison.OrdinalIgnoreCase)) continue;
                 pits.Add(pit);
             }
             doors.Clear();
@@ -229,8 +272,82 @@ namespace UltrakillAIBridge.Obs
             {
                 if (door != null && !IsTemplate(door.transform)) doors.Add(door);
             }
+            ScanDoorKeys();
+            ScanAltars(playerPos);
+            ScanItems(playerPos);
             checkpointSignature = CheckpointSignature(sm);
             ScanGates(playerPos);
+        }
+
+        /// <summary>
+        /// One key per Door in the level (rule A2), shared by the gates array and by <c>altars[].doors</c>
+        /// so the two string-match by construction. Keys are the same rounded "x,y,z" as everywhere else,
+        /// taken from the door's CLOSED position (see <see cref="ClosedPosition"/>).
+        ///
+        /// Suffixing is deterministic (rule A3): doors are keyed in ascending closed position, falling back
+        /// to the instance id so two doors authored at the same point still have a strict order. The old
+        /// code suffixed in FindObjectsOfType order, which is not stable across rescans while
+        /// <see cref="hopsByKey"/> is keyed on the suffixed string -- so a respawn could hand a gate the
+        /// other gate's hops. Measured over all 33 shipped levels, no gate key collides with a non-gate
+        /// door key, so widening the namespace to every door leaves every existing gate key unchanged;
+        /// 1-2's two doors at "0,20,380" are the only pair this reorders.
+        /// </summary>
+        private void ScanDoorKeys()
+        {
+            doorKeys.Clear();
+            keyScratch.Clear();
+            doorKeyOrder.Clear();
+            foreach (var door in doors)
+            {
+                if (door != null) doorKeyOrder.Add((door, ClosedPosition(door)));
+            }
+            doorKeyOrder.Sort(CompareDoorPosition);
+
+            int duplicates = 0;
+            foreach (var (door, pos) in doorKeyOrder)
+            {
+                var baseKey = CampaignPatches.Key(pos);
+                if (keyScratch.Contains(baseKey)) duplicates++;
+                doorKeys[door] = UniqueKey(baseKey, keyScratch);
+            }
+            if (duplicates > 0 && !duplicateDoorKeysWarned)
+            {
+                duplicateDoorKeysWarned = true;
+                Plugin.Log.LogWarning($"{duplicates} door position key(s) collide in {SceneHelper.CurrentScene}, suffixed with #N");
+            }
+        }
+
+        private static int CompareDoorPosition((Door door, Vector3 pos) a, (Door door, Vector3 pos) b)
+        {
+            int cmp = a.pos.x.CompareTo(b.pos.x);
+            if (cmp != 0) return cmp;
+            cmp = a.pos.y.CompareTo(b.pos.y);
+            if (cmp != 0) return cmp;
+            cmp = a.pos.z.CompareTo(b.pos.z);
+            if (cmp != 0) return cmp;
+            return a.door.GetInstanceID().CompareTo(b.door.GetInstanceID());
+        }
+
+        /// <summary><paramref name="baseKey"/>, or it with "#2", "#3", ... until it is not already in <paramref name="used"/>.</summary>
+        private static string UniqueKey(string baseKey, HashSet<string> used)
+        {
+            if (used.Add(baseKey)) return baseKey;
+            for (int n = 2; ; n++)
+            {
+                var key = baseKey + "#" + n.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                if (used.Add(key)) return key;
+            }
+        }
+
+        /// <summary>Inactive GameObjects on a transform's own chain, itself included (rule A6).</summary>
+        private static int InactiveAncestors(Transform t)
+        {
+            int inactive = 0;
+            for (; t != null; t = t.parent)
+            {
+                if (!t.gameObject.activeSelf) inactive++;
+            }
+            return inactive;
         }
 
         /// <summary>
@@ -246,6 +363,10 @@ namespace UltrakillAIBridge.Obs
             public int? Hops;
             public List<string> Rooms;
             public float Dist;
+            /// <summary>Phase 2: a door only an altar opens, which the two-room test rejects (see ScanGates).</summary>
+            public bool AltarOnly;
+            /// <summary>Indices into <see cref="altars"/> of the altars that OPEN this door; null when none does.</summary>
+            public List<int> Altars;
         }
 
         /// <summary>
@@ -253,11 +374,18 @@ namespace UltrakillAIBridge.Obs
         /// from the room holding the exit. Runs inside <see cref="Scan"/>, i.e. at most once every
         /// <see cref="RescanEvery"/> builds, so a step never walks the scene or the graph again.
         ///
-        /// A door is a gate when its activatedRooms holds at least two distinct GameObjects; the rooms of
-        /// those doors (and nothing else) are the graph's nodes, identified by their rounded world position
-        /// rather than by reference, because CheckPoint.ResetRoom destroys and re-instantiates a room on
-        /// every respawn. Two rooms are adjacent when one gate lists both, and a BFS from the exit's own
-        /// room gives every room its hop count; a gate takes the lowest hop count among its rooms.
+        /// Phase 1: a door is a gate when its activatedRooms holds at least two distinct GameObjects; the
+        /// rooms of those doors (and nothing else) are the graph's nodes, identified by their rounded world
+        /// position rather than by reference, because CheckPoint.ResetRoom destroys and re-instantiates a
+        /// room on every respawn. Two rooms are adjacent when one gate lists both, and a BFS from the exit's
+        /// own room gives every room its hop count; a gate takes the lowest hop count among its rooms.
+        ///
+        /// Phase 2 then appends the doors an altar OPENS that phase 1 rejected, marked "altar_only". A
+        /// skull-locked door is overwhelmingly a one-room streaming door (measured: 6 of 28 altar-driven
+        /// forward doors campaign-wide are gates today), so without this a skull leg is invisible to the
+        /// route. Phase 2 adds no node and no edge, so no existing hop count can change; the appended door
+        /// reads its hops off the rooms it does list, which leaves it null everywhere the rooms are outside
+        /// the graph (measured, it gives a usable hops only on 1-1, 5-3 and 8-1).
         ///
         /// The JSON objects themselves are built per step by <see cref="BuildGates"/> rather than cached:
         /// a JToken that already has a parent is deep-copied when it is assigned to the next step's obs,
@@ -268,37 +396,17 @@ namespace UltrakillAIBridge.Obs
             gates.Clear();
             roomNodes.Clear();
             roomEdges.Clear();
-            gateKeys.Clear();
+            gateDoors.Clear();
 
-            int duplicates = 0;
             foreach (var door in doors)
             {
                 if (door == null || door.activatedRooms == null) continue;
-                roomIds.Clear();
-                List<string> rooms = null;
-                foreach (var room in door.activatedRooms)
-                {
-                    if (room == null || !roomIds.Add(room.GetInstanceID())) continue;
-                    if (rooms == null) rooms = new List<string>(door.activatedRooms.Length);
-                    var node = CampaignPatches.Key(room.transform.position);
-                    if (!rooms.Contains(node)) rooms.Add(node);
-                }
-                if (roomIds.Count < 2) continue;
+                var rooms = RoomNodes(door, out var distinctRooms);
+                if (distinctRooms < 2) continue;
+                if (!doorKeys.TryGetValue(door, out var key)) continue;
+                gateDoors.Add(door);
 
                 var pos = ClosedPosition(door);
-                var key = CampaignPatches.Key(pos);
-                // CampaignPatches.Key rounds to whole metres, so two doors within a metre would collide,
-                // and Python uses the key alone to tell one gate from another.
-                if (!gateKeys.Add(key))
-                {
-                    duplicates++;
-                    var collided = key;
-                    for (int n = 2; ; n++)
-                    {
-                        key = collided + "#" + n.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                        if (gateKeys.Add(key)) break;
-                    }
-                }
                 gates.Add(new Gate
                 {
                     Door = door,
@@ -323,10 +431,31 @@ namespace UltrakillAIBridge.Obs
                     }
                 }
             }
-            if (duplicates > 0 && !duplicateKeysWarned)
+
+            // Phase 2: doors an altar opens that phase 1 rejected. A dead-branch altar (rule A6: more than
+            // one inactive GameObject on its own chain) can never activate or fill, so it drives nothing;
+            // measured, no door in the campaign is driven only by dead zones, so skipping them never loses
+            // a real lock.
+            foreach (var altar in altars)
             {
-                duplicateKeysWarned = true;
-                Plugin.Log.LogWarning($"{duplicates} gate position key(s) collide in {SceneHelper.CurrentScene}, suffixed with #N");
+                if (altar.Zone == null || altar.DoorObjects == null) continue;
+                if (InactiveAncestors(altar.Zone.transform) > 1) continue;
+                foreach (var door in altar.DoorObjects)
+                {
+                    if (door == null || !doorKeys.TryGetValue(door, out var key)) continue;
+                    if (!gateDoors.Add(door)) continue;
+                    var pos = ClosedPosition(door);
+                    gates.Add(new Gate
+                    {
+                        Door = door,
+                        Controllers = FindControllers(door),
+                        Key = key,
+                        Pos = pos,
+                        Rooms = RoomNodes(door, out _),
+                        Dist = Vector3.Distance(playerPos, pos),
+                        AltarOnly = true,
+                    });
+                }
             }
 
             gatesTruncated = gates.Count > MaxGates;
@@ -342,6 +471,58 @@ namespace UltrakillAIBridge.Obs
             gates.Sort(CompareGates);
             // Sorted hops-first, so only the first entry has to be checked.
             gatesOrdered = gates.Count > 0 && gates[0].Hops.HasValue;
+            LinkGateAltars();
+        }
+
+        /// <summary>
+        /// The distinct room nodes a door's activatedRooms names, identified by rounded world position, or
+        /// null when it names none. <paramref name="distinctRooms"/> counts distinct room GameObjects, which
+        /// is what decides whether the door is a phase-1 gate: two rooms can round to the same node key.
+        /// </summary>
+        private List<string> RoomNodes(Door door, out int distinctRooms)
+        {
+            roomIds.Clear();
+            List<string> rooms = null;
+            var activated = door.activatedRooms;
+            if (activated != null)
+            {
+                foreach (var room in activated)
+                {
+                    if (room == null || !roomIds.Add(room.GetInstanceID())) continue;
+                    if (rooms == null) rooms = new List<string>(activated.Length);
+                    var node = CampaignPatches.Key(room.transform.position);
+                    if (!rooms.Contains(node)) rooms.Add(node);
+                }
+            }
+            distinctRooms = roomIds.Count;
+            return rooms;
+        }
+
+        /// <summary>
+        /// Records, per gate, which altars OPEN it, so a step only has to read those altars' "filled" flag
+        /// to answer "needs_item". reverseDoors are deliberately not wired: placing the item CLOSES those,
+        /// so treating one as a lock would send the agent to fetch a skull that shuts the route.
+        /// </summary>
+        private void LinkGateAltars()
+        {
+            gateIndexByDoor.Clear();
+            for (int i = 0; i < gates.Count; i++)
+            {
+                gates[i].Altars = null;
+                if (gates[i].Door != null) gateIndexByDoor[gates[i].Door] = i;
+            }
+            for (int a = 0; a < altars.Count; a++)
+            {
+                var doorObjects = altars[a].DoorObjects;
+                if (doorObjects == null) continue;
+                foreach (var door in doorObjects)
+                {
+                    if (door == null || !gateIndexByDoor.TryGetValue(door, out var index)) continue;
+                    var gate = gates[index];
+                    if (gate.Altars == null) gate.Altars = new List<int>(1);
+                    if (!gate.Altars.Contains(a)) gate.Altars.Add(a);
+                }
+            }
         }
 
         /// <summary>
@@ -456,7 +637,8 @@ namespace UltrakillAIBridge.Obs
             {
                 var door = gate.Door;
                 bool alive = door != null;
-                arr.Add(new JObject
+                var needs = NeedsItem(gate);
+                var obj = new JObject
                 {
                     ["key"] = gate.Key,
                     ["pos"] = ObservationBuilder.Vec(gate.Pos),
@@ -465,9 +647,34 @@ namespace UltrakillAIBridge.Obs
                     ["locked"] = alive && door.locked,
                     ["active"] = alive && door.gameObject.activeInHierarchy,
                     ["controller_active"] = alive && ControllerActive(gate.Controllers),
-                });
+                    ["needs_item"] = needs != null ? new JValue(needs) : JValue.CreateNull(),
+                };
+                if (gate.AltarOnly) obj["altar_only"] = true;
+                arr.Add(obj);
             }
             return arr;
+        }
+
+        /// <summary>
+        /// The item type an UNFILLED, non-dead altar wants before this door will open, or null. With several
+        /// such altars the lowest type name wins, so the answer is deterministic.
+        ///
+        /// A dead-branch altar (rule A6) is excluded because it can never fill: counting it would leave the
+        /// lock set after the live twin has already been filled, and the agent would be sent to punch the
+        /// skull back out of the altar it just filled -- which ItemPlaceZone.CheckItem answers by closing
+        /// the door again. Measured, 20 of the campaign's 104 functional zones are such dead twins.
+        /// </summary>
+        private string NeedsItem(Gate gate)
+        {
+            if (gate.Altars == null) return null;
+            string needs = null;
+            foreach (var index in gate.Altars)
+            {
+                var altar = altars[index];
+                if (altar.Zone == null || altar.Filled || altar.InactiveAncestors > 1) continue;
+                if (needs == null || string.CompareOrdinal(altar.Item, needs) < 0) needs = altar.Item;
+            }
+            return needs;
         }
 
         private static bool ControllerActive(DoorController[] controllers)
@@ -478,6 +685,327 @@ namespace UltrakillAIBridge.Obs
                 if (controller != null && controller.gameObject.activeInHierarchy) return true;
             }
             return false;
+        }
+
+        /// <summary>
+        /// One altar: an ItemPlaceZone that accepts a real item type. Everything but the three per-step
+        /// flags at the bottom is decided in <see cref="ScanAltars"/>.
+        /// </summary>
+        private sealed class AltarInfo
+        {
+            public ItemPlaceZone Zone;
+            public string Key;
+            public Vector3 Pos;
+            /// <summary>ItemType name: SkullBlue, SkullRed, SkullGreen, Readable, Torch, Soap, CustomKey1..3.</summary>
+            public string Item;
+            /// <summary>The doors this altar OPENS, as wire-ready key/pos pairs.</summary>
+            public List<DoorRef> Doors;
+            /// <summary>The doors this altar CLOSES.</summary>
+            public List<DoorRef> ReverseDoors;
+            /// <summary>The same forward doors as objects, for gate phase 2 and the gate wiring.</summary>
+            public List<Door> DoorObjects;
+            public float Dist;
+
+            public bool Filled;
+            public bool Active;
+            public int InactiveAncestors;
+        }
+
+        /// <summary>One carryable item, an ItemIdentifier with a real item type. Positions move, so most of this is per step.</summary>
+        private sealed class ItemInfo
+        {
+            public ItemIdentifier Id;
+            public string Key;
+            public string Item;
+            public float Dist;
+
+            public Vector3 Pos;
+            public bool Held;
+            public bool Placed;
+            public string PlacedIn;
+            public bool Active;
+            public bool ActiveSelf;
+            public int InactiveAncestors;
+        }
+
+        /// <summary>A door named by an altar, as it goes on the wire.</summary>
+        private sealed class DoorRef
+        {
+            public string Key;
+            public Vector3 Pos;
+        }
+
+        /// <summary>
+        /// Every ItemPlaceZone in the level that accepts a real item type, room templates excluded. Zones in
+        /// rooms that have not streamed in yet are included (FindObjectsOfType with inactive), because the
+        /// point of the block is to give the agent a heading before it gets there.
+        ///
+        /// Dead branches are reported too, with their inactive_ancestors, so Python can apply rule A6 with
+        /// the same numbers the mod used; only "needs_item" filters them mod-side.
+        /// </summary>
+        private void ScanAltars(Vector3 playerPos)
+        {
+            altars.Clear();
+            altarKeys.Clear();
+            foreach (var zone in Object.FindObjectsOfType<ItemPlaceZone>(true))
+            {
+                if (zone == null || zone.acceptedItemType == ItemType.None || IsTemplate(zone.transform)) continue;
+                var pos = zone.transform.position;
+                altars.Add(new AltarInfo
+                {
+                    Zone = zone,
+                    Pos = pos,
+                    Item = zone.acceptedItemType.ToString(),
+                    Doors = DoorRefs(zone.doors),
+                    ReverseDoors = DoorRefs(zone.reverseDoors),
+                    DoorObjects = DoorObjects(zone.doors),
+                    Dist = Vector3.Distance(playerPos, pos),
+                });
+            }
+            if (altars.Count > MaxAltars)
+            {
+                altars.Sort((a, b) => a.Dist.CompareTo(b.Dist));
+                altars.RemoveRange(MaxAltars, altars.Count - MaxAltars);
+            }
+
+            // Keys in ascending position, #N on collision, the same deterministic rule the doors use:
+            // several levels ship coincident duplicate zones ~0.2 m apart (1-1 has three such pairs).
+            altars.Sort(CompareAltarPosition);
+            keyScratch.Clear();
+            int duplicates = 0;
+            foreach (var altar in altars)
+            {
+                var baseKey = CampaignPatches.Key(altar.Pos);
+                if (keyScratch.Contains(baseKey)) duplicates++;
+                altar.Key = UniqueKey(baseKey, keyScratch);
+                altarKeys[altar.Zone] = altar.Key;
+            }
+            if (duplicates > 0 && !duplicateAltarKeysWarned)
+            {
+                duplicateAltarKeysWarned = true;
+                Plugin.Log.LogWarning($"{duplicates} altar position key(s) collide in {SceneHelper.CurrentScene}, suffixed with #N");
+            }
+            altars.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+        }
+
+        private static int CompareAltarPosition(AltarInfo a, AltarInfo b)
+        {
+            int cmp = a.Pos.x.CompareTo(b.Pos.x);
+            if (cmp != 0) return cmp;
+            cmp = a.Pos.y.CompareTo(b.Pos.y);
+            if (cmp != 0) return cmp;
+            cmp = a.Pos.z.CompareTo(b.Pos.z);
+            if (cmp != 0) return cmp;
+            return a.Zone.GetInstanceID().CompareTo(b.Zone.GetInstanceID());
+        }
+
+        private List<DoorRef> DoorRefs(Door[] doorArray)
+        {
+            if (doorArray == null) return null;
+            List<DoorRef> refs = null;
+            foreach (var door in doorArray)
+            {
+                if (door == null || !doorKeys.TryGetValue(door, out var key)) continue;
+                if (refs == null) refs = new List<DoorRef>(doorArray.Length);
+                refs.Add(new DoorRef { Key = key, Pos = ClosedPosition(door) });
+            }
+            return refs;
+        }
+
+        private List<Door> DoorObjects(Door[] doorArray)
+        {
+            if (doorArray == null) return null;
+            List<Door> list = null;
+            foreach (var door in doorArray)
+            {
+                if (door == null || !doorKeys.ContainsKey(door)) continue;
+                if (list == null) list = new List<Door>(doorArray.Length);
+                list.Add(door);
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// Every ItemIdentifier in the level with a real item type, room templates excluded. infiniteSource
+        /// items are skipped: Punch.AltHit mints a fresh ItemIdentifier per punch for one of those, which
+        /// would be an unbounded key stream. (Measured: no shipped level has one, so this is a guard.)
+        ///
+        /// Keys are memoized by instance id (rule A4), because a carried skull moves every step while the
+        /// scan only runs every RescanEvery builds. Python does not depend on a key surviving a respawn;
+        /// the only requirement is that keys are unique within a step.
+        /// </summary>
+        private void ScanItems(Vector3 playerPos)
+        {
+            items.Clear();
+            foreach (var identifier in Object.FindObjectsOfType<ItemIdentifier>(true))
+            {
+                if (identifier == null || identifier.itemType == ItemType.None || identifier.infiniteSource) continue;
+                if (IsTemplate(identifier.transform)) continue;
+                var pos = identifier.transform.position;
+                items.Add(new ItemInfo
+                {
+                    Id = identifier,
+                    Item = identifier.itemType.ToString(),
+                    Pos = pos,
+                    Dist = Vector3.Distance(playerPos, pos),
+                });
+            }
+            if (items.Count > MaxItems)
+            {
+                items.Sort((a, b) => a.Dist.CompareTo(b.Dist));
+                items.RemoveRange(MaxItems, items.Count - MaxItems);
+            }
+
+            keyScratch.Clear();
+            liveItemIds.Clear();
+            foreach (var item in items)
+            {
+                int id = item.Id.GetInstanceID();
+                liveItemIds.Add(id);
+                if (itemKeys.TryGetValue(id, out var known) && keyScratch.Add(known)) item.Key = known;
+            }
+            items.Sort(CompareItemPosition);
+            foreach (var item in items)
+            {
+                if (item.Key != null) continue;
+                item.Key = UniqueKey(CampaignPatches.Key(item.Pos), keyScratch);
+                itemKeys[item.Id.GetInstanceID()] = item.Key;
+            }
+
+            // Drop memoized keys of instances that no longer exist (a respawn re-instantiates rooms), so the
+            // table cannot grow without bound over a level load.
+            staleItemKeys.Clear();
+            foreach (var pair in itemKeys)
+            {
+                if (!liveItemIds.Contains(pair.Key)) staleItemKeys.Add(pair.Key);
+            }
+            foreach (var id in staleItemKeys)
+            {
+                itemKeys.Remove(id);
+            }
+
+            items.Sort((a, b) => string.CompareOrdinal(a.Key, b.Key));
+        }
+
+        private static int CompareItemPosition(ItemInfo a, ItemInfo b)
+        {
+            int cmp = a.Pos.x.CompareTo(b.Pos.x);
+            if (cmp != 0) return cmp;
+            cmp = a.Pos.y.CompareTo(b.Pos.y);
+            if (cmp != 0) return cmp;
+            cmp = a.Pos.z.CompareTo(b.Pos.z);
+            if (cmp != 0) return cmp;
+            return a.Id.GetInstanceID().CompareTo(b.Id.GetInstanceID());
+        }
+
+        /// <summary>
+        /// The live flags of every altar and item, read once per step.
+        ///
+        /// "filled" is computed exactly as ItemPlaceZone.CheckItem does (decompiled/ItemPlaceZone.cs:160):
+        /// GetComponentInChildren&lt;ItemIdentifier&gt;() WITHOUT includeInactive, then the type test. With
+        /// includeInactive every "Altar (... Skull) Variant" would report as filled at load, because it
+        /// carries a disabled decoration skull. The consequence to accept is that an altar in a room that
+        /// has not streamed in reads filled: false (and active: false) -- conservative for routing, and it
+        /// also makes this cheap, since GetComponentInChildren on an inactive object returns immediately.
+        /// </summary>
+        private void UpdateAltarsAndItems()
+        {
+            foreach (var altar in altars)
+            {
+                var zone = altar.Zone;
+                if (zone == null)
+                {
+                    altar.Filled = false;
+                    altar.Active = false;
+                    altar.InactiveAncestors = 0;
+                    continue;
+                }
+                altar.Active = zone.gameObject.activeInHierarchy;
+                altar.InactiveAncestors = InactiveAncestors(zone.transform);
+                var placed = zone.GetComponentInChildren<ItemIdentifier>();
+                altar.Filled = placed != null && placed.itemType == zone.acceptedItemType;
+            }
+
+            foreach (var item in items)
+            {
+                var identifier = item.Id;
+                if (identifier == null)
+                {
+                    item.Held = false;
+                    item.Placed = false;
+                    item.PlacedIn = null;
+                    item.Active = false;
+                    item.ActiveSelf = false;
+                    item.InactiveAncestors = 0;
+                    continue;
+                }
+                item.Pos = identifier.transform.position;
+                item.Held = identifier.pickedUp;
+                // ItemPlaceZone.Start is what sets ipz, and Start has not run while the room is off, so a
+                // pedestal skull would read placed: false at load without the parent search (rule A5).
+                var zone = identifier.ipz != null ? identifier.ipz : identifier.GetComponentInParent<ItemPlaceZone>(true);
+                item.Placed = zone != null;
+                item.PlacedIn = zone != null && altarKeys.TryGetValue(zone, out var key) ? key : null;
+                item.Active = identifier.gameObject.activeInHierarchy;
+                item.ActiveSelf = identifier.gameObject.activeSelf;
+                item.InactiveAncestors = InactiveAncestors(identifier.transform);
+            }
+        }
+
+        private JArray BuildAltars()
+        {
+            var arr = new JArray();
+            foreach (var altar in altars)
+            {
+                arr.Add(new JObject
+                {
+                    ["key"] = altar.Key,
+                    ["pos"] = ObservationBuilder.Vec(altar.Pos),
+                    ["item"] = altar.Item,
+                    ["filled"] = altar.Filled,
+                    ["active"] = altar.Active,
+                    ["inactive_ancestors"] = altar.InactiveAncestors,
+                    ["doors"] = BuildDoorRefs(altar.Doors),
+                    ["reverse_doors"] = BuildDoorRefs(altar.ReverseDoors),
+                });
+            }
+            return arr;
+        }
+
+        private JArray BuildItems()
+        {
+            var arr = new JArray();
+            foreach (var item in items)
+            {
+                arr.Add(new JObject
+                {
+                    ["key"] = item.Key,
+                    ["pos"] = ObservationBuilder.Vec(item.Pos),
+                    ["item"] = item.Item,
+                    ["held"] = item.Held,
+                    ["placed"] = item.Placed,
+                    ["placed_in"] = item.PlacedIn != null ? new JValue(item.PlacedIn) : JValue.CreateNull(),
+                    ["active"] = item.Active,
+                    ["active_self"] = item.ActiveSelf,
+                    ["inactive_ancestors"] = item.InactiveAncestors,
+                });
+            }
+            return arr;
+        }
+
+        private static JArray BuildDoorRefs(List<DoorRef> refs)
+        {
+            var arr = new JArray();
+            if (refs == null) return arr;
+            foreach (var reference in refs)
+            {
+                arr.Add(new JObject
+                {
+                    ["key"] = reference.Key,
+                    ["pos"] = ObservationBuilder.Vec(reference.Pos),
+                });
+            }
+            return arr;
         }
 
         /// <summary>
@@ -514,10 +1042,21 @@ namespace UltrakillAIBridge.Obs
         }
 
         /// <summary>
-        /// The real exit, chosen once per level load. Decoys and secret-level pits are already out of
-        /// <see cref="pits"/> (see Scan), so this only has to prefer the pit that leads to the next
-        /// mission, then an active pit over one whose room hasn't loaded yet. The choice is frozen because
+        /// The real exit, chosen once per level load. Decoys, secret-level pits and Prime Sanctum pits are
+        /// already out of <see cref="pits"/> (see Scan), so this only has to prefer the pit that leads
+        /// onward, then an active pit over one whose room hasn't loaded yet. The choice is frozen because
         /// "active" changes as the level plays and every gate's hop count depends on which pit was picked.
+        ///
+        /// An "Intermission*" target counts as leading onward: an act finale's real exit drops into an
+        /// intermission, not into the next mission, and MissionNumber cannot parse it, so IsSuccessor has
+        /// no string to test and the rule cannot live inside it. Measured, 3-2 and 6-2 are the only levels
+        /// that ship such a pit.
+        ///
+        /// A tie at the best rank is logged once per level load. Two of the four exit-ambiguous levels stay
+        /// tied after this (3-2's two Intermission1 pits sit at the identical position, 2-4's two Level 3-1
+        /// pits 1.4 m apart in the same room, so both are benign), and 8-4's EarlyAccessEnd pit is picked by
+        /// uniqueness rather than by the successor test -- exactly the shape of level where a future
+        /// duplicate would go unnoticed.
         /// </summary>
         private FinalPit ChooseExit()
         {
@@ -526,14 +1065,30 @@ namespace UltrakillAIBridge.Obs
             var current = MissionNumber(SceneHelper.CurrentScene);
             FinalPit best = null;
             int bestRank = int.MaxValue;
+            int tied = 0;
             foreach (var pit in pits)
             {
                 if (pit == null) continue;
-                bool successor = current.HasValue && IsSuccessor(current.Value, MissionNumber(pit.targetLevelName));
+                var target = pit.targetLevelName;
+                bool successor = (target != null && target.StartsWith("Intermission", StringComparison.OrdinalIgnoreCase))
+                                 || (current.HasValue && IsSuccessor(current.Value, MissionNumber(target)));
                 int rank = (successor ? 0 : 2) + (pit.gameObject.activeInHierarchy ? 0 : 1);
-                if (rank >= bestRank) continue; // ties keep FindObjectsOfType order
+                if (rank > bestRank) continue;
+                if (rank == bestRank)
+                {
+                    tied++; // ties keep FindObjectsOfType order
+                    continue;
+                }
                 best = pit;
                 bestRank = rank;
+                tied = 0;
+            }
+            if (tied > 0 && best != null && !exitTieWarned)
+            {
+                exitTieWarned = true;
+                Plugin.Log.LogWarning(
+                    $"{tied + 1} FinalPit candidates tie at rank {bestRank} in {SceneHelper.CurrentScene}; "
+                    + $"keeping the one to '{best.targetLevelName}' at {CampaignPatches.Key(best.transform.position)}");
             }
             chosenExit = best;
             return chosenExit;

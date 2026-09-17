@@ -117,6 +117,37 @@ def fmt_pct(value) -> str:
     return "—" if v is None else f"{v * 100:.0f}%"
 
 
+def short_level(scene) -> str:
+    """"Level 0-1" -> "0-1", the form times.md and this panel use."""
+    if not isinstance(scene, str):
+        return "?"
+    try:
+        from ultrakill_ai.times import short_level as shorten
+    except ImportError:  # a checkout from before times.py
+        return scene.removeprefix("Level ")
+    return shorten(scene)
+
+
+def level_lines(campaign: dict) -> list[str]:
+    """One row per unlocked level of a multi-level run, or nothing at all on a single-level run.
+
+    R6 of the design spec: once two levels of different size run together the pooled `mean_100` numbers are
+    cross-level means that say nothing, so this table is what a multi-level run is judged on. `cp` is
+    checkpoints per level load and `w` the share of fresh draws the curriculum is giving the level.
+    """
+    levels = campaign.get("levels")
+    if not isinstance(levels, dict):
+        return []
+    rows = ["  levels"]
+    for name, row in levels.items():
+        if not isinstance(row, dict) or not row.get("unlocked"):
+            continue
+        rows.append(f"    {short_level(name):<4} fresh {fmt_pct(row.get('fresh_completion_rate'))}"
+                    f" ({fmt_int(row.get('fresh_window'))})  best {fmt_time(row.get('best_time'))}"
+                    f"  cp {fmt_float(row.get('checkpoints_level'), 1)}  w {fmt_float(row.get('weight'))}")
+    return rows if len(rows) > 1 else []
+
+
 def campaign_lines(campaign: dict, mean: dict, parts: dict | None = None, best: dict | None = None,
                    fresh: dict | None = None, ppo: dict | None = None) -> list[str]:
     """Campaign panel rows: completion and official times, per-episode means over the last 100, then the largest reward parts.
@@ -125,11 +156,19 @@ def campaign_lines(campaign: dict, mean: dict, parts: dict | None = None, best: 
     count from its level load: reading the all-episode number alone is how the pre-fix run's "peak by depth"
     was misread. The look-mode shares and the per-dimension entropy sit together, since a look mode leaves the
     yaw and pitch heads causally inert and only the entropy bonus acts on them on those steps.
+
+    On a multi-level run the headline is labelled a SCORE, not a percentage: `fresh_completion_rate` is then a
+    shrunk sum over the unlocked levels and can exceed 1.0. The real rates are in the per-level rows below it.
     """
     best, fresh, ppo = best or {}, fresh or {}, ppo or {}
     exit_dist = fmt_float(mean.get("exit_dist_min"), 0)
+    unlocked = [row for row in (campaign.get("levels") or {}).values() if isinstance(row, dict) and row.get("unlocked")]
+    if unlocked:
+        headline = ("fresh score     ", f"{fmt_float(campaign.get('fresh_completion_rate'))} / {len(unlocked)} levels")
+    else:
+        headline = ("fresh completed ", f"{fmt_pct(campaign.get('fresh_completion_rate'))} of last {fmt_int(campaign.get('fresh_window'))}")
     rows = (
-        ("fresh completed ", f"{fmt_pct(campaign.get('fresh_completion_rate'))} of last {fmt_int(campaign.get('fresh_window'))}"),
+        headline,
         ("all completed   ", fmt_pct(mean.get("completed"))),  # fresh starts and checkpoint respawns alike
         ("best time       ", fmt_time(campaign.get("best_time"))),
         ("median time     ", fmt_time(campaign.get("median_time_50"))),
@@ -145,6 +184,7 @@ def campaign_lines(campaign: dict, mean: dict, parts: dict | None = None, best: 
                              f"/{fmt_compact(ppo.get('entropy_look_mode'))}"),
     )
     lines = [f"  {label} {value}" for label, value in rows]
+    lines.extend(level_lines(campaign))
     # The four largest reward parts by size, so a term that dominates the return shows up at a glance.
     values = [(str(name), v) for name, v in ((name, num(value)) for name, value in (parts or {}).items()) if v is not None]
     if values:
@@ -544,7 +584,11 @@ class Dashboard:
                 last = f"none yet ({fmt_duration(age)})"
             # Campaign games report the checkpoints of the level load instead of a wave (their wave stays 0).
             progress = e.get("checkpoints_level") if e.get("checkpoints_level") is not None else e.get("wave")
-            values = (fmt_int(e.get("env")), fmt_float(e.get("reward")), fmt_int(e.get("kills")), fmt_int(progress),
+            # On a curriculum run each game picks its own level at every fresh load, so the row says which.
+            index = fmt_int(e.get("env"))
+            if isinstance(e.get("level"), str):
+                index = f"{index} {short_level(e['level'])}"
+            values = (index, fmt_float(e.get("reward")), fmt_int(e.get("kills")), fmt_int(progress),
                       last + ("  ⚠ stalled?" if stalled else ""))
             for c, (lbl, text) in enumerate(zip(row, values)):
                 lbl.config(text=text, fg=(ORANGE if stalled else FG) if c in (0, 4) else FG)

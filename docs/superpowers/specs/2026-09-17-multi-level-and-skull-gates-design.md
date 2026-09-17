@@ -773,7 +773,24 @@ Both are applied in `step()` where `_hold_slide` already edits the command, and 
 Animator is culled**. `TrainingSpeed.ApplyRendering` also walks `MonoSingleton<FistControl>.Instance` and
 `MonoSingleton<CameraController>.Instance` with `GetComponentsInChildren<Animator>(true)`, sets
 `cullingMode = AnimatorCullingMode.AlwaysAnimate`, and remembers the previous value so `RestoreRendering`
-restores it exactly as `disabledCameras` is restored. Cheap, unconditional, and §8 check 1 is what proves it.
+restores it exactly as `disabledCameras` is restored. §8 check 1 is what proves it.
+
+**The walk is cached, and the cache key has to be the Animator set, not a count.** Walking the hierarchy every
+step would allocate on every step of every game, so `ForcePlayerAnimators` only re-walks when the set changes.
+The change test cannot be a child count: `FistControl.ResetFists` (`decompiled/FistControl.cs:217-256`) destroys
+every spawned arm and instantiates the replacements as children of the same `FistControl` (`:231, :283, :300,
+:307`), and prefs do not change mid-level, so N arms are normally replaced by N arms — same count, same two
+singleton instance ids, an entirely new set of Animators. `ResetFists` runs mid-level from `WeaponPickUp.cs:104`
+(an arm pickup), `PlayerLoadout.SetLoadout`, `PlayerLoadoutTarget.CommitLoadout`, `VariationInfo.cs:199,247` and
+`FistControl.TutorialCheckForArmThatCanPunch` (a UnityEvent target, no C# caller), and the loadout paths can
+swap which arm prefabs exist without changing the count. The key is therefore a hash over the two instance ids
+**and every direct child's instance id**, plus a re-walk whenever any Animator already forced has become null (a
+destroyed `UnityEngine.Object` compares equal to null), which covers a replacement deeper than a direct child
+and the frame where Unity has instantiated the new arms but not yet processed the `Destroy` of the old ones.
+Both tests are needed: the null scan alone misses a loadout swap whose old arms were authored `AlwaysAnimate`
+(those are never added to the forced list), and the id hash alone misses a deep replacement. The failure this
+prevents is silent — the stale entries are null-guarded, nothing logs, and §8 check 1 passes if it is run before
+the pickup — so it is worth the few extra comparisons per step.
 
 ### 6.9 Observation, and degradation
 

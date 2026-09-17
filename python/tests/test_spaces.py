@@ -169,6 +169,30 @@ def test_target_slots_use_the_exit_scales_for_the_exit():
     assert close(far[5:9], [0.0, 0.0, 4.0, 4.0])  # clipped to +-4.0 as a guard
 
 
+def test_a_skull_subgoal_packs_through_the_unchanged_gate_branch():
+    """S4 adds no observation value and changes no index: spaces.py is deliberately not edited for it.
+
+    A sub-goal inherits its gate's `hops`, so it is not the exit sentinel and takes the gate scales. Slot 455
+    therefore reports the GATE's hops while the target is a fetch or carry leg, which may be nowhere near the
+    route -- harmless, but it is not a route distance then.
+    """
+    from ultrakill_ai.campaign import GateProgress
+
+    subgoal = {"key": "item:SkullRed", "pos": [0.0, 0.0, 40.0], "hops": 6, "open": False, "locked": False,
+               "active": True, "subgoal": "item", "gate_key": "20,-10,381"}
+    block = campaign_block(snapshot(level()), target=subgoal)
+    assert len(block) == CAMPAIGN_BLOCK == 36
+    assert close(block[5:13], [0.0, 0.0, 40.0 / 50.0, 40.0 / 100.0, 1.0, 0.0, 0.0, 6.0 / 20.0])
+    assert close(block, campaign_block(snapshot(level()), target=target((0.0, 0.0, 40.0), hops=6))), \
+        "identical to the gate it stands in for: the policy cannot tell a skull from a door, by design"
+    # The escape hatch, off by default: `open`/`locked` are 0.0 for every non-gate target, so they can carry
+    # "the target is an item" / "the target is an altar" without widening anything.
+    kinds = GateProgress(target_kind_slots=True)
+    assert kinds.target_kind_slots and not GateProgress().target_kind_slots
+    flagged = campaign_block(snapshot(level()), target=dict(subgoal, open=True))
+    assert close(flagged[10:13], [1.0, 0.0, 6.0 / 20.0])
+
+
 def test_no_target_leaves_the_slots_zero():
     assert close(campaign_block(snapshot(level()))[5:13], [0.0] * 8)
     assert close(campaign_block(snapshot(level()), target=None)[5:13], [0.0] * 8)
