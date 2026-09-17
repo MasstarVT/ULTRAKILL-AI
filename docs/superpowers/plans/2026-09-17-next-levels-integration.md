@@ -5,7 +5,7 @@ the multi-level curriculum (S1), the gates usability guard (S2), the 6-2 exit ti
 gates (S4) of `docs/superpowers/specs/2026-09-17-multi-level-and-skull-gates-design.md`. Mod version 0.6.0 → 0.7.0.
 
 **What has been verified, and what has not.** Everything offline: `dotnet build -c Release -p:InstallPlugin=false`
-is 0 warnings / 0 errors, and all twelve no-game test files pass (248 assertions). **Nothing on this branch has
+is 0 warnings / 0 errors, and all thirteen no-game test files pass (258 assertions). **Nothing on this branch has
 been run against the game.** No game was launched, no port opened and the live run's tree was never touched while
 the branch was written. So every claim below about in-game behaviour is a prediction from scene files and
 decompiled source, and this checklist is how it gets tested.
@@ -17,7 +17,7 @@ decompiled source, and this checklist is how it gets tested.
 | **S1** multi-level curriculum | `env.levels`, `curriculum.json`, per-level stats | ready to run | §4.1, §6 |
 | **S2** gates guard | Python-only, ignores a ladder below 50% hops coverage | ready to run | §4.6 |
 | **S3** 6-2 exit tie-break | mod, `Level P-` dropped / `Intermission*` kept | ready to run | §4.5 |
-| **S4** skull-carry gates | `altars[]`, `items[]`, `needs_item`, two new milestones | **wired but dormant** | §5 — **a probe script that does not exist yet** |
+| **S4** skull-carry gates | `altars[]`, `items[]`, `needs_item`, two new milestones | **wired but dormant** | §5 — `skull_check.py`, offline-green, never run in the game |
 
 S4 ships with `item_pickup` and `item_placed` at `0.0` in `configs/campaign_1-1.yaml` and absent (so `0.0`) in
 `configs/campaign_prelude.yaml`, and the prelude's three levels have no altars at all. **So S1+S2+S3 can merge,
@@ -45,9 +45,9 @@ Nothing here touches the main tree, the live run or the game.
      if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }
    ```
 
-   Expected: twelve files, every one ending in `N tests passed` / `all tests passed`. `test_campaign_check.py`
-   prints `[FAIL]` lines from its *fake* level on purpose — that file is asserting that a broken level is
-   reported as broken. Judge it on its last line only.
+   Expected: thirteen files, every one ending in `N tests passed` / `all tests passed`. `test_campaign_check.py`
+   and `test_skull_check.py` print `[FAIL]` lines from their *fake* levels on purpose — those files are asserting
+   that a broken level is reported as broken. Judge them on their last line only.
 
 2. **Rebuild the mod without installing**, to confirm the toolchain is there before the games are down. `dotnet`
    is not on `PATH` in this shell; the full path works:
@@ -215,14 +215,17 @@ python scripts\bridge_test.py --campaign
 
 **Pass:** `altars: 0`, `items: 1` (`CustomKey1`), no `needs_item` anywhere.
 
-**Then read this, because 0-4 is in the prelude curriculum of §6.** `UltrakillEnv._protect_carry` drops the
-`punch` button on any step where *anything* reads `held: true` and the current sub-goal is not an altar. 0-4 has a
-carryable key and no altar, so **the moment the agent picks the key up it loses the punch button for the rest of
-the carry, and cannot throw the key either** (throwing is itself a punch). Traced through the decompiled source
-this does not wedge the level — `ItemTrigger.OnTriggerEnter` fires on the *carried* item's collider, so the key is
-delivered by walking it in, not by punching — and losing punch costs only the parry and the melee. It is recorded
-here because the rule's docstring claims it is inert on a level with no `ItemPlaceZone`, which is true only while
-nothing is held. Watch for it in §6's smoke run (see §6's watch list) and leave the code alone unless it bites.
+**0-4 is in the prelude curriculum of §6, and this is where its punch bug was found and fixed (2026-09-17).**
+`UltrakillEnv._protect_carry` used to drop the `punch` button on any step where *anything* read `held: true` and
+the current sub-goal was not an altar. 0-4 has a carryable key and no altar, so **the moment the agent picked the
+key up it lost the punch button for the rest of the carry, and could not throw the key either** (throwing is
+itself a punch). It now gates on a *carry* — a held item some live unfilled altar accepts, through
+`campaign.wanting_altars`, the same filter `GateProgress._subgoal` picks a destination with — so on 0-4 the button
+is untouched. The forced look mode 2 beside it was checked and was already narrow: it keys on the target carrying
+a `subgoal` field, which only exists for a gate with `needs_item`.
+
+**Pass, therefore:** nothing about 0-4 changes the `bridge_test.py` readout above, and in §6's smoke run
+`part_punch` on 0-4 must look like it does on 0-1. (0-4 is locked at 20k steps, so that is for the real run.)
 
 ### 4.5 `Level 6-2` — the exit tie-break (S3)
 
@@ -273,38 +276,37 @@ python scripts\games.py stop
 
 ---
 
-## 5. The skull-carry checks — BLOCKED, and what unblocks them
+## 5. The skull-carry checks — `scripts/skull_check.py`
 
-§8 checks 1-3 of the spec gate raising `item_pickup` / `item_placed` off `0.0`. **None of them can be run with
-the tooling that exists today, and the gap is not small.** Flagging it here so it is discovered now and not while
-standing in front of a paused trainer.
+§8 checks 1-3 of the spec gate raising `item_pickup` / `item_placed` off `0.0`. **The tool that runs them now
+exists** (2026-09-17, on this branch): `scripts/skull_check.py`, in the shape of `campaign_check.py`, green
+against `FakeLevel`'s skull room in `tests/test_skull_check.py`. It has never been pointed at the game. The pause
+only has to run it.
 
-| check | what it settles | why nothing existing can run it |
+| check | what it settles | how the script does it |
 |---|---|---|
-| 1. `ActiveFrame` survives `render: false` | whether S4 is inert under training settings at all | needs an AI-driven punch at `(81.0, -2.2, 275.0)` on 1-1 with the cameras off. A human playthrough (the `watch_completion.py` pattern that cleared the exit blocker) **cannot** test this: `render: false` only applies while the AI has control. |
-| 2. placement survives punch spam | whether `filled` and `needs_item: null` stick | needs the carry from check 1 plus 100 steps of punch spam. |
-| 3. held skull on death | the one thing that cannot be settled offline | needs a held skull, i.e. check 1. |
+| 1. `ActiveFrame` survives `render: false` | whether S4 is inert under training settings at all | walks to `(81.0, -2.2, 275.0)` on 1-1 with the cameras off, faces it inside the game's own 85° clamp and punches until `items[].held`. A human playthrough **cannot** test this: `render: false` only applies while the AI has control. |
+| 2. placement survives punch spam | whether `filled` and `needs_item: null` stick | carries to `(0.0, -6.76, 381.0)`, punches, then presses punch for 100 decisions **through `env.step`**, so §6.7's gating is what is under test. Every decision is inspected, not just the last. |
+| 3. held skull on death | the one thing that cannot be settled offline | takes the skull back out of the altar, runs the protocol's `kill`, and prints every `items[]` entry of that type after the respawn. |
 
-`walk_to_exit.py` drives with scripted movement but its waypoints are hard-coded to the level's checkpoints and
-it never punches. `campaign_check.py` teleports and no-ops. `bridge_test.py --campaign` is read-only.
+```powershell
+python scripts\games.py launch --count 1 --monitor 1
+python scripts\skull_check.py                 # Level 1-1, training settings, rendering OFF
+python scripts\skull_check.py --render        # the control run, if check 1 fails
+python scripts\games.py stop
+```
 
-**What is needed: a ~100-line `scripts/skull_check.py`**, in the shape of `campaign_check.py`:
+**Pass:** `summary: 1 pickup PASS | 2 placement PASS | 3 held skull on death PASS`, exit code 0. Check 2's detail
+must show `altar 81,-2,275`-side pickup, then `filled=True` and `gate 20,-10,381 needs_item=None` **both at the
+placement and after the spam** — the dead twin `0,-7,381#2` keeping `needs_item` set is M14 and is a FAIL.
 
-- take `--level`, `--port`, `--render`, and a `--to x,y,z` waypoint list;
-- reuse `walk_to_exit.py`'s movement (face the waypoint, hold forward, jump on a stall) to drive to the pedestal
-  rather than teleporting — **a bare teleport into a switched-off room activates nothing**, measured on 0-1, and
-  1-1's Skull Field starts off. 1-1 spawns at `(0, 105, 253)`, 136 m away, and the Skull Field is adjacent to the
-  spawn room;
-- at the waypoint, face it and press `punch` for a few decisions, then print the matching `items[]` entry;
-- carry to `(0.0, -6.76, 381.0)`, punch, print that altar's `filled` and gate `20,-10,381`'s `needs_item`, then
-  100 more punch-spam steps and print both again;
-- `--kill` to run the debug kill command mid-carry and print `items[]` on the next step.
-
-It is offline-testable before it is ever pointed at the game: `FakeLevel` in `tests/test_campaign_env.py` already
-grows the skull room the spec asks for (a pedestal altar with a source, a wired destination, `punch` inside 4 m
-picking up and placing), so `tests/test_skull_check.py` can drive the script against it exactly as
-`test_campaign_check.py` drives `campaign_check.py` against a fake level. **Write and offline-test it before the
-pause; the pause then only has to run it.**
+**It walks; it never teleports.** A bare teleport into a switched-off room activates nothing (measured on 0-1) and
+1-1's Skull Field starts off. 1-1 spawns at `(0, 105, 253)`, 136 m away, and the Skull Field is adjacent to the
+spawn room. The script prints the item's `active` flag **before** it punches, so the two failures are never
+confused: if check 1 FAILs with `the item is NOT active`, the **walk** failed and the fix is `--via X Y Z`
+(repeatable) to route the approach — it says nothing about `ActiveStart`. Only a FAIL with `active=True` before
+the punch is evidence about the AnimationEvent, and then `--render` is the control that separates "the punch does
+not work" from "the punch does not work with the cameras off".
 
 Until all three pass, leave `item_pickup` and `item_placed` at `0.0` and do not start a 1-1 run. Check 1 is the
 kill switch: if the fist Animator is culled under `render: false` *with* `TrainingSpeed.ForcePlayerAnimators`
@@ -349,7 +351,7 @@ keeps the live checkpoint out of a directory that is about to be deleted.
   the S2 guard is firing on 0-1, which it must not (0-1's ratio is 1.000).
 - Any `UltrakillEnv: ignoring ...curriculum.json` line in the log means a worker rejected the file (wrong run
   name or level order) and is training on `levels[0]` only. Harmless here, fatal to the curriculum later.
-- The 0-4 punch effect of §4.4 cannot show up yet — 0-4 is locked at 20k steps.
+- The 0-4 punch behaviour of §4.4 cannot show up yet — 0-4 is locked at 20k steps.
 
 Then `python scripts\games.py stop` and delete `runs\campaign_prelude_smoke\` and
 `models\campaign_prelude_smoke\`.
@@ -459,7 +461,8 @@ level never changes and the campaign block is byte-identical to what it has alwa
 
 ## 9. What this list does not cover
 
-- **§8 checks 1-3 of the spec** — see §5. The probe script does not exist.
+- **§8 checks 1-3 of the spec** — see §5. The probe script exists and is offline-green, but nothing about the
+  skull carry has been observed in the running game, so the two item weights stay at `0.0` either way.
 - **Levels beyond the prelude three.** `campaign_prelude.yaml` lists 0-1, 0-3 and 0-4 only. 0-2 is held back for
   the skull carry and 0-5 has no goal room in its door graph at all (the Cerberus kill opens the exit), so it has
   no route signal to train against.

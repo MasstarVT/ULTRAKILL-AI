@@ -128,7 +128,9 @@ def go_to(env: UltrakillEnv, name: str, target, budget: int, assist: bool) -> tu
     since_gain = 0
     while used < budget:
         player = raw.get("player")
-        if player is None:
+        if player is None or block(raw).get("input_locked"):
+            # No player (a scene load), or a frame the game ignores input on (the opening drop, a cutscene,
+            # a respawn): send nothing and do not let it count toward the stall, which it did not cause.
             raw = env.client.step({})
             used += 1
             continue

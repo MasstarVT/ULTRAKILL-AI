@@ -479,6 +479,24 @@ def _live(entry: dict, *, need_active_self: bool = True) -> bool:
     return int(entry.get("inactive_ancestors", 0) or 0) <= 1
 
 
+def wanting_altars(campaign: dict | None, items) -> list[dict]:
+    """The live, unfilled `altars[]` entries that accept one of `items` (a type name or a set of them).
+
+    This is the filter a carry destination is chosen with, in one place because two callers must agree on it:
+    `GateProgress._subgoal` narrows it further to the altars wired to the gate it is trying to open, while
+    `UltrakillEnv._protect_carry` uses it as it stands -- a punch that throws what is held is only worth
+    dropping the button for when something, anywhere in the level, would accept the thing. Empty means the held
+    item has no destination at all (Level 0-4's `CustomKey1`, delivered by walking it into an `ItemTrigger`).
+
+    An `altars` list the mod never sent reads as empty, so a 0.6.x mod, and every level with no `ItemPlaceZone`,
+    gets the empty list and with it the unprotected, unchanged behaviour.
+    """
+    wanted = {items} if isinstance(items, str) else set(items)
+    return [a for a in ((campaign or {}).get("altars") or ())
+            if isinstance(a, dict) and a.get("pos") and a.get("item") in wanted
+            and not a.get("filled") and _live(a, need_active_self=False)]
+
+
 class GateProgress:
     """Route progress along the door graph the mod reports as `campaign.gates` (docs/protocol.md).
 
@@ -731,10 +749,8 @@ class GateProgress:
         need = gate.get("needs_item")
         if not need or pos is None:
             return gate
-        altars = [a for a in (campaign.get("altars") or ())
-                  if isinstance(a, dict) and a.get("pos") and a.get("item") == need and not a.get("filled")
-                  and _live(a, need_active_self=False)
-                  and any(isinstance(d, dict) and d.get("key") == gate.get("key") for d in (a.get("doors") or ()))]
+        altars = [a for a in wanting_altars(campaign, need)
+                  if any(isinstance(d, dict) and d.get("key") == gate.get("key") for d in (a.get("doors") or ()))]
         if not altars:
             return gate  # 3. every wired altar is filled (or only dead twins are left): the lock is open
         items = [i for i in (campaign.get("items") or ())

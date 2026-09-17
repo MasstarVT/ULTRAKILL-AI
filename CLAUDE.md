@@ -39,13 +39,16 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       curriculum file is opened and the level never changes.
     - **Carry protection** (`subgoal_punch_range_m`, default 4.0 = `Punch.ActiveFrame`'s own reach): inside punch
       range of a sub-goal the camera uses the game's own pitch clamp instead of the 45 degree band, and outside it
-      `punch` is dropped whenever anything is held or a filled altar is in reach. Only two presses survive — the
-      one that places and the one that picks up — because `Punch.ActiveStart` **throws** a held item and punching a
-      filled altar `ForceHold`s the skull back out, closing the door it opened. A dropped press is not charged
-      `punch` either. **Caveat: the rule keys on "anything held", not on "held item an altar wants"**, so on a
-      level with a carryable and no altar (0-4's `CustomKey1`) the agent loses punch for the whole carry and cannot
-      throw the item. Traced through `ItemTrigger.OnTriggerEnter`, which fires on the carried item's own collider,
-      0-4 is still solvable by walking the key in; the cost is the parry and the melee.
+      `punch` is dropped while a **carry** is in progress or a filled altar is in reach. Only two presses survive —
+      the one that places and the one that picks up — because `Punch.ActiveStart` **throws** a held item and
+      punching a filled altar `ForceHold`s the skull back out, closing the door it opened. A dropped press is not
+      charged `punch` either. A carry is a **held item some live unfilled altar accepts**, not merely
+      `any(items[].held)`: `campaign.wanting_altars` is the one filter, shared with `GateProgress._subgoal`, so the
+      two agree by construction. Both harms need a destination — an item nothing wants can be thrown and picked up
+      again, and the not-holding `ForceHold` branch is covered by the filled-altar test on its own. The release
+      stays the spec's (within range of the **sub-goal** altar), deliberately narrower than "any altar that accepts
+      this", because the source pedestal is itself an unfilled zone that accepts the item and releasing beside it
+      would let the first press after the pickup throw the skull straight back down.
     - Input-locked frames (landing, cutscenes) are stepped through with an empty action and never reach the policy (`max_locked_skip_s`).
     - A death pays `death`, respawns at the checkpoint (or reloads the level when there is none) and the episode continues. Doors, arenas and checkpoints a respawn itself changes pay nothing.
     - Ends, in this precedence: `level_complete` (terminated), `wedged`, `stuck`, `max_steps` (all truncated).
@@ -115,7 +118,9 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       item of type T, then the altar of type T wired to that gate, then the gate again. `best_dist` is keyed per
       target, so shuttling between them cannot be farmed. Dead twins (`inactive_ancestors > 1`) and decorations
       (`active_self: false`) are filtered out, or the machine sends the agent to punch the skull back out of the
-      altar it just filled. The **usability guard** drops a whole ladder when fewer than half its phase-1 gates
+      altar it just filled. That altar filter is `wanting_altars(campaign, types)` — live, unfilled, accepts one of
+      these types — in one place because `env._protect_carry` must use the identical test to decide a held item is
+      a carry worth silencing the punch button for. The **usability guard** drops a whole ladder when fewer than half its phase-1 gates
       carry a `hops` value (7-2 is 1 of 4, 8-3 1 of 32), falling back to the exit vector.
     - `GateProgress` walks the `hops` ladder of `campaign.gates`. `retarget()` picks a target and pays **nothing**
       (it runs before every observation is packed, including `reset()`'s, so slot 452 reads 1.0 on the first
@@ -157,7 +162,23 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   level's checkpoints in nearest-neighbour order, shooting what gets in the way) and reports whether the level
   reports complete. Kept for the diagnosis it produced rather than for routine use: it cannot leave 0-1's sealed
   starting room, and its teleport ancestor showed that teleporting never activates rooms at all. Both failures
-  are documented in the pilot entry under Status.
+  are documented in the pilot entry under Status. Its `go_to` mover is now also `skull_check.py`'s, and steps
+  through input-locked frames (the opening drop, a cutscene, a respawn) with an empty action instead of counting
+  them as a stall.
+- `python/scripts/skull_check.py` (branch `next-levels`): the in-game skull-carry probe, section 8 checks 1-3 of
+  the multi-level/skull spec — the three that gate raising `item_pickup` / `item_placed` off 0.0. On one game,
+  taking control at the training settings with rendering **off**, it **walks** (never teleports; a bare teleport
+  into a switched-off room activates nothing) to 1-1's red pedestal `(81.0, -2.2, 275.0)`, faces it inside the
+  game's own 85 degree pitch clamp and punches; carries to `(0.0, -6.76, 381.0)` and punches; then takes the
+  skull back out and dies holding it. Reports 1 pickup (`items[].held`, and `items[].active` **before** the punch,
+  so "the room is still switched off" is never mistaken for "the punch does not work"), 2 placement
+  (`altars[].filled`, gate `20,-10,381`'s `needs_item`, then 100 decisions of punch spam pressed **through
+  `env.step`**, so `_protect_carry` is what is under test — every decision is inspected, not just the last, since
+  an unprotected punch pulls the skull out and the next one puts it back), 3 what a held skull does across a
+  death. `--target/--altar/--gate/--via/--level/--render/--teleport-assist/--skip-kill`; PASS/FAIL/SKIP per check,
+  a `summary:` line and exit 1 on any FAIL, like `campaign_check.py`, whose helpers it reuses.
+  `python/tests/test_skull_check.py` runs all three against `FakeLevel`'s skull room, so the script is proven
+  before a game is ever launched.
 - `python/scripts/transfer_weights.py`: campaign starting weights from a Cyber Grind checkpoint. Widens the 448 inputs to 479 (first-layer columns 0-442 copied, 443-478 zero, so Cyber Grind inputs give the same hidden features), scales the action head by `--action-scale` (default 0.5) to raise entropy, and keeps a fresh final value layer and optimizer. It now also builds the destination with the **campaign** action space and zero-pads the three new logit rows, so the documented Cyber Grind -> campaign path still produces a model `train.py --resume` can load. Output: `models/campaign_ppo/transfer_init.zip` (committed).
 - `python/scripts/add_look_mode.py`: migrates a **campaign** checkpoint across the look-mode action dimension and the re-used target slots, so the run continues instead of restarting. Appends three zero action rows (all modes equally likely), zeroes first-layer columns 448-455 in both hidden stacks and **folds the removed inputs' mean into the first-layer bias** -- the fold is required, not optional: it roughly halves the displacement. Carries `num_timesteps`, `_n_updates` and the full Adam state (zero rows for the new logits, zeroed moments for the changed columns, `step` preserved). `--stats <run_raw.jsonl>` recomputes MU and measures the displacement on real observations. Output: `models/campaign_gates/look_init.zip` (committed). **This is the only migration path**: the action-space change makes every earlier campaign checkpoint unloadable. Cyber Grind is untouched.
 - `python/ultrakill_ai/times.py`: reads and updates `times.md` (`record` is pure, `record_file` edits in place). Level cells use the short form (`0-1`), times are `mm:ss.mmm`, the leaderboard is sorted by campaign order and only a faster time replaces a row.
@@ -168,7 +189,8 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/tests/test_campaign_config.py`: `configs/campaign_0-1.yaml` builds a 479-input env with its reward weights, every key is a real config field, and `train.fill_campaign_dirs` (no game needed).
 - `python/tests/test_keep_best.py`: `keep_best.py` scoring for both metrics on synthetic `metrics_log.csv` rows, and old `best.json` files (no game needed; `python tests/test_keep_best.py`).
 - `python/tests/test_times.py`: `times.md` updates against the committed file's exact text: placeholders, records, deltas, level order (no game needed; `python tests/test_times.py`).
-- `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load, and the two novelty-measure tests that pin the void exploit shut (`test_falling_off_the_map_pays_no_novelty`, `test_novelty_pays_for_new_ground_not_for_height`). `FakeLevel` reports ground rays the way the mod does, so its floor is at y 1 and `falling` makes every ray miss (no game needed).
+- `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load, and the two novelty-measure tests that pin the void exploit shut (`test_falling_off_the_map_pays_no_novelty`, `test_novelty_pays_for_new_ground_not_for_height`). `FakeLevel` reports ground rays the way the mod does, so its floor is at y 1 and `falling` makes every ray miss (no game needed). Its `enable_skulls(fields=, altars=, item_type=)` plus `item_active` cover the shapes a carryable comes in: the wired puzzle, a 0.6.x mod, 0-4's altar-free `CustomKey1`, an item no zone accepts, and an item whose room is still switched off.
+- `python/tests/test_skull_check.py`: `skull_check.py`'s three checks against `FakeLevel`'s skull room — the whole carry green, an item whose room is off named as the reason, a placement undone by the spam caught as a FAIL (run with the carry protection disabled, which is what makes it the regression test for `_protect_carry`), a pre-0.7.0 mod, `--skip-kill`, the `--render` control run and the default coordinates (no game needed).
 - `python/tests/test_campaign.py`: campaign helpers: level list, rank maths, exploration archive, milestones, path progress, the fresh-start rule and best runs (no game needed).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
 - `python/tests/test_spaces.py`: layout sizes (448 / 479) and every index range of the campaign block, including the yaw-frame signs (no game needed).
@@ -238,6 +260,14 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   The full merge-and-verify checklist is `docs/superpowers/plans/2026-09-17-next-levels-integration.md`.
 - TensorBoard: `tensorboard --logdir runs`.
 - Campaign in-game check (one game, nothing else connected to its port): `python scripts/games.py launch --count 1 --monitor 1`, then `python scripts/campaign_check.py` (Level 0-1) and `python scripts/campaign_check.py --level "Level 1-1"` (full arsenal), then `python scripts/games.py stop`. Six checks: level load, arsenal, checkpoint trigger, death respawn, exit, and **the gates block** (present, ordered, hop-monotone and unchanged after a respawn; SKIP rather than FAIL against a pre-0.6.0 mod). Prints PASS/FAIL/SKIP per check and a `summary:` line, exits 1 on any FAIL -- **check 5 (exit) is a known standing FAIL on both levels** (the exit's room is switched off at load, so a teleport onto its collider fires nothing; real play does trigger it, confirmed on a human run), so exit code 1 is expected today. `--fixed-fps 60 --frameskip 4` and `--render` repeat the trigger checks at other speed settings. Rerun after game updates and after mod changes to the campaign block; `python tests/test_campaign_check.py` tests the script without the game.
+- Skull-carry in-game check (branch `next-levels`, one game, nothing else connected to its port, and the **only**
+  thing that unblocks raising `item_pickup` / `item_placed` off 0.0):
+  `python scripts/games.py launch --count 1 --monitor 1`, then `python scripts/skull_check.py`
+  (Level 1-1, rendering **off**, which is the point of check 1), then `python scripts/games.py stop`. Add
+  `--render` for the control run, and `--via X Y Z` (repeatable) when the direct line to the pedestal does not
+  walk. Check 1 failing while the pre-punch line says `active=False` means the Skull Field room is still switched
+  off and the **walk** failed, not the punch -- route it with `--via` before concluding anything about
+  `ActiveStart`. `python tests/test_skull_check.py` tests the script without the game.
 - Campaign eval (one game on port 47800, e.g. `python scripts/games.py launch --count 1 --monitor 1`):
   `python scripts/eval.py models/campaign_gates/best.zip --level "Level 0-1" --episodes 10`. Fresh level loads,
   deterministic actions, real deaths; prints completed, official time, rank, kills, style, restarts and deaths per
@@ -245,7 +275,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (12 files; 248 named tests on branch `next-levels`, plus `test_progress.py`, which prints no count; ~2 min). `test_campaign_check.py` prints `[FAIL]` lines from its own fake level on purpose -- it is asserting that a broken level is reported as broken -- so judge it on its last line and its exit code.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (13 files; 258 named tests on branch `next-levels`, plus `test_progress.py`, which prints no count; ~2 min). `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
 
 ## Key design decisions
@@ -942,15 +972,16 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     The merge-and-verify checklist is `docs/superpowers/plans/2026-09-17-next-levels-integration.md`; it splits
     the branch into a shippable half (S1+S2+S3, which the prelude curriculum's altar-free levels exercise) and a
     dormant half (S4, whose two weights ship at 0.0).
-  - **Blocker for S4 only: the spec's in-game checks 1-3 have no tool that can run them.** They need an AI-driven
-    punch at 1-1's red pedestal **with rendering off** — a human playthrough cannot test `render: false`, since it
-    only applies while the AI has control, and no existing script drives to an arbitrary point and punches
-    (`walk_to_exit.py`'s waypoints are the level's checkpoints and it never punches; `campaign_check.py`
-    teleports and no-ops; `bridge_test.py --campaign` is read-only). A ~100-line `scripts/skull_check.py` is
-    needed, and it is offline-testable first: `FakeLevel` in `tests/test_campaign_env.py` already grows the skull
-    room. Check 1 is the kill switch — if the fist Animator is culled under `render: false` **with**
-    `TrainingSpeed.ForcePlayerAnimators` applied, S4 is inert under training settings and nothing else in it
-    matters.
+  - **The S4 tooling blocker is cleared: `scripts/skull_check.py` exists** (2026-09-17). It was the one gap — the
+    spec's in-game checks 1-3 need an AI-driven punch at 1-1's red pedestal **with rendering off**, which a human
+    playthrough cannot test (`render: false` only applies while the AI has control) and which no existing script
+    could do (`walk_to_exit.py`'s waypoints are the level's checkpoints and it never punches; `campaign_check.py`
+    teleports and no-ops; `bridge_test.py --campaign` is read-only). It walks rather than teleports, reads
+    `items[].active` before punching so a switched-off room is never mistaken for a broken `ActiveStart`, and is
+    green against `FakeLevel`'s skull room in `tests/test_skull_check.py`, so the pause only has to run it. **It
+    has still never been pointed at the game**, and check 1 remains the kill switch: if the fist Animator is
+    culled under `render: false` **with** `TrainingSpeed.ForcePlayerAnimators` applied, S4 is inert under training
+    settings and nothing else in it matters.
   - **Known, deliberate deviation from the brief:** `keep_best --metric campaign` was asked to score the **mean**
     fresh completion rate over unlocked levels. It scores a **shrunk sum** instead, and `keep_best.py` is not
     edited at all. A mean drops at every unlock (~0.52 -> ~0.26 when the second level joins), and `keep_best.py`
@@ -958,11 +989,17 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     and print the "15% below best" warning forever. A sum cannot drop, since a new level contributes 0 and grows;
     with one unlocked level at `fresh_window >= 20` it is exactly the rate that field has always been. The
     per-level means are all in `status.json`'s `campaign.levels`.
-  - **Known side effect, flagged not fixed:** `_protect_carry` drops `punch` while **anything** is held, not only
-    an item some altar wants. 0-4 is in the prelude curriculum and ships a `CustomKey1` with no altar, so once the
-    agent picks the key up it loses punch for the rest of the carry and cannot throw the key either. Traced
-    through `ItemTrigger.OnTriggerEnter`, which fires on the carried item's own collider, 0-4 stays solvable by
-    walking the key in; the cost is the parry and the melee. Watch it in the smoke run before changing anything.
+  - **Fixed 2026-09-17: `_protect_carry` was gating on "anything held".** It dropped `punch` on any step where any
+    `items[]` entry read `held: true`, so on 0-4 — in the prelude curriculum, shipping a `CustomKey1` and **zero**
+    `ItemPlaceZone`s — picking the key up cost the agent the button for the rest of the carry, including the throw
+    that would have given it back (throwing is itself a punch). It now gates on a **carry**: a held item some live
+    unfilled altar accepts, through `campaign.wanting_altars`, the same filter `GateProgress._subgoal` chooses a
+    destination with. Both harms the rule exists for need a destination, so where nothing accepts the item there is
+    nothing to protect. Pinned by `test_punch_passes_through_while_carrying_an_item_no_altar_wants` (0-4's shape)
+    and `..._the_altars_do_not_accept` (the type filter, which is what 1-1's two skull colours need); the wired
+    case still gates, unchanged. **The forced look mode 2 was checked and is not over-broad**: it keys on the
+    target carrying a `subgoal` field, which only `_subgoal` sets and only for a gate with `needs_item` and a live
+    wired altar, so it is already inert on 0-4 — asserted in the same test.
   - Also carried: S3 fixes 6-2 only. 3-2 keeps two `Intermission1` pits at an identical position and 2-4 two
     `Level 3-1` pits 1.4 m apart, and 8-4's `EarlyAccessEnd` pit parses as neither a level nor an intermission and
     is still picked by uniqueness alone — all three now visible through the rank-tie warning rather than silent.

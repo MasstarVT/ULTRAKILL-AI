@@ -26,6 +26,7 @@ from ultrakill_ai.campaign import (
     read_curriculum,
     safe_name,
     save_best_run,
+    wanting_altars,
 )
 from ultrakill_ai.protocol import DEFAULT_PORT, BridgeClient
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
@@ -573,12 +574,25 @@ class UltrakillEnv(gym.Env):
             calls `Close()` on the doors that altar had opened. So a punch next to a solved altar re-locks the
             gate it just opened.
 
-        So exactly two presses are kept: the one that places (holding, within range of the altar we are heading
-        for) and the one that picks up (not holding, within range of the item we are heading for -- which may
+        So exactly two presses are kept: the one that places (carrying, within range of the altar we are heading
+        for) and the one that picks up (not carrying, within range of the item we are heading for -- which may
         itself be sitting in some OTHER puzzle's filled altar, which is why that case is checked first). Every
-        other press is dropped while something is held or while a solved altar is in reach.
+        other press is dropped while a real carry is in progress or while a solved altar is in reach.
 
-        Inert with nothing held and no filled altar nearby, so a level with no `ItemPlaceZone` -- and any mod
+        **A carry is a held item some live UNFILLED altar accepts**, not merely `any(items[].held)`. Both harms
+        above need a destination: a thrown item that nothing wants can simply be picked up again, and the
+        not-holding `ForceHold` branch is already covered by `_near_filled_altar`. Level 0-4 ships a `CustomKey1`
+        carryable and zero `ItemPlaceZone`s, so under the first rule picking the key up cost the agent its punch
+        -- parry, melee and the throw that would have given the button back -- for the rest of the carry, on a
+        level in the prelude curriculum. `campaign.wanting_altars` is the filter `GateProgress._subgoal` chooses
+        a destination with, so the two agree by construction.
+
+        The release is the spec's: within `subgoal_punch_range_m` of the sub-goal altar. That is deliberately
+        narrower than "any altar that accepts this", because the SOURCE pedestal is itself an unfilled zone that
+        accepts the item, and releasing next to it would let the very first press after the pickup throw the
+        skull straight back down.
+
+        Inert with nothing carried and no filled altar nearby, so a level with no `ItemPlaceZone` -- and any mod
         that sends no `altars`/`items` -- behaves exactly as before, and punch stays available as an attack and
         a parry everywhere else. A removed press is not charged `RewardConfig.punch` either: the command the
         game receives is what the reward is computed from, here as for the slide latch.
@@ -587,10 +601,14 @@ class UltrakillEnv(gym.Env):
             return
         if "punch" not in command["buttons"]:
             return
-        holding = any(isinstance(i, dict) and i.get("held")
-                      for i in ((prev.get("campaign") or {}).get("items") or ()))
-        keep = self._near_subgoal(prev, (SUBGOAL_ALTAR,)) if holding else self._near_subgoal(prev, (SUBGOAL_ITEM,))
-        if keep or not (holding or self._near_filled_altar(prev)):
+        campaign = prev.get("campaign") or {}
+        held = {i.get("item") for i in (campaign.get("items") or ())
+                if isinstance(i, dict) and i.get("held")}
+        if held and not wanting_altars(campaign, held):
+            return  # something is held, but nothing in the level accepts it: there is no carry to protect
+        carrying = bool(held)
+        keep = self._near_subgoal(prev, (SUBGOAL_ALTAR,)) if carrying else self._near_subgoal(prev, (SUBGOAL_ITEM,))
+        if keep or not (carrying or self._near_filled_altar(prev)):
             return
         command["buttons"] = [b for b in command["buttons"] if b != "punch"]
 

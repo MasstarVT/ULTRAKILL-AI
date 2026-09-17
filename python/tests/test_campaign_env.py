@@ -38,6 +38,7 @@ SKULL_GATES = ((SKULL_GATE_KEY, SKULL_GATE_POS, 0),)
 PEDESTAL_KEY, PEDESTAL_POS = "0,1,20", (0.0, 1.0, 20.0)
 ALTAR_KEY, ALTAR_POS = "0,1,40", (0.0, 1.0, 40.0)
 DEAD_TWIN_KEY = "0,1,40#2"
+ALTAR_ITEM = "SkullRed"  # what every ItemPlaceZone in the skull room accepts; FakeLevel.item_type is what exists
 PUNCH_RANGE = 4.0  # Punch.ActiveFrame's own reach, and EnvConfig.subgoal_punch_range_m's default
 # The two-level curriculum tests. Both names must be in CAMPAIGN_LEVELS_SHIPPED or UltrakillEnv refuses them.
 LEVELS = ["Level 0-1", "Level 0-3"]
@@ -67,6 +68,12 @@ class FakeLevel:
                        dead twin, with `punch` picking up, placing and throwing exactly as `Punch.AltHit` does
       `skull_fields`   False keeps the skull room but drops `altars`, `items` and `needs_item`, as a mod older
                        than 0.7.0 does
+      `altars_present` False is Level 0-4's shape: a carryable and not one `ItemPlaceZone` in the level, so the
+                       gate is an ordinary door and the only thing a punch can do with the item is throw it
+      `item_type`      what the carryable is. Anything but ALTAR_ITEM is an item no zone here accepts, which is
+                       0-4's `CustomKey1` standing in a level that also has skull altars
+      `item_active`    False is the carryable's room still switched off: it is reported but has no collider, so
+                       no punch can reach it -- what a teleport into an unactivated room leaves you with
     """
 
     def __init__(self):
@@ -90,16 +97,29 @@ class FakeLevel:
         self.last_action: dict | None = None  # the command dict the env last sent
         self.skulls = False
         self.skull_fields = True
+        self.altars_present = True
+        self.item_type = ALTAR_ITEM
+        self.item_active = True
         self.picked_up = 0  # times a punch picked the skull up, and times one threw it: the physical events
         self.thrown = 0
         self._load()
 
-    def enable_skulls(self, *, fields: bool = True) -> None:
-        """Turns the level into the skull room. Call before reset(); `fields=False` is a mod older than 0.7.0."""
+    def enable_skulls(self, *, fields: bool = True, altars: bool = True, item_type: str = ALTAR_ITEM) -> None:
+        """Turns the level into the skull room. Call before reset(); `fields=False` is a mod older than 0.7.0.
+
+        `altars=False` and `item_type` are the two ways a level can hold a carryable that nothing accepts; see
+        the class docstring.
+        """
         self.skulls = True
         self.skull_fields = fields
+        self.altars_present = altars
+        self.item_type = item_type
         self.gates = SKULL_GATES
         self._load()
+
+    def _zone_accepts(self) -> bool:
+        """Whether this level has an ItemPlaceZone that takes the item it ships (`ItemPlaceZone.CheckItem`)."""
+        return self.altars_present and self.item_type == ALTAR_ITEM
 
     def _load(self) -> None:
         self.z = 0.0
@@ -108,7 +128,7 @@ class FakeLevel:
         # CheckPoint.ResetRoom destroys and re-instantiates the room, which is why nothing may key on an instance.
         self.skull_key = "skull"
         self.skull_held = False
-        self.skull_in: str | None = PEDESTAL_KEY
+        self.skull_in: str | None = PEDESTAL_KEY if self._zone_accepts() else None
         self.skull_pos = list(PEDESTAL_POS)
         self.seconds = 0.0
         self.kills = 0
@@ -135,6 +155,11 @@ class FakeLevel:
     def get_obs(self) -> dict:
         return self._obs()
 
+    def kill(self) -> dict:
+        """The protocol's debug kill. soft_death is not modelled here, so this is always a real death."""
+        self.dead = True
+        return self._obs("kill")
+
     def reset(self, scene: str | None = None, checkpoint: bool = False) -> dict:
         self.resets.append(checkpoint)
         self.reset_scenes.append(scene)
@@ -149,7 +174,9 @@ class FakeLevel:
                 self.doors.append(RESPAWN_DOOR_KEY)
             # The respawn re-instantiates the room, so its skull comes back under a new key.
             self.skull_key = f"skull#{self.restarts}"
-            self.skull_held, self.skull_in, self.skull_pos = False, PEDESTAL_KEY, list(PEDESTAL_POS)
+            self.skull_held = False
+            self.skull_in = PEDESTAL_KEY if self._zone_accepts() else None
+            self.skull_pos = list(PEDESTAL_POS)
         else:
             self._load()
         self.enemy_alive = True  # a fresh load or a checkpoint respawn both re-create the room's enemy
@@ -159,12 +186,12 @@ class FakeLevel:
     def _punch(self) -> None:
         """What `Punch.AltHit` does: place if holding and in reach of a zone, else throw; pick up if not holding."""
         if self.skull_held:
-            if abs(self.z - ALTAR_POS[2]) <= PUNCH_RANGE:
+            if self._zone_accepts() and abs(self.z - ALTAR_POS[2]) <= PUNCH_RANGE:
                 self.skull_held, self.skull_in, self.skull_pos = False, ALTAR_KEY, list(ALTAR_POS)
             else:  # ActiveStart throws whatever it is holding when the active frame did not place it
                 self.skull_held, self.skull_in, self.skull_pos = False, None, [0.0, self.y, self.z]
                 self.thrown += 1
-        elif abs(self.z - self.skull_pos[2]) <= PUNCH_RANGE:
+        elif self.item_active and abs(self.z - self.skull_pos[2]) <= PUNCH_RANGE:
             # Including out of a filled altar: AltHit's !holding branch is ForceHold whatever the skull sits in.
             self.skull_held, self.skull_in = True, None
             self.picked_up += 1
@@ -206,12 +233,12 @@ class FakeLevel:
             "open": abs(self.z - pos[2]) <= 8.0,  # the DoorController proximity trigger
             "locked": False, "active": True, "controller_active": True,
         } for key, pos, hops in self.gates]
-        if self.skulls and self.skull_fields:
+        if self.skulls and self.skull_fields and self.altars_present:
             for g in gates:
                 if g["key"] == SKULL_GATE_KEY:
                     # A skull-locked door reports exactly like a walk-up door; needs_item is the only difference.
                     # It clears from the LIVE altar only -- the dead twin can never fill (M14/X1).
-                    g["needs_item"] = None if self.skull_in == ALTAR_KEY else "SkullRed"
+                    g["needs_item"] = None if self.skull_in == ALTAR_KEY else ALTAR_ITEM
                     g["altar_only"] = True
         return {"gates_ordered": self.gates_ordered, "gates_truncated": False, "gates": gates}
 
@@ -220,20 +247,21 @@ class FakeLevel:
         if not self.skulls or not self.skull_fields:
             return {}
         def zone(key, pos, filled, doors, ancestors=1):
-            return {"key": key, "pos": list(pos), "item": "SkullRed", "filled": filled, "active": True,
+            return {"key": key, "pos": list(pos), "item": ALTAR_ITEM, "filled": filled, "active": True,
                     "inactive_ancestors": ancestors, "reverse_doors": [],
                     "doors": [{"key": k, "pos": list(SKULL_GATE_POS)} for k in doors]}
+        altars = [
+            # The pedestal drives no door and reads filled the moment its room switches on (31 zones
+            # campaign-wide do); the live destination altar opens the gate; the dead twin never can.
+            zone(PEDESTAL_KEY, PEDESTAL_POS, self.skull_in == PEDESTAL_KEY, ()),
+            zone(ALTAR_KEY, ALTAR_POS, self.skull_in == ALTAR_KEY, (SKULL_GATE_KEY,)),
+            zone(DEAD_TWIN_KEY, ALTAR_POS, False, (SKULL_GATE_KEY,), ancestors=2),
+        ]
         return {
-            "altars": [
-                # The pedestal drives no door and reads filled the moment its room switches on (31 zones
-                # campaign-wide do); the live destination altar opens the gate; the dead twin never can.
-                zone(PEDESTAL_KEY, PEDESTAL_POS, self.skull_in == PEDESTAL_KEY, ()),
-                zone(ALTAR_KEY, ALTAR_POS, self.skull_in == ALTAR_KEY, (SKULL_GATE_KEY,)),
-                zone(DEAD_TWIN_KEY, ALTAR_POS, False, (SKULL_GATE_KEY,), ancestors=2),
-            ],
+            "altars": altars if self.altars_present else [],
             "items": [{
-                "key": self.skull_key, "pos": list(self.skull_pos), "item": "SkullRed", "held": self.skull_held,
-                "placed": self.skull_in is not None, "placed_in": self.skull_in, "active": True,
+                "key": self.skull_key, "pos": list(self.skull_pos), "item": self.item_type, "held": self.skull_held,
+                "placed": self.skull_in is not None, "placed_in": self.skull_in, "active": self.item_active,
                 "active_self": True, "inactive_ancestors": 1,
             }],
         }
@@ -1030,9 +1058,9 @@ SKULL_REWARDS = RewardConfig(time=0.01, checkpoint=10.0, arena_clear=10.0, door_
                              gate=15.0, gate_approach=0.15, item_pickup=15.0, item_placed=15.0, punch=0.01)
 
 
-def skull_env(**overrides) -> tuple[UltrakillEnv, FakeLevel]:
+def skull_env(*, skulls: dict | None = None, **overrides) -> tuple[UltrakillEnv, FakeLevel]:
     env, fake = make_env(rewards=SKULL_REWARDS, **overrides)
-    fake.enable_skulls()
+    fake.enable_skulls(**(skulls or {}))
     return env, fake
 
 
@@ -1144,6 +1172,47 @@ def test_punch_is_dropped_while_carrying_outside_range_and_kept_inside():
     env.close()
     assert (picked, placed) == (1, 1) and carried_and_dropped >= 5
     assert fake.thrown == 0 and fake.picked_up == 1
+
+
+def test_punch_passes_through_while_carrying_an_item_no_altar_wants():
+    """Level 0-4's shape: a `CustomKey1` carryable and not one `ItemPlaceZone` in the level.
+
+    The protection exists to stop a punch throwing an item that has somewhere to go. Where nothing accepts what
+    is held there is nothing to protect, and the button is not free: dropping it costs the parry, the melee and
+    the throw itself, for the whole carry, on a level 0-4's key is carried across. The first version tested
+    `any(items[].held)`, so picking the key up silenced punch until the key was delivered -- and it could not
+    even be thrown away to get the button back, because throwing is a punch.
+    """
+    env, fake = skull_env(max_steps=40, skulls=dict(altars=False))
+    env.reset(seed=0)
+    assert env._raw["campaign"]["altars"] == [] and env._raw["campaign"]["items"], "items, and no altars at all"
+    assert "needs_item" not in env._raw["campaign"]["gates"][0], "so the gate is an ordinary walk-up door"
+    assert "subgoal" not in env.gates.target, "and the forced look mode is inert: it needs a sub-goal target"
+    kept = 0
+    for _ in range(12):  # walks from z 0 to z 24, over the key at z 20, pressing punch every decision
+        env.step(action(move=True, buttons=("punch",)))
+        kept += "punch" in fake.last_action["buttons"]
+    env.close()
+    assert kept == 12, f"every press must reach the game; {12 - kept} were dropped"
+    assert fake.picked_up >= 1 and fake.thrown >= 1, "it was picked up by punching and thrown by punching"
+
+
+def test_punch_passes_through_while_carrying_an_item_the_altars_do_not_accept():
+    """The test is the held item's TYPE, not "something is held": 1-1 carries two skull colours at once."""
+    env, fake = skull_env(max_steps=60, skulls=dict(item_type="CustomKey1"))
+    env.reset(seed=0)
+    assert env._raw["campaign"]["gates"][0]["needs_item"] == ALTAR_ITEM, "the gate still wants a red skull"
+    assert env.gates.target["key"] == SKULL_GATE_KEY and "subgoal" not in env.gates.target, \
+        "no source of the wanted type exists, so the fetch machine never starts"
+    walk(env, 8)  # z 16, within punch range of the loose key at z 20
+    env.step(action(buttons=("punch",)))
+    assert fake.skull_held and "punch" in fake.last_action["buttons"], "the pickup press reached the game"
+    kept = 0
+    for _ in range(6):
+        env.step(action(move=True, buttons=("punch",)))
+        kept += "punch" in fake.last_action["buttons"]
+    env.close()
+    assert kept == 6, "an unwanted carry never gates the button, however far from an altar it goes"
 
 
 def test_carry_protection_can_be_turned_off_and_then_the_punch_throws_it():
