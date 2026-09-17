@@ -140,7 +140,7 @@ def campaign_block(obs: dict[str, Any], explore: list[float] | None = None, targ
                100/200 -- the exit is ~195 m from 0-1's spawn, which the gate scales would put near 4.0. All four
                are clipped to +-4.0 as a guard
         9      target mask: 1.0 when a target exists
-        10-12  target gate `open`, `locked`, `hops` / 20 -- all 0.0 when the target is the exit or absent
+        10-12  target gate `open`, `locked`, min(`hops`, 20) / 20 -- all 0.0 when the target is the exit or absent
         13-17  nearest checkpoint neither activated nor current: rel xyz / 100, distance / 200, mask
         18-22  first locked door (the mod sends them nearest first): rel xyz / 50, distance / 100, mask
         23-26  arena enemies alive / 20, timer running, input locked, level seconds / 600
@@ -174,7 +174,10 @@ def campaign_block(obs: dict[str, Any], explore: list[float] | None = None, targ
         if not is_exit:
             out[10] = float(bool(target.get("open")))
             out[11] = float(bool(target.get("locked")))
-            out[12] = float(target["hops"]) / 20.0
+            # Bounded, so slot 12 cannot read above 1.0 whatever ships in a route file: a 25-rung trunk would
+            # otherwise pin a learned input column. A proven no-op on everything that exists -- the deepest
+            # gate ladder in the campaign is 13 hops and the longest room trunk 14 (spec §9).
+            out[12] = min(float(target["hops"]), 20.0) / 20.0
 
     pending = [cp for cp in (c.get("checkpoints") or []) if not cp["activated"] and not cp["current"]]
     if pending:

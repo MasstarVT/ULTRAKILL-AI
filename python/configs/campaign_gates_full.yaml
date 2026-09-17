@@ -1,0 +1,112 @@
+# The whole routed campaign: every shipped level that has a route signal, in mission order.
+#
+# This is configs/campaign_gates_main.yaml with ONE change -- the `levels` list, 11 -> 30 -- and nothing else.
+# Every env setting, every reward weight and every hyperparameter is character-for-character what the live run
+# is training under, and a test pins that
+# (test_campaign_config.test_the_full_config_is_the_main_config_with_more_levels). Same run name, same
+# models/campaign_gates/, same weights, same policy: this is the main run continuing with a longer ladder in
+# front of it, exactly as campaign_gates_main.yaml was to campaign_gates_prelude.yaml.
+#
+# NOT the live config, and not to be started casually. It is the config for AFTER the route fallback's
+# acceptance checks pass, because 12 of these 30 levels have no gate ladder at all and are routed by the
+# offline room trunks of docs/superpowers/specs/2026-09-17-route-fallback-and-boss-levels-design.md. Read that
+# spec's §10 table before starting it, and read the three warnings below.
+#
+# THE 30 LEVELS, and why exactly these. All 33 levels this game build ships, minus three that have no route
+# signal of any kind and minus the two with no scene bundle:
+#   - 18 on layer 1, the mod's live gate ladder: 0-1, 0-2, 0-3, 0-4, 1-1, 1-2, 2-1, 2-2, 2-3, 3-1, 3-2, 4-1,
+#     4-3, 5-1, 5-3, 6-1, 8-1, 8-2. These are untouched by the route work: `_gates()`'s success path is byte
+#     for byte what it was, no route file ships for any of them, and A0/A3 are what measure that.
+#   - 12 on layer 2, the offline room trunk: 0-5, 1-4, 2-4, 4-2, 4-4, 5-2, 7-1, 7-2, 7-3, 7-4, 8-3, 8-4.
+#     Eight get a trunk from the first room to the exit; FOUR STOP AT A SKULL/ALTAR LOCK (1-4, 4-4, 7-1, 7-2)
+#     until stage S3 stamps `needs_item` live, so their trunk is correct up to the lock and no further.
+#   - left out, with no route signal at all (spec §11.1): 1-3 (both wings required, and `GateProgress` cannot
+#     express "both"), 5-4 (the Leviathan arena: no numbered rooms, no gate-candidate doors) and 6-2 (two
+#     numbered rooms, one of them the Prime Sanctum door). They would train on the exit vector and exploration
+#     alone, which is what the whole campaign did before the gates work, and they are better added by name
+#     when there is something to route them with.
+#   - left out because the game cannot load them: Level 9-1 and Level 9-2 ship no scene bundle, and
+#     `UltrakillEnv` refuses them outright (CAMPAIGN_LEVELS_SHIPPED).
+# Mission order, not difficulty order, because `unlock_next` is a chained ladder: 0-1 is levels[0] and is
+# always unlocked, and each level opens its successor on its own rate (or on the 600-episode safety valve).
+# `unlocked` is latched per level BY NAME, so inserting 0-5 between 0-4 and 1-1 re-locks nothing that the live
+# run has already opened (test_inserting_a_level_before_an_unlocked_one_keeps_it_unlocked).
+#
+# THREE THINGS TO WATCH, none of them fixed here on purpose.
+#
+# 1. `max_steps` is 12000 for every level, and these levels are not the same size. It was measured on 0-1
+#    (median 6854 decisions for a completion, 24 of the last 100 fresh episodes cut off at 9000), and 8-3's
+#    trunk polyline alone is 3542 m against 0-1's 144 m longest gap. A longer level is therefore truncated by
+#    construction and its completion rate is NOT comparable with 0-1's -- judge this run PER LEVEL, on the
+#    dashboard's `levels` rows and status.json's `campaign.levels` table, never on the pooled
+#    `fresh_completion_rate`, which is a shrunk SUM over the unlocked levels and can exceed 1.0. The lever when
+#    a long level is being cut off is `max_steps_per_level`, which is deliberately still empty: one cap per
+#    level is its own decision with its own measurement, and it cannot be made from 0-1's numbers.
+#
+# 2. `gate_approach` on the long trunks. It is a global weight shared with the levels the live run is already
+#    training, so there is no per-level lever by design (spec §6). Measured per level over the shipped trunks,
+#    the worst case is 8-3 at 785 of `gate_approach` plus 180 of `gate` against `level_complete` 100 -- 9.7x.
+#    TRIPWIRE (spec §12.6): if `part_gate_approach` exceeds 6x `part_level_complete` over a 50-episode window
+#    on a fallback level whose completion rate is still 0, regenerate THAT LEVEL'S route file with a lower
+#    MAX_RUNGS. The data lever is reversible and level-local; the weight lever is neither.
+#
+# 3. A bad rung is worse than no rung, and no offline method can prove a leg is walkable (spec §2.8). The
+#    detector is `route_source` 2 (the dashboard's `route layer` row, poll_status.py's `route_source` column)
+#    on a level whose fresh `gates_reached` is stuck with `targets_parked` 0 -- a monotone trunk's rung-below is
+#    usually also its nearest unreached rung, so the patience rule is nearly inert there and will not rescue it.
+#    The cure is that level's own file: set its `"rungs": []` and it falls back to the exit vector with no code
+#    change and no retrain. 8-4 (0 of 4 legs checkpoint-witnessed), 2-4 (1 of 4, and its hops-1 rung is a tram)
+#    and 7-1 (5 of 10, order fixed offline and never read live) are the three to check first.
+#
+# From python/ (one display, so --monitor 1 everywhere):
+#   python scripts/games.py launch --count 12 --monitor 1
+#   python scripts/train.py --config configs/campaign_gates_full.yaml --resume models/campaign_gates/latest.zip
+#   python scripts/poll_status.py --run campaign_gates      # move metrics_log.csv aside for the new column
+#   python scripts/keep_best.py --run campaign_gates --metric campaign
+#   python scripts/dashboard.py --run campaign_gates --monitor 1
+#   python scripts/games.py stop
+env:
+  mode: campaign
+  levels: ["Level 0-1", "Level 0-2", "Level 0-3", "Level 0-4", "Level 0-5",
+           "Level 1-1", "Level 1-2", "Level 1-4",
+           "Level 2-1", "Level 2-2", "Level 2-3", "Level 2-4",
+           "Level 3-1", "Level 3-2",
+           "Level 4-1", "Level 4-2", "Level 4-3", "Level 4-4",
+           "Level 5-1", "Level 5-2", "Level 5-3",
+           "Level 6-1",
+           "Level 7-1", "Level 7-2", "Level 7-3", "Level 7-4",
+           "Level 8-1", "Level 8-2", "Level 8-3", "Level 8-4"]
+  unlock_rate: 0.5
+  unlock_window: 20
+  unlock_after_fresh_episodes: 600
+  level_weight_floor: 0.1
+  difficulty: 3
+  unlock_all_gear: true
+  fixed_fps: 30
+  frameskip: 2
+  render: false
+  soft_death: false
+  window_width: 368
+  window_height: 207
+  max_steps: 12000
+  fresh_start_prob: 0.2
+  stuck_seconds: 45
+  stuck_repeats: 3
+  cell_size: 4.0
+  pitch_limit_deg: 45.0
+  # configs/campaign_gates_main.yaml's weights, unchanged. A test pins every one of them equal, because the
+  # same policy continues on the same weights and the route fallback adds no reward term at all: a room rung
+  # pays through `gate` and `gate_approach`, exactly as a door does.
+  rewards: {time: 0.02, level_complete: 100.0, checkpoint: 10.0, arena_clear: 10.0, door_unlock: 15.0,
+            gate: 15.0, gate_approach: 0.15, novelty: 0.2, path: 0.0, kill: 0.5, damage_dealt: 0.5,
+            damage_taken: 0.01, death: 5.0, style: 0.0, punch: 0.01,
+            item_pickup: 10.0, item_placed: 20.0}
+train:
+  algo: ppo
+  num_envs: 12
+  run_name: campaign_gates
+  timesteps: 20000000
+  save_every: 50000
+  policy_kwargs: {net_arch: [512, 512]}
+  hyperparams: {learning_rate: 0.0002, n_steps: 2048, batch_size: 512, n_epochs: 5, gamma: 0.998,
+                gae_lambda: 0.95, ent_coef: 0.004, target_kl: 0.03}

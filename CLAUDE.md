@@ -116,7 +116,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       `look_enemy_frac`, which only `episodes.jsonl` reads. `oob_frac` is the share of steps with no ground
       beneath, i.e. falling or off the map.
     - `difficulty` and `unlock_all_gear` are sent on connect. With `explore_dir` the exploration archive is saved to `explore_<level>_<port>.npz` every 20 episodes and on close; with `best_runs_dir` the fastest fresh-start completion goes to `<level>.json` (positions every step, official time, rank).
-  - `spaces.py`: obs packing and `MultiDiscrete` actions. Cyber Grind is 448 dims, with 5 zeros where the retired route waypoint was so its checkpoints load; `ObsLayout(campaign=True)` is 479, replacing those 5 with the 36-value `campaign_block` (exit, **route target**, nearest checkpoint neither activated nor current, first locked door, arena enemies / timer / input lock / level seconds, and 9 exploration-map values). Every index before it is unchanged.
+  - `spaces.py`: obs packing and `MultiDiscrete` actions. Cyber Grind is 448 dims, with 5 zeros where the retired route waypoint was so its checkpoints load; `ObsLayout(campaign=True)` is 479, replacing those 5 with the 36-value `campaign_block` (exit, **route target**, nearest checkpoint neither activated nor current, first locked door, arena enemies / timer / input lock / level seconds, and 9 exploration-map values). Every index before it is unchanged. Slot 12 is `min(hops, 20)/20` — a **bound, not a behaviour change** (the deepest gate ladder in the campaign is 13 hops and the longest shipped room trunk 15 rungs, so it is a proven no-op on everything that exists), there so a regenerated file with 25 rungs cannot feed a learned input column a value above 1.0.
     - **Absolute 448-455 changed meaning** (block 5-12): they carried the NavMesh path hint and now carry the
       `GateProgress` target -- rel xyz, 3-D distance, mask, gate `open`, `locked`, `hops`/20. Gate scales 50/100,
       exit scales 100/200 (0-1's exit is ~195 m from spawn, which the gate scales would push near 4.0), all four
@@ -214,6 +214,27 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       `ResetRoom` banished by `x + 10000f`. A later report a whole multiple of 10,000 *below* the frozen one is
       accepted (the banish only ever adds, so that is the live pit coming back); anything beyond
       `exit_max_shift_m` is ignored. `env._guard_exit` runs it on every campaign observation the env adopts.
+    - **The route fallback — layer 2, the offline room trunk** (branch `route-fallback`, spec
+      `2026-09-17-route-fallback-and-boss-levels-design.md`). `_read_route` (lru-cached parse) / `load_route`
+      (a per-instance **deep copy**, because `_choose_target` hands a rung straight out as `self.target`) read
+      `ultrakill_ai/routes/route_<scene>.json`, and `GateProgress(route=...)` consults it on the **three
+      `return []` arms of `_gates()` and nowhere else** — so the `return gates` success path is byte for byte
+      what it was and no level with a usable gate ladder can reach any of this. Precedence per level load:
+      **gates ladder (18 levels) → room trunk (12) → exit vector (3)**. Five rules hold the two layers apart:
+      `_is_room_ladder` is **object identity** against the loaded document (nothing in the data can switch a
+      rooms-only rule on for a gate); `_hops_source` clears the ladder on a mid-load layer flip, because the
+      two carry different hop scales; guard **I5** refuses a file whose `exit.pos` is more than
+      `route_exit_tol_m` (5 m) from the pit the game reports **and clears `target` / `best_dist`**, so a stale
+      file really falls back instead of holding its last rung while `gate_approach` pays toward it; `_seed_start`
+      **absorbs** the rung the player loads near (within `route_seed_m`, 150 m) in all four of `mark_paid`'s
+      places rather than only the two hop floors, so the trunk aims at the rung *below* from the first decision
+      and can pay nothing for it; and the loader **normalises** `open`/`locked`/`active` and strips any static
+      `needs_item` rather than trusting the file (`open: true` would double `_is_reached`'s cylinder to
+      16 × 12 m and pin observation slot 453; a static `needs_item` is a permanent wedge). `route_source` is an
+      **integer** — 0 exit vector / 1 gates / 2 rooms — because everything in `CAMPAIGN_INFO_KEYS` goes through
+      `ProgressCallback._num`; the string rides `EPISODE_LOG_RAW` as `route_source_name`. `set_route` swaps the
+      trunk when the curriculum switches level. `route=None` (Cyber Grind, `route_fallback: false`, and the 21
+      levels with no file) is provably the tracker without this spec.
   - `progress.py`: `ProgressCallback`. **Chart history keeps `timesteps` strictly increasing**: `_restore` carries
   the whole old history over, but resuming from an *older* checkpoint rewinds `num_timesteps`, so the restored tail
   would sit ahead of the points that follow it and the dashboard would draw a line doubling back on itself (seen
@@ -235,6 +256,22 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   helper, which would write `null` for exactly the two fields that say where an episode died. A write failure
   warns and never stops training.
 - `python/scripts/`: `bridge_test.py` (`--drive`, `--campaign`), `random_agent.py` (`--mode campaign` prints completed / checkpoints_level / cells_new per episode), `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop/**relaunch** training instances; `relaunch --port N` restarts ONE instance, found by the pid listening on that port, leaving the others running — `launch` cannot, it calls `stop_all()` first), `dashboard.py` (Tkinter live view of `status.json`).
+- `python/ultrakill_ai/routes/route_Level_*.json`: **the committed room trunks, 12 files, 95 rungs, ~17 KB**
+  (0-5, 1-4, 2-4, 4-2, 4-4, 5-2, 7-1, 7-2, 7-3, 7-4, 8-3, 8-4) — layer 2's whole data set. Each is a ladder of
+  `{key, pos, hops, name, gated_by, open, locked, active}` rungs shaped exactly like a gate array, plus the
+  `exit` it was built against (guard I5's staleness check) and the diagnostics `tour_ratio`,
+  `checkpoints_within_60m`, `legs_witnessed`, `last_rung_to_exit_m` and `trunk_collapsed`. **The recovery path
+  for a bad rung is this data, never a knob:** set a level's `"rungs": []` and it falls to the exit vector with
+  no code change and no retrain. `gated_by` is written but ignored by every consumer until stage S3.
+- `python/scripts/build_routes.py`: the only thing that writes those files — regenerates them from the shipped
+  scene bundles with the spec's pipeline in order **I6 → T → R4 → I2 → R1 → I3 → R2**. One self-contained file
+  (it inlines the pure-Python UnityFS/SerializedFile readers, the MonoScript map, the room-trunk chain assembly
+  and the voxel standability probe), so regenerating needs nothing but the repo and the game install; the game
+  path comes from `mod/GamePaths.props`. Read-only with respect to the game, single-threaded, no port, ~2 min
+  for all 33 levels, **safe to run beside a live run**. `--validate` is the acceptance report, `--dry-run`
+  measures without writing, `--levels` narrows, `--analyse-gates-levels` produces the gates-level comparison
+  under Gotchas. **Rerun it after every game update** (risk 3: I5 catches a moved `FinalPit` within 5 m but not
+  rooms that moved while the pit did not).
 - `python/ultrakill_ai/windows.py`: monitor work-area lookup shared by `games.py` and `dashboard.py`.
 - `python/scripts/campaign_check.py`: in-game campaign checks on one game (difficulty, arsenal, checkpoint trigger, death respawn, exit and official time). `python/tests/test_campaign_check.py` runs the same five checks against a fake level (no game needed).
 - `python/scripts/watch_completion.py`: watches a **human** playthrough read-only (never takes control, never
@@ -332,13 +369,41 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   as many decisions, every park of the high door records a strictly closer baseline (the park log is pinned
   exactly), the target moves onto the walkable route, the forward legs pay `gate` (7 against 3) and the high door
   is un-parked once the agent actually climbs to it (no game needed).
+- `python/tests/test_route_files.py`: the **data**, judged against the route spec's section 7.1 and importing
+  nothing that produced it — every guard is re-derived from the spec's wording and recomputed from the shipped
+  `pos` list, so a bug in `build_routes.py`'s own helpers cannot hide behind it. Schema and version, I1
+  (`hops` n-1..0, strictly descending, unique), I2 (16 m separation), I3 (≤ 24 rungs), R1 (≥ 3), **R2 with the
+  stored `tour_ratio` reproduced from `pos` to 3 decimals** (the assertion that caught revision 1's
+  1.264-vs-1.421 gap), I6 and T pinned by name, `key` == `round(pos)`, the `Pit` exception (hops-0 only, under
+  70 m from the pit), and **`test_shipped_set_is_exactly_the_twelve`**, which makes a regeneration that gains or
+  loses a level a test failure rather than a silent coverage change (no game needed).
+- `python/tests/test_route_replay.py`: **A0 of the route spec's section 8**, the safety property, and the
+  regression test for invariant T. Replays the real `GateProgress` over each shipped trunk **in every visit
+  order the level allows** and from every rung the player could start at, asserting the target never advances
+  past an unvisited rung and no step pays more than one instalment; a synthetic **STAR** fixture reproduces
+  section 2.6's four-instalments-in-one-step so the assertions are demonstrably not vacuous. Its other half
+  protects the live run: `GateProgress` **with a route document in hand** reproduces `test_ladder_replay.py`'s
+  golden file over all 32,022 recorded 0-1 decisions and both 0-3 probes, and `route_reads == 0` proves the
+  trunk was never even consulted on a gates level (no game needed).
+- `python/tests/test_route_walk.py`: the **liveness** property S1 and S2 owe each other, and the wrap-up
+  stage's own check. Loads all 12 committed files through the packaged path `load_route(scene)` exactly as
+  `UltrakillEnv` does, then walks each trunk with a **continuous** synthetic trajectory (4 m per decision,
+  through every rung and on to the pit): every rung below the one the player starts at must become the target
+  in turn, each pays **exactly one** instalment, and after the hops-0 rung the target is handed to the exit and
+  never comes back. A continuous walk rather than a teleport per rung because the two failures it is here to
+  catch are invisible to a teleport — overlapping reach cylinders marking two rungs in one decision, and a
+  target that flaps or parks mid-leg. Four controls keep it honest: the trunk walked **backwards** pays 0, a
+  **second lap** in the same level load pays 0, the **live patience setting** (300 decisions) parks nothing and
+  changes no target, and `GateProgress(route=None)` over the identical walk pays 0 and reports layer 3. The
+  measured `gate_approach` reproduces the spec's section 6 table to within a few percent from the tracker
+  rather than from the polyline (no game needed).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
 - `python/tests/test_spaces.py`: layout sizes (448 / 479) and every index range of the campaign block, including the yaw-frame signs (no game needed).
-- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands). `campaign_prelude.yaml` (the multi-level curriculum 0-1 / 0-3 / 0-4 under a new run name `campaign_prelude`, kept as the reference) and `campaign_1-1.yaml` (the first skull-carry level, run `campaign_1-1`, **`item_pickup` and `item_placed` pinned at 0.0** until the three in-game checks pass). `campaign_gates_prelude.yaml` carried the live run from 4.8M to 6.77M steps (curriculum 0-1 / 0-3 / 0-4, `num_envs` 8, `ent_coef` 0.004) and is kept as history and as the partial rollback. **`campaign_gates_main.yaml` is the live one** (integration pause #2, 2026-09-17): the same `run_name: campaign_gates`, so the 6.77M-step weights, `best.zip` and the exploration archives carry on, with the 11-level Tier A + Tier B ladder, `unlock_after_fresh_episodes: 600`, `max_steps` 12000, `item_pickup` 10.0 / `item_placed` 20.0, `num_envs` 12 and `ent_coef` still 0.004. Each config's header lists its own run commands, and **`tests/test_campaign_config.py` pins every setting and every reward weight that is NOT a named change equal to the config before it**, so nothing can drift while the same policy continues.
-- `docs/level-survey.md`: all 35 levels parsed offline from the scene files — exits, checkpoints, door graphs and gate ladders, altars and carryables, arenas, bosses and hazards, plus a tier table and the recommended order of sub-projects. This is what the multi-level and skull-gates design was built from; check it before assuming anything about a level nobody has trained on.
+- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands). `campaign_prelude.yaml` (the multi-level curriculum 0-1 / 0-3 / 0-4 under a new run name `campaign_prelude`, kept as the reference) and `campaign_1-1.yaml` (the first skull-carry level, run `campaign_1-1`, **`item_pickup` and `item_placed` pinned at 0.0** until the three in-game checks pass). `campaign_gates_prelude.yaml` carried the live run from 4.8M to 6.77M steps (curriculum 0-1 / 0-3 / 0-4, `num_envs` 8, `ent_coef` 0.004) and is kept as history and as the partial rollback. **`campaign_gates_main.yaml` is the live one** (integration pause #2, 2026-09-17): the same `run_name: campaign_gates`, so the 6.77M-step weights, `best.zip` and the exploration archives carry on, with the 11-level Tier A + Tier B ladder, `unlock_after_fresh_episodes: 600`, `max_steps` 12000, `item_pickup` 10.0 / `item_placed` 20.0, `num_envs` 12 and `ent_coef` still 0.004. **`campaign_gates_full.yaml` is the route-fallback config, staged and NOT yet live** (branch `route-fallback`): `campaign_gates_main.yaml` with **one** change, the `levels` list 11 → 30, and a test pins that character for character. Same `run_name: campaign_gates`, same weights, same policy — 18 of its levels are on layer 1, 12 on the offline room trunk, and 1-3 / 5-4 / 6-2 are left out because they have no route signal of any kind. Its header carries the three things to watch. Each config's header lists its own run commands, and **`tests/test_campaign_config.py` pins every setting and every reward weight that is NOT a named change equal to the config before it**, so nothing can drift while the same policy continues.
+- `docs/level-survey.md`: all 35 levels parsed offline from the scene files — exits, checkpoints, door graphs and gate ladders, altars and carryables, arenas, bosses and hazards, plus a tier table and the recommended order of sub-projects. This is what the multi-level and skull-gates design was built from; check it before assuming anything about a level nobody has trained on. **Section 9 is the route-coverage appendix** (stage S1, 2026-09-17): which layer fires on each of the 33 levels, and per shipped trunk its rungs, gaps, tour ratio, legs witnessed and last-rung-to-pit distance.
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
-- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign design; `2026-09-16-campaign-gates-unwedge-design.md` is the route-gates / un-wedge / look-modes design that followed the 0-1 pilot's diagnosis (implemented in mod v0.6.0 and the `campaign_gates` run; its section 14 records the lead rulings R1-R4); `2026-09-17-multi-level-and-skull-gates-design.md` is the multi-level curriculum / gates guard / 6-2 exit / skull-carry design (implemented on branch `next-levels` and mod v0.7.0; its section 8 lists the five in-game checks, section 10 the risks and section 11 the review dispositions); `2026-09-17-ladder-patience-and-exit-guard.md` is the collapsed-ladder / banished-exit design (implemented on branch `ladder-fix`, Python only; its section 3 records the five deviations from the brief that measurement forced and why the reach test was left alone, section 6 the proof obligations and the tests that discharge them, and **section 7 the disposition of the eight adversarial-review findings** — six bugs fixed, one proposed cure rejected with a reproduction of its own failure, and one claim about 0-1 rebutted by measurement).
+- `docs/superpowers/specs/`: approved design specs. `2026-09-16-campaign-foundation-design.md` is the campaign design; `2026-09-16-campaign-gates-unwedge-design.md` is the route-gates / un-wedge / look-modes design that followed the 0-1 pilot's diagnosis (implemented in mod v0.6.0 and the `campaign_gates` run; its section 14 records the lead rulings R1-R4); `2026-09-17-multi-level-and-skull-gates-design.md` is the multi-level curriculum / gates guard / 6-2 exit / skull-carry design (implemented on branch `next-levels` and mod v0.7.0; its section 8 lists the five in-game checks, section 10 the risks and section 11 the review dispositions); `2026-09-17-ladder-patience-and-exit-guard.md` is the collapsed-ladder / banished-exit design (implemented on branch `ladder-fix`, Python only; its section 3 records the five deviations from the brief that measurement forced and why the reach test was left alone, section 6 the proof obligations and the tests that discharge them, and **section 7 the disposition of the eight adversarial-review findings** — six bugs fixed, one proposed cure rejected with a reproduction of its own failure, and one claim about 0-1 rebutted by measurement). **`2026-09-17-route-fallback-and-boss-levels-design.md`** is the route-fallback / boss-levels design, revision 2, 1115 lines (branch `route-fallback`; stages S1 and S2 built, S3 and S4 not): three layers with a strict precedence rule, the offline room trunk that routes the 12 levels the gate ladder cannot, and the boss block that is deliberately off the critical path. Read section 2.6 before touching the ordering (a total order cannot express a branch, which is why only the **trunk** ships), 4.3 for the guard pipeline, 4.5 for the skull locks four levels stop at until S3, section 8 for the acceptance checks A0-A5, **11.5 for the four-stage build plan**, 12 for the nine risks and 13.2 for the five things already tried and rejected — a straight-line distance-to-exit reward, a static `needs_item`, renumbering so the lowest rung is hops 1, a per-level `gate_approach` scale and refusing every level that crosses an altar door.
 - `docs/superpowers/plans/`: implementation plans. `2026-09-16-campaign-foundation.md` is the 16-task plan for the campaign foundation and the 0-1 pilot (Tasks 0-13 dry-run in a scratch copy: mod builds clean, all tests pass). `2026-09-17-next-levels-integration.md` is the ordered checklist for merging branch `next-levels` into main at a training pause and verifying it in the live game (merge, build and install, the six in-game readouts, the 20k-step smoke run, how to carry the live 0-1 policy into the multi-level run, and rollback).
 - `.tools/` (gitignored): local `ilspycmd` install used to regenerate `decompiled/`.
 
@@ -476,7 +541,9 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **parked/ep + exit-banished row** for the two ladder-patience mechanisms, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**18 files; 408 named tests** as of 2026-09-17, of which `test_progress.py`'s 19 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, and `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 12 trunks walked end to end). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**21 files; 477 named tests** as of 2026-09-17, of which `test_progress.py`'s 20 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, and `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
+  **In a worktree, set `PYTHONPATH` to that worktree's `python/`** or `import ultrakill_ai` resolves to the main tree and every test measures the wrong code: `$env:PYTHONPATH = "F:\Github\ULTRAKILL-AI-route\python"`.
+- Regenerate the route data (no game, no port, safe beside a live run): `python scripts/build_routes.py --validate` from `python/`. ~2 min for all 33 levels; it rewrites only `ultrakill_ai/routes/` and exits non-zero if any shipped level changes shape. Run it after every game update, then `python tests/test_route_files.py`.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
 
 ## Key design decisions
@@ -651,6 +718,41 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   which is why the bug went unseen for a whole run. Target patience (branch `ladder-fix`) is the mitigation, not
   a cure: it parks a target that stops getting closer and falls back to the nearest unreached gate at any hop
   count. If the falsifier under Status fails, the ladder needs a real per-level route, not another knob.
+
+- **The room trunk IS that per-level route for three of the six, measured 2026-09-17 — and it is deliberately
+  not shipped.** Stage S1 ran its pipeline over the six collapsed levels as a scratch measurement
+  (`python scripts/build_routes.py --levels 0-3 1-1 1-2 2-3 4-3 8-1 0-1 --analyse-gates-levels --dry-run`;
+  no file is written for any of them, because the emitter refuses to emit where the live gate guard passes,
+  and the route spec's risk 5 does not authorise replacing a gates ladder). The control first: **0-1**'s trunk
+  is 13 rungs, tour **1.000**, 13/13 legs witnessed, 6/6 checkpoints, 8/8 authored directed facts, and the gate
+  `hops` beside each trunk rung read `9,9,9,8,7,6,5,4,3,2,2,1,0` — monotone, reproducing the working ladder rung
+  for rung. Then:
+  - **0-3 — yes, and it would fix the collapse by construction.** Trunk 11 rungs, tour 0.944, 9/11 legs, 4/4
+    checkpoints. The gate `hops` along the trunk are `2,2,3,4,5,6,4,4,3,2,0` — the same out-and-back shape as
+    the measured walkable sequence above — while the trunk itself expresses that route as a strictly monotone
+    `10..0`, so **every forward leg pays**. It cannot collapse the same way either: the gate that collapses 0-3
+    (`0,13,330`, reached from the floor below) corresponds to trunk rung 2 of 11, and the floor-2 room above it
+    sits **40 m higher**. Over all 19 levels probed, the closest pair of trunk rungs within `_is_reached`'s 6 m
+    of vertical is **21 m apart horizontally** against an 8 m cylinder — invariant I2's 16 m separation plus the
+    room numbering keeps floors apart in a way the door graph does not.
+  - **4-3 — the strongest of the six.** 8 rungs, tour 1.000, 6/8 legs, 3/3 checkpoints, every guard passed. The
+    live ladder only covers the second half (3 of 5 gates carry `hops`, ratio 0.600, barely over the 0.5
+    threshold; the first four trunk rungs have no gate hops at all); the trunk covers the level from spawn.
+  - **1-1 — yes, and it measures the route spec's risk 5 directly.** 12 rungs, tour 1.058, 8/12 legs, 4/4
+    checkpoints. The gate nearest the spawn carries **`hops` 1**, i.e. 1-1's final door really does list the
+    spawn field in `activatedRooms` and put the spawn one hop from the goal. The trunk orders it `11..0`. It
+    would stop at a lock until S3 (SkullRed on leg 2, SkullBlue on leg 9).
+  - **8-1 — plausible order, but it loses the exit room.** 20 rungs, tour 1.245, 15/20 legs, 7/7 checkpoints,
+    but only one directed fact to score against, and invariant **T drops the exit's own room
+    `2C - Bathroom Ending`** (a member of a 429 m wide parallel set), leaving the last rung **1,513 m** from the
+    pit. Its first three rungs also sit beside `hops` 0 gates — the loop its ladder collapses on. Not a drop-in.
+  - **1-2 and 2-3 — refused by the spec's own tour guard.** 1-2 scores **1.426** and 2-3 **1.393** against R2's
+    1.35, so even if layer 2 were allowed to fire there neither would get a file.
+
+  **The order for the lead**, if the `ladder-fix` falsifier fails on 0-3: the trunk is the fix in hand for 0-3,
+  4-3 and 1-1, and taking it means a deliberate ruling to let layer 2 **replace** a passing gate ladder on
+  named levels — a change to `_gates()`'s precedence, not a data change, and it must be judged against A3
+  (0-1 identical) exactly as S2 was.
 
 - **`campaign.exit.pos` gets BANISHED +10,000 m in X on 0-2, and the proper fix is mod-side.**
   `CheckPoint.Start` (`decompiled/CheckPoint.cs:132`) and `CheckPoint.ResetRoom` (`:681`) clone every room the
@@ -1819,3 +1921,144 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - Verified: the full no-game suite, **18 files, 408 named tests, 0 failures**, run from the worktree with
     `PYTHONPATH` pointed at it, plus each of the eight review findings re-run against the fixed code. Not
     verified in game — the live run was never touched, per the brief.
+
+- **Branch `route-fallback` — the offline room trunk, stages S1 and S2, built 2026-09-17 and READY TO ACTIVATE.**
+  Spec: `docs/superpowers/specs/2026-09-17-route-fallback-and-boss-levels-design.md` (revision 2). Python and
+  data only: **no mod change, no protocol change, no reward weight, no observation width change, no action-space
+  change, and no checkpoint invalidated.** 479 inputs either way. The live run was never touched.
+  - **What it buys.** 15 of the 33 shipped levels have no usable gate ladder at all, so `GateProgress._gates()`
+    returns `[]` and they have never had a route signal of any kind. 12 of them now ship an offline **room
+    trunk** — the numbered rooms every playthrough must pass, in order, shaped exactly like a gate array.
+    Campaign-wide: **18 gates + 12 rooms + 3 nothing**, against today's 18 + 15 nothing. Of the 12, **8 get a
+    trunk from the first room to the exit and 4 stop at a skull/altar lock** (1-4, 4-4, 7-1, 7-2) until stage S3
+    stamps `needs_item` live.
+  - **Why only the trunk.** Revision 1 shipped a strict total order over every room, and two independent reviews
+    found that `GateProgress` carries one `best_hops`: `_note_reached` collapses it to the minimum over every
+    rung each step, so **on a branching level the branch the agent enters second permanently loses its signal**.
+    Re-run with the real tracker, entering one of 1-4's five side rooms first pays **four instalments in a
+    single step** and then points the observation at the boss door with three required rooms unvisited — the
+    same total instalments either way, so it is signal death, not extra reward. Invariant **T** is the fix: a
+    parallel set is collapsed onto the rung it hangs off. Coarser, never wrong, and it costs 1-3 and 6-2.
+  - **Stages. S1 and S2 are built; S3 and S4 are out of scope and separately mergeable.** S3 is the live
+    `needs_item` stamp from `campaign.altars` that takes the four locked levels through to their exit; S4 is the
+    mod's boss block (`ScanBosses`, mod 0.7.1), which needs the game closed for a DLL rebuild and waits for a
+    natural pause regardless.
+  - **Evidence, all of it offline — and that is stated rather than implied.** The live configs name no level
+    with a route file, so **A0 and the `FakeLevel` cases are the whole of the pre-merge evidence for layer 2,
+    and A3 is the whole of the evidence that layer 1 is untouched.**
+    - The full no-game suite: **21 files, 477 named tests, 0 failures**, run from the worktree with `PYTHONPATH`
+      pointed at it.
+    - **A0** (`tests/test_route_replay.py`): the real `GateProgress` replayed over each shipped trunk in every
+      visit order the level allows and from every possible starting rung — the target never advances past an
+      unvisited rung, no step pays more than one instalment. Non-vacuous by construction: the same replay over a
+      synthetic star reproduces the four-at-once above.
+    - **Layer 1 is untouched, twice over.** With a route document in hand, `GateProgress` reproduces
+      `test_ladder_replay.py`'s golden file — 32,022 recorded 0-1 decisions and both 0-3 probes, produced by the
+      implementation from *before* any of this existed — and `route_reads == 0` proves the trunk was not merely
+      equal but never read. `_gates()`'s `return gates` success path is byte for byte what it was.
+    - **The trunks walk** (`tests/test_route_walk.py`, this stage's own check): all 12 files loaded through the
+      packaged path and walked end to end with a continuous synthetic trajectory. Every rung becomes the target
+      in order, each pays exactly one instalment, the exit takes over after the hops-0 rung and never hands back.
+      Backwards pays 0, a second lap pays 0, the live patience setting parks nothing, and `route=None` pays 0.
+    - The measured `gate_approach` reproduces the spec's section 6 table from the tracker rather than from the
+      polyline: 0-5 **68.8** (spec 72), 1-4 60.0 (62), 2-4 173.2 (178), 4-2 153.4 (157), 4-4 382.3 (392), 5-2
+      160.9 (167), 7-1 241.3 (252), 7-2 273.1 (291), 7-3 203.8 (220), 7-4 200.1 (204), 8-3 **776.6** (785), 8-4
+      64.8 (70). Consistently a few percent under, because `best_dist` is seeded where the player enters a rung's
+      cylinder rather than at its centre.
+  - **Known deviation from the spec's section 10, and it is the pipeline working.** **8-3 ships 16 rungs, not
+    13**, so the campaign total is **95 rungs, not 92**. Section 10's 13 was measured on revision 1's file, which
+    the budget cap had already cut before invariant T ran; revision 2 reversed the order so R2 is judged on what
+    ships, and after T the cap binds on nothing. Median gap 258 -> 167 m, tour 1.247 -> 1.239, R2 still passes.
+    It does raise 8-3's ladder: `gate` 180 -> **225**, so `gate` + `gate_approach` is **1,002 against
+    `level_complete` 100 — 10.0x**, above the 9.7x the spec quotes. See the tripwire below.
+  - **One other deviation, flagged for a ruling.** Invariant T's parallel-set predicate now additionally
+    requires its members to be **distinct places** (spread >= 16 m). Read literally, the stated order
+    I6 -> T -> R4 -> I2 would drop 5-2's `1A - Opening` and `1B - Second Rock`, which sit at *exactly* the same
+    point, and 5-2 would lose the rung at its own spawn. A group inside one reach cylinder is not a choice the
+    agent can take in either order — arriving marks every member at once — so T's justification does not apply
+    and I2 is what should collapse it. **Exactly one group campaign-wide is affected**; every other same-ordinal
+    group is 41 m or wider. With the clause 5-2 reproduces section 10 exactly.
+
+  ### Activation checklist — how to put this in front of the live run
+
+  Do these in order. Steps 1-3 need no pause; step 4 is the only one that stops training, and it is a
+  graceful stop, not a kill.
+
+  1. **Merge `route-fallback` into `main`.** Python and data only — **no mod build, so the games can stay up**:
+     `git -C F:\Github\ULTRAKILL-AI merge route-fallback`, then from `python/` run the whole no-game suite
+     against the merged main (21 files, 0 failures) and push. Nothing in the merge changes behaviour on any
+     level the live config names: all 11 are on layer 1 or have no file, so `route_source` will read **1** and
+     `load_route` returns `None` for every one of them. The supervisor restarts the trainer from main's code, so
+     **main must be left in a state that runs** — do not merge and then leave the suite unrun.
+  2. **Move the metrics log aside**, or the new column is silently dropped: `poll_status.py` keeps an existing
+     `metrics_log.csv` header.
+     `Move-Item runs\campaign_gates\metrics_log.csv runs\campaign_gates\metrics_log.pre-route.csv`.
+  3. **Confirm the baseline before changing the config.** On the merged main, `route_source` must read 1 and
+     `gates_reached` / completion on 0-1, 0-2, 0-3 must be unchanged. This is acceptance check **A3**, the only
+     gate the spec says can block the merge, and it can be read straight off the dashboard's new **`route
+     layer`** row and `status.json`'s `mean_100.route_source`. Leave it here for a window of >= 50 episodes.
+  4. **Switch the config — and note that the pause file alone is not enough.** The supervisor holds the config
+     on **its own command line** (`supervise.py --config ...`) and passes it to every `train.py` it starts, so
+     changing which config is live means **restarting the supervisor**, not just the trainer:
+     ```powershell
+     # from python/
+     New-Item runs\campaign_gates\SUPERVISOR_PAUSE          # 1. the supervisor stops restarting anything
+     # 2. Ctrl+C the supervisor's own console and wait for it to exit
+     # 3. Ctrl+C the trainer and wait for "Saved models\campaign_gates\latest.zip"
+     Remove-Item runs\campaign_gates\SUPERVISOR_PAUSE       # 4. lift the pause
+     python scripts/supervise.py --run campaign_gates --config configs/campaign_gates_full.yaml --count 12 --monitor 1
+     ```
+     The supervisor finds no trainer, treats it as DEAD, relaunches the twelve games, waits out its boot health
+     gate and starts `train.py --config configs/campaign_gates_full.yaml --resume <the checkpoint with the most
+     timesteps>`. `campaign_gates_full.yaml` is `campaign_gates_main.yaml` with **one** change — `levels` 11 -> 30
+     — so the run name, the weights, `best.zip` and the exploration archives all carry straight on.
+     **Rollback is the same four steps with `--config configs/campaign_gates_main.yaml`.**
+  5. **The switch is safe because of the unlock ladder, not because of the code.** At 10.78M steps only 0-1, 0-2
+     and 0-3 are unlocked and **0-4 is still locked**; the levels are in mission order, so **0-5 is the first
+     rooms-routed level and it cannot open until 0-4 does**. Nothing on layer 2 runs on the day of the switch.
+     That is the point: the config change is reversible for as long as it takes 0-4 to pass its unlock rate.
+
+  ### What to watch, in this order
+
+  1. **`route_source` per level** — the dashboard's **`route layer`** row, `poll_status.py`'s `route_source`
+     column, `status.json`'s `mean_100.route_source` and the per-episode string in `episodes.jsonl`
+     (`route_source_name`). Expect **1 ("gates")** for weeks. A window reading **"mixed"** is the first
+     evidence a rooms level is running; a **2** on any of the 18 gates levels is a bug and the merge should be
+     rolled back, because it means `_gates()`'s success path was reached and rejected.
+  2. **`targets_parked`** — expect **0 on every rooms level**, and understand that this proves nothing on its
+     own. A monotone trunk's rung-below is usually also its nearest unreached rung, so `_nearer_unreached` keeps
+     the ladder's pick and the patience rule is structurally inert there. A walk that reaches every rung parks
+     nothing; so does a walk that reaches none. **The detector for a bad trunk is `route_source` 2 with fresh
+     `gates_reached` stuck AND `targets_parked` 0** — not either half alone.
+  3. **Per-level `gates_reached` on the first rooms level to unlock, which is 0-5.** Read
+     `status.json`'s `campaign.levels["Level 0-5"].gates_reached` (a 100-episode mean, per level) and the
+     dashboard's `levels` rows — **never the pooled `fresh_completion_rate`**, which is a shrunk sum over the
+     unlocked levels and can exceed 1.0. 0-5's trunk is 5 rungs, so `gates_reached` should climb toward 5 and
+     `fresh_completion_rate` off 0. **Judge on fresh starts only, on a window of >= 50**: a respawn episode
+     inherits `gates_reached` from its level load. A 0-5 that sits at `gates_reached` 1 with `targets_parked` 0
+     is the "bad rung" case, and the cure is 0-5's own file (`"rungs": []`), not a weight.
+  4. **The `gate_approach` dominance tripwire (spec section 12.6).** `gate_approach` is a **global** weight
+     shared with the levels the live run is already training and there is deliberately **no per-level lever** —
+     adding one would be a reward change, which is the property this whole spec buys. **If `part_gate_approach`
+     exceeds 6x `part_level_complete` over a 50-episode window on a fallback level whose completion rate is
+     still 0, regenerate THAT LEVEL'S file with a lower `MAX_RUNGS`** before touching any weight: the data lever
+     is reversible and level-local, the weight lever is neither. **8-3 is expected to trip it** — its perfect
+     walk is 777 of approach against `level_complete` 100, i.e. 7.8x before a single completion exists — so plan
+     for that one rather than treating it as a surprise. 4-4 (4.9x) and 7-2 (4.8x) are the next two; every other
+     trunk is under 4x.
+  5. **8-4, 2-4 and 7-1 are the three weak trunks to check first** if a fallback run wanders: 8-4 is **0 of 4**
+     legs checkpoint-witnessed, 2-4 is 1 of 4 with a **tram** as its hops-1 rung, and 7-1 is 5 of 10 with an
+     order that was fixed offline and has never been read live. 4-4, 7-1 and 2-4 also carry rungs that are
+     **movers** (two elevators, two trams): the reach cylinder sits where the mover started, not where it is.
+
+  - **The S1 engineer's finding on the six collapsed-ladder gates levels is under Gotchas, not here**, because
+    it is a fact about the levels rather than about this branch: the room trunk reproduces a sensible walkable
+    order on **0-3, 4-3 and 1-1** and would fix the collapse by construction, 8-1 loses its exit room to
+    invariant T, and 1-2 and 2-3 are refused by the tour guard. **No file ships for any of the six** — all six
+    pass the layer-1 guard and the spec's risk 5 does not authorise replacing a gates ladder. Acting on it is a
+    separate ruling about `_gates()`'s precedence.
+  - **What is NOT measured, and cannot be offline: whether a leg is walkable in that direction.** The fine
+    geodesic was measured dead and a straight knee-height segment test is `partial` on 0-1 itself. The trunk is
+    ordered, standable (100 of 100 probed places pass the voxel guard R4 over 95 rungs) and corroborated (58 of
+    95 legs have an authored checkpoint within 40 m); it is not proved traversable. That is why the recovery
+    path is deliberately trivial and why `route_source` exists.

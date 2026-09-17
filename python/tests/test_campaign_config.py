@@ -23,6 +23,7 @@ PRELUDE = ROOT / "configs" / "campaign_prelude.yaml"
 LEVEL_1_1 = ROOT / "configs" / "campaign_1-1.yaml"
 GATES_PRELUDE = ROOT / "configs" / "campaign_gates_prelude.yaml"
 GATES_MAIN = ROOT / "configs" / "campaign_gates_main.yaml"
+GATES_FULL = ROOT / "configs" / "campaign_gates_full.yaml"
 RUN_NAME = "campaign_gates"
 MODEL_DIR = Path("models") / RUN_NAME
 RUN_DIR = Path("runs") / RUN_NAME
@@ -184,6 +185,62 @@ def test_the_main_config_carries_the_gates_prelude_run_forward():
     assert "6.0" in header, "and the entropy tripwire has to survive the config change"
 
 
+def test_the_full_config_is_the_main_config_with_more_levels():
+    """configs/campaign_gates_full.yaml: the whole routed campaign, and NOTHING else may differ from main.
+
+    The route fallback adds no reward term and no hyperparameter -- a room rung pays through `gate` and
+    `gate_approach` exactly as a door does -- so the only difference this config is allowed to carry is the
+    levels list. That is the property that makes it safe to hand to the same policy on the same weights, and
+    it is asserted field by field rather than described.
+    """
+    main_env, main_train = train.load_config(str(GATES_MAIN))
+    env_dict, train_cfg = train.load_config(str(GATES_FULL))
+    main, cfg = EnvConfig.from_dict(main_env), EnvConfig.from_dict(env_dict)
+
+    differing = {f.name for f in dataclasses.fields(EnvConfig)
+                 if getattr(cfg, f.name) != getattr(main, f.name)}
+    assert differing == {"levels"}, f"only the levels list may change, got {sorted(differing)}"
+    assert cfg.rewards == main.rewards, "no reward weight moves: the fallback adds no term"
+    assert train_cfg == main_train, "same run name, same num_envs, same optimiser, same everything"
+    assert train_cfg["run_name"] == RUN_NAME and train_cfg["hyperparams"]["ent_coef"] == 0.004
+
+    # The 30 levels: every shipped level with a gate ladder OR a route file, in mission order.
+    unrouted = {"Level 1-3", "Level 5-4", "Level 6-2"}  # spec §11.1: no route signal of any kind
+    assert set(cfg.levels) == CAMPAIGN_LEVELS_SHIPPED - unrouted
+    assert len(cfg.levels) == 30 and len(set(cfg.levels)) == 30
+    assert not unrouted & set(cfg.levels), "a level with no route signal would train on the exit vector alone"
+    assert "Level 9-1" not in cfg.levels and "Level 9-2" not in cfg.levels, "no scene bundle in this build"
+    order = [CAMPAIGN_LEVELS.index(lv) for lv in cfg.levels]
+    assert order == sorted(order), "mission order, because unlock_next walks the list as a chained ladder"
+    assert cfg.levels[0] == "Level 0-1", "levels[0] is always unlocked, so it must be the trained level"
+    assert set(main.levels) <= set(cfg.levels), "no level the run is already training may be dropped"
+    # The 12 levels the route files cover, and the four that stop at a skull lock until S3 (spec §10).
+    rooms = {"Level 0-5", "Level 1-4", "Level 2-4", "Level 4-2", "Level 4-4", "Level 5-2",
+             "Level 7-1", "Level 7-2", "Level 7-3", "Level 7-4", "Level 8-3", "Level 8-4"}
+    assert rooms <= set(cfg.levels) and len(set(cfg.levels) - rooms) == 18, "18 gates levels + 12 room levels"
+    assert cfg.route_fallback is True and cfg.route_dir == "", "the packaged routes/ folder, on by default"
+    assert (cfg.route_exit_tol_m, cfg.route_seed_m) == (5.0, 150.0)
+    assert cfg.max_steps_per_level == {}, "one cap for every level; a per-level cap is its own decision"
+
+    header = GATES_FULL.read_text(encoding="utf-8")
+    for needed in ("1-3", "5-4", "6-2", "6x", "rungs", "route_source"):
+        assert needed in header, f"the header has to carry {needed}: why the list is this list, and the levers"
+
+
+def test_the_full_config_builds_a_479_input_curriculum_env():
+    env_dict, _ = train.load_config(str(GATES_FULL))
+    cfg = train.fill_campaign_dirs(EnvConfig.from_dict(env_dict), MODEL_DIR, RUN_DIR)
+    env = UltrakillEnv(dataclasses.replace(cfg, explore_dir="", best_runs_dir="", curriculum_path=""))
+    try:
+        assert env.observation_space.shape == (479,), "no level id enters the observation, by design"
+        assert list(env.action_space.nvec) == [3, 3, 2, 2, 2, 2, 2, 2, 6, 11, 7, 3]
+        assert env.level == "Level 0-1" and env._max_steps() == 12000
+        # No route file ships for 0-1, so a worker that starts on the first rung is on layer 1, unchanged.
+        assert env.gates._route is None and env.gates.route_source == 0
+    finally:
+        env.close()
+
+
 def test_the_main_config_builds_a_479_input_curriculum_env():
     env_dict, _ = train.load_config(str(GATES_MAIN))
     cfg = train.fill_campaign_dirs(EnvConfig.from_dict(env_dict), MODEL_DIR, RUN_DIR)
@@ -199,7 +256,7 @@ def test_the_main_config_builds_a_479_input_curriculum_env():
 
 def test_every_campaign_setting_is_a_real_field():
     # EnvConfig.from_dict drops keys it does not know, so a misspelt setting would silently use its default.
-    for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN):
+    for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN, GATES_FULL):
         env_dict, _ = train.load_config(str(path))
         unknown = sorted(set(env_dict) - field_names(EnvConfig))
         assert not unknown, f"{path.name}: env keys EnvConfig does not know: {unknown}"
@@ -375,7 +432,7 @@ def test_a_campaign_checkpoint_loads_against_every_campaign_config():
     from stable_baselines3.common.vec_env import DummyVecEnv
 
     configs = {path.name: EnvConfig.from_dict(train.load_config(str(path))[0])
-               for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN)}
+               for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN, GATES_FULL)}
     envs = {}
     try:
         for name, cfg in configs.items():

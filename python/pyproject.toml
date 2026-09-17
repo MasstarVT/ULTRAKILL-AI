@@ -19,3 +19,10 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["ultrakill_ai*"]
+
+# The room-trunk route files (layer 2 of the route signal) are DATA inside the package, and `routes/` is not
+# itself a package, so a non-editable install would drop all twelve and silently take twelve levels back to the
+# exit vector. Every machine here uses `pip install -e .`, where this is moot; it is declared so a wheel built
+# somewhere else cannot lose them without anything failing.
+[tool.setuptools.package-data]
+ultrakill_ai = ["routes/*.json"]

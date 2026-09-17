@@ -489,3 +489,90 @@ No demos, no recorded routes - the order comes from the lock graph the level alr
    skull room. No change to observation width, so **no checkpoint is invalidated**.
 10. **What it does not do:** it does not fix the 15 levels with no usable door route (§5.3). Skull carry and
     route repair are independent; do skull carry first because it is bounded and it unblocks 1-1.
+
+## 9. Route coverage of the room-trunk fallback (stage S1, 2026-09-17)
+
+Appendix to `docs/superpowers/specs/2026-09-17-route-fallback-and-boss-levels-design.md` §10. These are the
+numbers the committed data actually carries, regenerated from the scene bundles by
+`python scripts/build_routes.py --validate`. Everything here is parsed or computed offline; no game was
+launched and no port was opened.
+
+**What ships.** `python/ultrakill_ai/routes/route_Level_<N>.json`, **12 files, 95 rungs, 17.1 KB**. Python
+reads one only on a level whose live door-gate ladder fails `GateProgress._gates`'s own guard, so the 18 gates
+levels never open a file and no file exists for any of them.
+
+**Layer split, reproduced from the bundles:** gates **18**, rooms **12**, exit vector only **3**
+(1-3, 5-4, 6-2). The gate guard's own ratios reproduce §5.1's table exactly — 1.000 on fourteen levels, then
+8-2 0.960, 4-3 0.600, 8-1 0.538, 6-1 0.500 (PASS), 7-2 0.250, 8-3 0.031 (FAIL), and seven levels with no goal
+room at all.
+
+**Guard pipeline, in the spec's order:** I6 (optional areas) → T (trunk only) → R4 (voxel standability) →
+I2 (16 m separation) → R1 (≥ 3 rungs) → I3 (≤ 24 rungs) → R2 (tour ratio ≤ 1.35, judged on the rungs that
+ship).
+
+| Level | Tier | rungs | med gap m | max gap m | tour | legs wit. | last rung → pit m | cp≤60 | reaches |
+|---|---|---|---|---|---|---|---|---|---|
+| 0-5 | C | 5 | 46 | 137 | 1.000 | 3/5 | 211 | 1/1 | exit |
+| 1-4 | D | 4 | 81 | 117 | 1.000 | 2/4 | 150 | 2/2 | lock (3 × SkullBlue on leg 2) |
+| 2-4 | C | 4 | 425 | 430 | 1.000 | 1/4 | 111 | 1/2 | exit |
+| 4-2 | C | 6 | 172 | 268 | 1.000 | 4/6 | 163 | 2/4 | exit |
+| 4-4 | D | 8 | 119 | 1099 | 1.000 | 4/8 | 540 | 2/3 | lock (SkullBlue on leg 4) |
+| 5-2 | C | 7 | 71 | 407 | 1.000 | 6/7 | 373 | 3/4 | exit |
+| 7-1 | E | 10 | 80 | 478 | 1.000 | 5/10 | 128 | 2/5 | lock (SkullBlue on legs 1 and 4) |
+| 7-2 | E | 15 | 76 | 384 | 1.255 | 10/15 | 168 | 5/6 | lock (SkullRed on leg 11) |
+| 7-3 | D | 12 | 104 | 184 | 1.174 | 8/12 | 225 | 4/4 | exit |
+| 7-4 | C | 4 | 291 | 917 | 1.000 | 3/4 | 62 | 5/7 | exit |
+| 8-3 | E | 16 | 167 | 814 | 1.239 | 12/16 | 1690 | 8/13 | exit |
+| 8-4 | D | 4 | 64 | 306 | 1.000 | 0/4 | 62 | 0/1 | exit |
+
+Connectivity, on what ships: **100 of 100 probed places standable** (95 rungs; five of them carry two places
+because I2 merged a pair), **58 of 95 legs witnessed by an authored checkpoint within 40 m (61%)**, tour ratio
+≤ 1.255 everywhere. R4 dropped four rungs: `5 - Temple Entrance` (4-2, nearest standable cell 19.8 m
+horizontally), `8 - Ship` (5-2, no standable cell within ±40 m — the rung that would otherwise have frozen
+`best_hops` above 0 and kept 5-2 from ever targeting its own pit), and `0 - Leg Checkpoint` / `1 - Front
+Checkpoint` (7-4, zero triangles within ±40 m). 7-4's `3B - Secret Entrance Checkpoint` — the spec's fifth R4
+casualty — is removed one step earlier by I6, which runs first.
+
+**Two rows differ from the design's §10, both measured:**
+
+1. **8-3 ships 16 rungs, not 13.** Revision 1's file had already been cut to 24 rungs by the budget cap, and
+   the cap had dropped `2 - Shifting Hallway`, `3 - Shifting Arena` and `10 - Split Color Door` before the
+   trunk collapse ever ran; the design's 13 was measured on that cut file. §4.3 reverses the order so that I3
+   runs *last* and R2 is judged on what ships, and after T the cap binds on nothing — so those three trunk
+   rooms survive. Median gap falls 258 → 167 m, tour 1.247 → 1.239, and the 814 m step and the 1 690 m final
+   leg are unchanged. This is the reversal working as specified.
+2. **5-2's `1A - Opening` and `1B - Second Rock` are one rung, not zero.** Both sit at exactly
+   `(0, -10, 300)` — spread **0.0 m**. Read literally, T drops every member of a same-ordinal suffix group, and
+   5-2 has no unsuffixed rung at ordinal 1 to hang them off, so 5-2 would lose the rung at its own spawn and
+   start 129 m away at `2 - Fort`. The design's own measurement never saw this, because revision 1 ran the I2
+   merge first and T then saw one rung (§4.3 records the same effect on 4-4's "already-merged `3A`").
+   **T's predicate therefore requires a parallel set to be a set of distinct places**, at least the 16 m
+   `_is_reached` cannot tell apart: a group packed inside one reach cylinder is not a choice the agent can
+   take in either order — arriving marks every member at once — so T's justification does not apply to it and
+   I2 is what collapses it, into one rung carrying both names. Measured over all 33 levels **exactly one group
+   is affected**; every other same-ordinal group in the campaign is 41 m or wider and is collapsed as before.
+   With the clause, 5-2 reproduces §10 exactly: 7 rungs, median 71 m, 6/7 legs.
+
+Every other row reproduces the design's §10 to the printed digit, including 0-5 matching its literal example
+in §4.2 field for field.
+
+**Regenerating.** `python scripts/build_routes.py --validate` — single-threaded, no game, no port, ~2 min
+(the voxel pass is 2-21 s per fallback level and dominates; the 18 gates levels skip it). It reads the game
+path from `mod/GamePaths.props`, rewrites every file, and exits non-zero if the shipped set changes, if a
+shipped rung is not standable, if any invariant fails, **or if any level's ladder changes shape**. Run it
+after every game update, alongside `campaign_check.py`: I5 catches a moved `FinalPit` within 5 m and disables
+the fallback for that level, but it does not catch a level whose rooms moved and whose pit did not.
+`python tests/test_route_files.py` re-checks every guard from the committed files with no game and no
+generator import.
+
+**The shape is pinned, not just the coverage.** The guards above say a ladder is *well formed*; none of them
+says it is the *same* ladder, and this script rewrites the committed files in place. A patch that moved one
+room, or a room the parser stopped recognising, would re-aim the agent at a different sequence of places with
+every invariant still passing, the set still 12 and `--validate` still printing PASS — the "a wrong route is
+worse than none" case the design is built around. So the per-level row of the table above is also
+`EXPECTED_SHAPE` in `build_routes.py` (rungs, median and max gap, tour, legs witnessed, checkpoints within
+60 m, last rung → pit), checked on the freshly built ladders, and `EXPECTED_LADDERS` in
+`tests/test_route_files.py` pins every rung of every file by `key` and name with no game at all. Both have to
+be edited, with a measured reason, for a level's route to change; the two deviations recorded above are what
+such an edit looks like. Verified by rebuilding with one 7-3 room raised 40 m and again with it removed, each
+rewritten fully self-consistently: the old checks saw nothing, both new ones failed.

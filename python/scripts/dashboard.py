@@ -117,6 +117,25 @@ def fmt_pct(value) -> str:
     return "—" if v is None else f"{v * 100:.0f}%"
 
 
+ROUTE_LAYERS = {0: "exit vector", 1: "gates", 2: "rooms"}
+
+
+def fmt_route_source(value) -> str:
+    """The route layer the last 100 episodes ran on: a name when they agree, else the mixed mean.
+
+    `route_source` is an integer per episode (0 exit vector, 1 the mod's gate ladder, 2 the offline room
+    trunk), so the 100-episode mean is only a layer name when the whole window sat on one layer -- which is
+    every single-level run. On a mixed curriculum the number is what matters, and calling it "mixed" stops it
+    being read as a level's own layer.
+    """
+    v = num(value)
+    if v is None:
+        return "—"
+    if float(v).is_integer() and int(v) in ROUTE_LAYERS:
+        return ROUTE_LAYERS[int(v)]
+    return f"mixed {v:.2f}"
+
+
 def short_level(scene) -> str:
     """"Level 0-1" -> "0-1", the form times.md and this panel use."""
     if not isinstance(scene, str):
@@ -180,6 +199,10 @@ def campaign_lines(campaign: dict, mean: dict, parts: dict | None = None, best: 
         # `exit banished` above 0 says a CheckPoint clone moved the reported FinalPit and the guard caught it.
         ("parked/ep       ", f"{fmt_float(mean.get('targets_parked'), 2)}"
                              f"  exit banished {fmt_pct(mean.get('exit_banished'))}"),
+        # Which route layer is driving. "rooms" is the offline trunk of the route-fallback spec; on a level
+        # whose `gates/load` is stuck while this reads rooms and `parked/ep` is 0, the fix is that level's
+        # route file (set its `rungs` to []), not a weight.
+        ("route layer     ", fmt_route_source(mean.get("route_source"))),
         ("wedged/ep       ", fmt_float(mean.get("wedged_steps"), 0)),
         ("new cells/ep    ", fmt_float(mean.get("cells_new"), 0)),
         ("deaths/ep       ", fmt_float(mean.get("deaths"))),

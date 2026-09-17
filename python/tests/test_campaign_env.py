@@ -10,6 +10,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ultrakill_ai.campaign import (  # noqa: E402
+    ROUTE_SOURCE_GATES,
+    ROUTE_SOURCE_ROOMS,
+    ROUTE_VERSION,
+    _read_route,
+    load_route,
+    route_path,
+)
 from ultrakill_ai.env import CAMPAIGN_INFO_KEYS, EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.protocol import BridgeClient  # noqa: E402
 from ultrakill_ai.rewards import RewardConfig  # noqa: E402
@@ -51,6 +59,13 @@ ALTAR_ITEM = "SkullRed"  # what every ItemPlaceZone in the skull room accepts; F
 PUNCH_RANGE = 4.0  # Punch.ActiveFrame's own reach, and EnvConfig.subgoal_punch_range_m's default
 # The two-level curriculum tests. Both names must be in CAMPAIGN_LEVELS_SHIPPED or UltrakillEnv refuses them.
 LEVELS = ["Level 0-1", "Level 0-3"]
+# Layer 2, the offline room trunk (docs/superpowers/specs/2026-09-17-route-fallback-and-boss-levels-design.md).
+# Four rungs down the same corridor, 16 m apart so they clear invariant I2's own 16 m separation, ending 6 m
+# short of the pit. The first rung is 6 m from the spawn, which is what the seeding rule absorbs.
+ROUTE_RUNGS = ((0.0, 1.0, 6.0, 3), (0.0, 1.0, 22.0, 2), (0.0, 1.0, 38.0, 1), (0.0, 1.0, 54.0, 0))
+# The 0-1 spawn shape the seeding rule exists for: the NEAREST rung of a total order is 14 m BEHIND the player
+# while the route's next rung is 20 m ahead. Without seeding, the trunk aims at the room already left.
+BEHIND_RUNGS = ((0.0, 1.0, -14.0, 2), (0.0, 1.0, 20.0, 1), (0.0, 1.0, 50.0, 0))
 
 
 class FakeLevel:
@@ -71,7 +86,9 @@ class FakeLevel:
       `wedged`         the absorbing slowMode state: airborne, not sliding, not moving, z frozen
       `mod_flags`      False drops slow_mode/heavy_fall/crouching, as a mod older than 0.6.0 does
       `gates_present`  False drops the whole gates block, same reason
-      `gates_ordered`  False is a level whose door graph has no goal room (0-5)
+      `gates_ordered`  False is a level whose door graph has no goal room (0-5), i.e. the ROUTE MODE: with a
+                       route file for the scene the env falls to layer 2 and walks the offline room trunk, and
+                       `enable_route()` is the same switch under the name the route spec uses
       `ground_center`  overrides the centre ground ray, which the ring minimum can disagree with
       `skulls`         the skull room: an altar-locked gate, a pedestal source, a destination altar and its
                        dead twin, with `punch` picking up, placing and throwing exactly as `Punch.AltHit` does
@@ -136,6 +153,15 @@ class FakeLevel:
 
     def fail_next_steps(self, exc: BaseException, times: int = 1) -> None:
         self.fail_steps.extend(type(exc)(*exc.args) for _ in range(times))
+
+    def enable_route(self) -> None:
+        """Route mode: a level whose door graph has no goal room, so `_gates()` gives up and layer 2 fires.
+
+        This is 0-5's measured shape -- `gates_ordered` false, every `hops` null -- and it is all the mod side
+        of the route fallback needs, because a room rung carries no live state at all (spec §3). The trunk
+        itself comes from the env's `route_dir`, which is what `route_env` writes.
+        """
+        self.gates_ordered = False
 
     def enable_skulls(self, *, fields: bool = True, altars: bool = True, item_type: str = ALTAR_ITEM) -> None:
         """Turns the level into the skull room. Call before reset(); `fields=False` is a mod older than 0.7.0.
@@ -378,6 +404,53 @@ def make_env(rewards: RewardConfig | None = None, **overrides) -> tuple[Ultrakil
     env = UltrakillEnv(cfg)
     env.client = FakeLevel()
     return env, env.client
+
+
+def write_route(directory, *, level: str = LEVEL, rungs=ROUTE_RUNGS, exit_pos=(0.0, 1.0, EXIT_Z),
+                version: int = ROUTE_VERSION, **overrides) -> Path:
+    """Writes one `route_<scene>.json` in the spec's §4.1 schema and returns its directory.
+
+    Every field the schema lists is written, diagnostics included, so a test fixture cannot accidentally pass
+    against a loader that ignores half the file. The real files come from `build_routes.py`; until they exist
+    these hand-written ones are what the loader is tested on, and the wrap-up stage runs it over the real 12.
+
+    The loader caches parsed documents per (scene, dir), so the cache is cleared here: a test that rewrites one
+    file in one temp directory must not read the previous test's document back.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    # `rungs` is normally (x, y, z, hops) tuples; a test that wants a malformed file passes the entries itself.
+    entries = list(rungs) if any(isinstance(r, dict) for r in rungs) else [
+        {"key": f"{round(x)},{round(y)},{round(z)}", "pos": [float(x), float(y), float(z)],
+         "hops": int(hops), "name": f"{len(rungs) - int(hops)} - Room", "gated_by": [],
+         "open": False, "locked": False, "active": True}
+        for x, y, z, hops in rungs]
+    doc = {
+        "level": level, "version": version, "source": "room-trunk offline v2 (test fixture)",
+        "exit": {"pos": [float(v) for v in exit_pos], "target": "Level 0-2"},
+        "start_room": "1 - Opening Hallway", "trunk_collapsed": [],
+        "tour_ratio": 1.0, "checkpoints_within_60m": "1/1", "legs_witnessed": f"{len(entries)}/{len(entries) + 1}",
+        "last_rung_to_exit_m": round(abs(exit_pos[2] - entries[-1]["pos"][2]), 1) if entries else 0.0,
+        "rungs": entries,
+    }
+    doc.update(overrides)
+    route_path(level, str(directory)).write_text(json.dumps(doc, separators=(",", ":")), encoding="utf-8")
+    _read_route.cache_clear()
+    return directory
+
+
+def route_env(tmp, *, rungs=ROUTE_RUNGS, exit_pos=(0.0, 1.0, EXIT_Z), ordered: bool = False,
+              **overrides) -> tuple[UltrakillEnv, FakeLevel, Path]:
+    """An env on a level with a route file, and (by default) no usable gate ladder: layer 2.
+
+    `ordered=True` keeps the gate ladder working, which is how the "the trunk is never read when the gates are
+    good" case is set up: the file exists, the level ships gates, and nothing must consult the trunk.
+    """
+    route_dir = write_route(Path(tmp) / "routes", rungs=rungs, exit_pos=exit_pos)
+    env, fake = make_env(route_dir=str(route_dir), **overrides)
+    if not ordered:
+        fake.enable_route()
+    return env, fake, route_dir
 
 
 def idle():
@@ -642,12 +715,12 @@ def test_from_dict_ignores_retired_keys():
         "fixed_fps": 30,
         "checkpoint_resets": True,
         "stuck_steps": 450,
-        "route_dir": "routes",
+        "route_points_file": "routes/human_0-1.json",
         "layout": {"max_enemies": 8, "waypoint_offset": 3},
         "rewards": {"kill": 0.5, "route_point": 0.1, "stuck": 1.0},
     })
     assert cfg.mode == "campaign" and cfg.fixed_fps == 30 and cfg.layout.max_enemies == 8 and cfg.rewards.kill == 0.5
-    for retired in ("checkpoint_resets", "stuck_steps", "route_dir"):
+    for retired in ("checkpoint_resets", "stuck_steps", "route_points_file"):
         assert not hasattr(cfg, retired)
     assert not hasattr(cfg.rewards, "route_point") and not hasattr(cfg.rewards, "stuck")
     assert EnvConfig.from_dict(cfg.to_dict()) == cfg
@@ -1277,6 +1350,583 @@ def test_episode_info_has_the_new_keys():
 
 
 # ---------------------------------------------------------------------------------------------
+# S2: layer 2, the offline room trunk (2026-09-17-route-fallback-and-boss-levels-design.md §7.2)
+# ---------------------------------------------------------------------------------------------
+
+def test_route_fallback_pays_the_ladder():
+    """The whole point: a level with no usable gate ladder walks its shipped trunk and pays for it.
+
+    Three of the four rungs pay, not four, and the missing one is the seeding rule doing its job: the spawn is
+    6 m from rung `0,1,6`, so that rung is ABSORBED rather than earned (see
+    `test_route_seeding_absorbs_the_nearest_rung`). A second walk in the same level load pays nothing at all,
+    exactly as a gate ladder does -- `gate` is per level load, and it is the same rule, not a parallel one.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, fresh_start_prob=0.0, max_steps=29)
+        _, info = env.reset(seed=0)
+        assert env.gates.route_source == 2 and info["route_source"] == 2
+        assert info["route_source_name"] == "rooms"
+        parts: dict[str, float] = {}
+        for _ in range(29):
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+        assert truncated and info["end_reason"] == "max_steps" and fake.z == 58.0
+        assert parts["gate"] == 45.0, f"one instalment per rung descended, got {parts['gate']}"
+        assert parts["gate_approach"] > 0.0
+        assert info["gates_reached"] == 4 and info["gate_hops_best"] == 0
+        assert info["route_source"] == 2 and env.gates.route_reads > 0
+
+        _, info = env.reset()  # a checkpoint respawn: the trunk is per level load, like the gate ladder
+        assert fake.resets == [False, True] and info["fresh_start"] == 0
+        again: dict[str, float] = {}
+        for _ in range(29):
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(again, info)
+        assert "gate" not in again, f"the trunk is per level load, got {again.get('gate')}"
+        assert info["gates_reached"] == 4 and info["route_source"] == 2
+        env.close()
+
+
+def test_route_fallback_is_not_used_when_gates_are_good():
+    """Layer 1 wins, and the trunk is not consulted at all -- the byte-for-byte claim, through the env.
+
+    `route_reads` counts every call that hands the trunk out as the ladder, so 0 means `_gates()` never left
+    its success path. (The FILE is opened once, when the env is built: knowing whether a level has one is the
+    only way to know which layer applies. What must never happen is the trunk being READ as a route while a
+    gate ladder exists, which is what this pins.)
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, ordered=True, fresh_start_prob=0.0, max_steps=27)
+        assert env.gates._route is not None, "the level does ship a file, so the guard is being tested"
+        _, info = env.reset(seed=0)
+        assert info["route_source"] == 1 and info["route_source_name"] == "gates"
+        parts: dict[str, float] = {}
+        targets = set()
+        for _ in range(27):
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+            targets.add(env.gates.target["key"])
+        assert targets <= {key for key, _, _ in GATES} | {"exit"}, f"a rung became the target: {targets}"
+        assert parts["gate"] == 45.0 and info["gates_reached"] == 3  # 0-1's own numbers, unchanged
+        assert env.gates.route_reads == 0, "the trunk was read while the gate ladder was working"
+        assert env.gates._hops_source == "gates" and info["route_source"] == 1
+        env.close()
+
+
+def test_route_seeding_absorbs_the_nearest_rung():
+    """§6's seeding rule: the rung the player STARTS at is absorbed, and the target is the one below it.
+
+    The trunk is a total order over the level, so its nearest rung can be behind the player -- measured at
+    0-1's own spawn, where the nearest room rung is 31.6 m back and the route's next rung 34.4 m ahead. Here
+    the nearest rung is 14 m BEHIND: without the rule the observation would point the agent at the room it has
+    already left, which is the "a wrong route is worse than none" case. Absorbing pays nothing, so the rule
+    cannot be farmed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, rungs=BEHIND_RUNGS, fresh_start_prob=0.0, max_steps=30)
+        _, info = env.reset(seed=0)
+        assert env.gates.best_hops == 2 and env.gates.paid_hops == 2, "the rung behind is absorbed"
+        assert env.gates.target["key"] == "0,1,20", "and the target is the rung below it, 20 m AHEAD"
+        # Absorbing is `mark_paid` semantics in ALL FIVE places, not just the two hop floors: the rung counts as
+        # reached, its hop value counts, and it can never pay a fallback instalment. Marking only the floors left
+        # it looking unreached, and it is by construction the NEAREST rung, so it satisfied `_nearer_unreached`
+        # from the first decision and made the rung AHEAD parkable -- see the test below.
+        assert env.gates.reached == {"0,1,-14"} and env.gates.hops_reached == {2}
+        assert env.gates.paid_fallback == {"0,1,-14"}
+        parts: dict[str, float] = {}
+        for _ in range(30):
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+        assert parts["gate"] == 30.0, "the two rungs ahead pay; the absorbed one never does"
+        assert info["gates_reached"] == 3, \
+            "the absorbed rung counts, exactly as it would on a spawn that happened to fall inside its cylinder"
+        env.close()
+
+    # Out of range: the rule is a tolerance, not a licence. Below the distance to the nearest rung nothing is
+    # absorbed and the level gets today's behaviour -- which on this trunk is the bug itself, the target sitting
+    # on the room the player has already left. Note what the rule does and does not buy: the same instalments
+    # either way (the rung behind is never reachable, so it never pays), but the TARGET, and with it
+    # observation slots 448-455 and look mode 2, points forward from the first decision instead of backward.
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, rungs=BEHIND_RUNGS, fresh_start_prob=0.0, max_steps=30, route_seed_m=2.0)
+        env.reset(seed=0)
+        assert env.gates.best_hops is None
+        assert env.gates.target["key"] == "0,1,-14", "unseeded, the trunk aims at the rung 14 m behind"
+        parts = {}
+        for _ in range(30):
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+        assert parts["gate"] == 30.0 and info["gates_reached"] == 2
+        env.close()
+
+
+def test_a_seeded_load_that_stalls_at_the_spawn_keeps_aiming_forward():
+    """A fresh policy on an unseen level does not close on the first rung, and one patience window is short.
+
+    The seeding rule's whole job is to stop the trunk aiming at the room the player has already left. Absorbing
+    only `best_hops`/`paid_hops` left the absorbed rung out of `reached`, and it is by construction the NEAREST
+    rung -- so `_nearer_unreached` found it strictly nearer than the forward target on the very first decision,
+    which is exactly the "a park is only ever a SWITCH" guard being satisfied. The rung AHEAD then became
+    parkable, `_pick`'s fallback chose the absorbed rung BEHIND, and `_pay_fallback` paid an instalment for
+    walking back to it: the failure the rule exists to prevent, plus a payment `_seed_start`'s docstring says is
+    impossible. Reproduced at the shipped `gate_target_patience_s` 20.0 (300 decisions): parked at decision 299.
+
+    Held here at 1.0 s so the window is 15 decisions, and the agent does nothing at all for longer than that.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, rungs=BEHIND_RUNGS, fresh_start_prob=0.0, max_steps=200,
+                                 gate_target_patience_s=1.0)
+        env.reset(seed=0)
+        assert env.gates.patience_steps == 15 and env.gates.target["key"] == "0,1,20"
+        for _ in range(17):  # the whole window and two decisions more, standing still at the spawn
+            _, _, terminated, truncated, info = env.step(idle())
+            assert not terminated and not truncated
+        assert env.gates.parked == set() and info["targets_parked"] == 0, \
+            "nothing to switch to: the rung behind is absorbed, so it is not an unreached candidate"
+        assert env.gates.target["key"] == "0,1,20" and env.gates._fallback is False, \
+            "the target is still the rung AHEAD, chosen by the ladder"
+        parts: dict[str, float] = {}
+        for _ in range(60):  # and the forward walk still pays the trunk's depth, no more and no less
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+            if terminated or truncated:
+                break
+        assert parts["gate"] == 30.0, f"depth-1 over a 3-rung trunk: {parts.get('gate')}"
+        env.close()
+
+
+def test_route_respawn_mid_ladder_targets_forward():
+    """A checkpoint respawn keeps the ladder and keeps aiming forward, and does not re-seed.
+
+    `best_hops` is level-load scoped and `mark_paid` never clears it, so the seeding rule fires once per LOAD,
+    not per respawn (spec §6 corrects revision 1 here). The respawn point is 6 m from the rung behind it and
+    16 m from the rung ahead, so a rule that re-ran on every respawn would absorb the rung behind and could
+    keep re-absorbing its way down the trunk.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, fresh_start_prob=0.0, max_steps=13)
+        env.reset(seed=0)
+        parts: dict[str, float] = {}
+        for _ in range(13):  # z 26: past the checkpoint at 20 and the rung at 22
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+        assert truncated and env.gates.best_hops == 2 and parts["gate"] == 15.0
+        _, info = env.reset()  # respawn at z 20
+        assert info["fresh_start"] == 0 and fake.z == 20.0
+        assert env.gates.best_hops == 2 and env.gates.paid_hops == 2, "the ladder survives the respawn"
+        assert env.gates.target["key"] == "0,1,38", "the rung below, not the 2 m-away rung behind"
+        _, info = env.reset()  # and a second respawn cannot walk the absorption down the trunk either
+        assert env.gates.best_hops == 2 and env.gates.target["key"] == "0,1,38"
+        env.close()
+
+
+def test_route_reload_without_checkpoint_reseeds():
+    """The `_respawn` bug of spec §6: a death with NO checkpoint reloads the level, so the ladder must restart.
+
+    `StatsManager.Restart` reloads the whole level when there is no checkpoint yet, and `_respawn` was calling
+    `mark_paid` on that branch too -- leaving `best_hops` at whatever the dead attempt reached, pointing the
+    target at a rung far ahead of a player standing at the spawn, and making `gate` unpayable for the rest of
+    the load. It exists on every gate ladder today; a 13-rung trunk makes it bite much harder.
+
+    The other half of the fix, and the reason for `keep_paid`: the LADDER restarts, the PAYMENTS do not. This
+    episode is still running, and `gate` is "once per new lower rung", so the prefix already walked must not
+    become re-earnable -- see `test_a_reload_inside_one_episode_cannot_re_earn_the_prefix`. `paid_hops` stays 2
+    while `best_hops` goes back to 3, which is what lets the re-walk pay for the rungs BELOW 2 and nothing else.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, max_steps=60)
+        env.reset(seed=0)
+        assert env.gates.best_hops == 3, "the spawn stands inside the first rung's own cylinder"
+        parts: dict[str, float] = {}
+        for _ in range(7):  # z 14: the rung at 22 is reached (8 m), and the checkpoint at 20 is not
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+        assert env.gates.best_hops == 2 and parts["gate"] == 15.0 and fake.checkpoint is False
+        approach_before = parts["gate_approach"]
+        fake.kill_next = True
+        _, _, terminated, truncated, info = env.step(idle())
+        assert not terminated and not truncated and fake.z == 0.0, "no checkpoint, so the level reloaded"
+        assert env.gates.best_hops == 3, \
+            "the ladder restarted at the spawn; carrying 2 would leave `gate` unpayable for the rest of the load"
+        assert env.gates.paid_hops == 2, "but the payment record did not: the episode is still running"
+        assert env.gates.reached == {"0,1,6"} and env.gates.gates_reached == 1
+        assert env.gates.target["key"] == "0,1,22", "and the target is the rung ahead of the spawn again"
+        for _ in range(7):  # back over the identical 14 m, toward the identical target
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+        assert parts["gate_approach"] == approach_before, \
+            "re-walking to the pre-death best pays no approach either (ruling R1): `best_dist` stood"
+        assert parts["gate"] == 15.0, "and reaching the rung at 22 a second time pays no instalment"
+        for _ in range(24):  # on past it: ground the dead attempt never covered, which does pay
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+            if terminated or truncated:
+                break
+        assert info["end_reason"] == "level_complete"
+        assert parts["gate"] == 45.0, \
+            f"the trunk's own depth over the whole load, no more: {parts['gate']}"
+        assert parts["gate_approach"] > approach_before, "the two rungs below the pre-death best are new ground"
+        env.close()
+
+
+def test_a_reload_inside_one_episode_cannot_re_earn_the_prefix():
+    """A death with no checkpoint restarts the ladder; it must not restart the LADDER'S INCOME.
+
+    `_respawn`'s reload branch calls `new_level_load`, which is the honest call for the targeting bug above --
+    the level really did load again. But `new_level_load` also clears `paid_hops`, `paid_fallback` and
+    `best_dist`, and `_respawn` runs INSIDE a continuing episode. Unguarded, that makes `gate` and
+    `gate_approach` re-earnable once per death for ground already covered, which is exactly what `_respawn`
+    refuses for `MilestoneTracker` two lines above ("re-paying them would make 'die with no checkpoint' a way to
+    earn `checkpoint` and `arena_clear` again for ground already covered -- a farm"). The re-walk costing the
+    same walk is no defence: a checkpoint re-walk costs the same walk too.
+
+    Three rungs all placed BEFORE FakeLevel's checkpoint at z 20, so no checkpoint ever activates and every
+    death takes the reload branch. Measured before the fix: 30 / 30 / 30 per lap, an unbounded stream inside one
+    12 000-step episode against a `death` of 5 -- and worse, reaching the level's first checkpoint would move
+    every later death onto the `mark_paid` branch and end the stream for good, so the gradient pointed away from
+    the first checkpoint. The same three laps run on a pure GATES level (`route=None`, layer 1), because this
+    branch is not gated on the route layer and the live run trains on 0-1/0-3/0-4 today.
+    """
+    early = ((0.0, 1.0, 2.0, 2), (0.0, 1.0, 12.0, 1), (0.0, 1.0, 18.0, 0))
+
+    def three_laps(env, fake) -> list[float]:
+        per_lap = []
+        for _ in range(3):
+            parts: dict[str, float] = {}
+            while env._raw["player"]["pos"][2] < 18.0:
+                _, _, _, _, info = env.step(forward())
+                add_parts(parts, info)
+            fake.kill_next = True
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+            assert not terminated and not truncated and fake.z == 0.0, "the level reloaded, the episode stands"
+            per_lap.append(round(parts.get("gate", 0.0), 1))
+        return per_lap
+
+    with tempfile.TemporaryDirectory() as tmp:  # layer 2, the room trunk
+        env, fake, _ = route_env(tmp, rungs=early, fresh_start_prob=0.0, max_steps=4000)
+        env.reset(seed=0)
+        assert env.gates.route_source == ROUTE_SOURCE_ROOMS
+        assert three_laps(env, fake) == [30.0, 0.0, 0.0], "the trunk's depth once, not once per death"
+        env.close()
+
+    env, fake = make_env(fresh_start_prob=0.0, max_steps=4000)  # layer 1, the live gate ladder
+    fake.gates = tuple((f"0,1,{round(z)}", (x, y, z), h) for x, y, z, h in early)
+    fake._load()
+    env.reset(seed=0)
+    assert env.gates._route is None and env.gates.route_source == ROUTE_SOURCE_GATES
+    assert three_laps(env, fake) == [30.0, 0.0, 0.0], "and a gates level behaves identically: A3 is unaffected"
+    env.close()
+
+
+def test_a_respawn_frame_with_no_campaign_block_does_not_wipe_the_ladder():
+    """The `_respawn` reload branch is gated on the block being PRESENT, not just on "no checkpoint".
+
+    The mod omits the whole `campaign` block for any step whose build throws (docs/protocol.md), and an absent
+    block has no `checkpoints` either -- which reads as "no checkpoint yet", i.e. as a level reload. Treating
+    that as a reload would clear a ladder that was fine. Reading it as an ordinary respawn is the safe
+    direction and self-corrects at the next episode boundary, where `choose_fresh_start` sees no checkpoint and
+    forces a fresh load anyway.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, max_steps=60)
+        env.reset(seed=0)
+        for _ in range(11):  # z 22: past the checkpoint at 20 and the rung at 22
+            env.step(forward())
+        assert env.gates.best_hops == 2 and fake.checkpoint
+        fake.kill_next = True
+        fake.drop_campaign_steps = 2  # the death frame and the respawn frame both arrive without a block
+        _, _, terminated, truncated, info = env.step(idle())
+        assert not terminated and not truncated and fake.z == 20.0, "a real checkpoint respawn happened"
+        assert env.gates.best_hops == 2 and env.gates.paid_hops == 2, "the ladder survived the blind frame"
+        assert env.gates.reached == {"0,1,6", "0,1,22"}
+        env.close()
+
+
+def test_route_rejected_when_exit_moved():
+    """Guard I5: the trunk is offline data, so a FinalPit that has moved disables the file for that load.
+
+    And it really disables it. The first frame here carries no `campaign` block at all -- a mid-load frame,
+    which the mod does send -- so the trunk is used unvalidated and a rung becomes the target; the next frame
+    reports an exit 20 m from the file's, and the stale target has to be dropped rather than held while
+    `gate_approach` keeps paying toward it (the defect the reviewer found in revision 1).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, exit_pos=(0.0, 1.0, EXIT_Z + 20.0), max_steps=40)
+        fake.drop_campaign_steps = 1  # the reset frame: no block, so the check cannot be answered yet
+        env.reset(seed=0)
+        assert env.gates.target is not None and env.gates._route_ok is None
+        parts: dict[str, float] = {}
+        for _ in range(40):
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+            if terminated or truncated:
+                break
+        assert env.gates._route_ok is False and env.gates.target is None
+        assert "gate" not in parts and "gate_approach" not in parts, parts
+        assert info["gates_reached"] == 0 and info["route_source"] == 0
+        assert info["route_source_name"] == "none", "the level fell all the way to the exit vector"
+        assert info["end_reason"] == "level_complete", "and the level is still perfectly playable"
+        env.close()
+
+
+def test_route_source_flip_clears_the_ladder():
+    """A mid-load flip between the two layers must not pay the hop difference between their scales.
+
+    The two ladders are different measures of the same level -- 0-5's trunk is 5 rungs deep where its door
+    graph reports nothing at all -- so carrying `paid_hops` from one to the other would pay
+    `paid_hops - best_hops` instalments for a change of units. Here the trunk has paid down to hops 2 when the
+    gate graph comes good with a hops 0 door within reach: the guard forgets the ladder and the new scale
+    starts from its own first instalment.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, max_steps=40)
+        fake.gates = (("0,1,15", (0.0, 1.0, 15.0), 0), ("0,1,35", (0.0, 1.0, 35.0), 0))
+        env.reset(seed=0)
+        parts: dict[str, float] = {}
+        for _ in range(12):  # z 24: rung 3 absorbed at the spawn, rung 2 reached and paid
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+        assert env.gates._hops_source == "rooms" and env.gates.best_hops == 2 and parts["gate"] == 15.0
+        reads = env.gates.route_reads
+        fake.gates_ordered = True  # the mod's Scan() finds the goal room as rooms light up
+        after: dict[str, float] = {}
+        for _ in range(5):  # the flip, and on to the hops 0 gate at z 35
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(after, info)
+        assert env.gates._hops_source == "gates" and info["route_source"] == 1
+        assert env.gates.reached == {"0,1,35"}, "the trunk's reached set went with its hop scale"
+        assert after["gate"] == 15.0, \
+            "one instalment -- the new ladder's own first rung. Carrying paid_hops 2 into a hops 0 gate " \
+            f"would have paid two, for a change of units: {after['gate']}"
+        assert env.gates.route_reads == reads, "and the trunk is not read again once the gates work"
+        env.close()
+
+
+def test_route_absent_is_todays_behaviour():
+    """The 21 levels with no file, and the `route_fallback: false` switch: no target, no payment, no change."""
+    with tempfile.TemporaryDirectory() as tmp:
+        empty = Path(tmp) / "no-routes"
+        empty.mkdir()
+        _read_route.cache_clear()
+        assert load_route(LEVEL, str(empty)) is None and load_route(LEVEL, str(empty / "missing")) is None
+        env, fake = make_env(route_dir=str(empty))
+        fake.enable_route()
+        obs, info = env.reset(seed=0)
+        assert env.gates._route is None and info["route_source"] == 0
+        parts: dict[str, float] = {}
+        for _ in range(35):
+            obs, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+            if terminated or truncated:
+                break
+        assert info["end_reason"] == "level_complete" and info["gates_reached"] == 0
+        assert "gate" not in parts and "gate_approach" not in parts
+        assert not obs[GATE_BLOCK : GATE_BLOCK + 8].any(), "the target slots stay empty, as they are today"
+        assert env.gates.route_reads == 0 and env.gates.route_source == 0
+        env.close()
+
+    # The same level WITH a file, but the fallback switched off in the config: the file is never even read.
+    with tempfile.TemporaryDirectory() as tmp:
+        route_dir = write_route(Path(tmp) / "routes")
+        env, fake = make_env(route_dir=str(route_dir), route_fallback=False)
+        fake.enable_route()
+        env.reset(seed=0)
+        assert env.gates._route is None
+        parts = {}
+        for _ in range(35):
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(parts, info)
+            if terminated or truncated:
+                break
+        assert "gate" not in parts and info["route_source"] == 0
+        env.close()
+
+
+def test_a_route_rung_goes_through_the_same_patience_and_parking_machinery():
+    """A rung is shaped like a gate, so the ladder-patience spec applies to it unchanged -- and must.
+
+    A trunk is offline data with no live check that a leg is walkable (spec §2.8), so the mechanism that
+    rescues a collapsed gate ladder is the same one that rescues a bad rung: the target is parked after
+    `patience_steps` without getting closer, and the fallback hands over to the nearest unreached, unparked
+    rung at any hop count.
+
+    And the two payment rules stay mutually exclusive on a trunk, which is the "no double payment" claim. The
+    fallback rung here is BELOW the floor (`hops` 0 against `best_hops` 2), so `_pay_fallback` declines it and
+    the LADDER pays the two hop values the skip crossed -- the same telescoping a gate ladder does for a
+    shortcut. `_pay_fallback` only ever pays a rung at or above the floor, which the ladder by construction
+    cannot pay for, so no rung is paid twice and the load's whole `gate` income is still the trunk's depth.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # Rung hops 1 is 200 m straight up -- 0-3's shape, on a trunk. The rung below it is on the floor.
+        rungs = ((0.0, 1.0, 6.0, 3), (0.0, 1.0, 22.0, 2), (0.0, 201.0, 30.0, 1), (0.0, 1.0, 54.0, 0))
+        env, fake, _ = route_env(tmp, rungs=rungs, max_steps=1200, stuck_seconds=1000.0)
+        env.reset(seed=0)
+        for _ in range(12):  # z 24: rung 2 reached, so the ladder points at the unreachable rung 1
+            env.step(forward())
+        assert env.gates.target["key"] == "0,201,30" and env.gates.best_hops == 2
+        paid = 0.0
+        for _ in range(env.gates.patience_steps + 2):
+            _, _, terminated, truncated, info = env.step(idle())
+            paid += info["reward_parts"].get("gate", 0.0)
+            if terminated or truncated:
+                break
+        assert env.gates.parked == {"0,201,30"} and info["targets_parked"] == 1
+        assert env.gates.target["key"] == "0,1,54", "the nearest unreached, unparked rung at any hop count"
+        assert paid == 0.0, "parking is a switch, not a payment"
+        for _ in range(20):  # walk to the fallback rung, which is two hop values below the floor
+            _, _, terminated, truncated, info = env.step(forward())
+            paid += info["reward_parts"].get("gate", 0.0)
+            if terminated or truncated:
+                break
+        assert paid == 30.0, f"the ladder pays the two hop values the skip crossed, and only it: {paid}"
+        assert env.gates.best_hops == 0 and env.gates.paid_hops == 0
+        assert "0,1,54" not in env.gates.paid_fallback, \
+            "the fallback rule declined it (hops below the floor), so the ladder's payment is the only one"
+        # The whole level load earned the trunk's depth and not one instalment more: rung 3 absorbed where the
+        # player spawned inside its own cylinder, rung 2 on the way, then the two hop values the skip crossed.
+        assert env.gates.paid_fallback == {"0,1,6"}, "absorbed by mark_paid at the load, never paid"
+        env.close()
+
+
+def test_the_patience_rule_is_inert_on_a_walkable_trunk():
+    """And where the trunk IS walkable it changes nothing, which is the other half of the same claim.
+
+    Worth pinning because a monotone trunk is the shape where the patience rule's known residual bites: its
+    rung-below is usually also the nearest unreached rung, so `_nearer_unreached` finds nothing nearer and a
+    ladder pick is never parked. That makes parking nearly inert on a healthy trunk -- and means the detector
+    for a bad rung is `route_source` 2 with `gates_reached` stuck and `targets_parked` 0, exactly as the
+    ladder-patience spec's deviation 2 records. The cure is the data (`"rungs": []`), never a knob.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, max_steps=40)
+        env.reset(seed=0)
+        on: dict[str, float] = {}
+        for _ in range(40):
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(on, info)
+            if terminated or truncated:
+                break
+        assert info["targets_parked"] == 0 and info["end_reason"] == "level_complete"
+        env.close()
+    with tempfile.TemporaryDirectory() as tmp:  # the same walk with parking turned off entirely
+        env, fake, _ = route_env(tmp, max_steps=40, gate_target_patience_s=0.0)
+        env.reset(seed=0)
+        off: dict[str, float] = {}
+        for _ in range(40):
+            _, _, terminated, truncated, info = env.step(forward())
+            add_parts(off, info)
+            if terminated or truncated:
+                break
+        assert env.gates.patience_steps == 0
+        env.close()
+    assert on["gate"] == off["gate"] == 45.0
+    assert abs(on["gate_approach"] - off["gate_approach"]) < 1e-9, (on["gate_approach"], off["gate_approach"])
+
+
+def test_a_route_file_the_loader_refuses_is_the_same_as_no_file():
+    """Every rejection falls through to layer 3, because "no file" is the normal case on 21 of 33 levels."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / "routes"
+        cases = {
+            "version": {"version": 3},                       # a newer emitter than this loader
+            "level": {"level": "Level 0-3"},                 # a file renamed onto the wrong level
+            "rungs": {"rungs": []},                          # §12.4's recovery path: disable one level by hand
+            "two rungs": {"rungs": [{"key": "0,1,6", "pos": [0.0, 1.0, 6.0], "hops": 1},
+                                    {"key": "0,1,22", "pos": [0.0, 1.0, 22.0], "hops": 0}]},  # R1
+            "no exit": {"exit": {"target": "Level 0-2"}},     # guard I5 could never be evaluated
+            "bad pos": {"rungs": [{"key": "0,1,6", "pos": [0.0, 1.0], "hops": 2},
+                                  {"key": "0,1,22", "pos": [0.0, None, 22.0], "hops": 1},
+                                  {"key": "0,1,38", "pos": [0.0, 1.0, float("nan")], "hops": 0}]},
+        }
+        for name, override in cases.items():
+            write_route(base, **override)
+            assert load_route(LEVEL, str(base)) is None, name
+        # Not JSON at all, and a file that is JSON but not an object.
+        for text in ("{not json", "[]", "null"):
+            route_path(LEVEL, str(base)).write_text(text, encoding="utf-8")
+            _read_route.cache_clear()
+            assert load_route(LEVEL, str(base)) is None, text
+        # And the TYPE-level breakage, which the cases above never reached: each of these is valid JSON that
+        # used to raise straight out of the loader. `load_route` runs in `UltrakillEnv.__init__` and in
+        # `_switch_level` -> `_campaign_reset` -> `reset()`, neither of which catches anything, and SB3's
+        # SubprocVecEnv worker does not either, so on a 30-level curriculum one bad file would kill a worker
+        # the first time any env sampled that level -- hours into a run. Hand-editing a route file is the
+        # documented recovery path for a bad rung (spec §12.4), so a typo lands exactly here.
+        write_route(base)  # `rungs` is a parameter of the fixture, so a scalar one is written by hand
+        good = json.loads(route_path(LEVEL, str(base)).read_text(encoding="utf-8"))
+        for scalar in (5, True, 3.5, "three"):  # each is truthy and not iterable: `or ()` never saw it
+            good["rungs"] = scalar
+            route_path(LEVEL, str(base)).write_text(json.dumps(good), encoding="utf-8")
+            _read_route.cache_clear()
+            assert load_route(LEVEL, str(base)) is None, f"rungs is {scalar!r}"
+        # `1e400` parses to inf (json.dumps writes it as `Infinity`, json.loads reads it back), and int()
+        # refuses inf with OverflowError -- not the ValueError the clause caught.
+        write_route(base, rungs=[{"key": f"0,1,{z}", "pos": [0.0, 1.0, float(z)], "hops": float("inf"),
+                                  "name": "r", "gated_by": [], "open": False, "locked": False, "active": True}
+                                 for z in (6, 22, 38, 54)])
+        assert load_route(LEVEL, str(base)) is None, "every rung unreadable leaves fewer than ROUTE_MIN_RUNGS"
+
+
+def test_the_loader_never_raises_out_of_env_step():
+    """The backstop: any shape `_parse_route` did not anticipate is a layer-3 refusal, never an exception.
+
+    Every case above is a rejection the loader names explicitly; this pins the property they add up to, which
+    is the one `env.step` depends on. `_parse_route` is stubbed to raise because, with the type checks in
+    place, no file can reach the backstop any more -- which is the point: the guard is for the shape nobody
+    thought of. It prints one line (the only loud rejection there is) and `lru_cache` holds the None, so a
+    training run sees it once per scene per process rather than once per level load.
+    """
+    import ultrakill_ai.campaign as campaign_mod
+    with tempfile.TemporaryDirectory() as tmp:
+        base = write_route(Path(tmp) / "routes")
+        original = campaign_mod._parse_route
+        campaign_mod._parse_route = lambda scene, doc: (_ for _ in ()).throw(RuntimeError("unanticipated shape"))
+        try:
+            _read_route.cache_clear()
+            assert load_route(LEVEL, str(base)) is None, "the loader swallowed it and fell through to layer 3"
+        finally:
+            campaign_mod._parse_route = original
+            _read_route.cache_clear()
+        assert load_route(LEVEL, str(base)) is not None, "and the good file still loads once the stub is gone"
+
+
+def test_the_loader_normalises_the_fields_the_reach_test_reads():
+    """`open`, `locked`, `active` and `needs_item` are schema constants on a rung, not data.
+
+    `_is_reached` DOUBLES its cylinder for an open gate (16 m x 12 m, which R4 never measured) and refuses one
+    that carries `needs_item` however close the player stands, so a hand-edited file must not be able to widen
+    the reach test or wedge a rung. The loader guarantees what the reach test assumes; `test_route_files.py`
+    is what fails when a SHIPPED file disagrees.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        base = write_route(Path(tmp) / "routes", rungs=ROUTE_RUNGS)
+        doc = json.loads(route_path(LEVEL, str(base)).read_text(encoding="utf-8"))
+        for rung in doc["rungs"]:
+            rung.update(open=True, locked=True, active=False, needs_item="SkullBlue")
+        route_path(LEVEL, str(base)).write_text(json.dumps(doc), encoding="utf-8")
+        _read_route.cache_clear()
+        route = load_route(LEVEL, str(base))
+        assert route is not None
+        for rung in route["rungs"]:
+            assert rung["open"] is False and rung["locked"] is False and rung["active"] is True
+            assert "needs_item" not in rung, "a static needs_item is a permanent wedge; S3 stamps it live"
+        assert route["rungs"][0]["name"] == "1 - Room", "and everything else the file carries is kept"
+        assert route["rungs"][0]["gated_by"] == []
+
+
+def test_each_env_gets_its_own_copy_of_the_trunk():
+    """`load_route` deep-copies, because a rung is handed straight out as `GateProgress.target`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = write_route(Path(tmp) / "routes")
+        one, two = load_route(LEVEL, str(base)), load_route(LEVEL, str(base))
+        assert one == two and one is not two
+        assert one["rungs"][0] is not two["rungs"][0] and one["exit_pos"] is not two["exit_pos"]
+        one["rungs"][0]["hops"] = 99
+        assert load_route(LEVEL, str(base))["rungs"][0]["hops"] == 3, "the cached document was not mutated"
+
+
+# ---------------------------------------------------------------------------------------------
 # S4: the skull-carry leg
 # ---------------------------------------------------------------------------------------------
 
@@ -1771,9 +2421,15 @@ def test_levels_must_be_scenes_this_build_ships():
 
 
 def test_human_routes_are_retired():
+    """No human demo and no recorded route, which layer 2 does not change: its rungs are level DATA.
+
+    `route_dir` is a live config field again, but it names the offline room trunks `build_routes.py` derives
+    from the shipped scene bundles -- room transforms and their authored numbering, nothing a person played.
+    """
     root = Path(__file__).resolve().parents[1]
     assert not (root / "ultrakill_ai" / "routes.py").exists()
     assert not (root / "scripts" / "record_route.py").exists()
+    assert not hasattr(RewardConfig(), "route_point"), "the human-route reward terms stay gone"
 
 
 if __name__ == "__main__":

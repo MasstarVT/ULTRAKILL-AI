@@ -20,6 +20,11 @@ from ultrakill_ai.campaign import (  # noqa: E402
     CAMPAIGN_LEVELS_SHIPPED,
     GATE_EXIT_KEY,
     RANK_LETTERS,
+    ROUTE_SOURCE_GATES,
+    ROUTE_SOURCE_NAMES,
+    ROUTE_SOURCE_NONE,
+    ROUTE_SOURCE_ROOMS,
+    ROUTE_VERSION,
     SUBGOAL_ALTAR,
     SUBGOAL_ITEM,
     ExitGuard,
@@ -34,7 +39,9 @@ from ultrakill_ai.campaign import (  # noqa: E402
     dead_twin,
     grade,
     level_weights,
+    load_route,
     read_curriculum,
+    route_path,
     safe_name,
     save_best_run,
     unlock_next,
@@ -2068,6 +2075,217 @@ def test_save_best_run_gives_up_on_a_stale_lock_instead_of_blocking_forever():
         assert time.monotonic() - started < 2.0  # gave up quickly instead of blocking forever
         assert not path.exists()  # nothing was written
         assert stale_lock.exists()  # a stale lock is left for whoever created it to clean up, not deleted by a waiter
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: the room trunk as a ladder (§7.3 of the route-fallback spec)
+# ---------------------------------------------------------------------------
+
+def rung(pos, hops, **extra):
+    """One entry of a route file's `rungs`, in the schema `build_routes.py` emits."""
+    x, y, z = pos
+    return {"key": f"{round(x)},{round(y)},{round(z)}", "pos": [float(x), float(y), float(z)],
+            "hops": int(hops), "name": f"{hops} - Room", "gated_by": [],
+            "open": False, "locked": False, "active": True, **extra}
+
+
+def trunk(rungs, exit_pos=(0.0, 0.0, 200.0)) -> dict:
+    """A loaded route document, the shape `load_route` returns (no file, no cache, no disk)."""
+    return {"level": "Level 0-5", "exit_pos": [float(v) for v in exit_pos], "rungs": [dict(r) for r in rungs]}
+
+
+# The same corridor as LADDER, offset in x so a rung can never be confused with a gate: one rung every 20 m.
+TRUNK = [rung((50.0, 0.0, 20.0 * (9 - h)), h) for h in range(9, -1, -1)]
+
+
+def test_the_three_gates_arms_fall_through_to_the_room_trunk():
+    """Layer 2 is reachable from exactly the three arms where the gate ladder gives up, and nowhere else."""
+    route = trunk(TRUNK)
+    arms = {
+        "no campaign block": None,
+        "no gates at all": {"gates_ordered": True, "gates": []},
+        "unordered (0-5's shape)": gates_block(LADDER, ordered=False),
+        "too few hops (8-3's shape)": gates_block(
+            [gate("0,0,0", (0.0, 0.0, 0.0), 0)] + [gate(f"0,0,{20 * i}", (0.0, 0.0, 20.0 * i), None)
+                                                   for i in range(1, 32)]),
+    }
+    for name, camp in arms.items():
+        assert GateProgress(route=route)._gates(camp) is route["rungs"], name
+        assert GateProgress()._gates(camp) == [], f"{name}: without a file the arm is still `return []`"
+    # And the success path is untouched: a usable ladder never reaches the trunk.
+    camp = gates_block(LADDER)
+    assert GateProgress(route=route)._gates(camp) is not route["rungs"]
+
+
+def test_the_gates_success_path_returns_the_identical_list_it_returns_today():
+    """A3's offline half: with a route loaded, a level whose gates work gets exactly what it gets now."""
+    camp = gates_block(LADDER)
+    plain, routed = GateProgress(), GateProgress(route=trunk(TRUNK))
+    assert plain._gates(camp) == routed._gates(camp) == camp["gates"]
+    assert all(a is b for a, b in zip(plain._gates(camp), routed._gates(camp))), "the same gate objects"
+    assert routed.route_reads == 0, "and the trunk was never consulted"
+    # The source guard cannot fire on a gates level, because the source never changes there.
+    routed._note_reached(camp, (0.0, 0.0, 0.0))
+    assert routed._hops_source == "gates" and routed.route_source == ROUTE_SOURCE_GATES
+    routed._note_reached(None, (0.0, 0.0, 0.0))  # a mid-load frame with no block at all
+    assert routed._hops_source == "rooms", "a level WITH a file does flip while the block is missing"
+    plain._note_reached(camp, (0.0, 0.0, 0.0))
+    assert plain.route_source == ROUTE_SOURCE_GATES
+    plain._note_reached(None, (0.0, 0.0, 0.0))
+    assert plain._hops_source == "gates", "but a level without one never does, which is the 18-level claim"
+    assert plain.route_source == ROUTE_SOURCE_GATES, "an empty frame does not un-name the layer either"
+
+
+def test_is_room_ladder_short_circuits_without_a_route():
+    """`self._route is not None and ...`, so the rooms-only rules never subscript None on a gates level."""
+    p = GateProgress()
+    assert p._is_room_ladder([]) is False and p._is_room_ladder(LADDER) is False
+    route = trunk(TRUNK)
+    q = GateProgress(route=route)
+    assert q._is_room_ladder(route["rungs"]) is True
+    assert q._is_room_ladder(list(route["rungs"])) is False, "identity, not equality: a copy is not the trunk"
+    assert q._is_room_ladder([dict(r) for r in route["rungs"]]) is False
+
+
+def test_the_source_names_are_the_integers_the_info_field_reports():
+    assert (ROUTE_SOURCE_NONE, ROUTE_SOURCE_GATES, ROUTE_SOURCE_ROOMS) == (0, 1, 2)
+    assert ROUTE_SOURCE_NAMES == {0: "none", 1: "gates", 2: "rooms"}
+
+
+def test_a_deep_trunk_flipping_to_a_shallow_ladder_pays_one_instalment_not_nine():
+    """The `_hops_source` guard, with the arithmetic it exists to stop, measured both ways.
+
+    A trunk and a gate ladder are different measures of one level, so `paid_hops` cannot cross between them:
+    a trunk walked down to hops 7 whose level then reports a hops 0 gate would pay `7 - 0` instalments -- 105
+    reward at `gate` 15 -- for a change of units. The counterfactual is produced by the real code, by clearing
+    the recorded source just before the flip so the guard cannot see it.
+    """
+    camp = gates_block([gate("0,0,40", (50.0, 0.0, 40.0), 0)], ordered=False)
+    route = trunk(TRUNK)
+
+    def to_hops_7(guard: bool) -> GateProgress:
+        p = GateProgress(route=route)
+        p.new_level_load(camp, (50.0, 0.0, -30.0))
+        p.reset_episode()
+        p.retarget(camp, (50.0, 0.0, -30.0))
+        assert p.best_hops == 9 and p._hops_source == "rooms", "seeded on the trunk"
+        walk(p, camp, [(50.0, 0.0, 20.0), (50.0, 0.0, 40.0)])
+        assert p.best_hops == 7 and p.paid_hops == 7
+        if not guard:
+            p._hops_source = None  # exactly what the code did before the guard existed
+        return p
+
+    guarded, naive = to_hops_7(True), to_hops_7(False)
+    flipped = dict(camp, gates_ordered=True)
+    assert naive.update(flipped, (50.0, 0.0, 40.0))[0] == 7, "the harm: seven instalments for a change of units"
+    assert guarded.update(flipped, (50.0, 0.0, 40.0))[0] == 1, "one, the new ladder's own first rung"
+    assert guarded._hops_source == "gates" and guarded.route_source == ROUTE_SOURCE_GATES
+    assert guarded.reached == {"0,0,40"} and guarded.hops_reached == {0}, "the trunk's ladder went with its scale"
+
+
+def test_the_stale_check_clears_a_target_already_held():
+    """Guard I5: a moved FinalPit disables the file, and the stale rung must not be left as the target.
+
+    `_choose_target` opens with `if not active: return self.target`, so without the clear the level would keep
+    aiming at a rung from a trunk it had just refused, and `gate_approach` would keep paying toward it.
+    """
+    route = trunk(TRUNK, exit_pos=(0.0, 0.0, 200.0))
+    p = GateProgress(route=route)
+    p.new_level_load({"gates_ordered": False, "gates": []}, (50.0, 0.0, 0.0))  # no exit yet: unvalidated
+    p.reset_episode()
+    p.retarget({"gates_ordered": False, "gates": []}, (50.0, 0.0, 0.0))
+    assert p.target is not None and p._route_ok is None and p.route_source == ROUTE_SOURCE_ROOMS
+    assert p.best_dist, "and it has an approach baseline that would go on paying"
+    moved = gates_block([], ordered=False, exit_pos=(0.0, 0.0, 260.0))  # the pit is 60 m from the file's
+    paid, approach = p.update(moved, (50.0, 0.0, 20.0))
+    assert p._route_ok is False and p.target is None and not p.best_dist
+    assert (paid, approach) == (0, 0.0) and p.route_source == ROUTE_SOURCE_NONE
+    assert p._gates(moved) == [], "the level is on layer 3 for the rest of the load"
+    # Within tolerance it is accepted, and the check is re-run on the next level load either way.
+    q = GateProgress(route=trunk(TRUNK))
+    near = gates_block([], ordered=False, exit_pos=(0.0, 0.0, 204.0))  # 4 m, inside the 5 m tolerance
+    q.new_level_load(near, (50.0, 0.0, 0.0))
+    assert q._route_ok is True and q._gates(near)
+    q.new_level_load(moved, (50.0, 0.0, 0.0))
+    assert q._route_ok is False, "re-decided per load, so a reload can rescue a level and lose it again"
+
+
+def test_a_mid_load_frame_with_no_exit_uses_the_trunk_unvalidated():
+    """The block arrives without an exit on the frames a fresh load reports first; the route still works."""
+    route = trunk(TRUNK)
+    p = GateProgress(route=route)
+    for camp in (None, {"gates_ordered": False, "gates": []}, gates_block([], ordered=False, exit_pos=None)):
+        p._route_ok = None
+        assert p._gates(camp) is route["rungs"], camp
+        assert p._route_ok is None, "the verdict waits for a frame that can answer it"
+
+
+def test_the_trunk_pays_at_most_one_instalment_per_rung_on_a_straight_walk():
+    """No double payment: the ladder rule and the fallback rule are mutually exclusive by `hops >= floor`."""
+    camp = gates_block([], ordered=False, exit_pos=(0.0, 0.0, 200.0))
+    route = trunk(TRUNK)
+    p = GateProgress(route=route, patience_steps=PATIENCE)
+    p.new_level_load(camp, (50.0, 0.0, -30.0))
+    p.reset_episode()
+    p.retarget(camp, (50.0, 0.0, -30.0))
+    paid, _ = walk(p, camp, [(50.0, 0.0, float(z)) for z in range(0, 190, 2)])
+    assert paid == 9, "ten rungs, the first absorbed at the spawn, so nine paid"
+    assert p.best_hops == 0 and p.gates_reached == 10 and p.parks == 0
+    again, _ = walk(p, camp, [(50.0, 0.0, float(z)) for z in range(188, -2, -2)])
+    assert again == 0, "and walking the trunk backwards pays nothing at all"
+
+
+def test_a_fallback_rung_behind_the_floor_pays_once_and_only_once():
+    """The other payment rule on a trunk, and its bound.
+
+    When the rung below is parked, the fallback can pick a rung the trunk has already passed -- above the
+    floor, where the ladder rule can never pay, because `best_hops` only falls. `_pay_fallback` pays that leg
+    one instalment, then records the key, so a tour of rungs behind cannot earn a second. Over a level load the
+    two rules together are bounded by the trunk's depth once each: the ladder pays per hop value descended and
+    the fallback per rung reached at or above the floor, and `paid_fallback` plus `hops_reached` close both.
+    """
+    # Rungs placed so that, standing at the hops 2 rung, the rung BEHIND is nearer than the rung ahead --
+    # which is what lets the ladder pick be parked at all (a park is only ever a switch).
+    rungs = [rung((0.0, 0.0, 0.0), 3), rung((0.0, 0.0, 20.0), 2), rung((0.0, 0.0, 60.0), 1),
+             rung((0.0, 0.0, 80.0), 0)]
+    camp = gates_block([], ordered=False, exit_pos=(0.0, 0.0, 120.0))
+    route = trunk(rungs, exit_pos=(0.0, 0.0, 120.0))
+    p = GateProgress(route=route, patience_steps=20)
+    p.new_level_load(camp, (0.0, 0.0, 22.0))
+    p.reset_episode()
+    p.retarget(camp, (0.0, 0.0, 22.0))
+    assert p.best_hops == 2 and p.target["key"] == "0,0,60"
+    paid, _ = dwell(p, camp, (0.0, 0.0, 22.0), 22)
+    assert p.parked == {"0,0,60"} and paid == 0, "parking never pays"
+    assert p.target["key"] == "0,0,0" and p._fallback, "the fallback picks the nearest, which is behind"
+    back, _ = walk(p, camp, [(0.0, 0.0, 22.0 - 2.0 * k) for k in range(1, 12)])
+    assert back == 1, f"the rung behind pays one instalment through the fallback rule, got {back}"
+    assert p.best_hops == 2, "and it cannot lower the floor: the ladder rule paid nothing"
+    assert p.paid_fallback == {"0,0,20", "0,0,0"}
+    once, _ = walk(p, camp, [(0.0, 0.0, 0.0 + 2.0 * k) for k in range(1, 12)] + [(0.0, 0.0, 0.0)])
+    assert once == 0, "walking out to it and back again earns nothing more"
+    # Then the rest of the trunk, which the ladder pays for as usual: hops 1 and hops 0.
+    rest, _ = walk(p, camp, [(0.0, 0.0, float(z)) for z in range(0, 82, 2)])
+    assert rest == 2 and p.best_hops == 0
+    assert back + once + rest == 3, "three instalments over a four-rung trunk whose first rung was absorbed"
+
+
+def test_a_trunk_of_fewer_than_three_rungs_is_never_loaded():
+    """R1 lives in the loader as well as in the emitter, so a hand-edited file cannot ship a 2-rung route."""
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = {"level": "Level 0-5", "version": ROUTE_VERSION, "exit": {"pos": [0.0, 0.0, 200.0]},
+               "rungs": [rung((0.0, 0.0, 0.0), 1), rung((0.0, 0.0, 20.0), 0)]}
+        path = route_path("Level 0-5", tmp)
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        assert load_route("Level 0-5", tmp) is None
+        doc["rungs"].append(rung((0.0, 0.0, 40.0), 2))
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        from ultrakill_ai.campaign import _read_route
+        _read_route.cache_clear()
+        loaded = load_route("Level 0-5", tmp)
+        assert loaded is not None and len(loaded["rungs"]) == 3
+        assert loaded["exit_pos"] == [0.0, 0.0, 200.0]
+        assert route_path("Level 0-5", tmp).name == "route_Level_0-5.json"
 
 
 if __name__ == "__main__":

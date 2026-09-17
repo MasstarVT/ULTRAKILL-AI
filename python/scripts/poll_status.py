@@ -37,6 +37,10 @@ FIELDS = [
     # The 2026-09-17 patience/exit-guard mechanisms. An existing metrics_log.csv keeps its own header, so move
     # the old file aside to get these two columns.
     "targets_parked", "exit_banished",
+    # Which route layer the window ran on: 0 exit vector, 1 gate ladder, 2 offline room trunk. Read
+    # `part_gate_approach` against `part_level_complete` on any window where this is above 1 -- the route
+    # spec's §12.6 tripwire is 6x, and the lever is the route file, never the weight.
+    "route_source",
 ]
 # The same means over fresh-start episodes only (status["mean_fresh_100"]): a respawn episode inherits
 # gates_reached and checkpoints_level from its level load, so only these two say how a whole run goes.

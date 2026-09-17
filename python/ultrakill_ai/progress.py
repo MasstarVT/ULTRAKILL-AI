@@ -48,8 +48,10 @@ PPO_METRICS = (
 # Per-episode fields carried straight into runs/<run>/episodes.jsonl. `field()` routes everything through
 # _num(), which returns None for anything float() rejects, so a string checkpoint id and a [x, y, z] list have
 # to bypass it -- otherwise the two fields that say where an episode died would both be written as null.
+# `route_source_name` is the string half of the route layer ("none" / "gates" / "rooms"); the numeric
+# `route_source` travels in CAMPAIGN_INFO_KEYS and is charted, exactly as rl-5 of the route spec asks.
 EPISODE_LOG_RAW = ("level", "start_checkpoint", "end_pos", "end_reason", "level_seconds", "gate_hops_best",
-                   "bridge_resets")
+                   "bridge_resets", "route_source_name")
 
 
 def _num(value: Any) -> float | None:
@@ -368,6 +370,9 @@ class ProgressCallback(BaseCallback):
             # the exit guard rejected a banished FinalPit report. Both 0 on a healthy monotone level.
             "targets_parked": field("targets_parked"),
             "exit_banished": field("exit_banished"),
+            # Which route layer drove the level load: 0 exit vector, 1 gate ladder, 2 room trunk. Numeric so it
+            # survives `_num`; a mean between two integers means the window spans levels on different layers.
+            "route_source": field("route_source"),
             "wedged_steps": field("wedged_steps"),
             "level_started": field("level_started"),
             "look_free_frac": field("look_free_frac"),
@@ -463,6 +468,7 @@ class ProgressCallback(BaseCallback):
             "gates_reached": stats["gates_reached"],
             "targets_parked": stats["targets_parked"],
             "exit_banished": stats["exit_banished"],
+            "route_source": stats["route_source"],
             "level_started": stats["level_started"],
             "wedged_steps": stats["wedged_steps"],
             "completed": stats["completed"],
@@ -554,7 +560,7 @@ class ProgressCallback(BaseCallback):
                                                  "yaw_track", "pitch_track",
                                                  "pitch_mean", "look_up_mean", "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac",
                                                  "gates_reached", "wedged_steps", "level_started", "slide_forced_frac",
-                                                 "targets_parked", "exit_banished",
+                                                 "targets_parked", "exit_banished", "route_source",
                                                  "look_free_frac", "look_enemy_frac", "look_gate_frac")}
         fresh_recent = {key: self._fresh_mean(key) for key in ("gates_reached", "checkpoints_level", "completed", "wedged_steps")}
         part_names = sorted({name for ep in self.episodes_recent for name in ep["reward_parts"]})
@@ -575,6 +581,10 @@ class ProgressCallback(BaseCallback):
                 "completion_rate_fresh_50": campaign["fresh_completion_rate"] if campaign else None,
                 "mean_checkpoints_level_100": recent["checkpoints_level"],
                 "mean_gates_reached_100": recent["gates_reached"],
+                # The route layer as a chart series: on a mixed curriculum it is the share of the window that
+                # ran on a room trunk rather than a gate ladder, and it is the first thing to read when a
+                # fallback level wedges (route spec §12.4).
+                "mean_route_source_100": recent["route_source"],
                 "steps_per_s": steps_per_s,
             })
 
