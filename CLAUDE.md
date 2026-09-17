@@ -215,6 +215,27 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/tests/test_keep_best.py`: `keep_best.py` scoring for both metrics on synthetic `metrics_log.csv` rows, and old `best.json` files (no game needed; `python tests/test_keep_best.py`).
 - `python/tests/test_games.py`: `games.py`'s instance-count guard — that `disk_logging_enabled` reads `Enabled` from `[Logging.Disk]` and not from the `[Logging.Console]` section above it, and that a missing file or key means BepInEx's default (on). This is what keeps `launch --count 8` from silently starting three copies whose plugin never loads (no game needed).
 - `python/scripts/post_times.py`: posts a training run's best official level times to `times.md` from files the run already writes (no game, idempotent). `python/tests/test_post_times.py` covers first post, repeat post, only-faster and a missing `episodes.jsonl` (no game needed).
+- `python/scripts/supervise.py`: **the crash supervisor** — restarts the run when it dies, with no LLM and no
+  tokens. Health is three things at once: a `train.py` process for this run exists (matched on the command line),
+  `runs/<run>/status.json` moved within `--stale-seconds`, and its `state` is `running`. A process that exists
+  while `status.json` stays stale is HUNG and is killed by PID with its SubprocVecEnv workers; a process that is
+  gone is DEAD. A restart logs the last 30 lines of the train log, stops the games, relaunches `--count N
+  --monitor M` through `games.launch()` (readiness from netstat — it never opens a TCP connection to a bridge
+  port), resumes from whichever of `latest.zip` and the newest `ckpt_*_steps.zip` holds **more timesteps**
+  (`latest.zip`'s count is read out of the `num_timesteps` field of the `data` member inside the zip, so it costs
+  no torch import), and starts the trainer detached with the same `cmd /c ... >> log 2>&1` line a human would
+  type. `poll_status.py` and `keep_best.py` are restarted whenever they are missing, on every poll. Matching
+  rejects any command line containing `supervise.py`, `Win32_Process`, `Get-CimInstance`, `tasklist` or `wmic`,
+  and the supervisor's own process tree by PID: a command line that *mentions* the trainer is not the trainer,
+  which is how an earlier report script counted a PowerShell query as a running run. **`runs/<run>/SUPERVISOR_PAUSE`
+  turns it off** (see Commands). Budget: after `--max-restarts-per-hour` restarts in an hour it logs `GIVING UP`
+  and exits non-zero, because a restart loop grinds the checkpoints.
+- `python/tests/test_supervise.py`: the supervisor's decisions against injected processes, clock, status probe,
+  killer and launcher — healthy leaves everything alone, dead restarts once with the right resume file and count,
+  hung kills the workers first, the pause file blocks everything, a graceful stop mid-save is not killed, the
+  budget exits non-zero, the grace period stops a second trainer, helpers are started only when missing, the
+  resume choice in all three shapes (latest ahead, checkpoint ahead, latest unreadable) and the self-match trap
+  (no game, no real process; `python tests/test_supervise.py`).
 - `python/tests/test_times.py`: `times.md` updates against the committed file's exact text: placeholders, records, deltas, level order (no game needed; `python tests/test_times.py`).
 - `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load, and the two novelty-measure tests that pin the void exploit shut (`test_falling_off_the_map_pays_no_novelty`, `test_novelty_pays_for_new_ground_not_for_height`). `FakeLevel` reports ground rays the way the mod does, so its floor is at y 1 and `falling` makes every ray miss (no game needed). Its `enable_skulls(fields=, altars=, item_type=)` plus `item_active` cover the shapes a carryable comes in: the wired puzzle, a 0.6.x mod, 0-4's altar-free `CustomKey1`, an item no zone accepts, and an item whose room is still switched off.
 - `python/tests/test_skull_check.py`: `skull_check.py`'s three checks against `FakeLevel`'s skull room — the whole carry green, an item whose room is off named as the reason, a placement undone by the spam caught as a FAIL (run with the carry protection disabled, which is what makes it the regression test for `_protect_carry`), a pre-0.7.0 mod, `--skip-kill`, the `--render` control run and the default coordinates (no game needed).
@@ -274,6 +295,31 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     and the same shape for `-u scripts/poll_status.py --run campaign_gates >> runs\campaign_gates_poll.log 2>&1`
     and `-u scripts/keep_best.py --run campaign_gates --metric campaign >> runs\campaign_gates_keep_best.log 2>&1`;
     the dashboard runs from `pythonw.exe scripts/dashboard.py --run campaign_gates --monitor 1`.
+- **The crash supervisor — keep it running, and pause it before you pause training.** The run died on its own on
+  2026-09-17 (a worker's `TimeoutError` on a level reset) and nothing restarted it for hours. `supervise.py`
+  is the standing fix; start it the same detached way, fifth:
+  ```powershell
+  Start-Process -FilePath cmd.exe -WorkingDirectory F:\Github\ULTRAKILL-AI\python -WindowStyle Minimized `
+    -ArgumentList '/c', '"F:\Github\ULTRAKILL-AI\python\.venv\Scripts\python.exe" -u scripts/supervise.py --run campaign_gates --config configs/campaign_gates_main.yaml --count 12 --monitor 1 >> runs\campaign_gates_supervisor.log 2>&1'
+  ```
+  `python scripts/supervise.py ... --dry-run` reports the health decision and exits without changing anything —
+  run that first, and expect one `healthy: trainer pid N, ... steps, status Ns old` line. It appends to
+  `runs/campaign_gates_supervisor.log`, logs once per change of situation and one heartbeat an hour.
+  - **STOP THE SUPERVISOR, OR CREATE THE PAUSE FILE, BEFORE ANY PLANNED PAUSE.** A deliberate Ctrl+C, a
+    `games.py stop`, an integration pause — all of them look exactly like a crash to it, and it will stop your
+    games and start the trainer again underneath you. Either kill it, or:
+    ```powershell
+    New-Item runs\campaign_gates\SUPERVISOR_PAUSE       # from python/; it then does nothing at all
+    Remove-Item runs\campaign_gates\SUPERVISOR_PAUSE    # when the pause is over
+    ```
+    While that file exists it does not restart the trainer, does not touch the games and does not start the
+    helpers. It logs the pause once and logs once when it lifts. A trainer that is mid-teardown with a fresh
+    `status.json` (`state` already `stopped`) is left alone anyway, but only until the file goes stale, so the
+    pause file is the only thing that holds across a whole pause.
+  - It restarts `poll_status.py` and `keep_best.py` whenever they are missing, so do not count on stopping a
+    helper by hand while the supervisor is up.
+  - After `--max-restarts-per-hour` (3) restarts inside an hour it logs `GIVING UP` and exits non-zero: read
+    `runs/campaign_gates_supervisor.log` and the train-log tail it copied in, because restarting is not the fix.
   - **Judge a curriculum run per level**, on the dashboard's `levels` rows and `status.json`'s `campaign.levels`
     table, **never on the pooled numbers**: `max_steps` is one value for every level, so a longer level is
     truncated by construction, and `campaign.fresh_completion_rate` becomes a shrunk **sum** over the unlocked
@@ -333,7 +379,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**15 files; 304 named tests** as of 2026-09-17, of which `test_progress.py`'s 19 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery) and `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**16 files; 323 named tests** as of 2026-09-17, of which `test_progress.py`'s 19 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and `tests/test_supervise.py` the crash supervisor. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
 
 ## Key design decisions
@@ -1479,3 +1525,31 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
        revolver up, or dies in the gun room. Nothing in this pause addresses it — `max_steps` helps the *deep*
        runs, not these — so 0-1's rate stays roughly capped near 0.75 until it is. That is the next thing to
        attack on 0-1, and it is a separate change from anything shipped here.
+- **The run now supervises itself: `scripts/supervise.py`, live since 2026-09-17 09:26.** On the morning of
+  2026-09-17 `campaign_gates` died on its own — a SubprocVecEnv worker hit `TimeoutError` on a level reset,
+  `train.py`'s `finally` wrote `latest.zip`, and the trainer then wedged in teardown — and nothing restarted it.
+  An LLM monitor agent was covering that with a manual playbook; this is the same playbook as a plain process, so
+  it costs no tokens, never sleeps and cannot forget. Health is a `train.py` process for this run **and** a
+  `status.json` younger than `--stale-seconds` (600) **and** `state: running`; a process that is up while
+  `status.json` is stale is HUNG and is killed with its workers first. See the Layout entry for the mechanism and
+  Commands for how it is started.
+  - **The pause file is the whole safety story: `runs/campaign_gates/SUPERVISOR_PAUSE`.** Stop the supervisor or
+    create that file BEFORE any planned pause, because a deliberate Ctrl+C is indistinguishable from a crash from
+    the outside and it will relaunch the games and the trainer underneath you. A teardown in progress (fresh
+    `status.json`, `state` already `stopped`) is left alone, but only until it goes stale.
+  - Verified before going live: the full no-game suite (**16 files, 323 named tests**, 0 failures) and a
+    `--dry-run` against the live run, which reported `healthy: trainer pid 23480, 7,000,054 steps, status 1s old`
+    and took no action. Confirmed over the first polls that the trainer PID (23480, started 09:05:56) and
+    `status.json`'s step count were untouched.
+  - **The bug that first start found, and why the log write is doubled.** `cmd /c ... >> runs\<run>_supervisor.log`
+    holds that file with an exclusive share mode, so the supervisor's own `open(..., "a")` raises PermissionError
+    for as long as it runs: started the documented way, **every log line silently vanished**. `log()` now writes
+    the line to stdout (which the shell redirects into that same file) *and* tries the direct append, and needs
+    only one of them to land — exactly one copy reaches the file either way. Pinned by
+    `test_logging_survives_the_shell_holding_the_log_file`. Any future helper that logs to a file it is also
+    redirected into has the same trap waiting.
+  - **Matching a process is not matching a string.** The supervisor rejects any command line containing
+    `supervise.py`, `Win32_Process`, `Get-CimInstance`, `tasklist` or `wmic`, and its own process tree by PID,
+    because a query that *lists* the trainer contains the trainer's name — the miscount an earlier report script
+    made. Measured live while building this: the probe's own Bash wrapper matched on `train.py` + the run name
+    and was caught only by the ancestor-PID rule, so both halves of that guard earn their place.
