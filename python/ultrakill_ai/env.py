@@ -14,6 +14,7 @@ import numpy as np
 
 from ultrakill_ai.campaign import (
     CAMPAIGN_LEVELS_SHIPPED,
+    ROUTE_SOURCE_NAMES,
     SUBGOAL_ALTAR,
     SUBGOAL_ITEM,
     ExitGuard,
@@ -25,6 +26,7 @@ from ultrakill_ai.campaign import (
     choose_fresh_start,
     choose_level,
     compute_rank,
+    load_route,
     read_curriculum,
     safe_name,
     save_best_run,
@@ -46,7 +48,7 @@ CYBERGRIND_SCENE = "Endless"
 CAMPAIGN_INFO_KEYS = ("kills", "style", "deaths", "completed", "fresh_start", "level_seconds",
                       "checkpoints_level", "cells_new", "exit_dist_min", "oob_frac",
                       "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac",
-                      "targets_parked", "exit_banished")
+                      "targets_parked", "exit_banished", "route_source", "ladder_collapsed")
 
 YAW_CAP = max(abs(b) for b in YAW_BINS)  # 90 degrees per decision, the widest look bin
 PITCH_CAP = max(abs(b) for b in PITCH_BINS)  # 20 degrees per decision
@@ -126,7 +128,24 @@ class EnvConfig:
     gate_target_patience_s: float = 20.0  # game seconds a target may go without getting closer before it is parked
     gate_unpark_m: float = 2.0  # metres nearer than it was parked at that bring a parked gate back
     gate_fallback_hysteresis_m: float = 10.0  # metres a rival must beat the sticky fallback target by
+    # WHERE parking may act. "collapsed" (the default) is only on a level whose gate ladder the detector calls
+    # collapsed at the spawn -- measured on 0-3, 1-1, 1-2, 2-3, 4-3 and 8-1 and on none of the twelve healthy
+    # ladders. "always" is the unconditional mechanism as first shipped, which cost 0-1 half its fresh
+    # completion rate; "off" is `gate_target_patience_s: 0` by another name. See `detect_collapsed_ladder`.
+    gate_patience_mode: str = "collapsed"
+    # Layer choice on a collapsed level that also ships a room trunk (0-3, 4-3): False -- the default, and the
+    # lead's ruling -- keeps them on gates plus patience, which is what is moving 0-3 today. True hands them
+    # their trunk instead. A level with a HEALTHY ladder never reads its route file either way.
+    prefer_route_when_collapsed: bool = False
     exit_max_shift_m: float = 100.0  # metres the exit may legitimately move inside one level load (ExitGuard)
+    # The route fallback: layer 2, the offline room trunk shipped per level in ultrakill_ai/routes/ (see
+    # docs/superpowers/specs/2026-09-17-route-fallback-and-boss-levels-design.md). On by default and INERT on
+    # every level with a usable gate ladder and on every level with no file, which is all 21 the live configs
+    # name; `route_fallback: false` refuses every file without deleting one.
+    route_fallback: bool = True
+    route_dir: str = ""  # folder holding route_<scene>.json ("" = the packaged ultrakill_ai/routes/)
+    route_exit_tol_m: float = 5.0  # guard I5: metres the live FinalPit may differ before the file is refused
+    route_seed_m: float = 150.0  # how near a rung the player may start and still have it absorbed, not paid
     # Skull carry. 0 disables both carry-protection rules; they are inert on any level with no ItemPlaceZone.
     subgoal_punch_range_m: float = 4.0  # Punch.ActiveFrame's own 4 m reach: inside it a punch can pick up or place
     camera_height_m: float = 0.9  # metres from player.pos up to the camera, where every ray starts (see _eye)
@@ -249,7 +268,12 @@ class UltrakillEnv(gym.Env):
         self.gates = GateProgress(self.cfg.gate_reach_m, self.cfg.gate_reach_v_m, self.cfg.gate_min_gain_m,
                                   self.cfg.gate_hops_min_frac, self.cfg.target_kind_slots,
                                   patience_steps=patience_steps, unpark_m=self.cfg.gate_unpark_m,
-                                  fallback_hysteresis_m=self.cfg.gate_fallback_hysteresis_m)
+                                  fallback_hysteresis_m=self.cfg.gate_fallback_hysteresis_m,
+                                  route=self._route_for(self.level),
+                                  route_exit_tol_m=self.cfg.route_exit_tol_m,
+                                  route_seed_m=self.cfg.route_seed_m,
+                                  patience_mode=self.cfg.gate_patience_mode,
+                                  prefer_route_when_collapsed=self.cfg.prefer_route_when_collapsed)
         self.exit_guard = ExitGuard(self.cfg.exit_max_shift_m)
         self.path_progress = PathProgress()
         self._parks_at_start = 0  # GateProgress.parks when this episode began, so info reports the difference
@@ -988,6 +1012,18 @@ class UltrakillEnv(gym.Env):
     def _archive_path(self, level: str | None = None) -> Path:
         return Path(self.cfg.explore_dir) / f"explore_{safe_name(level or self.level)}_{self.cfg.port}.npz"
 
+    def _route_for(self, level: str) -> dict | None:
+        """This level's offline room trunk, or None -- which is layer 1 or layer 3, i.e. today's behaviour.
+
+        None for every Cyber Grind env, for `route_fallback: false`, and for the 21 campaign levels that ship
+        no file (the 18 the gate ladder already routes plus 1-3, 5-4 and 6-2). `GateProgress` built with
+        `route=None` is byte for byte the tracker without this spec, which is what makes acceptance check A3
+        on Level 0-1 a fair test.
+        """
+        if self.cfg.mode != "campaign" or not self.cfg.route_fallback:
+            return None
+        return load_route(level, self.cfg.route_dir)
+
     def _save_archive(self) -> None:
         """Saves every level's archive this env has touched, not only the current one."""
         if self.cfg.mode != "campaign" or not self.cfg.explore_dir:
@@ -1004,7 +1040,9 @@ class UltrakillEnv(gym.Env):
         Both names are arguments on purpose: an implementation that assigns `self.level` and then builds the save
         path from it writes the outgoing counts under the incoming level's filename and corrupts both archives.
         `_stuck_streak` / `_stuck_checkpoint` are level-scoped and are cleared, so a streak on the level being
-        left cannot force a reload on the level being entered.
+        left cannot force a reload on the level being entered. The route trunk is level-scoped too and is
+        swapped here: it is read from disk once per scene (`_read_route` is cached), so a curriculum that
+        revisits a level does not re-parse its file.
         """
         self._archives[previous_level] = self.archive
         if self.cfg.explore_dir:
@@ -1021,6 +1059,7 @@ class UltrakillEnv(gym.Env):
                        if self.cfg.explore_dir else ExplorationArchive(self.cfg.cell_size))
             self._archives[new_level] = archive
         self.archive = archive
+        self.gates.set_route(self._route_for(new_level))
         self._stuck_streak, self._stuck_checkpoint = 0, None
 
     def _sample_level(self) -> str:
@@ -1136,6 +1175,11 @@ class UltrakillEnv(gym.Env):
         no checkpoint yet: a switch here would change the scene mid-episode and make `info["level"]`, the best
         run's positions and the exploration archive all disagree with each other. Sampling lives in
         `_campaign_reset` and nowhere else.
+
+        `MilestoneTracker` is deliberately left on `mark_paid` even on the reload branch. Its keys are rounded
+        positions, identical across loads, so re-paying them would make "die with no checkpoint" a way to earn
+        `checkpoint` and `arena_clear` again for ground already covered -- a farm. `GateProgress` is held to the
+        same rule by `new_level_load(keep_paid=True)`: the ladder restarts, the payments do not.
         """
         before = self._raw.get("stats", {})
         raw, recovered = self._resilient_reset(checkpoint=True)
@@ -1147,15 +1191,38 @@ class UltrakillEnv(gym.Env):
         raw = self._guard_exit(self._skip_locked(raw))
         self.milestones.mark_paid(raw.get("campaign"))
         player = raw.get("player")
-        # No reset_episode here: the episode continues, so the gate approach it has already earned stands.
-        self.gates.mark_paid(raw.get("campaign"), (player or {}).get("pos"))
-        self.gates.retarget(raw.get("campaign"), (player or {}).get("pos"))
+        pos = (player or {}).get("pos")
+        # Was there a checkpoint to respawn at? With none, `StatsManager.Restart` reloaded the WHOLE level and
+        # the player is back at the spawn, so the ladder has to start again: `mark_paid` would leave `best_hops`
+        # at whatever the pre-death attempt reached, `_choose_target` would point at a rung far ahead of a
+        # player standing at the start, and `gate` could never pay again for this load. The bug predates the
+        # route fallback -- it exists on every gates ladder -- and a 13-rung trunk makes it bite much harder
+        # (spec §6). `new_level_load` is the honest call: the level really did load again.
+        # Gated on the block being PRESENT: the mod omits the whole `campaign` block for a step whose build
+        # throws, and an absent block has no `checkpoints` either, which would read as "no checkpoint" and wipe
+        # a ladder that was fine. Reading it as an ordinary respawn is the safe direction and self-corrects at
+        # the next episode boundary, where `choose_fresh_start` sees no checkpoint and forces a fresh load.
+        reloaded = raw.get("campaign") is not None and self._current_checkpoint(raw) is None
+        if reloaded:
+            # `keep_paid` is what stops the honest call from becoming a farm, and it is the SAME rule the
+            # paragraph above applies to `MilestoneTracker`: the episode is continuing, so `paid_hops`,
+            # `paid_fallback` and `best_dist` survive while the ladder itself starts again. Without it a death
+            # here re-arms `gate` and `gate_approach` for the whole prefix already walked -- measured at 30 / 30
+            # / 30 over three laps of a 3-rung FakeLevel trunk, against a `death` of 5 and with no bound but
+            # `max_steps`. Worse, reaching the level's first checkpoint moves every later death onto the branch
+            # below and ends the stream for good, so the gradient would point AWAY from the first checkpoint.
+            # The re-walk still pays for genuinely new ground: `paid_hops` is a floor, not a lock.
+            self.gates.new_level_load(raw.get("campaign"), pos, keep_paid=True)
+        else:
+            # No reset_episode here: the episode continues, so the gate approach it has already earned stands.
+            self.gates.mark_paid(raw.get("campaign"), pos)
+        self.gates.retarget(raw.get("campaign"), pos)
         # A respawn moves the player, so the pre-death stuck clock says nothing about where they are now.
         self._steps_since_progress = 0
         self._wedge_run = 0
         self._slide_latch = 0
         self._track_enemies(raw)
-        if player and self._current_checkpoint(raw) is None:
+        if player and reloaded:
             # No checkpoint yet, so StatsManager.Restart reloaded the level and its counters started again. Keep
             # the kills and style from before the death in this episode's info, and start a best run's positions
             # again from the spawn: the official time is the reloaded attempt's.
@@ -1412,6 +1479,18 @@ class UltrakillEnv(gym.Env):
             # expected to be 0 on a monotone level such as 0-1 and to rise on a collapsed one such as 0-3.
             info["targets_parked"] = self.gates.parks - self._parks_at_start
             info["exit_banished"] = int(self._exit_banished)
+            # The detector's verdict for the level load this episode ran on: 1 when the gate ladder collapses at
+            # the spawn, which is what switches parking on at all under `gate_patience_mode: collapsed`. A
+            # constant per level, so a level whose row reads anything but 0 or 1 means workers disagree about it.
+            # Undecided (a load whose block never carried a ladder) reports 0, which is how it behaves.
+            info["ladder_collapsed"] = int(bool(self.gates.ladder_collapsed))
+            # Which of the three route layers drove this level load: 0 exit vector, 1 the mod's gate ladder,
+            # 2 the offline room trunk. An INTEGER here because everything in CAMPAIGN_INFO_KEYS goes through
+            # Monitor(info_keywords=...) and ProgressCallback._num, which writes None for anything float()
+            # rejects -- the string belongs in EPISODE_LOG_RAW, next to `level` and `end_reason`. Level-load
+            # scoped, so a respawn episode inherits it, which is correct: the layer is a fact about the load.
+            info["route_source"] = self.gates.route_source
+            info["route_source_name"] = ROUTE_SOURCE_NAMES.get(self.gates.route_source, "none")
             info["wedged_steps"] = self._wedged_steps
             info["level_started"] = int(self._level_started)
             info["look_free_frac"] = b["look_free"] / steps

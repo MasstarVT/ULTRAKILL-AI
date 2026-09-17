@@ -117,6 +117,25 @@ def fmt_pct(value) -> str:
     return "—" if v is None else f"{v * 100:.0f}%"
 
 
+ROUTE_LAYERS = {0: "exit vector", 1: "gates", 2: "rooms"}
+
+
+def fmt_route_source(value) -> str:
+    """The route layer the last 100 episodes ran on: a name when they agree, else the mixed mean.
+
+    `route_source` is an integer per episode (0 exit vector, 1 the mod's gate ladder, 2 the offline room
+    trunk), so the 100-episode mean is only a layer name when the whole window sat on one layer -- which is
+    every single-level run. On a mixed curriculum the number is what matters, and calling it "mixed" stops it
+    being read as a level's own layer.
+    """
+    v = num(value)
+    if v is None:
+        return "—"
+    if float(v).is_integer() and int(v) in ROUTE_LAYERS:
+        return ROUTE_LAYERS[int(v)]
+    return f"mixed {v:.2f}"
+
+
 def short_level(scene) -> str:
     """"Level 0-1" -> "0-1", the form times.md and this panel use."""
     if not isinstance(scene, str):
@@ -142,9 +161,13 @@ def level_lines(campaign: dict) -> list[str]:
     for name, row in levels.items():
         if not isinstance(row, dict) or not row.get("unlocked"):
             continue
+        # `col` is the collapsed-ladder verdict for this level (1 = patience may park there, 0 = it may not),
+        # and `pk` the parks per episode it is actually taking. `col 0` with `pk` above 0 is the bug.
         rows.append(f"    {short_level(name):<4} fresh {fmt_pct(row.get('fresh_completion_rate'))}"
                     f" ({fmt_int(row.get('fresh_window'))})  best {fmt_time(row.get('best_time'))}"
-                    f"  cp {fmt_float(row.get('checkpoints_level'), 1)}  w {fmt_float(row.get('weight'))}")
+                    f"  cp {fmt_float(row.get('checkpoints_level'), 1)}  w {fmt_float(row.get('weight'))}"
+                    f"  col {fmt_float(row.get('ladder_collapsed'), 0)}"
+                    f"  pk {fmt_float(row.get('targets_parked'), 1)}")
     return rows if len(rows) > 1 else []
 
 
@@ -178,8 +201,16 @@ def campaign_lines(campaign: dict, mean: dict, parts: dict | None = None, best: 
         # The two mechanisms of the ladder-patience/exit-guard spec. `parked/ep` above ~0 says the ladder is
         # collapsed on the level being played (expected on 0-3, 1-1, 1-2, 2-3, 4-3, 8-1, not on 0-1);
         # `exit banished` above 0 says a CheckPoint clone moved the reported FinalPit and the guard caught it.
+        # `ladder` is the detector's verdict over the window (1 = a collapsed ladder, which is the only place
+        # parking is allowed to act): `parked/ep` above 0 while `ladder` reads 0 is the 0-1 regression coming
+        # back and means the detector let patience loose on a correct ladder.
         ("parked/ep       ", f"{fmt_float(mean.get('targets_parked'), 2)}"
+                             f"  ladder collapsed {fmt_pct(mean.get('ladder_collapsed'))}"
                              f"  exit banished {fmt_pct(mean.get('exit_banished'))}"),
+        # Which route layer is driving. "rooms" is the offline trunk of the route-fallback spec; on a level
+        # whose `gates/load` is stuck while this reads rooms and `parked/ep` is 0, the fix is that level's
+        # route file (set its `rungs` to []), not a weight.
+        ("route layer     ", fmt_route_source(mean.get("route_source"))),
         ("wedged/ep       ", fmt_float(mean.get("wedged_steps"), 0)),
         ("new cells/ep    ", fmt_float(mean.get("cells_new"), 0)),
         ("deaths/ep       ", fmt_float(mean.get("deaths"))),
@@ -553,9 +584,13 @@ class Dashboard:
         self.end_reasons.config(text="End reasons (last 100)\n" + "\n".join("  " + "   ".join(r) for r in rows if r))
 
         ppo = get("ppo") if isinstance(get("ppo"), dict) else {}
+        # `entropy` is SB3's entropy_loss, i.e. NEGATED total entropy, and `ent_coef` is the live coefficient
+        # the entropy-floor controller is holding it up with (scripts/train.py). Read them together: a rising
+        # ent_coef with a flat entropy means the floor is working; a rising one with entropy still falling
+        # means it is losing and the cap is the next thing to look at.
         cells = [f"{label} {fmt_compact(ppo.get(key))}" for key, label in (
             ("entropy_loss", "entropy"), ("approx_kl", "approx_kl"), ("value_loss", "value_loss"),
-            ("explained_variance", "explained_var"), ("clip_fraction", "clip_frac"))]
+            ("explained_variance", "explained_var"), ("clip_fraction", "clip_frac"), ("ent_coef_live", "ent_coef"))]
         self.ppo.config(text="PPO (last update)\n  " + "   ".join(cells[:3]) + "\n  " + "   ".join(cells[3:]))
 
     def _draw_bar(self) -> None:

@@ -115,6 +115,12 @@ class FakeCampaignEnv(gym.Env):
             # The ladder-patience and exit-guard mechanisms (2026-09-17 spec).
             "targets_parked": self.steps // 6,
             "exit_banished": int(self.steps % 7 == 0),
+            # ... and the detector's verdict, which is what lets parking act at all. 1 here, so the per-level
+            # row and the pooled mean both have something to carry; on a real 0-1 episode it is 0.
+            "ladder_collapsed": 1,
+            # The route layer (route-fallback spec): 1 is the mod's gate ladder, the layer 0-1 runs on.
+            "route_source": 1,
+            "route_source_name": "gates",
             "wedged_steps": 45 if self.steps % 5 == 0 else 0,
             "level_started": 1,
             "look_free_frac": 0.5,
@@ -312,8 +318,10 @@ def test_campaign_progress():
         assert "route_progress" not in m
         for key in ("completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "exit_dist_min",
                     "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac",
-                    "targets_parked", "exit_banished"):
+                    "targets_parked", "exit_banished", "route_source", "ladder_collapsed"):
             assert m[key] is not None, key
+        assert m["ladder_collapsed"] == 1.0, "the whole window ran on a level whose ladder is collapsed"
+        assert m["route_source"] == 1.0, "the whole window ran on the gate ladder, so the mean is the layer"
         assert s["mean_fresh_100"]["gates_reached"] is not None
         assert set(s["end_reasons_100"]) <= {"level_complete", "stuck", "wedged"}
         assert set(s["reward_parts_mean_100"]) == {"time", "novelty", "gate"}
@@ -322,6 +330,7 @@ def test_campaign_progress():
         assert s["history"], "expected chart history points"
         assert all("completion_rate_fresh_50" in p and "mean_checkpoints_level_100" in p for p in s["history"])
         assert all("mean_gates_reached_100" in p for p in s["history"])  # dashboard.py reads it by this name
+        assert all(p["mean_route_source_100"] == 1.0 for p in s["history"]), "the route layer is charted too"
         rates = [p["completion_rate_fresh_50"] for p in s["history"] if p["completion_rate_fresh_50"] is not None]
         assert rates and all(0.0 <= r <= 1.0 for r in rates)
 
@@ -331,8 +340,11 @@ def test_campaign_progress():
         for entry in lines:
             for key in ("t", "env", "timesteps", "reward", "length", "fresh_start", "start_checkpoint", "end_reason",
                         "kills", "deaths", "checkpoints_level", "gates_reached", "gate_hops_best", "level_started",
-                        "wedged_steps", "end_pos", "level_seconds", "completed", "targets_parked", "exit_banished"):
+                        "wedged_steps", "end_pos", "level_seconds", "completed", "targets_parked", "exit_banished",
+                        "ladder_collapsed", "route_source", "route_source_name"):
                 assert key in entry, key
+            # The integer is charted; the string is the readable half, and it has to bypass _num() to survive.
+            assert entry["route_source"] == 1 and entry["route_source_name"] == "gates"
             assert isinstance(entry["end_pos"], list) and len(entry["end_pos"]) == 3
             assert all(isinstance(v, float) for v in entry["end_pos"])
             assert entry["end_reason"] in ("level_complete", "stuck", "wedged")
@@ -575,10 +587,13 @@ def test_dashboard_renders_the_per_level_block():
         "fresh_window": 50, "fresh_completion_rate": 1.34, "median_time_50": 152.0, "best_time": 141.2,
         "order": CURRICULUM_LEVELS,
         "levels": {
+            # 0-1's ladder is monotone, so `col 0` and `pk 0.0`; 0-3's collapses, so it is allowed to park.
             "Level 0-1": {"unlocked": True, "fresh_window": 50, "fresh_completion_rate": 0.62, "best_time": 141.2,
-                          "episodes": 812, "weight": 0.38, "checkpoints_level": 4.1, "gates_reached": 3.2},
+                          "episodes": 812, "weight": 0.38, "checkpoints_level": 4.1, "gates_reached": 3.2,
+                          "ladder_collapsed": 0.0, "targets_parked": 0.0},
             "Level 0-3": {"unlocked": True, "fresh_window": 23, "fresh_completion_rate": 0.13, "best_time": None,
-                          "episodes": 188, "weight": 0.62, "checkpoints_level": 1.0, "gates_reached": 0.4},
+                          "episodes": 188, "weight": 0.62, "checkpoints_level": 1.0, "gates_reached": 0.4,
+                          "ladder_collapsed": 1.0, "targets_parked": 8.3},
             "Level 0-4": {"unlocked": False, "fresh_window": 0, "fresh_completion_rate": None, "best_time": None,
                           "episodes": 0, "weight": 0.0, "checkpoints_level": None, "gates_reached": None},
         },
@@ -588,8 +603,8 @@ def test_dashboard_renders_the_per_level_block():
     assert "  levels" in lines
     block = lines[lines.index("  levels") + 1:]
     assert block[:2] == [
-        "    0-1  fresh 62% (50)  best 02:21.200  cp 4.1  w 0.38",
-        "    0-3  fresh 13% (23)  best —  cp 1.0  w 0.62",
+        "    0-1  fresh 62% (50)  best 02:21.200  cp 4.1  w 0.38  col 0  pk 0.0",
+        "    0-3  fresh 13% (23)  best —  cp 1.0  w 0.62  col 1  pk 8.3",
     ], block
     assert not any("0-4" in line for line in block), "a locked level has no rows to show"
     # A single-level run keeps the old headline and grows no block at all.
@@ -647,7 +662,7 @@ def test_dashboard_campaign_panel():
         {"fresh_window": 50, "fresh_completion_rate": 0.62, "median_time_50": 59.9996, "best_time": 83.25},
         {"completed": 0.4, "checkpoints_level": 2.14, "cells_new": 84.4, "deaths": 1.3, "exit_dist_min": 12.2,
          "gates_reached": 1.82, "wedged_steps": 612.4, "look_free_frac": 0.51, "look_gate_frac": 0.29,
-         "targets_parked": 0.34, "exit_banished": 0.02},
+         "targets_parked": 0.34, "exit_banished": 0.02, "route_source": 2, "ladder_collapsed": 1.0},
         {"time": -9.0, "checkpoint": 20.0, "novelty": 5.04, "path": 0.8, "level_complete": 50.0, "death": None},
         {"best_gates_reached": 4, "best_gate_hops": 2},
         {"gates_reached": 0.91},
@@ -660,7 +675,8 @@ def test_dashboard_campaign_panel():
         "  median time      01:00.000",  # whole milliseconds, never "00:60.000"
         "  gates/load       1.8 fresh 0.9 best 4 hops 2",
         "  checkpoints/load 2.1",
-        "  parked/ep        0.34  exit banished 2%",
+        "  parked/ep        0.34  ladder collapsed 100%  exit banished 2%",
+        "  route layer      rooms",
         "  wedged/ep        612",
         "  new cells/ep     84",
         "  deaths/ep        1.30",
@@ -674,8 +690,12 @@ def test_dashboard_campaign_panel():
     ], lines
     empty = dashboard.campaign_lines({"fresh_window": 0, "fresh_completion_rate": None, "median_time_50": None, "best_time": None}, {})
     assert empty[0] == "  fresh completed  — of last 0", empty
-    assert len(empty) == 12, empty
+    assert len(empty) == 13, empty
     assert all("—" in line for line in empty[1:]), empty
+    # The layer reads as a name only when the whole window agrees; a mixed curriculum shows the number.
+    assert "  route layer      gates" in dashboard.campaign_lines({}, {"route_source": 1})
+    assert "  route layer      exit vector" in dashboard.campaign_lines({}, {"route_source": 0})
+    assert "  route layer      mixed 1.42" in dashboard.campaign_lines({}, {"route_source": 1.42})
 
     # The whole window on a real campaign status (charts, games table, Campaign panel).
     with tempfile.TemporaryDirectory() as tmp:
@@ -700,7 +720,7 @@ def test_poll_status_keeps_old_header():
         "mean_100": {"reward": 12.5, "kills": 3.0, "deaths": 1.2, "completed": 0.4, "fresh_start": 0.2,
                      "checkpoints_level": 1.5, "cells_new": 60.0, "exit_dist_min": 20.0,
                      "gates_reached": 1.8, "wedged_steps": 612.0, "look_gate_frac": 0.3,
-                     "targets_parked": 0.34, "exit_banished": 0.02},
+                     "targets_parked": 0.34, "exit_banished": 0.02, "route_source": 2.0},
         "mean_fresh_100": {"gates_reached": 0.9, "checkpoints_level": 0.4, "completed": 0.0},
         "campaign": {"fresh_window": 50, "fresh_completion_rate": 0.4, "median_time_50": 95.0, "best_time": 83.25},
         "best_checkpoints_level": 3,
@@ -756,6 +776,52 @@ def test_poll_status_keeps_old_header():
         # why an existing metrics_log.csv has to be moved aside to see them.
         assert logged["targets_parked"] == "0.34" and logged["exit_banished"] == "0.02", logged
         assert "targets_parked" not in appended and "exit_banished" not in appended
+        # And the route layer, for the same reason: it is a new column on an existing log.
+        assert logged["route_source"] == "2.0", logged
+        assert "route_source" not in appended
+
+
+def test_the_entropy_floors_live_coefficient_reaches_status_and_the_csv():
+    """`train/ent_coef_live` is recorded by scripts/train.py's EntropyFloorCallback once per update.
+
+    It only reaches anyone if `ProgressCallback` copies it out of the logger like PPO's own metrics and
+    `poll_status.py` has a column for it, so both halves are pinned here. Read it against `ppo_entropy_loss`:
+    entropy is the negation of that, and the coefficient is what is holding it up.
+    """
+    assert "train/ent_coef_live" in progress_mod.PPO_METRICS
+    spec = importlib.util.spec_from_file_location("poll_status", ROOT / "scripts" / "poll_status.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    row = module.row({"ppo": {"ent_coef_live": 0.0044, "entropy_loss": -5.2}, "mean_100": {"ladder_collapsed": 1.0}})
+    assert row["ppo_ent_coef_live"] == 0.0044 and row["ppo_entropy_loss"] == -5.2
+    assert row["ladder_collapsed"] == 1.0, "and the detector's verdict is a column too"
+
+
+def test_every_campaign_info_key_survives_the_numeric_pipeline():
+    """§7.4 of the route spec: `CAMPAIGN_INFO_KEYS` must all be NUMERIC, and that was only ever prose.
+
+    `env.py` documents the invariant ("they go through `Monitor(info_keywords=...)` and
+    `ProgressCallback._num` and must all be numeric") and nothing enforced it. Revision 1 of the route spec put
+    the STRING `route_source` in that tuple, which `_num` turns into None on every episode -- silently killing
+    the one metric every recovery path in §12 reads, with no test failing anywhere. So the invariant is pinned
+    here, against a representative campaign info: an int, a float, a bool and a None-valued key all pass, and
+    a string does not.
+    """
+    info = {
+        "kills": 12, "style": 900, "deaths": 1, "completed": 0, "fresh_start": 1, "level_seconds": 146.582,
+        "checkpoints_level": 6, "cells_new": 421, "exit_dist_min": 12.25, "oob_frac": 0.09,
+        "gates_reached": 4, "wedged_steps": 0, "level_started": True, "look_gate_frac": 0.31,
+        "slide_forced_frac": 0.0, "targets_parked": 0, "exit_banished": 0, "route_source": 2,
+        "ladder_collapsed": 1,
+    }
+    assert set(info) == set(CAMPAIGN_INFO_KEYS), "the representative info has to cover exactly the tuple"
+    for key in CAMPAIGN_INFO_KEYS:
+        assert progress_mod._num(info[key]) is not None, f"{key} does not survive _num(): it must be numeric"
+    # `level_seconds` is None on every episode that did not complete, which is fine -- a missing VALUE is not a
+    # non-numeric TYPE -- but a string is not, whatever it holds.
+    assert progress_mod._num(None) is None and progress_mod._num("rooms") is None
+    assert "route_source_name" in progress_mod.EPISODE_LOG_RAW, "the string half bypasses _num() instead"
+    assert "route_source_name" not in CAMPAIGN_INFO_KEYS
 
 
 if __name__ == "__main__":

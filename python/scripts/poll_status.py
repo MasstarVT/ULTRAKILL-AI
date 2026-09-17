@@ -37,6 +37,15 @@ FIELDS = [
     # The 2026-09-17 patience/exit-guard mechanisms. An existing metrics_log.csv keeps its own header, so move
     # the old file aside to get these two columns.
     "targets_parked", "exit_banished",
+    # 1 when the level being played has a collapsed gate ladder, which is what lets `targets_parked` move at
+    # all under `gate_patience_mode: collapsed`. On a curriculum it is the share of the window spent on
+    # collapsed levels; `targets_parked` above 0 while this reads 0 would mean the detector let patience run
+    # on a healthy ladder, which is the 0-1 regression this column exists to catch.
+    "ladder_collapsed",
+    # Which route layer the window ran on: 0 exit vector, 1 gate ladder, 2 offline room trunk. Read
+    # `part_gate_approach` against `part_level_complete` on any window where this is above 1 -- the route
+    # spec's §12.6 tripwire is 6x, and the lever is the route file, never the weight.
+    "route_source",
 ]
 # The same means over fresh-start episodes only (status["mean_fresh_100"]): a respawn episode inherits
 # gates_reached and checkpoints_level from its level load, so only these two say how a whole run goes.
@@ -45,7 +54,10 @@ FRESH_FIELDS = ["gates_reached", "checkpoints_level", "completed"]
 CAMPAIGN_FIELDS = ["fresh_window", "fresh_completion_rate", "median_time_50", "best_time"]
 BEST_FIELDS = ["best_checkpoints_level", "best_gates_reached", "best_gate_hops"]
 PPO_FIELDS = ["entropy_loss", "approx_kl", "clip_fraction", "explained_variance", "value_loss", "learning_rate",
-              "entropy_yaw", "entropy_pitch", "entropy_look_mode"]
+              "entropy_yaw", "entropy_pitch", "entropy_look_mode",
+              # The adaptive floor's live coefficient: equal to the config's `ent_coef` while total entropy
+              # (|ppo_entropy_loss|) sits above `ent_floor` + 1, and climbing while it does not.
+              "ent_coef_live"]
 PART_FIELDS = ["aim_yaw", "aim_pitch", "aim_locked", "aim", "kill", "damage_dealt", "damage_taken", "death", "wave", "style", "step",
                "time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path", "level_complete", "punch",
                "gate", "gate_approach", "item_pickup", "item_placed"]

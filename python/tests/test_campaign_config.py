@@ -23,6 +23,7 @@ PRELUDE = ROOT / "configs" / "campaign_prelude.yaml"
 LEVEL_1_1 = ROOT / "configs" / "campaign_1-1.yaml"
 GATES_PRELUDE = ROOT / "configs" / "campaign_gates_prelude.yaml"
 GATES_MAIN = ROOT / "configs" / "campaign_gates_main.yaml"
+GATES_FULL = ROOT / "configs" / "campaign_gates_full.yaml"
 RUN_NAME = "campaign_gates"
 MODEL_DIR = Path("models") / RUN_NAME
 RUN_DIR = Path("runs") / RUN_NAME
@@ -184,6 +185,77 @@ def test_the_main_config_carries_the_gates_prelude_run_forward():
     assert "6.0" in header, "and the entropy tripwire has to survive the config change"
 
 
+def test_the_full_config_is_the_main_config_with_more_levels():
+    """configs/campaign_gates_full.yaml: the whole routed campaign, and FOUR listed differences from main.
+
+    The route fallback adds no reward term and no hyperparameter -- a room rung pays through `gate` and
+    `gate_approach` exactly as a door does -- so the differences this config is allowed to carry are named one
+    by one, and anything else is a change nobody decided. The three beyond the levels list are the 2026-09-17
+    revision: where target patience may act, which layer a collapsed level uses, and the entropy floor.
+    `ent_coef` itself is untouched -- the floor raises it only while the policy is sharpening past 5 nats.
+    """
+    main_env, main_train = train.load_config(str(GATES_MAIN))
+    env_dict, train_cfg = train.load_config(str(GATES_FULL))
+    main, cfg = EnvConfig.from_dict(main_env), EnvConfig.from_dict(env_dict)
+
+    # The raw YAML, which is where "written out on purpose" lives: two of these three are the defaults, and
+    # stating them is what makes flipping one a deliberate act rather than a silent inherit.
+    assert set(env_dict) - set(main_env) == {"gate_patience_mode", "prefer_route_when_collapsed"}
+    assert set(main_env) - set(env_dict) == set()
+    assert {k for k in set(env_dict) & set(main_env) if env_dict[k] != main_env[k]} == {"levels"}
+    assert set(train_cfg) - set(main_train) == {"ent_floor", "ent_coef_max"}
+    assert {k for k in set(train_cfg) & set(main_train) if train_cfg[k] != main_train[k]} == set(), \
+        "the optimiser, the run name and num_envs are character for character main's"
+
+    # And the parsed effect of those keys: patience is level-conditional, the route preference is OFF, and the
+    # two new settings hold their defaults, so the only EnvConfig field that actually differs is `levels`.
+    differing = {f.name for f in dataclasses.fields(EnvConfig)
+                 if getattr(cfg, f.name) != getattr(main, f.name)}
+    assert differing == {"levels"}, f"only the levels list may change, got {sorted(differing)}"
+    assert cfg.gate_patience_mode == "collapsed" and cfg.prefer_route_when_collapsed is False
+    assert cfg.gate_target_patience_s == 20.0, "the window itself does not move; only where it may act"
+    assert cfg.rewards == main.rewards, "no reward weight moves: the fallback adds no term"
+    assert train_cfg["num_envs"] == 12 and train_cfg["run_name"] == RUN_NAME
+    assert train_cfg["hyperparams"]["ent_coef"] == 0.004, "the BASE coefficient is unchanged"
+    assert (train_cfg["ent_floor"], train_cfg["ent_coef_max"]) == (5.0, 0.02)
+
+    # The 30 levels: every shipped level with a gate ladder OR a route file, in mission order.
+    unrouted = {"Level 1-3", "Level 5-4", "Level 6-2"}  # spec §11.1: no route signal of any kind
+    assert set(cfg.levels) == CAMPAIGN_LEVELS_SHIPPED - unrouted
+    assert len(cfg.levels) == 30 and len(set(cfg.levels)) == 30
+    assert not unrouted & set(cfg.levels), "a level with no route signal would train on the exit vector alone"
+    assert "Level 9-1" not in cfg.levels and "Level 9-2" not in cfg.levels, "no scene bundle in this build"
+    order = [CAMPAIGN_LEVELS.index(lv) for lv in cfg.levels]
+    assert order == sorted(order), "mission order, because unlock_next walks the list as a chained ladder"
+    assert cfg.levels[0] == "Level 0-1", "levels[0] is always unlocked, so it must be the trained level"
+    assert set(main.levels) <= set(cfg.levels), "no level the run is already training may be dropped"
+    # The 12 levels the route files cover, and the four that stop at a skull lock until S3 (spec §10).
+    rooms = {"Level 0-5", "Level 1-4", "Level 2-4", "Level 4-2", "Level 4-4", "Level 5-2",
+             "Level 7-1", "Level 7-2", "Level 7-3", "Level 7-4", "Level 8-3", "Level 8-4"}
+    assert rooms <= set(cfg.levels) and len(set(cfg.levels) - rooms) == 18, "18 gates levels + 12 room levels"
+    assert cfg.route_fallback is True and cfg.route_dir == "", "the packaged routes/ folder, on by default"
+    assert (cfg.route_exit_tol_m, cfg.route_seed_m) == (5.0, 150.0)
+    assert cfg.max_steps_per_level == {}, "one cap for every level; a per-level cap is its own decision"
+
+    header = GATES_FULL.read_text(encoding="utf-8")
+    for needed in ("1-3", "5-4", "6-2", "6x", "rungs", "route_source"):
+        assert needed in header, f"the header has to carry {needed}: why the list is this list, and the levers"
+
+
+def test_the_full_config_builds_a_479_input_curriculum_env():
+    env_dict, _ = train.load_config(str(GATES_FULL))
+    cfg = train.fill_campaign_dirs(EnvConfig.from_dict(env_dict), MODEL_DIR, RUN_DIR)
+    env = UltrakillEnv(dataclasses.replace(cfg, explore_dir="", best_runs_dir="", curriculum_path=""))
+    try:
+        assert env.observation_space.shape == (479,), "no level id enters the observation, by design"
+        assert list(env.action_space.nvec) == [3, 3, 2, 2, 2, 2, 2, 2, 6, 11, 7, 3]
+        assert env.level == "Level 0-1" and env._max_steps() == 12000
+        # No route file ships for 0-1, so a worker that starts on the first rung is on layer 1, unchanged.
+        assert env.gates._route is None and env.gates.route_source == 0
+    finally:
+        env.close()
+
+
 def test_the_main_config_builds_a_479_input_curriculum_env():
     env_dict, _ = train.load_config(str(GATES_MAIN))
     cfg = train.fill_campaign_dirs(EnvConfig.from_dict(env_dict), MODEL_DIR, RUN_DIR)
@@ -199,7 +271,7 @@ def test_the_main_config_builds_a_479_input_curriculum_env():
 
 def test_every_campaign_setting_is_a_real_field():
     # EnvConfig.from_dict drops keys it does not know, so a misspelt setting would silently use its default.
-    for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN):
+    for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN, GATES_FULL):
         env_dict, _ = train.load_config(str(path))
         unknown = sorted(set(env_dict) - field_names(EnvConfig))
         assert not unknown, f"{path.name}: env keys EnvConfig does not know: {unknown}"
@@ -361,6 +433,81 @@ def test_action_entropy_callback_measures_each_look_dimension():
         assert f"train/entropy_{name}" in PPO_METRICS, name  # so they reach status.json and the dashboard
 
 
+class _FakeLogger:
+    def __init__(self, entropy_loss=None):
+        self.name_to_value = {} if entropy_loss is None else {"train/entropy_loss": entropy_loss}
+        self.recorded: dict[str, float] = {}
+
+    def record(self, key, value):
+        self.recorded[key] = value
+
+
+class _FakeModel:
+    """The two attributes EntropyFloorCallback touches: SB3's PPO reads `ent_coef` on every update."""
+
+    def __init__(self, logger):
+        self.logger = logger
+        self.ent_coef = None
+
+
+def _floor_step(callback, entropy):
+    """One rollout boundary with `entropy` nats of total policy entropy behind it."""
+    callback.model = _FakeModel(_FakeLogger(None if entropy is None else -entropy))
+    callback._on_rollout_start()
+    return callback.model
+
+
+def test_the_entropy_floor_raises_the_coefficient_below_the_floor_and_stops_at_the_cap():
+    cb = train.EntropyFloorCallback(floor=5.0, base=0.004, maximum=0.02)
+    assert cb.live == 0.004
+    model = _floor_step(cb, 4.2)
+    assert abs(cb.live - 0.004 * 1.10) < 1e-12, cb.live
+    assert model.ent_coef == cb.live, "the coefficient PPO reads is written, not just logged"
+    assert abs(model.logger.recorded["train/ent_coef_live"] - cb.live) < 1e-12
+    for _ in range(60):
+        _floor_step(cb, 4.2)
+    assert cb.live == 0.02, "capped at ent_coef_max however long entropy stays under the floor"
+
+
+def test_the_entropy_floor_decays_back_to_the_base_and_no_further():
+    cb = train.EntropyFloorCallback(floor=5.0, base=0.004, maximum=0.02)
+    for _ in range(60):
+        _floor_step(cb, 4.2)
+    assert cb.live == 0.02
+    _floor_step(cb, 6.5)  # a nat clear of the floor: the controller starts letting go
+    assert abs(cb.live - 0.02 * 0.95) < 1e-12, cb.live
+    for _ in range(200):
+        _floor_step(cb, 9.0)
+    assert cb.live == 0.004, "never below the config's own ent_coef"
+
+
+def test_the_entropy_floor_holds_still_inside_the_band_and_does_nothing_at_all_when_off():
+    cb = train.EntropyFloorCallback(floor=5.0, base=0.004, maximum=0.02)
+    _floor_step(cb, 4.0)
+    held = cb.live
+    for entropy in (5.0, 5.5, 6.0):  # floor .. floor + 1: neither raise nor decay
+        _floor_step(cb, entropy)
+        assert cb.live == held, entropy
+    off = train.EntropyFloorCallback(floor=0.0, base=0.004, maximum=0.02)
+    model = _floor_step(off, 0.5)  # far below any floor, and still untouched
+    assert off.live == 0.004 and model.ent_coef is None, "ent_floor 0 never writes the coefficient"
+    assert model.logger.recorded["train/ent_coef_live"] == 0.004, "it still reports what PPO is using"
+    blank = train.EntropyFloorCallback(floor=5.0, base=0.004)
+    model = _floor_step(blank, None)  # the first rollout: no update has run, so there is no entropy yet
+    assert blank.live == 0.004 and model.ent_coef is None
+    assert blank.maximum == 0.02, "the default cap"
+
+
+def test_the_entropy_floor_is_wired_into_the_run_and_reported():
+    """Config -> callback -> status.json, and the resume behaviour stated in the docstring."""
+    _, t = train.load_config(str(GATES_FULL))
+    cb = train.EntropyFloorCallback(t["ent_floor"], t["hyperparams"]["ent_coef"], t.get("ent_coef_max", 0.02))
+    assert (cb.floor, cb.base, cb.maximum) == (5.0, 0.004, 0.02)
+    assert "train/ent_coef_live" in PPO_METRICS, "so it reaches status.json, the dashboard and poll_status"
+    assert "does not survive a resume" in train.EntropyFloorCallback.__doc__, \
+        "the resume behaviour is deliberate and has to be stated where it is read"
+
+
 def test_a_campaign_checkpoint_loads_against_every_campaign_config():
     """The live campaign_gates run's weights must keep loading: 479 inputs, 12 action dimensions, unchanged.
 
@@ -375,7 +522,7 @@ def test_a_campaign_checkpoint_loads_against_every_campaign_config():
     from stable_baselines3.common.vec_env import DummyVecEnv
 
     configs = {path.name: EnvConfig.from_dict(train.load_config(str(path))[0])
-               for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN)}
+               for path in (CONFIG, PRELUDE, LEVEL_1_1, GATES_PRELUDE, GATES_MAIN, GATES_FULL)}
     envs = {}
     try:
         for name, cfg in configs.items():

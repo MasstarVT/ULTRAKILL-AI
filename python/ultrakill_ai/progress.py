@@ -44,12 +44,18 @@ PPO_METRICS = (
     "train/entropy_yaw",
     "train/entropy_pitch",
     "train/entropy_look_mode",
+    # The adaptive entropy floor's live coefficient (scripts/train.py's EntropyFloorCallback). Equal to the
+    # config's `ent_coef` whenever the floor is off or total entropy is comfortably above it; above that when
+    # the controller is holding entropy up.
+    "train/ent_coef_live",
 )
 # Per-episode fields carried straight into runs/<run>/episodes.jsonl. `field()` routes everything through
 # _num(), which returns None for anything float() rejects, so a string checkpoint id and a [x, y, z] list have
 # to bypass it -- otherwise the two fields that say where an episode died would both be written as null.
+# `route_source_name` is the string half of the route layer ("none" / "gates" / "rooms"); the numeric
+# `route_source` travels in CAMPAIGN_INFO_KEYS and is charted, exactly as rl-5 of the route spec asks.
 EPISODE_LOG_RAW = ("level", "start_checkpoint", "end_pos", "end_reason", "level_seconds", "gate_hops_best",
-                   "bridge_resets")
+                   "bridge_resets", "route_source_name")
 
 
 def _num(value: Any) -> float | None:
@@ -186,7 +192,8 @@ class ProgressCallback(BaseCallback):
             # many fresh tries a level has had in total, and a restart must not hand it a clean slate or a run
             # that is stopped every few hours can never reach the valve at all.
             record["fresh_episodes"] = int(_num(old.get("fresh_episodes")) or 0)
-            carried = {key: _num(old.get(key)) for key in ("checkpoints_level", "gates_reached")}
+            carried = {key: _num(old.get(key))
+                       for key in ("checkpoints_level", "gates_reached", "ladder_collapsed", "targets_parked")}
             if any(v is not None for v in carried.values()):
                 record["recent"].append(carried)  # one synthetic episode, so the panel is not blank on restart
 
@@ -231,7 +238,7 @@ class ProgressCallback(BaseCallback):
         for level, row in table.items():
             row["weight"] = (weights[level] / total) if level in weights and total else 0.0
             row["median_time_50"] = statistics.median(times[level]) if times[level] else None
-            for key in ("checkpoints_level", "gates_reached"):
+            for key in ("checkpoints_level", "gates_reached", "ladder_collapsed", "targets_parked"):
                 row[key] = _mean(ep.get(key) for ep in self._level_record(level)["recent"])
         return table
 
@@ -368,6 +375,13 @@ class ProgressCallback(BaseCallback):
             # the exit guard rejected a banished FinalPit report. Both 0 on a healthy monotone level.
             "targets_parked": field("targets_parked"),
             "exit_banished": field("exit_banished"),
+            # 1 when this level load's gate ladder was detected collapsed at the spawn, which is what allows
+            # parking under `gate_patience_mode: collapsed`. A property of the LEVEL, so the per-level table
+            # carries it and the pooled mean is only meaningful on a single-level run.
+            "ladder_collapsed": field("ladder_collapsed"),
+            # Which route layer drove the level load: 0 exit vector, 1 gate ladder, 2 room trunk. Numeric so it
+            # survives `_num`; a mean between two integers means the window spans levels on different layers.
+            "route_source": field("route_source"),
             "wedged_steps": field("wedged_steps"),
             "level_started": field("level_started"),
             "look_free_frac": field("look_free_frac"),
@@ -431,7 +445,13 @@ class ProgressCallback(BaseCallback):
             return
         record = self._level_record(level)
         record["episodes"] += 1
-        record["recent"].append({"checkpoints_level": stats["checkpoints_level"], "gates_reached": stats["gates_reached"]})
+        record["recent"].append({"checkpoints_level": stats["checkpoints_level"],
+                                 "gates_reached": stats["gates_reached"],
+                                 # Per LEVEL, because that is what it describes: every load of one level gets
+                                 # the same verdict, so this row reads 0.0 or 1.0 and anything between them
+                                 # means two workers disagreed about the same level.
+                                 "ladder_collapsed": stats["ladder_collapsed"],
+                                 "targets_parked": stats["targets_parked"]})
         if stats["fresh_start"]:
             record["fresh_episodes"] += 1
             completed, seconds = stats["completed"] or 0.0, stats["level_seconds"]
@@ -463,6 +483,8 @@ class ProgressCallback(BaseCallback):
             "gates_reached": stats["gates_reached"],
             "targets_parked": stats["targets_parked"],
             "exit_banished": stats["exit_banished"],
+            "ladder_collapsed": stats["ladder_collapsed"],
+            "route_source": stats["route_source"],
             "level_started": stats["level_started"],
             "wedged_steps": stats["wedged_steps"],
             "completed": stats["completed"],
@@ -554,7 +576,7 @@ class ProgressCallback(BaseCallback):
                                                  "yaw_track", "pitch_track",
                                                  "pitch_mean", "look_up_mean", "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac",
                                                  "gates_reached", "wedged_steps", "level_started", "slide_forced_frac",
-                                                 "targets_parked", "exit_banished",
+                                                 "targets_parked", "exit_banished", "route_source", "ladder_collapsed",
                                                  "look_free_frac", "look_enemy_frac", "look_gate_frac")}
         fresh_recent = {key: self._fresh_mean(key) for key in ("gates_reached", "checkpoints_level", "completed", "wedged_steps")}
         part_names = sorted({name for ep in self.episodes_recent for name in ep["reward_parts"]})
@@ -575,6 +597,10 @@ class ProgressCallback(BaseCallback):
                 "completion_rate_fresh_50": campaign["fresh_completion_rate"] if campaign else None,
                 "mean_checkpoints_level_100": recent["checkpoints_level"],
                 "mean_gates_reached_100": recent["gates_reached"],
+                # The route layer as a chart series: on a mixed curriculum it is the share of the window that
+                # ran on a room trunk rather than a gate ladder, and it is the first thing to read when a
+                # fallback level wedges (route spec §12.4).
+                "mean_route_source_100": recent["route_source"],
                 "steps_per_s": steps_per_s,
             })
 
