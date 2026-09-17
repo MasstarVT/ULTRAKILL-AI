@@ -74,6 +74,26 @@ def test_missing_episode_row_still_posts_without_a_step_count():
         assert len(posted) == 1 and "(campaign_gates)" in posted[0]
 
 
+def test_push_stages_only_times_md():
+    calls = []
+
+    class Done:
+        returncode = 0
+
+    def fake_run(cmd, check=False):
+        calls.append(cmd)
+        return Done()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        times = Path(tmp) / "times.md"
+        times.write_text(TIMES_MD, encoding="utf-8")
+        assert post_times.push_times(times, ["0-1: 03:03.628 rank A (campaign_gates@6.85M)"], run=fake_run)
+    add, commit, push = calls
+    assert add[-2:] == ["--", "times.md"] and "-A" not in add and "." not in add
+    assert commit[-2:] == ["--", "times.md"] and "0-1: 03:03.628" in commit[commit.index("-m") + 1]
+    assert push[-3:] == ["push", "origin", "HEAD"]
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     for name, fn in tests:

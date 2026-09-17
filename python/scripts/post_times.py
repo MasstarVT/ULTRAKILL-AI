@@ -6,12 +6,17 @@ kills, deaths, difficulty), and `runs/<run>/episodes.jsonl` gives the step count
 posted only when its time beats the row times.md already holds, so running this repeatedly adds nothing.
 
     python scripts/post_times.py --run campaign_gates
+    python scripts/post_times.py --run campaign_gates --watch 600 --push   (keeps times.md current by itself)
+
+`--watch N` repeats every N seconds; `--push` commits times.md ALONE and pushes it after a post, so a live
+trainer's changes under python/models/ are never staged.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -79,16 +84,42 @@ def post(run_dir: Path, times_md: Path, run: str) -> list[str]:
     return posted
 
 
+def push_times(times_md: Path, posted: list[str], run=subprocess.run) -> bool:
+    """Commits `times_md` alone and pushes it. Returns False (and leaves the commit local) when the push fails."""
+    repo = times_md.resolve().parent
+    message = "Post a new best time to times.md\n\n" + "\n".join(posted)
+    run(["git", "-C", str(repo), "add", "--", times_md.name], check=True)
+    run(["git", "-C", str(repo), "commit", "-m", message, "--", times_md.name], check=True)
+    if run(["git", "-C", str(repo), "push", "origin", "HEAD"], check=False).returncode == 0:
+        return True
+    # main moved: replay our one commit on top of it, stashing nothing (only times.md is ever staged here)
+    run(["git", "-C", str(repo), "pull", "--rebase", "--autostash", "origin", "main"], check=False)
+    return run(["git", "-C", str(repo), "push", "origin", "HEAD"], check=False).returncode == 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--run", required=True, help="run name under runs/")
     parser.add_argument("--times", default=str(TIMES_MD), help="times.md to update")
+    parser.add_argument("--watch", type=float, default=0, help="repeat every N seconds (0 = once)")
+    parser.add_argument("--push", action="store_true", help="commit times.md alone and push it after a post")
     args = parser.parse_args()
-    posted = post(ROOT / "runs" / args.run, Path(args.times), args.run)
-    for line in posted:
-        print("posted", line)
-    if not posted:
-        print("nothing new: times.md already holds every best run")
+    while True:
+        try:
+            posted = post(ROOT / "runs" / args.run, Path(args.times), args.run)
+            for line in posted:
+                print(time.strftime("%Y-%m-%d %H:%M:%S"), "posted", line, flush=True)
+            if posted and args.push:
+                print("pushed" if push_times(Path(args.times), posted) else "push failed: commit kept locally", flush=True)
+            if not posted and not args.watch:
+                print("nothing new: times.md already holds every best run")
+        except Exception as error:  # a half-written best_runs file or a git hiccup must not end the watcher
+            if not args.watch:
+                raise
+            print(time.strftime("%Y-%m-%d %H:%M:%S"), "error:", error, flush=True)
+        if not args.watch:
+            return
+        time.sleep(args.watch)
 
 
 if __name__ == "__main__":
