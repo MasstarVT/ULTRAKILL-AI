@@ -1142,3 +1142,17 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     completion (the 12 so far are all checkpoint respawns); and then `levels_unlocked` going 1 -> 2, at which
     point the pooled `fresh_completion_rate` stops being readable as a percentage and only the per-level rows
     mean anything.
+  - **ent_coef falsifier PASSED at +727k steps, and the first FRESH-START completions (2026-09-17 06:32,
+    5,532,670 steps).** Entropy 11.43 -> 10.16 -> 9.19 with all three look heads falling together (yaw 2.09 -> 1.71,
+    pitch 1.79 -> 1.24, look_mode 1.03 -> 0.81), fresh `gates_reached` 4.56 -> 4.88 -> 5.74, completions per 100
+    episodes 2 -> 5 -> 17, `approx_kl` 0.0216, `explained_variance` 0.90. **Two fresh-start completions of 0-1:
+    479.71 s official (64 kills, 2 deaths; `campaign.best_time`) and 522.12 s** (human reference 146.58 s).
+    Weights kept as `models/campaign_gates/first_fresh_completion_5505630.zip`; `fresh_completion_rate` 0.04 on a
+    full 50 window; 29 completions all-time.
+    - Entropy is still descending at about 1.0 nat per 300k steps, which reaches the 6.0 tripwire near 6.5M steps.
+      Plan at that point: raise `ent_coef` (0.006-0.008) to hold entropy around 6-7 rather than let it run down.
+    - **Fresh episodes are bimodal** (last 100 fresh): 38 end early (gates 0-2, `stuck`, ~3,850 decisions; 22%
+      never reach checkpoint 1) and 45 get deep (gates 7-8) but end on `max_steps`. The two completions used 7,967
+      decisions on average, 88% of the 9,000 cap (600 game seconds), so deep runs are near-misses against the
+      clock. Candidate for the next planned pause, as its own change: `max_steps` 9,000 -> 12,000. Not done
+      mid-climb because it needs a trainer restart and the run is improving on its own.
