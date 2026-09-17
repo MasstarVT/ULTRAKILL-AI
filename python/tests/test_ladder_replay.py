@@ -3,6 +3,11 @@ against recorded game data:  python tests/test_ladder_replay.py  (or pytest). No
 
 A6, Level 0-1 must not change. A7, Level 0-3 must stop locking onto the door it cannot walk to.
 
+Since the 2026-09-17 revision the two are kept apart by the detector rather than by the mechanism being inert:
+the A6 tests that measure what unconditional patience DID to 0-1 (46 expired windows, one park, +10.363 m of
+approach) run with `patience_mode: "always"` and are the record of a retired configuration, while
+`test_a6_0b` is the guarantee that actually ships -- under `PATIENT`, 0-1 replays the golden file exactly.
+
 The fixtures under tests/fixtures/ are trimmed probe logs (positions rounded to 0.1 m, plus
 `arena_enemies_alive`, `kills` and `style`, one line per episode, gzipped) and `ladder_golden.json`, which was
 produced by the PRE-patience `GateProgress` over exactly those rounded positions, so A6.1 is a regression pin
@@ -30,7 +35,12 @@ from ultrakill_ai.campaign import GateProgress  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 PATIENCE = 300  # the default 20 game seconds at 30 fps / frameskip 2
+# The SHIPPED settings: parking only where the detector calls the ladder collapsed, which is 0-3 and not 0-1.
 PATIENT = {"patience_steps": PATIENCE, "unpark_m": 2.0, "fallback_hysteresis_m": 10.0}
+# The mechanism as it first shipped, unconditional. Kept because the A6 numbers below are what it cost 0-1, and
+# a measured cost is worth more in a test than in a comment: this is the configuration that took 0-1's live
+# fresh completion rate from 0.55 (n=43) to 0.30 (n=56).
+ALWAYS = dict(PATIENT, patience_mode="always")
 UNREACHABLE = "-16,73,315"  # 0-3's hops 1 door, 66 m straight up from the pit the agent locks under
 ROUTE_0_3 = {"0,13,362", "0,53,330", "0,13,402", "-20,8,413", "-86,-12,413", "76,53,398"}
 
@@ -123,6 +133,38 @@ def test_a6_1_patience_off_reproduces_the_old_implementation_exactly():
             assert comparable(replay(camp, steps)) == want[tag][ep], f"{tag} ep {ep}"
 
 
+def test_a6_0_the_detector_is_what_makes_0_1_inert_and_0_3_patient():
+    """The verdict on each fixture's own gate array, at its own recorded spawn.
+
+    Everything else in this file follows from these two lines: 0-1 gets the pre-patience tracker byte for byte
+    because its ladder is monotone, and 0-3 gets the whole mechanism because its ladder is not.
+    """
+    for level, name, want in (("0-1", "level_0-1_run.jsonl.gz", False),
+                              ("0-3", "level_0-3_probe.jsonl.gz", True),
+                              ("0-3", "level_0-3_scripted.jsonl.gz", True)):
+        camp, eps = gates(level), episodes(name)
+        for ep, steps in eps.items():
+            progress = GateProgress(**PATIENT)
+            progress.new_level_load(json.loads(json.dumps(camp)), steps[0][:3])
+            assert progress.ladder_collapsed is want, f"{name} ep {ep}"
+            assert progress.patience_active is want
+
+
+def test_a6_0b_the_shipped_settings_leave_every_recorded_0_1_episode_identical():
+    """A6 as it is now specified: on 0-1 the SHIPPED configuration is the golden file, in all seven episodes.
+
+    The old A6 could only promise this where every target was reached inside the window (test_a6_2) and had to
+    measure a +10.363 m difference on episode 5 where it was not (test_a6_4). With the detector there is
+    nothing to measure: parking cannot act on 0-1 at all, so patience on and patience off are the same run.
+    """
+    camp, eps = gates("0-1"), episodes("level_0-1_run.jsonl.gz")
+    want = golden()["level_0-1_run"]
+    for ep, steps in eps.items():
+        on = replay(camp, steps, **PATIENT)
+        assert comparable(on) == want[ep], f"ep {ep}"
+        assert on["parks"] == 0 and not on["parked_keys"] and on["park_log"] == [], f"ep {ep}"
+
+
 def test_a6_2_a_monotone_ladder_walked_inside_the_window_is_untouched_by_patience():
     """0-1's own eleven gates, walked hops 9 -> 0 and out of the pit, every target reached inside the window.
 
@@ -135,7 +177,7 @@ def test_a6_2_a_monotone_ladder_walked_inside_the_window_is_untouched_by_patienc
     route.append(tuple(camp["exit"]["pos"]))
     steps = [list(p) + [0, 0, 0] for p in walk(route, 1.0)]
     assert len(steps) > 2 * PATIENCE, "the walk has to be long enough for patience to have had a chance"
-    off, on = replay(camp, steps), replay(camp, steps, **PATIENT)
+    off, on = replay(camp, steps), replay(camp, steps, **ALWAYS)
     assert max(n for _, n in off["targets"]) < PATIENCE, "the precondition: every target reached inside the window"
     assert on["parks"] == 0
     assert comparable(on) == comparable(off)
@@ -150,7 +192,7 @@ def test_a6_3_an_arena_holding_a_door_shut_never_parks_it_on_the_recorded_run():
     arena_steps = sum(1 for steps in eps.values() for row in steps if row[3] > 0)
     assert arena_steps > 3000, "the fixture has to contain the arena stalls this rule exists for"
     for ep, steps in eps.items():
-        assert replay(camp, steps, **PATIENT)["parked_while_arena"] == 0, ep
+        assert replay(camp, steps, **ALWAYS)["parked_while_arena"] == 0, ep
 
 
 def test_a6_4_the_recorded_run_keeps_its_payments_and_its_ladder():
@@ -167,7 +209,7 @@ def test_a6_4_the_recorded_run_keeps_its_payments_and_its_ladder():
     camp, eps = gates("0-1"), episodes("level_0-1_run.jsonl.gz")
     identical, parks, deltas = 0, 0, {}
     for ep, steps in eps.items():
-        off, on = replay(camp, steps), replay(camp, steps, **PATIENT)
+        off, on = replay(camp, steps), replay(camp, steps, **ALWAYS)
         identical += comparable(off) == comparable(on)
         parks += on["parks"]
         deltas[ep] = round(on["gate_approach"] - off["gate_approach"], 3)
@@ -182,7 +224,7 @@ def test_a6_4_the_recorded_run_keeps_its_payments_and_its_ladder():
 def test_a6_5_the_one_park_on_0_1_only_moves_a_hand_over_earlier():
     """What that single park costs, to the decision: episode 5's fifth and sixth targets swap 78 decisions."""
     camp, steps = gates("0-1"), episodes("level_0-1_run.jsonl.gz")["5"]
-    off, on = replay(camp, steps), replay(camp, steps, **PATIENT)
+    off, on = replay(camp, steps), replay(camp, steps, **ALWAYS)
     assert [n for _, n in off["targets"]] == [134, 3034, 42, 181, 3183, 1092, 743, 592]
     assert [n for _, n in on["targets"]] == [134, 3034, 42, 181, 3105, 1170, 743, 592]
     assert sum(n for _, n in on["targets"]) == sum(n for _, n in off["targets"]) == len(steps)

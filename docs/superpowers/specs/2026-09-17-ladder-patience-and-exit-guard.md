@@ -346,3 +346,36 @@ reward on one of seven recorded episodes, with the same target order, the same i
 and the same `best_hops`. The opt-out exists per config (`gate_target_patience_s: 0.0`) and is documented in §5;
 what this appendix retracts is the claim that 0-1's inertness is structural. It is measured, and §6's tests are
 what measure it.
+
+## 8. Revision, 2026-09-17: patience is level-conditional
+
+Shipped unconditionally and measured live over the 1.5M steps after activation at 9.59M steps, this spec did
+what it was written to do on a collapsed ladder and cost a monotone one half its completions:
+
+| level | ladder | measured |
+|---|---|---|
+| 0-3 | collapsed | fresh `gates_reached` 1.0 → **4.5**, checkpoints per load 0 → **1.1** |
+| 0-2 | (exit guard) | fresh completion 0.03 → **0.41-0.62**, best 163.2 s |
+| 0-1 | **monotone, correct** | fresh completion **0.55 (n=43) → 0.30 (n=56)**; `targets_parked` 0.00 → **1.04** per fresh episode, 34% of fresh episodes parking at least once; gates histogram mass moved from 10 (23/43 → 17/58) to 2 (1 → 15); 8 of 34 stuck endings at (40, ~480) with exactly 2 gates |
+
+§6's A6 proofs were not wrong, they were **stale**: they replay `campaign_ppo_ground/latest.zip`, and today's
+policy holds a target through much longer arena fights. The bounded suspension of §3 deviation 1 — the
+correction the review forced — is what then expires, parks the CORRECT door and hands the agent a worse one.
+On a level whose ladder is right there is nothing better to switch to, so a park can only mislead.
+
+**The fix is a detector, not a knob.** `campaign.detect_collapsed_ladder(rungs, spawn)` is a pure function of
+the ladder and the player's first position on a fresh load: collapsed when the gate nearest the spawn carries
+`hops <= max_hops / 2`. Measured over all 18 shipped levels with a usable gate ladder it flags exactly the six
+§1 names (0-3 2/6, 1-1 1/5, 1-2 2/4, 2-3 0/2, 4-3 1/2, 8-1 0/4) and none of the twelve healthy ladders (ten at
+max/max, 5-3 12/13, 8-2 5/8). The verdict is taken once per level load — a checkpoint respawn keeps it, since
+a respawn starts the player half-way through a level where the nearest gate says nothing — and is reported per
+episode and per level as `ladder_collapsed`.
+
+New config key: **`gate_patience_mode`**, `"collapsed"` (default) | `"always"` (this spec as first shipped)
+| `"off"`. `gate_target_patience_s: 0.0` remains the global off switch and is unchanged.
+
+What this does to §6's obligations: A6.1 and A6.2 are untouched; **A6.0b is the new, stronger A6** — under the
+shipped settings all seven recorded 0-1 episodes reproduce `ladder_golden.json` exactly, with zero parks, so
+the +10.363 m of episode 5 no longer happens at all. A6.3, A6.4 and A6.5 keep their numbers and now run with
+`patience_mode="always"`, as the record of a retired configuration. A7 (0-3) runs at the SHIPPED settings and
+is unchanged, which is the proof that the default keeps the level the mechanism exists for.

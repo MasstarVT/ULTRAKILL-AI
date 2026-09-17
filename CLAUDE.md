@@ -209,6 +209,23 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       Parks survive `reset_episode` and die with the level load. `patience_steps` 0 restores the pre-patience
       tracker byte for byte, which is how the 0-1 proof is written and the per-config opt-out.
       Config: `gate_target_patience_s` (20 s), `gate_unpark_m` (2), `gate_fallback_hysteresis_m` (10).
+    - **...and it only runs where the ladder is COLLAPSED** (`detect_collapsed_ladder`, `patience_active`,
+      config `gate_patience_mode`: `collapsed` (default) | `always` | `off`; branch `route-fallback`,
+      2026-09-17). Unconditional patience regressed the one level whose ladder is right: live, **0-1's fresh
+      completion went 0.55 (n=43) -> 0.30 (n=70)** while 0-3's fresh `gates_reached` went 1.0 -> 4.5. The
+      detector is a **pure function of the gates block and the player's first position on a fresh load**:
+      collapsed when the gate nearest the spawn carries `hops <= max_hops / 2`. Measured over all 18 levels with
+      a usable gate ladder it flags exactly the six the spec names (0-3 2/6, 1-1 1/5, 1-2 2/4, 2-3 0/2, 4-3 1/2,
+      8-1 0/4) and none of the twelve healthy ones (ten at max/max, 5-3 12/13, 8-2 5/8). Decided **once per
+      level load**, before anything reads it, from the layer precedence *without* the route preference; a
+      checkpoint respawn keeps it, because a respawn starts the player half-way through a level where the
+      nearest gate says nothing. `None` (no ladder or no player yet) reads as OFF. Reported per episode and per
+      level as `ladder_collapsed`.
+    - **`prefer_route_when_collapsed`** (default **false**, the lead's ruling): on a level that has both a
+      collapsed gate ladder and a shipped trunk — 0-3 and 4-3, the only two — `true` hands it the trunk
+      instead. A level whose ladder is HEALTHY can never read its file whatever the flag says, because the
+      verdict gates it. With the flag false those two levels behave exactly as they do today (gates + patience),
+      which is what 0-3 is currently progressing on.
     - **`ExitGuard`**: freezes `campaign.exit.pos` per level load and rewrites the block in place, so the gate
       target, observation slots 0-4 and `exit_dist_min` all stop following a `FinalPit` that `CheckPoint.Start` /
       `ResetRoom` banished by `x + 10000f`. A later report a whole multiple of 10,000 *below* the frozen one is
@@ -233,8 +250,15 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       16 × 12 m and pin observation slot 453; a static `needs_item` is a permanent wedge). `route_source` is an
       **integer** — 0 exit vector / 1 gates / 2 rooms — because everything in `CAMPAIGN_INFO_KEYS` goes through
       `ProgressCallback._num`; the string rides `EPISODE_LOG_RAW` as `route_source_name`. `set_route` swaps the
-      trunk when the curriculum switches level. `route=None` (Cyber Grind, `route_fallback: false`, and the 21
+      trunk when the curriculum switches level. `route=None` (Cyber Grind, `route_fallback: false`, and the 19
       levels with no file) is provably the tracker without this spec.
+      **Fourteen files ship, not twelve** (2026-09-17): the twelve levels with no usable ladder, plus **0-3 and
+      4-3**, whose ladder is usable but collapsed. Those two are the only levels with both, which made one
+      documented-as-impossible hazard real and it is now handled: a frame the mod sends with **no `campaign`
+      block** used to take `_gates()`'s first arm, hand out the trunk unvalidated, flip `_hops_source` and clear
+      a ladder that was fine. The layer is therefore **latched per load** — once a load's ladder has come from
+      the gates, a block-less frame returns `[]` rather than the trunk. The twelve trunk-only levels are
+      untouched, because their source is "rooms" from their first frame.
   - `progress.py`: `ProgressCallback`. **Chart history keeps `timesteps` strictly increasing**: `_restore` carries
   the whole old history over, but resuming from an *older* checkpoint rewinds `num_timesteps`, so the restored tail
   would sit ahead of the points that follow it and the dashboard would draw a line doubling back on itself (seen
@@ -255,7 +279,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   appends to one file. `start_checkpoint`, `end_pos`, `end_reason` and `level_seconds` bypass the numeric `field()`
   helper, which would write `null` for exactly the two fields that say where an episode died. A write failure
   warns and never stops training.
-- `python/scripts/`: `bridge_test.py` (`--drive`, `--campaign`), `random_agent.py` (`--mode campaign` prints completed / checkpoints_level / cells_new per episode), `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop/**relaunch** training instances; `relaunch --port N` restarts ONE instance, found by the pid listening on that port, leaving the others running — `launch` cannot, it calls `stop_all()` first), `dashboard.py` (Tkinter live view of `status.json`).
+- `python/scripts/`: `bridge_test.py` (`--drive`, `--campaign`), `random_agent.py` (`--mode campaign` prints completed / checkpoints_level / cells_new per episode), `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv; **`EntropyFloorCallback`** adapts `ent_coef` between updates to hold total policy entropy above `train.ent_floor` nats — below the floor it multiplies by 1.10 up to `train.ent_coef_max` (0.02), a nat above it decays by 0.95 back to the config's own `ent_coef` and never below, and `ent_floor: 0` never touches the coefficient at all; the live value is logged as `train/ent_coef_live` and reaches `status.json`'s `ppo` block, the dashboard's PPO panel and `poll_status.py`. It does **not** survive a resume: every restart begins at the base and re-adapts over the first few updates), `eval.py`, `games.py` (launch/tile/status/stop/**relaunch** training instances; `relaunch --port N` restarts ONE instance, found by the pid listening on that port, leaving the others running — `launch` cannot, it calls `stop_all()` first), `dashboard.py` (Tkinter live view of `status.json`).
 - `python/ultrakill_ai/routes/route_Level_*.json`: **the committed room trunks, 12 files, 95 rungs, ~17 KB**
   (0-5, 1-4, 2-4, 4-2, 4-4, 5-2, 7-1, 7-2, 7-3, 7-4, 8-3, 8-4) — layer 2's whole data set. Each is a ladder of
   `{key, pos, hops, name, gated_by, open, locked, active}` rungs shaped exactly like a gate array, plus the
@@ -369,14 +393,20 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   as many decisions, every park of the high door records a strictly closer baseline (the park log is pinned
   exactly), the target moves onto the walkable route, the forward legs pay `gate` (7 against 3) and the high door
   is un-parked once the agent actually climbs to it (no game needed).
+  **Since the level-conditional revision** the A6 tests that measure what unconditional patience DID to 0-1 run
+  with `patience_mode="always"` and are the record of a retired configuration; the guarantee that ships is
+  `test_a6_0b` — under the SHIPPED settings all seven recorded 0-1 episodes reproduce the golden file exactly
+  with **zero parks**, so the +10.363 m no longer happens at all. A7 (0-3) runs at the shipped default
+  unchanged, which is the proof that the default keeps the level the mechanism exists for.
 - `python/tests/test_route_files.py`: the **data**, judged against the route spec's section 7.1 and importing
   nothing that produced it — every guard is re-derived from the spec's wording and recomputed from the shipped
   `pos` list, so a bug in `build_routes.py`'s own helpers cannot hide behind it. Schema and version, I1
   (`hops` n-1..0, strictly descending, unique), I2 (16 m separation), I3 (≤ 24 rungs), R1 (≥ 3), **R2 with the
   stored `tour_ratio` reproduced from `pos` to 3 decimals** (the assertion that caught revision 1's
   1.264-vs-1.421 gap), I6 and T pinned by name, `key` == `round(pos)`, the `Pit` exception (hops-0 only, under
-  70 m from the pit), and **`test_shipped_set_is_exactly_the_twelve`**, which makes a regeneration that gains or
-  loses a level a test failure rather than a silent coverage change (no game needed).
+  70 m from the pit), and **`test_shipped_set_is_exactly_the_fourteen`**, which makes a regeneration that gains or
+  loses a level a test failure rather than a silent coverage change, plus
+  `test_the_collapsed_levels_that_ship_are_the_two_the_lead_approved` (0-3 and 4-3 only) (no game needed).
 - `python/tests/test_route_replay.py`: **A0 of the route spec's section 8**, the safety property, and the
   regression test for invariant T. Replays the real `GateProgress` over each shipped trunk **in every visit
   order the level allows** and from every rung the player could start at, asserting the target never advances
@@ -386,7 +416,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   golden file over all 32,022 recorded 0-1 decisions and both 0-3 probes, and `route_reads == 0` proves the
   trunk was never even consulted on a gates level (no game needed).
 - `python/tests/test_route_walk.py`: the **liveness** property S1 and S2 owe each other, and the wrap-up
-  stage's own check. Loads all 12 committed files through the packaged path `load_route(scene)` exactly as
+  stage's own check. Loads all 14 committed files through the packaged path `load_route(scene)` exactly as
   `UltrakillEnv` does, then walks each trunk with a **continuous** synthetic trajectory (4 m per decision,
   through every rung and on to the pit): every rung below the one the player starts at must become the target
   in turn, each pays **exactly one** instalment, and after the hops-0 rung the target is handed to the exit and
@@ -399,7 +429,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   rather than from the polyline (no game needed).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
 - `python/tests/test_spaces.py`: layout sizes (448 / 479) and every index range of the campaign block, including the yaw-frame signs (no game needed).
-- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands). `campaign_prelude.yaml` (the multi-level curriculum 0-1 / 0-3 / 0-4 under a new run name `campaign_prelude`, kept as the reference) and `campaign_1-1.yaml` (the first skull-carry level, run `campaign_1-1`, **`item_pickup` and `item_placed` pinned at 0.0** until the three in-game checks pass). `campaign_gates_prelude.yaml` carried the live run from 4.8M to 6.77M steps (curriculum 0-1 / 0-3 / 0-4, `num_envs` 8, `ent_coef` 0.004) and is kept as history and as the partial rollback. **`campaign_gates_main.yaml` is the live one** (integration pause #2, 2026-09-17): the same `run_name: campaign_gates`, so the 6.77M-step weights, `best.zip` and the exploration archives carry on, with the 11-level Tier A + Tier B ladder, `unlock_after_fresh_episodes: 600`, `max_steps` 12000, `item_pickup` 10.0 / `item_placed` 20.0, `num_envs` 12 and `ent_coef` still 0.004. **`campaign_gates_full.yaml` is the route-fallback config, staged and NOT yet live** (branch `route-fallback`): `campaign_gates_main.yaml` with **one** change, the `levels` list 11 → 30, and a test pins that character for character. Same `run_name: campaign_gates`, same weights, same policy — 18 of its levels are on layer 1, 12 on the offline room trunk, and 1-3 / 5-4 / 6-2 are left out because they have no route signal of any kind. Its header carries the three things to watch. Each config's header lists its own run commands, and **`tests/test_campaign_config.py` pins every setting and every reward weight that is NOT a named change equal to the config before it**, so nothing can drift while the same policy continues.
+- `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands). `campaign_prelude.yaml` (the multi-level curriculum 0-1 / 0-3 / 0-4 under a new run name `campaign_prelude`, kept as the reference) and `campaign_1-1.yaml` (the first skull-carry level, run `campaign_1-1`, **`item_pickup` and `item_placed` pinned at 0.0** until the three in-game checks pass). `campaign_gates_prelude.yaml` carried the live run from 4.8M to 6.77M steps (curriculum 0-1 / 0-3 / 0-4, `num_envs` 8, `ent_coef` 0.004) and is kept as history and as the partial rollback. **`campaign_gates_main.yaml` is the live one** (integration pause #2, 2026-09-17): the same `run_name: campaign_gates`, so the 6.77M-step weights, `best.zip` and the exploration archives carry on, with the 11-level Tier A + Tier B ladder, `unlock_after_fresh_episodes: 600`, `max_steps` 12000, `item_pickup` 10.0 / `item_placed` 20.0, `num_envs` 12 and `ent_coef` still 0.004. **`campaign_gates_full.yaml` is the route-fallback config, staged and NOT yet live** (branch `route-fallback`): `campaign_gates_main.yaml` with **four** named changes and nothing else, each pinned by `test_the_full_config_is_the_main_config_with_more_levels` — the `levels` list 11 → 30, `gate_patience_mode: collapsed`, `prefer_route_when_collapsed: false` (both written out although they are the defaults, so flipping one is a deliberate act) and `ent_floor: 5.0` + `ent_coef_max: 0.02` (the adaptive entropy floor; `ent_coef` itself stays 0.004). Same `run_name: campaign_gates`, same weights, same policy — 18 of its levels are on layer 1, 12 on the offline room trunk, and 1-3 / 5-4 / 6-2 are left out because they have no route signal of any kind. Its header carries the three things to watch. Each config's header lists its own run commands, and **`tests/test_campaign_config.py` pins every setting and every reward weight that is NOT a named change equal to the config before it**, so nothing can drift while the same policy continues.
 - `docs/level-survey.md`: all 35 levels parsed offline from the scene files — exits, checkpoints, door graphs and gate ladders, altars and carryables, arenas, bosses and hazards, plus a tier table and the recommended order of sub-projects. This is what the multi-level and skull-gates design was built from; check it before assuming anything about a level nobody has trained on. **Section 9 is the route-coverage appendix** (stage S1, 2026-09-17): which layer fires on each of the 33 levels, and per shipped trunk its rungs, gaps, tour ratio, legs witnessed and last-rung-to-pit distance.
 - `docs/protocol.md`: the socket protocol.
 - `docs/game-internals.md`: game classes and fields the mod relies on (check after game updates).
@@ -541,7 +571,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **parked/ep + exit-banished row** for the two ladder-patience mechanisms, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 12 trunks walked end to end). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**21 files; 477 named tests** as of 2026-09-17, of which `test_progress.py`'s 20 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, and `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 14 trunks walked end to end). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**21 files; 499 named tests** as of 2026-09-17, of which `test_progress.py`'s 21 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, and `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
   **In a worktree, set `PYTHONPATH` to that worktree's `python/`** or `import ultrakill_ai` resolves to the main tree and every test measures the wrong code: `$env:PYTHONPATH = "F:\Github\ULTRAKILL-AI-route\python"`.
 - Regenerate the route data (no game, no port, safe beside a live run): `python scripts/build_routes.py --validate` from `python/`. ~2 min for all 33 levels; it rewrites only `ultrakill_ai/routes/` and exits non-zero if any shipped level changes shape. Run it after every game update, then `python tests/test_route_files.py`.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
@@ -1981,45 +2011,46 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 
   ### Activation checklist — how to put this in front of the live run
 
-  Do these in order. Steps 1-3 need no pause; step 4 is the only one that stops training, and it is a
-  graceful stop, not a kill.
+  Eight steps, in order. Steps 1-2 need no pause; steps 3-7 are the switch, and the stop is graceful, not a
+  kill. **The config lives on the SUPERVISOR's command line**, so switching configs means restarting the
+  supervisor, not just the trainer — the pause file alone does not do it.
 
-  1. **Merge `route-fallback` into `main`.** Python and data only — **no mod build, so the games can stay up**:
-     `git -C F:\Github\ULTRAKILL-AI merge route-fallback`, then from `python/` run the whole no-game suite
-     against the merged main (21 files, 0 failures) and push. Nothing in the merge changes behaviour on any
-     level the live config names: all 11 are on layer 1 or have no file, so `route_source` will read **1** and
-     `load_route` returns `None` for every one of them. The supervisor restarts the trainer from main's code, so
-     **main must be left in a state that runs** — do not merge and then leave the suite unrun.
-  2. **Move the metrics log aside**, or the new column is silently dropped: `poll_status.py` keeps an existing
-     `metrics_log.csv` header.
+  1. **Merge `route-fallback` into `main`** — Python and data only, no mod build, so the games stay up:
+     `git -C F:\Github\ULTRAKILL-AI merge route-fallback`. Then from `python/` run the whole no-game suite
+     against the merged main (21 files, 499 named tests, 0 failures) and push. The supervisor restarts the
+     trainer from main's code, so **main must be left in a state that runs**.
+  2. **Move the metrics log aside** for the two new columns (`ladder_collapsed`, `ppo_ent_coef_live`);
+     `poll_status.py` keeps an existing header and would silently drop them:
      `Move-Item runs\campaign_gates\metrics_log.csv runs\campaign_gates\metrics_log.pre-route.csv`.
-  3. **Confirm the baseline before changing the config.** On the merged main, `route_source` must read 1 and
-     `gates_reached` / completion on 0-1, 0-2, 0-3 must be unchanged. This is acceptance check **A3**, the only
-     gate the spec says can block the merge, and it can be read straight off the dashboard's new **`route
-     layer`** row and `status.json`'s `mean_100.route_source`. Leave it here for a window of >= 50 episodes.
-  4. **Switch the config — and note that the pause file alone is not enough.** The supervisor holds the config
-     on **its own command line** (`supervise.py --config ...`) and passes it to every `train.py` it starts, so
-     changing which config is live means **restarting the supervisor**, not just the trainer:
-     ```powershell
-     # from python/
-     New-Item runs\campaign_gates\SUPERVISOR_PAUSE          # 1. the supervisor stops restarting anything
-     # 2. Ctrl+C the supervisor's own console and wait for it to exit
-     # 3. Ctrl+C the trainer and wait for "Saved models\campaign_gates\latest.zip"
-     Remove-Item runs\campaign_gates\SUPERVISOR_PAUSE       # 4. lift the pause
-     python scripts/supervise.py --run campaign_gates --config configs/campaign_gates_full.yaml --count 12 --monitor 1
-     ```
-     The supervisor finds no trainer, treats it as DEAD, relaunches the twelve games, waits out its boot health
-     gate and starts `train.py --config configs/campaign_gates_full.yaml --resume <the checkpoint with the most
-     timesteps>`. `campaign_gates_full.yaml` is `campaign_gates_main.yaml` with **one** change — `levels` 11 -> 30
-     — so the run name, the weights, `best.zip` and the exploration archives all carry straight on.
-     **Rollback is the same four steps with `--config configs/campaign_gates_main.yaml`.**
-  5. **The switch is safe because of the unlock ladder, not because of the code.** At 10.78M steps only 0-1, 0-2
-     and 0-3 are unlocked and **0-4 is still locked**; the levels are in mission order, so **0-5 is the first
-     rooms-routed level and it cannot open until 0-4 does**. Nothing on layer 2 runs on the day of the switch.
-     That is the point: the config change is reversible for as long as it takes 0-4 to pass its unlock rate.
+  3. **Pause the supervisor**: `New-Item runs\campaign_gates\SUPERVISOR_PAUSE`.
+  4. **Stop the supervisor** — Ctrl+C its own console and wait for it to exit.
+  5. **Stop the trainer** — Ctrl+C and wait for `Saved models\campaign_gates\latest.zip`.
+  6. **Lift the pause**: `Remove-Item runs\campaign_gates\SUPERVISOR_PAUSE`.
+  7. **Restart the supervisor on the new config**, from `python/`:
+     `python scripts/supervise.py --run campaign_gates --config configs/campaign_gates_full.yaml --count 12 --monitor 1`.
+     It finds no trainer, treats it as DEAD, relaunches the twelve games, waits out its boot health gate and
+     starts `train.py --config configs/campaign_gates_full.yaml --resume <the checkpoint with the most
+     timesteps>`. Same run name, same weights, same `best.zip`, same exploration archives.
+  8. **Read the first update**: `ladder_collapsed` 0 on 0-1 and 1 on 0-3, `targets_parked` 0 on 0-1, and
+     `ent_coef_live` 0.004 while total entropy is above 6. **Rollback is steps 3-7 with
+     `--config configs/campaign_gates_main.yaml`.**
+
+  The switch is also safe because of the unlock ladder rather than because of the code: at ~11.2M steps only
+  0-1, 0-2 and 0-3 are unlocked and **0-4 is still locked**, so 0-5 — the first trunk-routed level — cannot
+  open until 0-4 does, and nothing on layer 2 runs on the day of the switch. 0-3 and 4-3 do ship a file now,
+  but `prefer_route_when_collapsed` is false, so neither of them reads it.
+
 
   ### What to watch, in this order
 
+  0. **The conditional-patience readouts, first, because they are the ones that changed live behaviour.**
+     `ladder_collapsed` per level (`status.json`'s `campaign.levels[...]`, the dashboard's `col` column and
+     `poll_status.py`'s column) must read **0 on 0-1, 0-2, 0-4, 2-1, 2-2, 3-1 and 4-1** and **1 on 0-3** —
+     it is a property of the level, so anything between 0 and 1 on one level means two workers disagree.
+     **`targets_parked` on 0-1 must read 0**; anything above that is the regression coming back. Then 0-1's
+     fresh completion rate recovering toward **0.55+** (window >= 50, fresh starts only) while 0-3 keeps its
+     post-fix `gates_reached` near **4.5**. And `ent_coef_live` against `|entropy_loss|`: the coefficient
+     should sit at 0.004 while entropy is above 6 and only climb if it falls under 5.
   1. **`route_source` per level** — the dashboard's **`route layer`** row, `poll_status.py`'s `route_source`
      column, `status.json`'s `mean_100.route_source` and the per-episode string in `episodes.jsonl`
      (`route_source_name`). Expect **1 ("gates")** for weeks. A window reading **"mixed"** is the first
@@ -2051,14 +2082,103 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
      order that was fixed offline and has never been read live. 4-4, 7-1 and 2-4 also carry rungs that are
      **movers** (two elevators, two trams): the reach cylinder sits where the mover started, not where it is.
 
-  - **The S1 engineer's finding on the six collapsed-ladder gates levels is under Gotchas, not here**, because
-    it is a fact about the levels rather than about this branch: the room trunk reproduces a sensible walkable
-    order on **0-3, 4-3 and 1-1** and would fix the collapse by construction, 8-1 loses its exit room to
-    invariant T, and 1-2 and 2-3 are refused by the tour guard. **No file ships for any of the six** — all six
-    pass the layer-1 guard and the spec's risk 5 does not authorise replacing a gates ladder. Acting on it is a
-    separate ruling about `_gates()`'s precedence.
+  - **The S1 engineer's finding on the six collapsed-ladder gates levels has been RULED ON** (lead,
+    2026-09-17; spec section 13.4). The room trunk reproduces a sensible walkable order on **0-3, 4-3 and
+    1-1**, 8-1 loses its exit room to invariant T, and 1-2 and 2-3 are refused by the tour guard. Files now
+    ship for **0-3 and 4-3 only** (`build_routes.COLLAPSED_SHIP`) — not 1-1, whose skull locks wait for S3 —
+    and they are read only when `prefer_route_when_collapsed` is **true**, which it is not by default, because
+    0-3 is currently progressing on gates plus patience. Flipping it is a per-run decision on evidence; a level
+    whose ladder is healthy cannot reach its file whatever the flag says.
   - **What is NOT measured, and cannot be offline: whether a leg is walkable in that direction.** The fine
     geodesic was measured dead and a straight knee-height segment test is `partial` on 0-1 itself. The trunk is
     ordered, standable (100 of 100 probed places pass the voxel guard R4 over 95 rungs) and corroborated (58 of
     95 legs have an authored checkpoint within 40 m); it is not proved traversable. That is why the recovery
     path is deliberately trivial and why `route_source` exists.
+
+- **Target patience is now LEVEL-CONDITIONAL, and two lead rulings landed with it (branch `route-fallback`,
+  2026-09-17). Python and data only; not merged — the lead merges and the supervisor picks it up at its next
+  restart.** The ladder-patience fix went live at **9.59M steps** and the live run measured both halves of it
+  inside 1.5M steps:
+  - **0-3 (collapsed ladder): the fix works.** Fresh `gates_reached` **1.0 -> 4.5**, checkpoints per load
+    **0 -> 1.1**.
+  - **0-2: the exit guard works.** Fresh completion **0.03 -> 0.41-0.62**, best **163.2 s**.
+  - **0-1 (monotone, CORRECT ladder): it REGRESSED.** Fresh completion **0.55 (n=43, 7.5M-9.58M) -> 0.30
+    (n=70 after)**. Before: `targets_parked` 0.00 per fresh episode, gates histogram `{1:3, 2:1, 5:1, 6:1,
+    7:8, 8:6, 10:23}`, one stuck episode near (40, 480). After: `targets_parked` mean **1.17**, **34%** of
+    fresh episodes park at least once, histogram `{0:2, 1:7, 2:19, 4:4, 5:2, 7:5, 8:10, 10:21}` — the mass
+    moved from 10 to 2 — and **14 of 39** stuck episodes end at (40, ~480) with exactly 2 gates.
+  - **Cause.** The offline replay that "proved" 0-1 inert used recordings of a much older policy
+    (`campaign_ppo_ground/latest.zip`). Today's policy holds a target through much longer arena fights, the
+    **bounded** arena suspension (2 x patience, the correction the adversarial review forced) expires, the
+    CORRECT target is parked and the fallback sends the agent somewhere wrong. On a level whose ladder is
+    right there is nothing better to switch to, so a park can only mislead.
+  - **The fix is a detector, not a knob.** `campaign.detect_collapsed_ladder(rungs, spawn)` is a pure function
+    of the `campaign.gates` block and the player's first position on a fresh load: **collapsed when the gate
+    nearest the spawn carries `hops <= max_hops / 2`**. Measured over all 18 shipped levels with a usable gate
+    ladder (`scratchpad/collapse_detect_scan.py`, from the offline level survey, with the two live spawns for
+    0-1 and 0-3 and the level's first authored room elsewhere):
+
+    | verdict | levels (nearest-gate hops / max hops) |
+    |---|---|
+    | COLLAPSED | 0-3 2/6, 1-1 1/5, 1-2 2/4, 2-3 0/2, 4-3 1/2, 8-1 0/4 — ratios 0.00-0.50 |
+    | healthy | 0-1 9/9, 0-2 7/7, 0-4 5/5, 2-1 3/3, 2-2 2/2, 3-1 7/7, 3-2 3/3, 4-1 8/8, 5-1 2/2, 6-1 2/2, 5-3 12/13, 8-2 5/8 — ratios 0.62-1.00 |
+
+    The worst collapsed level sits exactly at 0.50 and the nearest healthy one at 0.625 (**8-2**, whose spawn
+    is the least certain of the eighteen: at each of its three plausible spawn points it reads 5, 5 or 7 of 8,
+    so it stays healthy whichever is right). **Nothing else separated them**: the absolute deficit
+    `max - near` puts 8-2 (3) above three collapsed levels (4-3 1, 1-2 2, 2-3 2) and has no working threshold.
+    The verdict is taken **once per level load**, before anything reads it; a checkpoint respawn keeps it
+    (a respawn starts the player half-way through a level, where the nearest gate says nothing); undecided
+    reads as OFF. Reported as `ladder_collapsed` per episode and per level.
+  - **Config: `gate_patience_mode`** — `collapsed` (default) | `always` (the mechanism as first shipped) |
+    `off`. `gate_target_patience_s: 0.0` is still the global off switch.
+  - **Confirmed against the live run, as far as `episodes.jsonl` allows** (it has no per-step positions, so
+    this is a summary replay, not a step replay — `scratchpad/replay_live_0_1.py`): the detector reads
+    **collapsed = False** on 0-1's real gate array at its real spawn (nearest gate `40,1,408`, hops 9 of 9),
+    so patience is off on **every** 0-1 level load and all **125 parks** the run took on 0-1 after the fix
+    (24 of 70 fresh episodes affected) could not have happened. The step-level proof is `test_a6_0b`: under
+    the shipped settings all seven recorded 0-1 episodes reproduce `ladder_golden.json` exactly with zero
+    parks, where the unconditional mechanism moved episode 5 by +10.363 m of `gate_approach`.
+  - **Ruling (a): invariant T's distinct-places clause is ACCEPTED exactly as built** (spec section 13.4). A
+    same-ordinal suffixed group is dropped only when its members are >= 16 m apart, the distance `_is_reached`
+    cannot tell apart; a group inside one reach cylinder is one PLACE, not a choice, and I2 collapses it
+    instead. Exactly one group campaign-wide is affected — 5-2's `1A - Opening` / `1B - Second Rock`, both at
+    (0, -10, 300) — and without the clause 5-2 loses the rung at its own spawn.
+  - **Ruling (b): 0-3 and 4-3 ship a trunk, and nothing prefers it yet.** `build_routes.COLLAPSED_SHIP` emits
+    a file for those two beside their collapsed gate ladder (0-3 11 rungs, tour 0.944, 9/11 legs witnessed;
+    4-3 8 rungs, tour 1.000, 6/8) — **not** 1-1 (skull locks wait for S3), **not** 1-2 / 2-3 / 8-1 (guards).
+    `prefer_route_when_collapsed` selects it, and it **defaults to false** because 0-3 is progressing on gates
+    plus patience today; the lead flips it per run on evidence. **14 route files ship, not 12.** A level whose
+    ladder is HEALTHY can never read its file whatever the flag says — the verdict gates it, not the file.
+  - **The one hazard that became real, and is handled.** 0-3 and 4-3 are now the only levels with BOTH a
+    ladder and a file, so a frame the mod sends with no `campaign` block would have taken `_gates()`'s first
+    arm, handed out the trunk unvalidated, flipped `_hops_source` and cleared a ladder that was fine — losing
+    that load's `gate` income on the level the patience fix is rescuing. The layer is now **latched per load**:
+    once a load's ladder has come from the gates, a block-less frame returns `[]`.
+  - **Adaptive entropy floor (`train.ent_floor`, `train.ent_coef_max`).** The live run went `|entropy_loss|`
+    **7.88 at 9.58M steps -> 5.57 at 11.0M** (heads yaw 1.06 / pitch 0.97 / look_mode 0.43) on a FIXED
+    `ent_coef` of 0.004, and this project's Cyber Grind run collapsed exactly this way **twice** — peak near
+    3.5 nats, then worse while it kept sharpening. A fixed coefficient cannot defend a floor: the bonus is a
+    constant pull against an advantage signal that grows as the policy gets confident. `EntropyFloorCallback`
+    reads the update that just finished and, per rollout: **entropy < floor -> `ent_coef *= 1.10`, capped at
+    `ent_coef_max` (0.02); entropy > floor + 1.0 -> `*= 0.95`, never below the config's `ent_coef`; inside the
+    band, unchanged.** Multiplicative and slow (17 updates from 0.004 to the cap, 34 back, against ~2000
+    updates in a 20M-step run) and a floor, never a ceiling. `ent_floor: 5.0` in
+    `configs/campaign_gates_full.yaml`, just under the live value, so it is inert while nothing is wrong. It
+    **does not survive a resume** by design: every restart starts at the base and re-adapts over a few updates.
+    Live value logged as `train/ent_coef_live` -> `status.json`'s `ppo` block, the dashboard's PPO panel and
+    `poll_status.py`'s `ppo_ent_coef_live`.
+  - **`configs/campaign_gates_full.yaml` now differs from `campaign_gates_main.yaml` in exactly four things**,
+    each pinned by `test_the_full_config_is_the_main_config_with_more_levels`: `levels` 11 -> 30,
+    `gate_patience_mode: collapsed`, `prefer_route_when_collapsed: false` and `ent_floor: 5.0` +
+    `ent_coef_max: 0.02`. `num_envs` stays 12, `ent_coef` stays 0.004 and no reward weight moves.
+  - **Evidence: the whole no-game suite, 21 files, 499 named tests, 0 failures.** New: the detector's
+    separation table as a test, the three modes, the verdict's per-load scope and late-ladder case, 0-1 inert
+    and 0-3 patient under the shipped default (unit, env and recorded-replay), both settings of
+    `prefer_route_when_collapsed` including "a healthy ladder never reads its file", the block-less-frame
+    latch, the two new route files against `EXPECTED_LADDERS`, and four entropy-floor tests against a fake
+    model (raise, decay, cap, base, band, off).
+  - **What to watch after activation**, in order: `ladder_collapsed` per level (0 on 0-1, 1 on 0-3; a value
+    between them means workers disagree); **`targets_parked` on 0-1 must read 0**; 0-1's fresh completion
+    recovering toward **0.55+** on a window of >= 50 fresh starts while 0-3 holds `gates_reached` near 4.5;
+    and `ent_coef_live` against `|entropy_loss|` — 0.004 while entropy is above 6, climbing only under 5.

@@ -1,11 +1,14 @@
 # The whole routed campaign: every shipped level that has a route signal, in mission order.
 #
-# This is configs/campaign_gates_main.yaml with ONE change -- the `levels` list, 11 -> 30 -- and nothing else.
-# Every env setting, every reward weight and every hyperparameter is character-for-character what the live run
-# is training under, and a test pins that
-# (test_campaign_config.test_the_full_config_is_the_main_config_with_more_levels). Same run name, same
-# models/campaign_gates/, same weights, same policy: this is the main run continuing with a longer ladder in
-# front of it, exactly as campaign_gates_main.yaml was to campaign_gates_prelude.yaml.
+# This is configs/campaign_gates_main.yaml with FOUR changes and nothing else, each of them listed by name in
+# test_campaign_config.test_the_full_config_is_the_main_config_with_more_levels:
+#   - `levels`, 11 -> 30 (the whole routed campaign);
+#   - `gate_patience_mode: collapsed`, the 2026-09-17 revision after target patience regressed Level 0-1;
+#   - `prefer_route_when_collapsed: false`, the lead's ruling, written out so flipping it is a deliberate act;
+#   - `ent_floor: 5.0` (+ `ent_coef_max`), the adaptive entropy floor. `ent_coef` itself is UNCHANGED at 0.004.
+# No reward weight and no other hyperparameter moves. Same run name, same models/campaign_gates/, same weights,
+# same policy: this is the main run continuing with a longer ladder in front of it, exactly as
+# campaign_gates_main.yaml was to campaign_gates_prelude.yaml.
 #
 # NOT the live config, and not to be started casually. It is the config for AFTER the route fallback's
 # acceptance checks pass, because 12 of these 30 levels have no gate ladder at all and are routed by the
@@ -94,6 +97,16 @@ env:
   stuck_repeats: 3
   cell_size: 4.0
   pitch_limit_deg: 45.0
+  # Target patience only where the gate ladder is COLLAPSED at the spawn (`detect_collapsed_ladder`): of the 18
+  # gates levels in this list that is 0-3, 1-1, 1-2, 2-3, 4-3 and 8-1, and it is NOT 0-1, whose ladder is
+  # monotone and which lost half its fresh completion rate to the unconditional mechanism (0.55 n=43 -> 0.30
+  # n=56 across the 2026-09-17 activation). Written out rather than left to the default so the run's own config
+  # says where parking is allowed to act.
+  gate_patience_mode: collapsed
+  # 0-3 and 4-3 ship a room trunk as well as a collapsed gate ladder. FALSE keeps them on gates plus patience,
+  # which is what took 0-3's fresh gates_reached from 1.0 to 4.5 live; flip it per run, on evidence, to hand
+  # those two levels their trunk instead. A level with a healthy ladder never reads its file either way.
+  prefer_route_when_collapsed: false
   # configs/campaign_gates_main.yaml's weights, unchanged. A test pins every one of them equal, because the
   # same policy continues on the same weights and the route fallback adds no reward term at all: a room rung
   # pays through `gate` and `gate_approach`, exactly as a door does.
@@ -110,3 +123,12 @@ train:
   policy_kwargs: {net_arch: [512, 512]}
   hyperparams: {learning_rate: 0.0002, n_steps: 2048, batch_size: 512, n_epochs: 5, gamma: 0.998,
                 gae_lambda: 0.95, ent_coef: 0.004, target_kl: 0.03}
+  # Adaptive entropy floor (scripts/train.py, EntropyFloorCallback). `ent_coef` above is the BASE and does not
+  # change; this is the total entropy in nats the controller defends by raising the coefficient when the last
+  # update fell below it, and letting it decay back to the base once it is a nat clear. Measured reason: this
+  # run went |entropy_loss| 7.88 at 9.58M steps to 5.57 at 11.0M on the fixed 0.004 and was still falling, and
+  # the Cyber Grind run collapsed this way twice -- peak near 3.5 nats, then worse while it kept sharpening.
+  # 5.0 sits just under the live value, so the controller is inert while nothing is wrong. It does not survive
+  # a resume: every restart begins at the base and re-adapts over the first few updates.
+  ent_floor: 5.0
+  ent_coef_max: 0.02

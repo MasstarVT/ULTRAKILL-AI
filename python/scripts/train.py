@@ -21,6 +21,7 @@ import os
 os.environ.setdefault("KMP_BLOCKTIME", "1")
 
 import argparse  # noqa: E402
+import math  # noqa: E402
 import sys  # noqa: E402
 from collections import defaultdict  # noqa: E402
 from dataclasses import replace  # noqa: E402
@@ -113,6 +114,75 @@ class ActionEntropyCallback(BaseCallback):
         # PPO's own train/* metrics, and this callback runs before ProgressCallback in the list that reads them.
         for name, value in self.entropies.items():
             self.logger.record(f"train/entropy_{name}", value)
+
+
+class EntropyFloorCallback(BaseCallback):
+    """Holds total policy entropy above a floor by adapting `ent_coef` between updates.
+
+    This run's failure mode, twice over, is a policy that sharpens past its own peak and then gets worse: the
+    Cyber Grind run peaked near 3.5 nats and degraded while entropy kept falling (CLAUDE.md, "second peak and
+    second collapse"), and the live campaign run went |entropy_loss| 7.88 at 9.58M steps to 5.57 at 11.0M on a
+    FIXED `ent_coef` of 0.004. A fixed coefficient cannot defend a floor: the entropy bonus is a constant pull
+    against an advantage signal that grows as the policy gets confident, so the same 0.004 that held 7.9 nats
+    holds nothing at all later. This is the smallest controller that can -- one scalar, read once per update.
+
+        floor = train.ent_floor       total entropy in NATS, summed over the action dimensions. 0 = off,
+                                      and off means this callback never writes `ent_coef` at all.
+        base  = train.hyperparams.ent_coef      the floor it never goes below, i.e. today's fixed value
+        cap   = train.ent_coef_max    default 0.02, five times the base: the most it is ever allowed to push
+
+    Each rollout, reading the entropy of the update that just finished (SB3 logs `train/entropy_loss`, which is
+    NEGATED mean total entropy):
+
+        entropy <  floor          ->  ent_coef *= 1.10, capped at `cap`
+        entropy >  floor + 1.0    ->  ent_coef *= 0.95, never below `base`
+        otherwise                 ->  unchanged (the 1 nat band is what stops it oscillating)
+
+    Multiplicative both ways, so it is scale-free and slow: from 0.004 it takes 17 updates to reach the 0.02
+    cap and 34 to come back, against ~2000 updates in a 20M-step run. It is a floor, never a ceiling -- above
+    the band it only ever returns to `base`, so a run that is comfortably entropic trains at exactly the
+    coefficient its config asks for and this callback is invisible.
+
+    **It does not survive a resume, deliberately.** `ent_coef` is not in the checkpoint (SB3 stores it as a
+    hyperparameter and `train.py` overrides it from the config on every resume anyway), so a resumed run starts
+    at `base` and re-adapts over the first few updates. That is the honest behaviour: the state it would carry
+    is a claim about a policy that has just been reloaded, and re-measuring costs a few thousand steps.
+    """
+
+    RAISE = 1.10
+    DECAY = 0.95
+    BAND = 1.0  # nats above the floor before the coefficient starts coming back down
+
+    def __init__(self, floor: float, base: float, maximum: float = 0.02):
+        super().__init__()
+        self.floor = max(0.0, float(floor))
+        self.base = float(base)
+        self.maximum = max(float(base), float(maximum))
+        self.live = float(base)
+        self.entropy: float | None = None  # total entropy of the last update, for the log line
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_start(self) -> None:
+        # PPO's train() records into the logger after the rollout ends and the values live until the next dump,
+        # so this reads the update that just ran -- the same window ProgressCallback reads its PPO metrics in.
+        # Recorded here too (not at rollout end), so `train/ent_coef_live` has the same lifetime as train/*.
+        values = getattr(self.logger, "name_to_value", {})
+        entropy_loss = values.get("train/entropy_loss")
+        if self.floor > 0 and entropy_loss is not None:
+            try:
+                entropy = -float(entropy_loss)
+            except (TypeError, ValueError):
+                entropy = None
+            if entropy is not None and math.isfinite(entropy):
+                self.entropy = entropy
+                if entropy < self.floor:
+                    self.live = min(self.maximum, self.live * self.RAISE)
+                elif entropy > self.floor + self.BAND:
+                    self.live = max(self.base, self.live * self.DECAY)
+                self.model.ent_coef = self.live
+        self.logger.record("train/ent_coef_live", self.live)
 
 
 def make_env(cfg: EnvConfig, info_keywords: tuple[str, ...]):
@@ -223,10 +293,18 @@ def main() -> None:
         # silently re-locks every level and this is where that shows.
         progress.write_curriculum()
         print(f"curriculum: {len(env_cfg.levels)} levels, unlocked {progress.unlocked_levels or [env_cfg.levels[0]]}")
+    # The entropy floor, if the config asks for one. Before `progress` in the list, so the coefficient it
+    # records is in the logger when ProgressCallback copies PPO_METRICS into status.json.
+    entropy_floor = EntropyFloorCallback(train_cfg.get("ent_floor", 0.0), hyper["ent_coef"],
+                                         train_cfg.get("ent_coef_max", 0.02))
+    if entropy_floor.floor > 0:
+        print(f"entropy floor: {entropy_floor.floor} nats, ent_coef {entropy_floor.base} -> at most "
+              f"{entropy_floor.maximum} (starts at the base on every resume and re-adapts)")
     callbacks = CallbackList([
         CheckpointCallback(save_freq=max(1, train_cfg.get("save_every", 50_000) // num_envs), save_path=str(model_dir), name_prefix="ckpt"),
         EpisodeStatsCallback(),
         ActionEntropyCallback(),
+        entropy_floor,
         progress,
     ])
 

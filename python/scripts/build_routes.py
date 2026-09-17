@@ -95,9 +95,19 @@ CP_NEAR = 60.0          # `checkpoints_within_60m`
 LEG_NEAR = 40.0         # `legs_witnessed`
 PIT_MAX_M = 70.0        # spec 7.1 test 9: a rung named `Pit` may only be hops 0, and near the pit
 
-# The 12 levels the spec ships. `--validate` fails when the emitted set differs, because a file
-# appearing or vanishing is a coverage change and must not be silent (spec 7.1 test 10, risk 1).
-EXPECTED_SHIPPED = ("0-5", "1-4", "2-4", "4-2", "4-4", "5-2",
+# Levels whose gate ladder layer 1 ACCEPTS but which the collapse detector calls collapsed at the
+# spawn, and whose trunk the S1 measurement showed reproduces a sensible walkable order. Their file
+# ships beside the ladder and is read only by a run with `prefer_route_when_collapsed: true` (the
+# lead's ruling, default false) -- `GateProgress._gates` gives a healthy level's file no way in at
+# all. An explicit allow-list, not a guard result: of the other four collapsed levels 1-1 waits for
+# S3 to stamp its skull locks, and 1-2 (tour 1.426), 2-3 (tour 1.393) and 8-1 (exit room dropped by
+# guard T, last leg 1513 m) are not trunks anyone should hand an agent.
+COLLAPSED_SHIP = ("0-3", "4-3")
+
+# The 14 levels the spec ships: the 12 with no gate ladder, plus the two collapsed ones above.
+# `--validate` fails when the emitted set differs, because a file appearing or vanishing is a
+# coverage change and must not be silent (spec 7.1 test 10, risk 1).
+EXPECTED_SHIPPED = ("0-3", "0-5", "1-4", "2-4", "4-2", "4-3", "4-4", "5-2",
                     "7-1", "7-2", "7-3", "7-4", "8-3", "8-4")
 
 # The SHAPE of each shipped ladder, not just the set. Spec risk 3 tells the operator to rerun this
@@ -122,6 +132,12 @@ EXPECTED_SHIPPED = ("0-5", "1-4", "2-4", "4-2", "4-4", "5-2",
 #       a group inside one `_is_reached` cylinder is not an order the agent can take either way, so
 #       I2 collapses it rather than T dropping it. 7 rungs, which is what the design says.
 EXPECTED_SHAPE = {
+    # The two collapsed-ladder levels (COLLAPSED_SHIP), measured 2026-09-17. 0-3's trunk is the one the S1
+    # survey printed room by room: 11 rungs from `1 - Main Room - Floor 1` to the merged
+    # `10B - Second Encounter + 11 - Boss Arena - Floor 2`, in the order the level is actually walked
+    # (the gate ladder's own hops along it run 2,2,3,4,5,6,4,4,3,2,0 -- which is why it collapses).
+    "0-3": (11, 64.9, 117.6, 0.944, "9/11", "4/4", 119.7),
+    "4-3": (8, 64.8, 249.8, 1.000, "6/8", "3/3", 218.5),
     "0-5": (5, 46.5, 137.2, 1.000, "3/5", "1/1", 211.1),
     "1-4": (4, 81.2, 117.0, 1.000, "2/4", "2/2", 149.5),
     "2-4": (4, 425.0, 430.2, 1.000, "1/4", "1/2", 111.2),
@@ -2029,12 +2045,16 @@ def build_level(lvl, probe=True, analyse_gates=False):
         rep["ships"] = False
         rep["why"].append("no usable FinalPit")
         return rep
+    collapsed_ship = lvl in COLLAPSED_SHIP
     if gate["pass"]:
         # Layer 1 already routes this level and never reads a file (spec 1). Measured, not assumed.
+        # The exception is a COLLAPSED ladder on the allow-list above, whose file ships as an
+        # alternative the run may select; the level is still reported as signal "gates", because
+        # that is what drives it unless `prefer_route_when_collapsed` is turned on.
         rep["signal"] = "gates"
         rep["why"].append("layer 1: %d/%d gates carry hops (%.3f)"
                           % (gate["with_hops"], gate["gates"], gate["ratio"]))
-        if not analyse_gates:
+        if not (analyse_gates or collapsed_ship):
             rep["ships"] = False
             return rep
 
@@ -2079,7 +2099,7 @@ def build_level(lvl, probe=True, analyse_gates=False):
     locks.sort(key=lambda x: (x["leg"], x["m"]))
 
     rep.update({
-        "ships": bool(r1 and r2 and not gate["pass"]),
+        "ships": bool(r1 and r2 and (not gate["pass"] or collapsed_ship)),
         "rungs": len(rows),
         "drop_i6": drop_i6, "drop_trunk": drop_t, "drop_r4": drop_r4, "drop_i3": drop_i3,
         "merges": merges,

@@ -37,6 +37,7 @@ from ultrakill_ai.campaign import (  # noqa: E402
     choose_level,
     compute_rank,
     dead_twin,
+    detect_collapsed_ladder,
     grade,
     level_weights,
     load_route,
@@ -1306,7 +1307,15 @@ COLLAPSED = [
 
 
 def patient(**kw) -> GateProgress:
+    """A tracker with parking switched on UNCONDITIONALLY, which is what the mechanism tests below test.
+
+    The shipped default is `patience_mode: "collapsed"`, i.e. parking only on a level whose ladder the detector
+    calls collapsed (see the detector tests further down, and `test_the_mode_decides_where_patience_may_act`).
+    Pinning "always" here keeps each mechanism test about its own rule rather than about the detector's verdict
+    on a four-gate miniature -- several of these ladders are too small to have a meaningful verdict at all.
+    """
     kw.setdefault("patience_steps", PATIENCE)
+    kw.setdefault("patience_mode", "always")
     return GateProgress(**kw)
 
 
@@ -1793,6 +1802,205 @@ def test_a_fallback_gate_reporting_no_hops_does_not_raise():
 
 
 # ---------------------------------------------------------------------------
+# The collapsed-ladder detector, and the modes that read it
+# (the 2026-09-17 revision, after the unconditional mechanism regressed Level 0-1)
+# ---------------------------------------------------------------------------
+
+# The two levels the verdict is measured against live, with their real gate ladders and their real spawns.
+# 0-1's eleven gates run hops 9 down to 0 and the door nearest its spawn is hops 9: monotone, correct, and the
+# level the unconditional mechanism cost 0.55 -> 0.30 fresh completion. 0-3's nearest gate is hops 2 of 6.
+L01_SPAWN = (39.7, -0.5, 343.7)
+L01_GATES = [gate("40,1,408", (40.0, 1.0, 408.0), 9), gate("40,1,470", (40.0, 1.0, 470.0), 8),
+             gate("40,-9,490", (40.0, -9.0, 490.0), 7), gate("40,-9,552", (40.0, -9.0, 552.0), 6),
+             gate("40,11,624", (40.0, 11.0, 624.0), 5), gate("66,21,640", (66.0, 21.0, 640.0), 4),
+             gate("146,31,640", (146.0, 31.0, 640.0), 3), gate("192,31,594", (192.0, 31.0, 594.0), 2),
+             gate("202,56,534", (202.0, 56.0, 534.0), 2), gate("202,56,452", (202.0, 56.0, 452.0), 1),
+             gate("202,56,432", (202.0, 56.0, 431.5), 0)]
+L03_SPAWN = (0.0, 0.5, 253.0)
+L03_GATES = [gate("-82,93,315", (-81.5, 93.0, 315.0), 0), gate("-16,73,315", (-15.5, 73.0, 315.0), 1),
+             gate("0,13,330", (0.0, 13.0, 330.5), 2), gate("0,53,330", (0.0, 53.0, 330.5), 2),
+             gate("0,13,362", (0.0, 13.0, 361.5), 3), gate("76,53,398", (76.0, 53.0, 397.5), 3),
+             gate("0,13,402", (0.0, 13.0, 401.5), 4), gate("10,53,413", (10.0, 53.0, 413.0), 4),
+             gate("116,53,448", (116.0, 53.0, 448.0), 4), gate("-20,8,413", (-20.0, 8.0, 413.0), 5),
+             gate("-86,-12,413", (-86.0, -12.0, 413.0), 6)]
+
+
+def test_the_detector_calls_0_1_healthy_and_0_3_collapsed_at_their_real_spawns():
+    """The two levels with measured live data, which is the whole reason the rule is `2 * near <= max`."""
+    assert detect_collapsed_ladder(L01_GATES, L01_SPAWN) is False, "9 of 9: the nearest door is the top rung"
+    assert detect_collapsed_ladder(L03_GATES, L03_SPAWN) is True, "2 of 6: a third of the way down at the spawn"
+
+
+def test_the_detector_separates_every_shipped_gates_level_the_same_way():
+    """The measurement in `detect_collapsed_ladder`'s docstring, as a table: (near hops, max hops) -> verdict.
+
+    Taken from the offline level survey with the live spawns for 0-1 and 0-3 and the level's first authored
+    room elsewhere (scratchpad/collapse_detect_scan.py). The six on the left are the levels the ladder-patience
+    spec measured as collapsed; the twelve on the right are every other level whose gate ladder `_gates()`
+    accepts. 8-2 at 5 of 8 is the closest healthy level to the line and the one with the least certain spawn:
+    at each of its three plausible spawn points it reads 5, 5 or 7 of 8, so it never crosses.
+    """
+    collapsed = {"0-3": (2, 6), "1-1": (1, 5), "1-2": (2, 4), "2-3": (0, 2), "4-3": (1, 2), "8-1": (0, 4)}
+    healthy = {"0-1": (9, 9), "0-2": (7, 7), "0-4": (5, 5), "2-1": (3, 3), "2-2": (2, 2), "3-1": (7, 7),
+               "3-2": (3, 3), "4-1": (8, 8), "5-1": (2, 2), "5-3": (12, 13), "6-1": (2, 2), "8-2": (5, 8)}
+    assert len(collapsed) + len(healthy) == 18, "every shipped level with a usable gate ladder"
+    for table, want in ((collapsed, True), (healthy, False)):
+        for level, (near, top) in table.items():
+            # The nearest gate at the origin, the top rung 100 m away, so "nearest" is unambiguous.
+            rungs = [gate("near", (0.0, 0.0, 0.0), near), gate("top", (0.0, 0.0, 100.0), top)]
+            assert detect_collapsed_ladder(rungs, (0.0, 0.0, 0.0)) is want, f"{level}: {near} of {top}"
+
+
+def test_the_detector_answers_none_when_the_frame_cannot_decide():
+    """None is "ask again next frame", never False: a mid-load frame must not latch a verdict."""
+    assert detect_collapsed_ladder(L03_GATES, None) is None, "no player yet"
+    assert detect_collapsed_ladder([], L03_SPAWN) is None, "no ladder yet"
+    assert detect_collapsed_ladder(None, L03_SPAWN) is None, "no block at all"
+    nulls = [gate("a", (0.0, 0.0, 0.0), None), {"key": "b", "hops": 3}]  # altar_only doors, and one with no pos
+    assert detect_collapsed_ladder(nulls, L03_SPAWN) is None, "nothing gradeable in the array"
+    assert detect_collapsed_ladder([gate("a", (0.0, 0.0, 0.0), 0)], L03_SPAWN) is False, \
+        "one tier of doors: there is no ladder above the spawn to lose"
+
+
+def test_the_verdict_is_taken_once_per_level_load_and_survives_a_respawn():
+    """A respawn starts the player half-way through a level, where the nearest gate says nothing about it."""
+    camp = gates_block(L01_GATES, exit_pos=None)
+    p = GateProgress(patience_steps=PATIENCE)
+    p.new_level_load(camp, L01_SPAWN)
+    assert p.ladder_collapsed is False and not p.patience_active
+    p.mark_paid(camp, (202.0, 56.0, 452.0))  # respawn at the last checkpoint, one hop from the exit
+    assert p.ladder_collapsed is False, "a respawn keeps the load's verdict; only a new load re-decides"
+    p.reset_episode()
+    assert p.ladder_collapsed is False, "and so does an episode boundary"
+    p.new_level_load(gates_block(L03_GATES, exit_pos=None), L03_SPAWN)
+    assert p.ladder_collapsed is True and p.patience_active, "a new load decides again, on its own ladder"
+
+
+def test_a_load_whose_ladder_arrives_late_is_judged_from_the_spawn_it_started_at():
+    """`_collapse_spawn` is the first position of the load, not the position the ladder finally arrives at."""
+    camp = gates_block(L03_GATES, exit_pos=None)
+    p = GateProgress(patience_steps=PATIENCE)
+    p.new_level_load(None, L03_SPAWN)  # a scene-load frame: a player, no campaign block
+    assert p.ladder_collapsed is None, "undecided, and therefore inert"
+    assert not p.patience_active
+    p.update(camp, (0.0, 13.0, 362.0))  # by the time the doors report, the agent has walked 110 m
+    assert p.ladder_collapsed is True, "judged from the spawn, which is what makes the verdict a level's own"
+
+
+def test_the_mode_decides_where_patience_may_act():
+    on, off = gates_block(L03_GATES, exit_pos=None), gates_block(L01_GATES, exit_pos=None)
+    for mode, want in (("collapsed", (True, False)), ("always", (True, True)), ("off", (False, False))):
+        for camp, spawn, expected in ((on, L03_SPAWN, want[0]), (off, L01_SPAWN, want[1])):
+            p = GateProgress(patience_steps=PATIENCE, patience_mode=mode)
+            p.new_level_load(camp, spawn)
+            assert p.patience_active is expected, (mode, spawn)
+    p = GateProgress(patience_steps=0, patience_mode="always")  # the global off switch still wins
+    p.new_level_load(on, L03_SPAWN)
+    assert p.ladder_collapsed is True and not p.patience_active
+    assert GateProgress(patience_steps=PATIENCE, patience_mode="nonsense").patience_mode == "collapsed", \
+        "an unknown mode is the safe one, not a crash and not `always`"
+
+
+def test_the_default_mode_leaves_a_monotone_ladder_exactly_as_it_was():
+    """0-1's own gates, stalled for ten patience windows: no park, and the ladder's target is still the target.
+
+    This is the regression in miniature. Under `always` this stall parks the correct door and hands the agent a
+    different one; under the shipped default nothing happens at all, which on a correct ladder is right.
+    """
+    camp = gates_block(L01_GATES, exit_pos=None)
+    door9 = (40.0, 1.0, 408.0)   # walk through the first door, so the ladder aims at the hops 8 one
+    stall = (40.0, -9.0, 505.0)  # then stall past it: 36 m from the target, 15 m from the unreached hops 7 door
+    default, always = GateProgress(patience_steps=PATIENCE), GateProgress(patience_steps=PATIENCE,
+                                                                          patience_mode="always")
+    for p in (default, always):
+        p.new_level_load(camp, L01_SPAWN)
+        p.reset_episode()
+        p.retarget(camp, L01_SPAWN)
+        p.update(camp, door9)
+        assert p.target["key"] == "40,1,470", "the rung below, which is the correct door on this level"
+        dwell(p, camp, stall, 2 * PATIENCE)
+    assert default.parks == 0 and not default.parked and default.target["key"] == "40,1,470"
+    assert always.parks > 0 and always.target["key"] != "40,1,470", \
+        "the unconditional mechanism parks the correct door and aims elsewhere: the behaviour being retired"
+
+
+def test_a_collapsed_level_still_gets_the_whole_mechanism_under_the_default():
+    """0-3's own gates and spawn, and its actual bug: the verdict is what switches parking on, no config change.
+
+    The bug, as recorded: the agent drops into the pit, the hops 2 door is "reached" from below, `best_hops`
+    locks at 2 and the ladder hands it `-16,73,315` -- 66 m straight up through a ceiling -- for the rest of
+    the load. Parking is what ends that, and under the shipped default it still does.
+    """
+    camp = gates_block(L03_GATES, exit_pos=None)
+    p = GateProgress(patience_steps=PATIENCE)
+    p.new_level_load(camp, L03_SPAWN)
+    p.reset_episode()
+    p.retarget(camp, L03_SPAWN)
+    assert p.patience_active and p.target["key"] == "0,13,330", "the nearest, before anything is reached"
+    pit = (0.0, 8.0, 336.0)  # in the pit under the hops 2 door, inside its reach cylinder
+    p.update(camp, pit)
+    assert p.best_hops == 2 and p.target["key"] == "-16,73,315", "the wedge: the rung below, through a ceiling"
+    dwell(p, camp, pit, PATIENCE)
+    assert p.parks == 1 and p.parked == {"-16,73,315"}
+    assert p.target["key"] != "-16,73,315", "and the fallback hands it somewhere else to try"
+
+
+# ---------------------------------------------------------------------------
+# prefer_route_when_collapsed: the layer choice on a collapsed level that ships a trunk
+# ---------------------------------------------------------------------------
+
+def test_a_collapsed_level_keeps_its_gate_ladder_unless_the_flag_is_set():
+    """The lead's ruling, as behaviour: 0-3 and 4-3 ship a trunk, and by default it is not read."""
+    camp = gates_block(L03_GATES, exit_pos=None)
+    route = trunk(TRUNK, exit_pos=(0.0, 0.0, 200.0))
+    p = GateProgress(patience_steps=PATIENCE, route=route)
+    p.new_level_load(camp, L03_SPAWN)
+    assert p.ladder_collapsed is True and p.route_source == ROUTE_SOURCE_GATES
+    assert p.route_reads == 0, "the file ships, and with the flag off nothing ever opens it as the ladder"
+    assert {str(g["key"]) for g in p._gates(camp)} == {str(g["key"]) for g in L03_GATES}
+
+
+def test_the_flag_hands_a_collapsed_level_its_trunk_instead():
+    camp = gates_block(L03_GATES, exit_pos=None)
+    route = trunk(TRUNK, exit_pos=(0.0, 0.0, 200.0))
+    p = GateProgress(patience_steps=PATIENCE, route=route, prefer_route_when_collapsed=True)
+    p.new_level_load(camp, L03_SPAWN)
+    assert p.ladder_collapsed is True
+    assert p._gates(camp) is route["rungs"] and p.route_source == ROUTE_SOURCE_ROOMS
+    assert p._hops_source == "rooms", "and it is the trunk's hop scale from the first frame, so nothing flips"
+
+
+def test_a_healthy_ladder_never_reads_its_route_file_whatever_the_flag_says():
+    """The guarantee that makes the flag safe to flip per run: the verdict gates it, not the file's presence."""
+    camp = gates_block(L01_GATES, exit_pos=None)
+    route = trunk(TRUNK, exit_pos=(0.0, 0.0, 200.0))
+    for flag in (False, True):
+        p = GateProgress(patience_steps=PATIENCE, route=route, prefer_route_when_collapsed=flag)
+        p.new_level_load(camp, L01_SPAWN)
+        assert p.ladder_collapsed is False and p.route_reads == 0, flag
+        assert p._gates(camp) is not route["rungs"] and p.route_source == ROUTE_SOURCE_GATES, flag
+
+
+def test_a_block_less_frame_cannot_drop_a_gates_level_onto_its_trunk():
+    """The latch. 0-3 and 4-3 now have BOTH a ladder and a file, and the mod omits the block on some frames.
+
+    Without the latch such a frame takes `_gates()`'s "no campaign block" arm, hands out the trunk unvalidated,
+    flips `_hops_source` and clears the ladder -- losing the load's `gate` income on the level the patience fix
+    is rescuing. With it, a load already walking its gates simply has no ladder on that frame.
+    """
+    camp = gates_block(L03_GATES, exit_pos=None)
+    route = trunk(TRUNK, exit_pos=(0.0, 0.0, 200.0))
+    p = GateProgress(patience_steps=PATIENCE, route=route)
+    p.new_level_load(camp, L03_SPAWN)
+    p.update(camp, (0.0, 13.0, 330.5))  # reaches the hops 2 door
+    assert p.best_hops == 2 and p._hops_source == "gates"
+    assert p._gates(None) == [], "a frame with no block is no ladder, not another level's route"
+    p.update(None, (0.0, 13.0, 330.5))
+    assert p.best_hops == 2 and p.hops_reached == {2}, "and the ladder it had is still there afterwards"
+    assert p.route_reads == 0
+
+
+# ---------------------------------------------------------------------------
 # ExitGuard: the banished FinalPit
 # ---------------------------------------------------------------------------
 
@@ -2128,7 +2336,11 @@ def test_the_gates_success_path_returns_the_identical_list_it_returns_today():
     routed._note_reached(camp, (0.0, 0.0, 0.0))
     assert routed._hops_source == "gates" and routed.route_source == ROUTE_SOURCE_GATES
     routed._note_reached(None, (0.0, 0.0, 0.0))  # a mid-load frame with no block at all
-    assert routed._hops_source == "rooms", "a level WITH a file does flip while the block is missing"
+    # This used to flip to "rooms" and clear the ladder, which was documented as harmless because no level had
+    # both a ladder and a file. 0-3 and 4-3 now do, so the layer is latched per load instead: see
+    # `test_a_block_less_frame_cannot_drop_a_gates_level_onto_its_trunk`.
+    assert routed._hops_source == "gates", "a load already on its gates stays there through an empty frame"
+    assert routed.route_reads == 0, "and still never opens the file"
     plain._note_reached(camp, (0.0, 0.0, 0.0))
     assert plain.route_source == ROUTE_SOURCE_GATES
     plain._note_reached(None, (0.0, 0.0, 0.0))
@@ -2224,7 +2436,7 @@ def test_the_trunk_pays_at_most_one_instalment_per_rung_on_a_straight_walk():
     """No double payment: the ladder rule and the fallback rule are mutually exclusive by `hops >= floor`."""
     camp = gates_block([], ordered=False, exit_pos=(0.0, 0.0, 200.0))
     route = trunk(TRUNK)
-    p = GateProgress(route=route, patience_steps=PATIENCE)
+    p = GateProgress(route=route, patience_steps=PATIENCE, patience_mode="always")  # parks 0 has to MEAN it
     p.new_level_load(camp, (50.0, 0.0, -30.0))
     p.reset_episode()
     p.retarget(camp, (50.0, 0.0, -30.0))
@@ -2250,7 +2462,9 @@ def test_a_fallback_rung_behind_the_floor_pays_once_and_only_once():
              rung((0.0, 0.0, 80.0), 0)]
     camp = gates_block([], ordered=False, exit_pos=(0.0, 0.0, 120.0))
     route = trunk(rungs, exit_pos=(0.0, 0.0, 120.0))
-    p = GateProgress(route=route, patience_steps=20)
+    # "always": a trunk is a total order, so the detector calls it healthy (that is what makes parking nearly
+    # inert on a trunk); this test is about the PAYMENT rule, so parking is forced on to reach it.
+    p = GateProgress(route=route, patience_steps=20, patience_mode="always")
     p.new_level_load(camp, (0.0, 0.0, 22.0))
     p.reset_episode()
     p.retarget(camp, (0.0, 0.0, 22.0))

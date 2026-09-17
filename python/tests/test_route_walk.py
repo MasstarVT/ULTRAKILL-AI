@@ -2,7 +2,8 @@
     python tests/test_route_walk.py    (or pytest). No game needed.
 
 This is the wrap-up stage's own check of S1 x S2 -- the offline data and the Python that consumes it, run
-against each other over all twelve committed files. `tests/test_route_files.py` judges the FILES against the
+against each other over all fourteen committed files (the twelve with no gate ladder, plus 0-3
+and 4-3, whose ladder is usable but collapsed and whose trunk ships for `prefer_route_when_collapsed`). `tests/test_route_files.py` judges the FILES against the
 spec's invariants and imports nothing that reads them; `tests/test_route_replay.py` (A0 of the spec's section
 8) judges the TRACKER on a safety property -- over every visit order the level allows, the target must never
 advance past a rung nobody has entered. Neither one walks a trunk.
@@ -315,8 +316,10 @@ def test_without_a_route_the_same_walk_is_todays_behaviour():
 def test_a_good_gate_ladder_beats_the_trunk_on_the_same_level():
     """Precedence, on the files themselves: layer 1 wins whenever it can, and the trunk is not even read.
 
-    No shipped level is in both sets -- `build_routes.py` refuses to emit where the gate guard passes, and
-    `test_route_files.py` pins the exact twelve -- so this is a property of the CODE, checked by handing a
+    Twelve of the fourteen shipped levels have no gate ladder at all; 0-3 and 4-3 have one that is usable but
+    COLLAPSED, and their file is read only when a run sets `prefer_route_when_collapsed` (default false, the
+    lead's ruling). Either way the precedence below is the same and is a property of the CODE: with the flag at
+    its default a level that HAS a usable ladder never reads its file, which is checked here by handing every
     route level a gate ladder it does not have.
     """
     for scene, route in shipped():

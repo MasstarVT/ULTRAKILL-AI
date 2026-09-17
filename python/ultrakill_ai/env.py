@@ -48,7 +48,7 @@ CYBERGRIND_SCENE = "Endless"
 CAMPAIGN_INFO_KEYS = ("kills", "style", "deaths", "completed", "fresh_start", "level_seconds",
                       "checkpoints_level", "cells_new", "exit_dist_min", "oob_frac",
                       "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac",
-                      "targets_parked", "exit_banished", "route_source")
+                      "targets_parked", "exit_banished", "route_source", "ladder_collapsed")
 
 YAW_CAP = max(abs(b) for b in YAW_BINS)  # 90 degrees per decision, the widest look bin
 PITCH_CAP = max(abs(b) for b in PITCH_BINS)  # 20 degrees per decision
@@ -128,6 +128,15 @@ class EnvConfig:
     gate_target_patience_s: float = 20.0  # game seconds a target may go without getting closer before it is parked
     gate_unpark_m: float = 2.0  # metres nearer than it was parked at that bring a parked gate back
     gate_fallback_hysteresis_m: float = 10.0  # metres a rival must beat the sticky fallback target by
+    # WHERE parking may act. "collapsed" (the default) is only on a level whose gate ladder the detector calls
+    # collapsed at the spawn -- measured on 0-3, 1-1, 1-2, 2-3, 4-3 and 8-1 and on none of the twelve healthy
+    # ladders. "always" is the unconditional mechanism as first shipped, which cost 0-1 half its fresh
+    # completion rate; "off" is `gate_target_patience_s: 0` by another name. See `detect_collapsed_ladder`.
+    gate_patience_mode: str = "collapsed"
+    # Layer choice on a collapsed level that also ships a room trunk (0-3, 4-3): False -- the default, and the
+    # lead's ruling -- keeps them on gates plus patience, which is what is moving 0-3 today. True hands them
+    # their trunk instead. A level with a HEALTHY ladder never reads its route file either way.
+    prefer_route_when_collapsed: bool = False
     exit_max_shift_m: float = 100.0  # metres the exit may legitimately move inside one level load (ExitGuard)
     # The route fallback: layer 2, the offline room trunk shipped per level in ultrakill_ai/routes/ (see
     # docs/superpowers/specs/2026-09-17-route-fallback-and-boss-levels-design.md). On by default and INERT on
@@ -262,7 +271,9 @@ class UltrakillEnv(gym.Env):
                                   fallback_hysteresis_m=self.cfg.gate_fallback_hysteresis_m,
                                   route=self._route_for(self.level),
                                   route_exit_tol_m=self.cfg.route_exit_tol_m,
-                                  route_seed_m=self.cfg.route_seed_m)
+                                  route_seed_m=self.cfg.route_seed_m,
+                                  patience_mode=self.cfg.gate_patience_mode,
+                                  prefer_route_when_collapsed=self.cfg.prefer_route_when_collapsed)
         self.exit_guard = ExitGuard(self.cfg.exit_max_shift_m)
         self.path_progress = PathProgress()
         self._parks_at_start = 0  # GateProgress.parks when this episode began, so info reports the difference
@@ -1468,6 +1479,11 @@ class UltrakillEnv(gym.Env):
             # expected to be 0 on a monotone level such as 0-1 and to rise on a collapsed one such as 0-3.
             info["targets_parked"] = self.gates.parks - self._parks_at_start
             info["exit_banished"] = int(self._exit_banished)
+            # The detector's verdict for the level load this episode ran on: 1 when the gate ladder collapses at
+            # the spawn, which is what switches parking on at all under `gate_patience_mode: collapsed`. A
+            # constant per level, so a level whose row reads anything but 0 or 1 means workers disagree about it.
+            # Undecided (a load whose block never carried a ladder) reports 0, which is how it behaves.
+            info["ladder_collapsed"] = int(bool(self.gates.ladder_collapsed))
             # Which of the three route layers drove this level load: 0 exit vector, 1 the mod's gate ladder,
             # 2 the offline room trunk. An INTEGER here because everything in CAMPAIGN_INFO_KEYS goes through
             # Monitor(info_keywords=...) and ProgressCallback._num, which writes None for anything float()

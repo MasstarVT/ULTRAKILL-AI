@@ -186,23 +186,38 @@ def test_the_main_config_carries_the_gates_prelude_run_forward():
 
 
 def test_the_full_config_is_the_main_config_with_more_levels():
-    """configs/campaign_gates_full.yaml: the whole routed campaign, and NOTHING else may differ from main.
+    """configs/campaign_gates_full.yaml: the whole routed campaign, and FOUR listed differences from main.
 
     The route fallback adds no reward term and no hyperparameter -- a room rung pays through `gate` and
-    `gate_approach` exactly as a door does -- so the only difference this config is allowed to carry is the
-    levels list. That is the property that makes it safe to hand to the same policy on the same weights, and
-    it is asserted field by field rather than described.
+    `gate_approach` exactly as a door does -- so the differences this config is allowed to carry are named one
+    by one, and anything else is a change nobody decided. The three beyond the levels list are the 2026-09-17
+    revision: where target patience may act, which layer a collapsed level uses, and the entropy floor.
+    `ent_coef` itself is untouched -- the floor raises it only while the policy is sharpening past 5 nats.
     """
     main_env, main_train = train.load_config(str(GATES_MAIN))
     env_dict, train_cfg = train.load_config(str(GATES_FULL))
     main, cfg = EnvConfig.from_dict(main_env), EnvConfig.from_dict(env_dict)
 
+    # The raw YAML, which is where "written out on purpose" lives: two of these three are the defaults, and
+    # stating them is what makes flipping one a deliberate act rather than a silent inherit.
+    assert set(env_dict) - set(main_env) == {"gate_patience_mode", "prefer_route_when_collapsed"}
+    assert set(main_env) - set(env_dict) == set()
+    assert {k for k in set(env_dict) & set(main_env) if env_dict[k] != main_env[k]} == {"levels"}
+    assert set(train_cfg) - set(main_train) == {"ent_floor", "ent_coef_max"}
+    assert {k for k in set(train_cfg) & set(main_train) if train_cfg[k] != main_train[k]} == set(), \
+        "the optimiser, the run name and num_envs are character for character main's"
+
+    # And the parsed effect of those keys: patience is level-conditional, the route preference is OFF, and the
+    # two new settings hold their defaults, so the only EnvConfig field that actually differs is `levels`.
     differing = {f.name for f in dataclasses.fields(EnvConfig)
                  if getattr(cfg, f.name) != getattr(main, f.name)}
     assert differing == {"levels"}, f"only the levels list may change, got {sorted(differing)}"
+    assert cfg.gate_patience_mode == "collapsed" and cfg.prefer_route_when_collapsed is False
+    assert cfg.gate_target_patience_s == 20.0, "the window itself does not move; only where it may act"
     assert cfg.rewards == main.rewards, "no reward weight moves: the fallback adds no term"
-    assert train_cfg == main_train, "same run name, same num_envs, same optimiser, same everything"
-    assert train_cfg["run_name"] == RUN_NAME and train_cfg["hyperparams"]["ent_coef"] == 0.004
+    assert train_cfg["num_envs"] == 12 and train_cfg["run_name"] == RUN_NAME
+    assert train_cfg["hyperparams"]["ent_coef"] == 0.004, "the BASE coefficient is unchanged"
+    assert (train_cfg["ent_floor"], train_cfg["ent_coef_max"]) == (5.0, 0.02)
 
     # The 30 levels: every shipped level with a gate ladder OR a route file, in mission order.
     unrouted = {"Level 1-3", "Level 5-4", "Level 6-2"}  # spec §11.1: no route signal of any kind
@@ -416,6 +431,81 @@ def test_action_entropy_callback_measures_each_look_dimension():
     assert abs(callback.entropies["pitch"] - math.log(len(PITCH_BINS))) < 0.01
     for name in ("yaw", "pitch", "look_mode"):
         assert f"train/entropy_{name}" in PPO_METRICS, name  # so they reach status.json and the dashboard
+
+
+class _FakeLogger:
+    def __init__(self, entropy_loss=None):
+        self.name_to_value = {} if entropy_loss is None else {"train/entropy_loss": entropy_loss}
+        self.recorded: dict[str, float] = {}
+
+    def record(self, key, value):
+        self.recorded[key] = value
+
+
+class _FakeModel:
+    """The two attributes EntropyFloorCallback touches: SB3's PPO reads `ent_coef` on every update."""
+
+    def __init__(self, logger):
+        self.logger = logger
+        self.ent_coef = None
+
+
+def _floor_step(callback, entropy):
+    """One rollout boundary with `entropy` nats of total policy entropy behind it."""
+    callback.model = _FakeModel(_FakeLogger(None if entropy is None else -entropy))
+    callback._on_rollout_start()
+    return callback.model
+
+
+def test_the_entropy_floor_raises_the_coefficient_below_the_floor_and_stops_at_the_cap():
+    cb = train.EntropyFloorCallback(floor=5.0, base=0.004, maximum=0.02)
+    assert cb.live == 0.004
+    model = _floor_step(cb, 4.2)
+    assert abs(cb.live - 0.004 * 1.10) < 1e-12, cb.live
+    assert model.ent_coef == cb.live, "the coefficient PPO reads is written, not just logged"
+    assert abs(model.logger.recorded["train/ent_coef_live"] - cb.live) < 1e-12
+    for _ in range(60):
+        _floor_step(cb, 4.2)
+    assert cb.live == 0.02, "capped at ent_coef_max however long entropy stays under the floor"
+
+
+def test_the_entropy_floor_decays_back_to_the_base_and_no_further():
+    cb = train.EntropyFloorCallback(floor=5.0, base=0.004, maximum=0.02)
+    for _ in range(60):
+        _floor_step(cb, 4.2)
+    assert cb.live == 0.02
+    _floor_step(cb, 6.5)  # a nat clear of the floor: the controller starts letting go
+    assert abs(cb.live - 0.02 * 0.95) < 1e-12, cb.live
+    for _ in range(200):
+        _floor_step(cb, 9.0)
+    assert cb.live == 0.004, "never below the config's own ent_coef"
+
+
+def test_the_entropy_floor_holds_still_inside_the_band_and_does_nothing_at_all_when_off():
+    cb = train.EntropyFloorCallback(floor=5.0, base=0.004, maximum=0.02)
+    _floor_step(cb, 4.0)
+    held = cb.live
+    for entropy in (5.0, 5.5, 6.0):  # floor .. floor + 1: neither raise nor decay
+        _floor_step(cb, entropy)
+        assert cb.live == held, entropy
+    off = train.EntropyFloorCallback(floor=0.0, base=0.004, maximum=0.02)
+    model = _floor_step(off, 0.5)  # far below any floor, and still untouched
+    assert off.live == 0.004 and model.ent_coef is None, "ent_floor 0 never writes the coefficient"
+    assert model.logger.recorded["train/ent_coef_live"] == 0.004, "it still reports what PPO is using"
+    blank = train.EntropyFloorCallback(floor=5.0, base=0.004)
+    model = _floor_step(blank, None)  # the first rollout: no update has run, so there is no entropy yet
+    assert blank.live == 0.004 and model.ent_coef is None
+    assert blank.maximum == 0.02, "the default cap"
+
+
+def test_the_entropy_floor_is_wired_into_the_run_and_reported():
+    """Config -> callback -> status.json, and the resume behaviour stated in the docstring."""
+    _, t = train.load_config(str(GATES_FULL))
+    cb = train.EntropyFloorCallback(t["ent_floor"], t["hyperparams"]["ent_coef"], t.get("ent_coef_max", 0.02))
+    assert (cb.floor, cb.base, cb.maximum) == (5.0, 0.004, 0.02)
+    assert "train/ent_coef_live" in PPO_METRICS, "so it reaches status.json, the dashboard and poll_status"
+    assert "does not survive a resume" in train.EntropyFloorCallback.__doc__, \
+        "the resume behaviour is deliberate and has to be stated where it is read"
 
 
 def test_a_campaign_checkpoint_loads_against_every_campaign_config():

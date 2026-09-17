@@ -923,14 +923,31 @@ def test_patience_is_measured_in_game_seconds_whatever_the_frameskip():
     env.close()
 
 
+# A COLLAPSED ladder in the corridor, with 0-3's shape and 0-3's ratio: the gate nearest the spawn already
+# carries hops 1 of 3, the rung below it is 200 m straight up, and the walkable route runs forward through the
+# hops 3 door. `detect_collapsed_ladder` reads 1 <= 3/2, so parking is allowed here under the shipped default.
+COLLAPSED_GATES = (("0,1,15", (0.0, 1.0, 15.0), 1), ("0,201,15", (0.0, 201.0, 15.0), 0),
+                   ("0,1,55", (0.0, 1.0, 55.0), 3))
+# 0-1's shape, with the one thing the plain corridor lacks: a door deeper in the level that happens to be
+# physically NEAR (0-1 has several -- `202,56,534` at hops 2 sits 82 m from `202,56,452` at hops 1). That is
+# what satisfies the "a park is only ever a switch" guard on a healthy ladder, so it is the shape where
+# unconditional patience really does take the agent off the correct door.
+MONOTONE_WITH_SIDE_DOOR = (("0,1,15", (0.0, 1.0, 15.0), 2), ("0,1,35", (0.0, 1.0, 35.0), 1),
+                           ("0,1,55", (0.0, 1.0, 55.0), 0), ("10,1,30", (10.0, 1.0, 30.0), 0))
+
+
 def test_a_target_the_agent_cannot_reach_is_parked_in_a_real_episode():
-    """The 0-3 shape through the env: the ladder's next rung is 200 m up, and standing still must not wedge."""
+    """The 0-3 shape through the env: the ladder's next rung is 200 m up, and standing still must not wedge.
+
+    Run at the SHIPPED settings, with no `gate_patience_mode` override: on a level whose ladder collapses at the
+    spawn the detector switches the whole mechanism on by itself, which is the point of the 2026-09-17 revision.
+    """
     env, fake = make_env(max_steps=1200, stuck_seconds=1000.0)
-    fake.gates = (("0,1,15", (0.0, 1.0, 15.0), 2), ("0,201,15", (0.0, 201.0, 15.0), 1),
-                  ("0,1,55", (0.0, 1.0, 55.0), 0))
+    fake.gates = COLLAPSED_GATES
     fake._load()
     env.reset(seed=0)
-    for _ in range(9):  # reach the hops 2 gate, which locks best_hops at 2
+    assert env.gates.ladder_collapsed is True and env.gates.patience_active
+    for _ in range(9):  # reach the hops 1 gate, which locks best_hops at 1
         env.step(forward())
     assert env.gates.target["key"] == "0,201,15", "the ladder points at the unreachable rung"
     for _ in range(env.gates.patience_steps + 2):
@@ -943,8 +960,49 @@ def test_a_target_the_agent_cannot_reach_is_parked_in_a_real_episode():
         _, _, terminated, truncated, info = env.step(forward())
         if terminated or truncated:
             break
-    assert info["targets_parked"] == 1
+    assert info["targets_parked"] == 1 and info["ladder_collapsed"] == 1
     env.close()
+
+
+def test_a_monotone_level_parks_nothing_however_long_the_agent_stalls():
+    """The 0-1 regression, as an env test: the same stall, on a healthy ladder, with and without the detector.
+
+    Live, the unconditional mechanism parked a target in 34% of 0-1's fresh episodes and its fresh completion
+    rate went 0.55 (n=43) to 0.30 (n=56). The corridor here is 0-1's shape -- hops 2, 1, 0 in walking order --
+    so the honest behaviour is the one on the left: nothing to switch to, so nothing is parked.
+    """
+    for mode, parks in (("collapsed", 0), ("always", 1)):
+        env, fake = make_env(max_steps=2000, stuck_seconds=1000.0, gate_patience_mode=mode)
+        fake.gates = MONOTONE_WITH_SIDE_DOOR
+        fake._load()
+        env.reset(seed=0)
+        assert env.gates.ladder_collapsed is False, "the corridor's nearest gate is its top rung"
+        for _ in range(9):  # through the first door, so the target is the correct next one
+            env.step(forward())
+        assert env.gates.target["key"] == "0,1,35"
+        for _ in range(env.gates.patience_steps + 2):
+            _, _, terminated, truncated, info = env.step(idle())
+            if terminated or truncated:
+                break
+        assert env.gates.parks == parks, mode
+        assert (env.gates.target["key"] == "0,1,35") is (mode == "collapsed"), \
+            f"{mode}: the correct door is kept only when the detector says the ladder is right"
+        env.close()
+
+
+def test_the_verdict_reaches_the_episode_info_for_every_level():
+    """`ladder_collapsed` is per episode and per level, so the dashboard can show `parked/ep` against it."""
+    for gates_array, want in ((GATES, 0), (COLLAPSED_GATES, 1)):
+        env, fake = make_env(max_steps=40)
+        fake.gates = gates_array
+        fake._load()
+        env.reset(seed=0)
+        for _ in range(35):
+            _, _, terminated, truncated, info = env.step(forward())
+            if terminated or truncated:
+                break
+        assert info["ladder_collapsed"] == want, gates_array
+        env.close()
 
 
 def test_unordered_level_falls_back_to_the_exit_vector():
@@ -1756,11 +1814,18 @@ def test_a_route_rung_goes_through_the_same_patience_and_parking_machinery():
     the LADDER pays the two hop values the skip crossed -- the same telescoping a gate ladder does for a
     shortcut. `_pay_fallback` only ever pays a rung at or above the floor, which the ladder by construction
     cannot pay for, so no rung is paid twice and the load's whole `gate` income is still the trunk's depth.
+
+    `gate_patience_mode: "always"`, because a trunk is a total order and the collapse detector therefore calls
+    it healthy -- correctly: a trunk's nearest rung at the spawn IS its top rung. That is the same structural
+    fact as `test_the_patience_rule_is_inert_on_a_walkable_trunk` below, and it is why the route spec's detector
+    for a bad rung is `route_source` 2 with `gates_reached` stuck rather than `targets_parked`. What this test
+    pins is that a rung goes through the machinery unchanged WHEN the machinery is switched on.
     """
     with tempfile.TemporaryDirectory() as tmp:
         # Rung hops 1 is 200 m straight up -- 0-3's shape, on a trunk. The rung below it is on the floor.
         rungs = ((0.0, 1.0, 6.0, 3), (0.0, 1.0, 22.0, 2), (0.0, 201.0, 30.0, 1), (0.0, 1.0, 54.0, 0))
-        env, fake, _ = route_env(tmp, rungs=rungs, max_steps=1200, stuck_seconds=1000.0)
+        env, fake, _ = route_env(tmp, rungs=rungs, max_steps=1200, stuck_seconds=1000.0,
+                                 gate_patience_mode="always")
         env.reset(seed=0)
         for _ in range(12):  # z 24: rung 2 reached, so the ladder points at the unreachable rung 1
             env.step(forward())
@@ -1797,10 +1862,14 @@ def test_the_patience_rule_is_inert_on_a_walkable_trunk():
     ladder pick is never parked. That makes parking nearly inert on a healthy trunk -- and means the detector
     for a bad rung is `route_source` 2 with `gates_reached` stuck and `targets_parked` 0, exactly as the
     ladder-patience spec's deviation 2 records. The cure is the data (`"rungs": []`), never a knob.
+
+    Forced on with "always", so the inertness is the RULE's and not the detector's: under the shipped default a
+    trunk reads healthy and parking never runs here at all, which is a second reason for the same answer.
     """
     with tempfile.TemporaryDirectory() as tmp:
-        env, fake, _ = route_env(tmp, max_steps=40)
+        env, fake, _ = route_env(tmp, max_steps=40, gate_patience_mode="always")
         env.reset(seed=0)
+        assert env.gates.ladder_collapsed is False and env.gates.patience_active, "forced on over a False verdict"
         on: dict[str, float] = {}
         for _ in range(40):
             _, _, terminated, truncated, info = env.step(forward())

@@ -25,10 +25,14 @@ from ultrakill_ai.campaign import CAMPAIGN_LEVELS, safe_name  # noqa: E402
 
 ROUTES = Path(__file__).resolve().parents[1] / "ultrakill_ai" / "routes"
 
-# Spec section 10. Exactly these levels ship a room trunk: 18 stay on the gate ladder and
+# Spec section 10, plus the 2026-09-17 lead ruling. Twelve levels ship a trunk because their gate
+# ladder is unusable; 0-3 and 4-3 ship one BESIDE a usable-but-collapsed ladder, read only by a run
+# with `prefer_route_when_collapsed: true` (default false). 16 levels stay on the gate ladder and
 # 1-3, 5-4 and 6-2 fall through to the exit vector.
-SHIPPED = ("Level 0-5", "Level 1-4", "Level 2-4", "Level 4-2", "Level 4-4", "Level 5-2",
-           "Level 7-1", "Level 7-2", "Level 7-3", "Level 7-4", "Level 8-3", "Level 8-4")
+SHIPPED = ("Level 0-3", "Level 0-5", "Level 1-4", "Level 2-4", "Level 4-2", "Level 4-3", "Level 4-4",
+           "Level 5-2", "Level 7-1", "Level 7-2", "Level 7-3", "Level 7-4", "Level 8-3", "Level 8-4")
+# The two of those that also have a gate ladder, and the only levels allowed to have both.
+COLLAPSED_SHIP = ("Level 0-3", "Level 4-3")
 UNROUTED = ("Level 1-3", "Level 5-4", "Level 6-2")
 
 VERSION = 2
@@ -290,7 +294,7 @@ def test_a_pit_rung_is_only_ever_the_last_one():
 
 # ---------------------------------------------------------------- 10. the coverage set
 
-def test_shipped_set_is_exactly_the_twelve():
+def test_shipped_set_is_exactly_the_fourteen():
     got = tuple(sorted(shipped_docs(), key=CAMPAIGN_LEVELS.index))
     assert got == SHIPPED, "shipped %r, expected %r" % (got, SHIPPED)
 
@@ -308,13 +312,25 @@ def test_the_unrouted_levels_ship_nothing():
 
 
 def test_no_file_ships_for_a_gates_level():
-    """The 18 levels layer 1 routes never read a file -- `_rooms()` is only reached on the three
-    `return []` arms of `_gates()` -- so a file there would be dead weight and a coverage change."""
+    """A level layer 1 routes never reads a file, so a file there would be dead weight and a coverage
+    change -- with exactly two exceptions, `COLLAPSED_SHIP`, whose ladder is usable but collapses at
+    the spawn. Their file is inert unless a run sets `prefer_route_when_collapsed`, and
+    `GateProgress` gives a HEALTHY level's file no way in at all whatever that flag says."""
     for level in CAMPAIGN_LEVELS:
         if level in SHIPPED or level in UNROUTED:
             continue
         name = "route_%s.json" % safe_name(level)
         assert name not in files(), "%s is on the gate ladder but ships %s" % (level, name)
+
+
+def test_the_collapsed_levels_that_ship_are_the_two_the_lead_approved():
+    """0-3 and 4-3 only. 1-1 waits for S3 to stamp its skull locks; 1-2, 2-3 and 8-1 fail the trunk
+    guards (tour 1.426, tour 1.393, and an exit room guard T drops 1513 m short). A third collapsed
+    level appearing here would be a coverage change made by editing `build_routes.COLLAPSED_SHIP`."""
+    for level in COLLAPSED_SHIP:
+        assert level in SHIPPED, level
+    for level in ("Level 1-1", "Level 1-2", "Level 2-3", "Level 8-1"):
+        assert "route_%s.json" % safe_name(level) not in files(), level
 
 
 # ---------------------------------------------------------------- 11. the shape of each ladder
@@ -332,6 +348,21 @@ def test_no_file_ships_for_a_gates_level():
 #
 #   level -> (tour_ratio, legs_witnessed, checkpoints_within_60m, last_rung_to_exit_m, [rungs])
 EXPECTED_LADDERS = {
+    # The two collapsed-ladder levels. 0-3's trunk is the level's real walking order -- the gate
+    # ladder's own hops along it run 2,2,3,4,5,6,4,4,3,2,0, which is the collapse itself.
+    "Level 0-3":   (0.944, "9/11", "4/4", 119.7, [
+        "0,-10,300  1 - Main Room - Floor 1",
+        "0,10,331  2 - Side Hallway - Floor 1",
+        "0,10,362  3 - Side Arena - Floor 1",
+        "0,10,403  4 - Side Stairway - Floor 1-2",
+        "-26,5,413  5 - Path 1 - First Encounter",
+        "-87,-15,413  6 - Path 1 - Boss Arena",
+        "11,50,413  7 - Path 2 - Menacing Room",
+        "116,50,449  8 - Path 2 - Menacing Hallway",
+        "76,50,397  9 - Windtunnel",
+        "0,50,330  10 - Main Room - Floor 2",
+        "-82,90,315  10B - Second Encounter + 11 - Boss Arena - Floor 2",
+    ]),
     "Level 0-5":   (1.000, "3/5",  "1/1",    211.1, [
         "0,-10,300  1 - Opening Hallway",
         "0,0,351  2 - Lava Foundry",
@@ -358,6 +389,16 @@ EXPECTED_LADDERS = {
         "-2,-18,774  4 - Arena",
         "8,15,904  6 - Solarium",
         "8,-15,1158  7 - Boss Arena",
+    ]),
+    "Level 4-3":   (1.000, "6/8", "3/3", 218.5, [
+        "0,-10,300  1 - First Chambers",
+        "2,-40,548  2 - Torches Arena",
+        "2,-40,630  3 - Traitor Hallway",
+        "-17,-40,676  3B - Tomb of Kings",
+        "47,-50,676  4 - Pit Room",
+        "62,-30,624  5 - Cerberus Room",
+        "129,-29,589  6 - Generator Room Hallway",
+        "191,-19,589  7 - Generator Room",
     ]),
     "Level 4-4":   (1.000, "4/8",  "2/3",    539.9, [
         "0,-10,300  1 - Underground",
@@ -453,7 +494,7 @@ EXPECTED_LADDERS = {
     ]),
 }
 
-TOTAL_RUNGS = 95
+TOTAL_RUNGS = 114  # 95 over the twelve unrouted levels, plus 0-3's 11 and 4-3's 8
 
 
 def test_the_ladder_table_covers_exactly_the_shipped_levels():

@@ -1113,3 +1113,58 @@ trunk max hops 14); §2.1's 0-1 claim reproduces exactly (11/11 within 10.0 m, m
 `CheckPointsReEnabler`; 5-2's at `87.5,-53,1240` → `FightEnd`; 2-4/3-2/6-2 have no `ActivateNextWave` at all;
 6-2's `Door "ExitRaiser"` at `-295,7.5,350` → `FinalRoom`; six of seven end with a one-room `DoorLeft` whose
 single `activatedRooms` entry is `Pit`).
+
+### 13.4 Lead rulings, 2026-09-17 (after the route build, decided on the live run's evidence)
+
+Two questions the route build left open, both answered by the lead and both implemented on `route-fallback`.
+
+**(a) Invariant T's distinct-places clause: ACCEPTED exactly as built.** T drops a same-ordinal suffixed
+group only when its members are at least `SEP` = 16 m apart — the distance `_is_reached` itself cannot tell
+apart (`build_routes.guard_trunk`). The reasoning stands as written: a group packed inside one reach cylinder
+is one PLACE, not a choice, so arriving marks every member at once whatever order the agent took and T's
+"whichever member you enter first pays the whole set" justification does not apply; I2 then collapses it into
+one rung carrying both names. Measured over all 33 levels there is exactly one such group — 5-2's
+`1A - Opening` and `1B - Second Rock`, both at (0, −10, 300), spread 0.0 m — it is the only same-ordinal group
+with no unsuffixed rung at its ordinal to hang off, and without the clause 5-2 loses the rung at its own
+spawn and its first rung jumps 129 m to `2 - Fort`. Every other group in the campaign is 41 m or wider and is
+collapsed. No change; the clause is now a decision rather than an implementation detail.
+
+**(b) Collapsed-ladder gates levels: ship the trunk for 0-3 and 4-3, and do not prefer it yet.**
+`build_routes.COLLAPSED_SHIP` emits a file for those two levels beside their (usable but collapsed) gate
+ladder — 0-3 11 rungs, tour 0.944, 9/11 legs witnessed; 4-3 8 rungs, tour 1.000, 6/8 — because the S1
+measurement showed both trunks reproduce a sensible walkable order (0-3's is the level's own route, along
+which the gate ladder's `hops` run 2,2,3,4,5,6,4,4,3,2,0, which IS the collapse). **Not** 1-1, whose skull
+locks wait for stage S3 to stamp `needs_item` live; **not** 1-2 (tour 1.426), 2-3 (tour 1.393) or 8-1 (guard T
+drops its exit room and the trunk ends 1513 m short), all of which fail the guards.
+
+Layer selection prefers a trunk over a collapsed gates ladder only when `prefer_route_when_collapsed` is
+true, and it **defaults to false**: 0-3 is currently progressing on gates plus patience (fresh
+`gates_reached` 1.0 → 4.5, checkpoints 0 → 1.1 after the ladder-patience fix went live at 9.59M steps), so
+the flag is a per-run decision to be flipped on evidence rather than a redesign. With the flag false the two
+levels behave exactly as §13.5 describes. A level whose ladder is HEALTHY can never read its route file
+whatever the flag says, because the verdict — not the file's presence — is what gates it
+(`test_a_healthy_ladder_never_reads_its_route_file_whatever_the_flag_says`).
+
+### 13.5 The ladder-patience revision that came with those rulings
+
+Target patience as first shipped was unconditional, and the live run measured both halves of it within
+1.5M steps of activation at 9.59M:
+
+- **Level 0-3, collapsed ladder: the fix works.** Fresh `gates_reached` 1.0 → 4.5, checkpoints per load
+  0 → 1.1.
+- **Level 0-2: the exit guard works.** Fresh completion 0.03 → 0.41-0.62, best 163.2 s.
+- **Level 0-1, monotone and CORRECT ladder: it regressed.** Fresh completion 0.55 (n=43, 7.5M-9.58M steps)
+  → 0.30 (n=56). `targets_parked` went 0.00 per fresh episode to 1.04, 34% of fresh episodes parked at least
+  once, the gates histogram lost its mass at 10 (23/43 → 17/58) and gained it at 2 (1 → 15), and stuck
+  endings piled up at one spot: 8 of 34 at (40, ~480) with exactly 2 gates. The offline replay that had
+  "proved" 0-1 inert used recordings of a much older policy; today's policy holds targets through longer
+  arena fights, the bounded arena suspension (2 × patience) expires, the correct target is parked, and the
+  fallback sends the agent somewhere wrong. On a level whose ladder is correct, parking can only mislead.
+
+So patience is now **level-conditional** (`gate_patience_mode`, default `"collapsed"`): `detect_collapsed_ladder`
+decides once per level load, from the gates block and the player's first position, whether the gate nearest
+the spawn sits at or below half of the ladder's maximum `hops`. Measured over all 18 shipped levels with a
+usable gate ladder that rule flags exactly the six the patience spec was written for (0-3 2/6, 1-1 1/5,
+1-2 2/4, 2-3 0/2, 4-3 1/2, 8-1 0/4) and none of the twelve healthy ones (ten at max/max, 5-3 12/13,
+8-2 5/8 — the closest to the line, and still a full hop clear of it). The verdict is reported per episode and
+per level as `ladder_collapsed`.

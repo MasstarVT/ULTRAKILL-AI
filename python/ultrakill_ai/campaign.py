@@ -614,6 +614,57 @@ ROUTE_SOURCE_ROOMS = 2  # layer 2: the shipped room trunk
 ROUTE_SOURCE_NAMES = {ROUTE_SOURCE_NONE: "none", ROUTE_SOURCE_GATES: "gates", ROUTE_SOURCE_ROOMS: "rooms"}
 
 
+# Patience is level-conditional (the 2026-09-17 ladder-patience spec, revised after the live 0-1 regression).
+PATIENCE_MODES = ("collapsed", "always", "off")
+COLLAPSE_RATIO = 0.5  # a ladder is collapsed when the gate nearest the spawn sits at or below HALF of max hops
+
+
+def detect_collapsed_ladder(rungs, spawn) -> bool | None:
+    """Is this level's ladder COLLAPSED at the spawn? None when the frame cannot answer it yet.
+
+    The whole of the patience machinery hangs off this one bit, so it is a pure function of the two things a
+    fresh load reports: the ladder (`campaign.gates`, or the room trunk on a level that has no usable one) and
+    the player's first position. No history, no timers, nothing the policy can influence -- so a level's verdict
+    is a property of the LEVEL, identical for every worker and every load of it.
+
+    **The rule, and the measurement behind it.** `hops` counts the rooms still to traverse, so on a healthy
+    ladder the door nearest the spawn is the one at the TOP of it: `near_hops == max_hops`. Bug A (spec §1) is
+    exactly the opposite -- a multi-room door makes the BFS treat a door near the exit as adjacent to the start
+    room, the nearest gate already carries a low `hops`, `best_hops` locks there and every rung above it is
+    unreachable to `_choose_target` forever. Measured over all 18 shipped levels whose gate ladder
+    `_gates()` accepts (`scratchpad/collapse_detect_scan.py`, from the offline level survey, with the two live
+    spawns read off the running game for 0-1 and 0-3 and the level's first authored room elsewhere):
+
+        COLLAPSED  0-3 2/6   1-1 1/5   1-2 2/4   2-3 0/2   4-3 1/2   8-1 0/4        (ratios 0.00-0.50)
+        healthy    0-1 9/9   0-2 7/7   0-4 5/5   2-1 3/3   2-2 2/2   3-1 7/7
+                   3-2 3/3   4-1 8/8   5-1 2/2   6-1 2/2   5-3 12/13  8-2 5/8       (ratios 0.62-1.00)
+
+    `2 * near <= max` separates them with a clear gap -- the worst collapsed level is exactly 0.50 and the
+    nearest healthy one 0.625 (8-2, whose spawn is the least certain of the eighteen: at each of the three
+    plausible spawn points it scores 5, 5 or 7 of 8, so it stays healthy whichever is right). Nothing else
+    tried separated them at all: the absolute deficit `max - near` puts 8-2 (3) above three collapsed levels
+    (4-3 1, 1-2 2, 2-3 2), so it has no threshold that works.
+
+    The three levels this matters for are 0-1 (healthy; patience regressed it live), 0-3 and 4-3 (collapsed;
+    patience is what made 0-3 move at all).
+
+    Read defensively, like every other field in this module: `hops` may be null (an `altar_only` door), a
+    frame may carry no ladder at all, and a mid-load frame may have no player. Any of those is None, "ask
+    again on the next frame", never False.
+    """
+    if spawn is None:
+        return None
+    graded = [g for g in (rungs or ())
+              if isinstance(g, dict) and g.get("hops") is not None and g.get("pos")]
+    if not graded:
+        return None
+    max_hops = max(int(g["hops"]) for g in graded)
+    if max_hops < 1:
+        return False  # one tier of doors: there is no ladder above the spawn to lose, so nothing to rescue
+    nearest = min(graded, key=lambda g: _dist3(spawn, g["pos"]))
+    return int(nearest["hops"]) <= COLLAPSE_RATIO * max_hops
+
+
 def _point(value) -> list[float] | None:
     """`value` as an [x, y, z] of finite floats, or None when it is not one.
 
@@ -773,6 +824,13 @@ class GateProgress:
     forward legs of a non-monotone route earn something. `patience_steps` 0 disables all of it and restores this
     class exactly as it was before that spec, which is how the 0-1 inertness proof is written.
 
+    **And it only runs where the ladder is collapsed** (`patience_mode`, `detect_collapsed_ladder`,
+    `patience_active`). Shipped unconditionally, the mechanism did what it was built for on 0-3 -- fresh
+    `gates_reached` 1.0 -> 4.5 -- and REGRESSED 0-1, whose ladder is monotone and correct, from a 0.55 fresh
+    completion rate (n=43) to 0.30 (n=56), parking a target in 34% of its fresh episodes. On a correct ladder
+    there is nothing better to switch to, so a park can only mislead; the verdict is taken once per level load
+    from the gates block and the spawn, and "collapsed" is the shipped default.
+
     The four rules that keep the park from becoming a second wedge, each of them a reproduced failure rather
     than a precaution -- see `_tick_patience`, `_unpark`, `_pay_fallback` and `mark_paid`:
 
@@ -819,7 +877,8 @@ class GateProgress:
                  hops_min_frac: float = 0.5, target_kind_slots: bool = False,
                  patience_steps: int = 0, unpark_m: float = 2.0, fallback_hysteresis_m: float = 10.0,
                  route: dict | None = None, route_exit_tol_m: float = ROUTE_EXIT_TOL_M,
-                 route_seed_m: float = ROUTE_SEED_M):
+                 route_seed_m: float = ROUTE_SEED_M, patience_mode: str = "collapsed",
+                 prefer_route_when_collapsed: bool = False):
         self.reach_h = float(reach_m)
         self.reach_v = float(reach_v_m)
         self.min_gain = float(min_gain_m)
@@ -830,6 +889,11 @@ class GateProgress:
         self.patience_steps = int(patience_steps)
         self.unpark_m = float(unpark_m)
         self.fallback_hysteresis = float(fallback_hysteresis_m)
+        # ... and WHERE it is allowed to act: "collapsed" (the shipped default) only on a level whose ladder
+        # `detect_collapsed_ladder` reports collapsed at the spawn, "always" unconditionally (what shipped on
+        # 2026-09-17 and regressed 0-1), "off" never. See `patience_active`.
+        self.patience_mode = str(patience_mode) if patience_mode in PATIENCE_MODES else "collapsed"
+        self.prefer_route_when_collapsed = bool(prefer_route_when_collapsed)
         # The route fallback. `route` is `load_route(level)`, or None on the 21 levels with no file and for any
         # env built with `route_fallback: false` -- and None makes every branch below inert.
         self._route = route
@@ -839,6 +903,8 @@ class GateProgress:
         self.route_reads = 0  # env lifetime: times the trunk was used as the ladder, so a test can prove it wasn't
         # Per level load
         self._route_ok: bool | None = None  # guard I5's verdict, decided once per load and re-decided per load
+        self.ladder_collapsed: bool | None = None  # the detector's verdict, decided once per load (None = not yet)
+        self._collapse_spawn: list[float] | None = None  # the first player position this load reported
         self._hops_source: str | None = None  # "gates" | "rooms": which ladder set `best_hops`
         self.route_source = ROUTE_SOURCE_NONE  # the layer driving the target, reported per episode as an int
         self._seed_pending = False  # §6's seeding rule fires once per level load, on the rooms path only
@@ -908,6 +974,12 @@ class GateProgress:
         self._route_ok = None
         self._hops_source = None
         self.route_source = ROUTE_SOURCE_NONE
+        # The collapse verdict is per LEVEL LOAD and is taken from the player's first position of that load, so
+        # it is cleared here and nowhere else: `mark_paid` (every checkpoint respawn, and every reset that is
+        # not a fresh load) deliberately keeps it, because a respawn starts the player half-way through a level
+        # where the nearest gate says nothing about the level's shape.
+        self.ladder_collapsed = None
+        self._collapse_spawn = None
         self._seed_pending = self._route is not None
         self.best_hops = self.paid_hops = None
         self.reached.clear()
@@ -1010,6 +1082,35 @@ class GateProgress:
     def gates_reached(self) -> int:
         """Distinct hop values reached in this level load (0 when none)."""
         return len(self.hops_reached)
+
+    @property
+    def patience_active(self) -> bool:
+        """Whether parking, the fallback target and the fallback payment may act on this level load.
+
+        `patience_steps` 0 is the global off switch it has always been. `patience_mode` is the level-conditional
+        one, and the reason it exists is measured rather than argued: shipped unconditionally on 2026-09-17, the
+        mechanism took Level 0-1's fresh completion rate from 0.55 (n=43) to 0.30 (n=56) while it was taking
+        0-3's gates from 1.0 to 4.5. 0-1's ladder is monotone and CORRECT, so parking its target can only ever
+        move the agent off the right door -- and it did: 34% of its fresh episodes parked at least once, and a
+        third of their stuck endings piled up at one spot two gates in. On a level whose ladder is right there
+        is nothing for the fallback to find, so the honest setting is not to run it there at all.
+
+        While the verdict is still None -- a mid-load frame with no ladder or no player -- "collapsed" reads as
+        OFF. That is the conservative direction: a level whose block never arrives behaves exactly as it did
+        before the patience spec.
+        """
+        if not self.patience_steps or self.patience_mode == "off":
+            return False
+        return True if self.patience_mode == "always" else bool(self.ladder_collapsed)
+
+    def _prefers_route(self) -> bool:
+        """Whether this load should walk the shipped room trunk INSTEAD of its own collapsed gate ladder.
+
+        Lead ruling (2026-09-17): the flag is off by default, so 0-3 and 4-3 keep running on gates plus
+        patience, which is what is currently making 0-3 progress. Turning it on is a per-run decision to be made
+        on evidence, and it can never reach a level whose ladder is healthy: the verdict gates it.
+        """
+        return bool(self.prefer_route_when_collapsed and self._route is not None and self.ladder_collapsed)
 
     # -- patience, parking and the fallback ---------------------------------------------------
 
@@ -1163,7 +1264,7 @@ class GateProgress:
             self._clock_best = _dist3(pos, self.target["pos"]) \
                 if pos is not None and (self.target or {}).get("pos") else math.inf
         gate_key = self._park_key(self.target)
-        if not self.patience_steps or pos is None or key is None or gate_key in (None, GATE_EXIT_KEY):
+        if not self.patience_active or pos is None or key is None or gate_key in (None, GATE_EXIT_KEY):
             return  # the exit is never parked: it is the terminal target, and parking it leaves nothing
         if (self.target or {}).get("subgoal") in (SUBGOAL_ITEM, SUBGOAL_ALTAR):
             return  # a carry in progress: see the docstring. Never park the machine holding the skull.
@@ -1261,6 +1362,24 @@ class GateProgress:
         return self._route is not None and rungs is self._route["rungs"]
 
     def _gates(self, campaign: dict | None) -> list[dict]:
+        """The ladder in use: `_layer_gates()`, except where a collapsed level prefers its shipped trunk.
+
+        The preference is the ONLY thing between the caller and the layer precedence this class has always had,
+        and it is off unless three things hold at once: the run asked for it (`prefer_route_when_collapsed`),
+        this level ships a trunk, and the detector called its gate ladder collapsed at the spawn. A healthy
+        level therefore cannot reach its route file however the flag is set -- which is what makes the flag safe
+        to flip per run -- and with the flag off this method IS `_layer_gates`.
+
+        A stale trunk (guard I5) returns [], and the level falls back to its own gate ladder rather than to
+        nothing: a collapsed ladder is a bad route, an absent one is no route at all.
+        """
+        if self._prefers_route():
+            rooms = self._rooms(campaign)
+            if rooms:
+                return rooms
+        return self._layer_gates(campaign)
+
+    def _layer_gates(self, campaign: dict | None) -> list[dict]:
         """The usable gate array, the room trunk behind it, or nothing at all.
 
         Three guards on the gate ladder, all needed:
@@ -1302,7 +1421,9 @@ class GateProgress:
         levels the gate ladder already routes.
         """
         if not campaign or not campaign.get("gates_ordered"):
-            return self._rooms(campaign)
+            # The latch (see `_note_reached`): a load already walking its gate ladder does not fall to a trunk
+            # on a frame that simply carries no block.
+            return [] if self._hops_source == "gates" else self._rooms(campaign)
         gates = [g for g in (campaign.get("gates") or ()) if isinstance(g, dict) and g.get("pos")]
         ladder = [g for g in gates if not g.get("altar_only")] or gates
         if not ladder:
@@ -1362,14 +1483,27 @@ class GateProgress:
         block), and the episode's `info` is built on exactly those frames. It is cleared by `new_level_load`
         and by I5's refusal, so it can only ever name a layer that really did drive this load.
 
-        One interaction is documented rather than handled, because it cannot happen with what ships: on a level
-        that had BOTH a usable gate ladder and a route file, a frame the mod sent with no `campaign` block
-        would read as "rooms" (the trunk is used unvalidated mid-load) and flip the source twice, clearing a
-        ladder that was fine. No such level exists -- `build_routes.py` emits a file only where the gate ladder
-        is unusable, the two sets are disjoint in §10 of the spec, and `test_route_files.py` asserts the exact
-        shipped set -- so the safe direction was chosen here (clearing costs a load's `gate` income; paying the
-        difference between two hop scales would be a reward the agent did not earn).
+        It is also where the COLLAPSE VERDICT is taken, for the same reason: this is the first thing every frame
+        runs, so the verdict is in place before any rule reads it, and it is taken from `_layer_gates` -- the
+        layer precedence WITHOUT the collapsed-level route preference -- so that deciding it cannot depend on
+        itself. `_collapse_spawn` is the first position of the load, kept even if the ladder only arrives a
+        frame or two later (a mid-load block, a game still switching scenes), because the answer is about where
+        the level STARTS you, not about where you happen to be when its doors finally report.
+
+        The interaction that used to be documented as impossible is now real, and handled: 0-3 and 4-3 ship a
+        route file AND have a usable gate ladder. A frame the mod sent with no `campaign` block would take the
+        `not campaign` arm, hand out the trunk unvalidated, flip the source and clear a ladder that was fine --
+        losing that load's `gate` income on the one level the patience fix is currently rescuing. So the layer
+        is LATCHED per load: once a load's ladder has come from the gates, a block-less frame returns [] rather
+        than the trunk. A level whose ladder never came from gates (all twelve trunk levels) is untouched,
+        because its source is "rooms" from its first frame.
         """
+        if self.ladder_collapsed is None:
+            if self._collapse_spawn is None and pos is not None:
+                self._collapse_spawn = [float(v) for v in pos]
+            verdict = detect_collapsed_ladder(self._layer_gates(campaign), self._collapse_spawn)
+            if verdict is not None:
+                self.ladder_collapsed = verdict
         rungs = self._gates(campaign)
         source = "rooms" if self._is_room_ladder(rungs) else "gates"
         if self._hops_source is not None and source != self._hops_source:
@@ -1409,7 +1543,7 @@ class GateProgress:
         free = [g for g in rung if str(g.get("key")) not in self.parked]
         if free:
             return self._ladder_pick(self._nearest(free, pos))
-        if not self.patience_steps:
+        if not self.patience_active:
             return None  # parking off: no fallback exists, so the choice is byte for byte the pre-patience one
         candidates = [g for g in active
                       if str(g.get("key")) not in self.reached and str(g.get("key")) not in self.parked]
