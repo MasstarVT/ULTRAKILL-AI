@@ -513,7 +513,41 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       pitch is causally irrelevant to navigation -- `NewMovement` builds `inputDir` from horizontal projections).
     - Keep the five `explore_*.npz` archives: their floor counts carry the `1/sqrt(N)` decay history that is the
       frontier-seeking engine, and a standing player's cell and its ground-point cell are the same cell. The ~347k
-      air and void keys just become dead weight.
+      air and void keys just become dead weight. They were copied into `models/campaign_ppo_ground/` for the
+      restart, because `explore_dir` follows `run_name`.
+- **Campaign run `campaign_ppo_ground` (0-1, Violent), started 2026-09-16** from
+  `models/campaign_ppo/ckpt_2450000_steps.zip` -- the pre-fix run's own weights, since the reward was wrong, not
+  the policy. New run name because `part_novelty` and `cells_new` change meaning across the fix and
+  `poll_status.py` keeps an existing CSV header (it would silently drop the new `oob_frac` column).
+  - Baseline at 28 episodes / 2.59M steps, against the pre-fix run's last window: `novelty` 395.6 -> **75.1**
+    (93.9% -> **76.8%** of gross positive), `time` -59.1 -> **-94.7** and now the largest single term,
+    `checkpoint` 5.10 -> **6.79** (1.2% -> 6.9%), `punch` **-17.13** (still pressing on ~35% of steps, now priced),
+    total reward +501 -> **-16.9**, `oob_frac` **0.090**, episode length 5950 -> 4836, deaths 1.0 -> 0.19,
+    entropy 10.6 and rising. A negative total is intended: wandering no longer pays for itself, and SB3 bootstraps
+    `gamma * V(s_T)` on both `stuck` and `max_steps`, so the agent cannot escape the stream by ending the episode.
+    `level_complete` is the only termination that stops the clock, and it also pays +100.
+  - **Gates, in order. Judge on none of them early, and on no gate satisfied by the accounting change alone:**
+    `novelty` and `cells_new` fall by construction and prove nothing on their own.
+    1. **+400k steps (~2.99M): `oob_frac` well below the 0.090 baseline**, on a 100-episode window. Mechanism check
+       only. If it does not fall, the ground-ray sentinel is not being read as intended -- debug it, do not tune
+       weights. Some floor is legitimate: 0-1 has real drops, so do not expect zero.
+    2. **+1.0M steps (~3.59M): `fresh_start` <= 0.32 and `best_checkpoints_level` >= 6.** The real gate.
+       `choose_fresh_start` forces a reload whenever the previous episode ended with no current checkpoint, so the
+       measured `fresh_start` rate is a direct readout of how often a fresh load fails to reach any checkpoint at
+       all: `f_measured = f_forced + (1 - f_forced) * 0.2`. The pre-fix run ended at 0.49, i.e. 36% forced reloads,
+       up from 10% at 1.13M.
+    3. **+2.0M steps (~4.59M): `campaign.fresh_completion_rate` > 0** with `fresh_window` >= 20.
+    Gate every comparison on `window >= 50`.
+  - **Open, and worth 15 minutes before more GPU time: nobody has ever seen a completion register through the
+    bridge.** `part_level_complete` is blank in all 544 rows of the pre-fix run and `best_runs/` is empty. The code
+    path reads right -- `FinalPit.OnTriggerEnter` sets `nmov.levelOver`, `ObservationBuilder.cs:274` reads
+    `sm.infoSent || nm.levelOver` (so detection does not depend on the campaign `exit` block), and `Door.Open()`
+    (`decompiled/Door.cs:432`, loop 458-465) is what calls `SetActive(true)` on `activatedRooms`, which is why
+    check 5's teleport-onto-an-inactive-collider failure is expected rather than evidence of a broken chain. But it
+    is unverified. To settle it: one game, `python scripts/bridge_test.py --campaign` (it polls without taking
+    control), then play 0-1 to the end by hand and watch `exit.active` flip true near the final room and
+    `level_over` go true in the pit. If `level_over` never fires, no reward change can move the completion rate and
+    the next work is mod-side.
   - `exit_dist_min` went 157.9 m -> 193.6 m over the same window. That is straight-line distance, and 0-1's route
     does not run straight at the pit, so it is not yet evidence of anything; it matters only if it keeps rising
     while checkpoints stop.
