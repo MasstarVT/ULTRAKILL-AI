@@ -46,3 +46,4 @@ python/models/campaign_smoke/
 .idea/
 Thumbs.db
 .DS_Store
+python/models/campaign_ppo_ground/ckpt_*.zip

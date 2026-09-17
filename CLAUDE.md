@@ -32,11 +32,23 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     - Input-locked frames (landing, cutscenes) are stepped through with an empty action and never reach the policy (`max_locked_skip_s`).
     - A death pays `death`, respawns at the checkpoint (or reloads the level when there is none) and the episode continues. Doors, arenas and checkpoints a respawn itself changes pay nothing.
     - Ends: `level_complete` (terminated), `stuck` (`stuck_seconds` without a milestone, a new cell or a shorter exit path) or `max_steps` (truncated).
-    - Info: `CAMPAIGN_INFO_KEYS` (`completed`, `fresh_start`, `level_seconds`, `checkpoints_level`, `cells_new`, `exit_dist_min`, plus `kills`, `style`, `deaths`), and `rank` / `restarts` on a fresh-start completion.
+    - Novelty is keyed on the **ground under the player**, not the player: `_ground_point` subtracts the shortest
+      ground ray from the player's y, and pays nothing at all when every ray misses (the mod writes
+      `ground_ray_length` exactly, so "off the map" is unambiguous). So a fall pays nothing, jumping on the spot
+      pays once instead of once per cell of height, and running forward still pays for new floor while airborne.
+      See the void-farming entry under Status for why.
+    - `level_complete` is graded **before** death and scene change, because the frame that ends a level arrives as
+      the scene unloads and can have no player: grading a death first would pay 0 and lose the completion.
+    - Info: `CAMPAIGN_INFO_KEYS` (`completed`, `fresh_start`, `level_seconds`, `checkpoints_level`, `cells_new`,
+      `oob_frac`, `exit_dist_min`, plus `kills`, `style`, `deaths`), and `rank` / `restarts` on a fresh-start
+      completion. `oob_frac` is the share of steps with no ground beneath, i.e. falling or off the map.
     - `difficulty` and `unlock_all_gear` are sent on connect. With `explore_dir` the exploration archive is saved to `explore_<level>_<port>.npz` every 20 episodes and on close; with `best_runs_dir` the fastest fresh-start completion goes to `<level>.json` (positions every step, official time, rank).
   - `spaces.py`: obs packing and `MultiDiscrete` actions. Cyber Grind is 448 dims, with 5 zeros where the retired route waypoint was so its checkpoints load; `ObsLayout(campaign=True)` is 479, replacing those 5 with the 36-value `campaign_block` (exit, path next corner and status, nearest checkpoint neither activated nor current, first locked door, arena enemies / timer / input lock / level seconds, and 9 exploration-map values). Every index before it is unchanged.
-  - `rewards.py`: reward weights and computation; `aim_errors` gives the 3-D, yaw and pitch angles off an enemy, `horizon_elevation` the enemy elevation above the horizontal (diagnostics, convention-free). Campaign terms (`time` per decision, `checkpoint`, `arena_clear`, `door_unlock`, `novelty`, `path`, all 0 by default) are paid only when the env passes a `CampaignStep` to `compute_reward`, and are paid even on a step without a player because the env has already marked those milestones paid. `level_complete` (default 100) pays once on the rising edge in both modes. The human-route terms `route_point` and `stuck` are gone.
-  - `campaign.py`: campaign helpers: `CAMPAIGN_LEVELS` (the 35 main scene names in mission order), `safe_name`, the game's rank maths (`grade`, `compute_rank`; P needs 12 with no restarts), `ExplorationArchive` (per-game visit counts over 4 m cells: novelty `1/sqrt(N+1)` on a cell's first entry per episode, the 9-value exploration map around the player, atomic `.npz` save/load), `MilestoneTracker` (pays each checkpoint, arena clear and door unlock once per level load; `mark_paid` absorbs what a reset or respawn reveals), `PathProgress` (metres of new best complete NavMesh path to the exit; gains count once they exceed 1 m), `choose_fresh_start` (level reload or checkpoint respawn for the next episode) and `save_best_run` (keeps the fastest run per level as JSON, written atomically).
+  - `rewards.py`: reward weights and computation; `aim_errors` gives the 3-D, yaw and pitch angles off an enemy, `horizon_elevation` the enemy elevation above the horizontal (diagnostics, convention-free). Campaign terms (`time` per decision, `checkpoint`, `arena_clear`, `door_unlock`, `novelty`, `path`, all 0 by default) are paid only when the env passes a `CampaignStep` to `compute_reward`, and are paid even on a step without a player because the env has already marked those milestones paid. `level_complete` (default 100) pays once on the rising edge in both modes, and is paid **before** the missing-player
+    early return so a completion on a player-less frame still scores. `punch` is charged per decision that presses the
+    punch button: the button is an independent coin flip with no cost and, outside a parry, no effect, so nothing ever
+    taught the policy to stop pressing it. The human-route terms `route_point` and `stuck` are gone.
+  - `campaign.py`: campaign helpers: `CAMPAIGN_LEVELS` (the 35 main scene names in mission order), `safe_name`, the game's rank maths (`grade`, `compute_rank`; P needs 12 with no restarts), `ExplorationArchive` (per-game visit counts over 4 m cells: novelty `1/sqrt(N+1)` on a cell's first entry per episode, the 9-value exploration map around the player, atomic `.npz` save/load; the archive itself is position-agnostic — `env._ground_point` is what decides that the position handed to `visit`/`features` is the ground under the player, not the player), `MilestoneTracker` (pays each checkpoint, arena clear and door unlock once per level load; `mark_paid` absorbs what a reset or respawn reveals), `PathProgress` (metres of new best complete NavMesh path to the exit; gains count once they exceed 1 m), `choose_fresh_start` (level reload or checkpoint respawn for the next episode) and `save_best_run` (keeps the fastest run per level as JSON, written atomically).
   - `progress.py`: `ProgressCallback`, which writes live training stats to `runs/<run_name>/status.json` (atomic, every 2 s; `state` running/finished/stopped). Campaign runs add a `campaign` block (completion rate and median official time over the last 50 fresh starts, best time over all of them) and `best_checkpoints_level`; both bests survive a restart.
 - `python/scripts/`: `bridge_test.py` (`--drive`, `--campaign`), `random_agent.py` (`--mode campaign` prints completed / checkpoints_level / cells_new per episode), `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop training instances), `dashboard.py` (Tkinter live view of `status.json`).
 - `python/ultrakill_ai/windows.py`: monitor work-area lookup shared by `games.py` and `dashboard.py`.
@@ -49,7 +61,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/tests/test_campaign_config.py`: `configs/campaign_0-1.yaml` builds a 479-input env with its reward weights, every key is a real config field, and `train.fill_campaign_dirs` (no game needed).
 - `python/tests/test_keep_best.py`: `keep_best.py` scoring for both metrics on synthetic `metrics_log.csv` rows, and old `best.json` files (no game needed; `python tests/test_keep_best.py`).
 - `python/tests/test_times.py`: `times.md` updates against the committed file's exact text: placeholders, records, deltas, level order (no game needed; `python tests/test_times.py`).
-- `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load (no game needed).
+- `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load, and the two novelty-measure tests that pin the void exploit shut (`test_falling_off_the_map_pays_no_novelty`, `test_novelty_pays_for_new_ground_not_for_height`). `FakeLevel` reports ground rays the way the mod does, so its floor is at y 1 and `falling` makes every ray miss (no game needed).
 - `python/tests/test_campaign.py`: campaign helpers: level list, rank maths, exploration archive, milestones, path progress, the fresh-start rule and best runs (no game needed).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
 - `python/tests/test_spaces.py`: layout sizes (448 / 479) and every index range of the campaign block, including the yaw-frame signs (no game needed).
@@ -79,13 +91,20 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   2. `python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo_v2/best.zip` (`num_envs` 5 in config; `timesteps` is the run total, so resuming trains only the rest; drop `--resume` for a fresh run, and give it a new `run_name` so `status.json` does not inherit the old episodes)
   3. `python scripts/games.py stop`
   - `python scripts/games.py status` is safe during training (it reads netstat, it does not connect).
-- Campaign training (0-1, `configs/campaign_0-1.yaml`; it uses the same five games, so Cyber Grind stays paused):
+- Campaign training (0-1, `configs/campaign_0-1.yaml`, run `campaign_ppo_ground` since the ground-novelty fix;
+  it uses the same five games, so Cyber Grind stays paused):
   1. `python scripts/transfer_weights.py models/cybergrind_ppo_v2/best.zip models/campaign_ppo/transfer_init.zip` (done once and committed; rerun only to change `--action-scale`)
   2. `python scripts/games.py launch --count 5` (add `--monitor 1` on the one-display PC)
-  3. `python scripts/train.py --config configs/campaign_0-1.yaml --resume models/campaign_ppo/transfer_init.zip` (a new run: the file is at 0 steps). To continue a stopped run, resume from `models/campaign_ppo/best.zip` once `keep_best.py` has written it, else from the newest `ckpt_*_steps.zip`.
-  4. Alongside it: `python scripts/poll_status.py --run campaign_ppo`, `python scripts/keep_best.py --run campaign_ppo --metric campaign` and `python scripts/dashboard.py --run campaign_ppo` (`--monitor 1` on the one-display PC).
+  3. `python scripts/train.py --config configs/campaign_0-1.yaml --resume models/campaign_ppo/ckpt_2450000_steps.zip`
+     (the ground-novelty restart; the pre-fix run's own weights, which are fine -- it was the reward that was wrong).
+     To continue a stopped run, resume from `models/campaign_ppo_ground/latest.zip` after a graceful Ctrl+C, else
+     from the newest `ckpt_*_steps.zip`. Not `best.zip` until completions exist: see the note under the pilot entry.
+  4. Alongside it: `python scripts/poll_status.py --run campaign_ppo_ground`, `python scripts/keep_best.py --run campaign_ppo_ground --metric campaign` and `python scripts/dashboard.py --run campaign_ppo_ground` (`--monitor 1` on the one-display PC).
   5. `python scripts/games.py stop`
-  - `train.py` fills `explore_dir` (the per-game exploration archives, `models/campaign_ppo/explore_*.npz`) and `best_runs_dir` (`runs/campaign_ppo/best_runs/`) when the config leaves them empty, before writing `env_config.yaml`.
+  - `train.py` fills `explore_dir` (the per-game exploration archives, `models/<run_name>/explore_*.npz`) and `best_runs_dir` (`runs/<run_name>/best_runs/`) when the config leaves them empty, before writing `env_config.yaml`.
+  - **Renaming a run orphans its exploration archives**, because `explore_dir` defaults to `models/<run_name>/`.
+    Copy the `explore_*.npz` files into the new model directory before starting, or the run restarts exploration
+    from nothing: their floor counts carry the `1/sqrt(N)` decay that makes the agent push outward at all.
   - Commit `transfer_init.zip`, `best.zip` + `best.json`, `latest.zip`, `env_config.yaml` and the `explore_*.npz` archives; the numbered `ckpt_*` files and `models/campaign_smoke/` are gitignored.
   - If the first update's entropy (the dashboard's PPO panel shows it negated, as `entropy`) is outside 6-10 nats: stop, rerun step 1 once with another `--action-scale` and commit the new `transfer_init.zip`, delete `runs/campaign_ppo/` (dashboard history), the `runs/campaign_ppo_*` TensorBoard folders (a `--resume` run keeps writing into the newest one) and the run's `ckpt_*` and `explore_*.npz` files so the restart does not inherit them, then start step 3 again.
 - TensorBoard: `tensorboard --logdir runs`.
@@ -460,6 +479,41 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     progress is genuinely improving, so it stays for now. Tripwire: if the fresh completion rate is still 0 at
     3M steps while `novelty` is above 70% of the gross positive reward, cut `novelty` 0.5 -> 0.15 so the
     milestones and the time cost drive instead, and give it 400k steps before judging.
+  - **STOPPED at 2.49M steps, 2026-09-16, and the reward was wrong. The agent was farming the void.** Zero
+    completions in 397 episodes; `best_checkpoints_level` frozen at 5 since 1.36M; checkpoints per level load
+    peaked 2.54 at 1.33M and fell to 1.73; `exit_dist_min` 157 m -> 188 m. The cause, found by a 9-agent
+    adversarial review and then confirmed straight from the five committed `explore_*.npz` archives:
+    **`ExplorationArchive` was keyed on the raw 3-D player position with no bound on y**, so novelty paid for
+    occupying *volume*, not for covering *ground* -- and the cheapest volume in a 3-D game is vertical.
+    - Measured over all 364,984 novelty units the run ever paid: **47.1% below y = -60 m** (the void under the
+      map, reaching **y = -57,304 m**), of whose cells **99.98% were entered exactly once**; another **47.7%**
+      for air cells stacked above ground already paid for (the playable footprint was 1,397 XZ columns but
+      15,251 cells, ~11 stacked per column). **Only 5.3% was ever paid for actual ground covered.**
+    - Why it was stable: a fall enters a brand-new 4 m cell every decision at the full `1/sqrt(0+1)` = 1.0, the
+      supply never runs out, those cells are never revisited so the decay never bites, there is no kill plane,
+      and any `novelty > 0` reset the stuck clock -- so diving off the level was an unbounded income stream that
+      could not be truncated. Finishing pays +100 once and *terminates*, forfeiting the stream. Under that
+      reward, completing the level was never the argmax, and the policy was correct to refuse.
+    - Do not mistake this for the shape of the level: `corr(fresh_start, checkpoints_level) = -0.975`, so the
+      1.33M "peak by depth" is an artifact of respawn episodes inheriting a checkpoint count, not a better policy.
+      A fresh level load essentially never reached even the first checkpoint
+      (`checkpoints_level = 3.748 - 4.434*fresh_start`, ~0 at `fresh_start = 1`).
+    - **Fixed** by keying novelty on the ground point under the player (`env._ground_point`), which closes the
+      void faucet and the air slab with one bounded mechanism while still paying for new floor covered while
+      airborne -- which matters, because fast movement in this game is airborne. `oob_frac` was added so the
+      mechanism is directly observable. Also fixed: `level_complete` graded and paid before death/scene-change,
+      so the first real completion cannot be booked as a death.
+    - **Rejected during review, do not retry without new evidence:** a straight-line distance-to-exit reward
+      (measured `exit_dist_min = 224.9 - 90.5*fresh_start`, i.e. the checkpoints sit ~90 m *farther* from the pit
+      than spawn does, so it would pay the agent to reverse, and it is farmable by a void glide); a 2-D cell key
+      (breaks the saved 3-tuple archives and deletes the vertical structure of a vertical level); cutting
+      `novelty` 0.5 -> 0.15 as well (the measure change already cuts the income ~5-10x; doing both removes the
+      only forward pressure the run has -- hold it in reserve); cutting `max_steps`; and touching `gamma`,
+      `ent_coef` or `pitch_limit_deg` (entropy is 9.7 nats and rising, `approx_kl` 0.021 vs `target_kl` 0.03, and
+      pitch is causally irrelevant to navigation -- `NewMovement` builds `inputDir` from horizontal projections).
+    - Keep the five `explore_*.npz` archives: their floor counts carry the `1/sqrt(N)` decay history that is the
+      frontier-seeking engine, and a standing player's cell and its ground-point cell are the same cell. The ~347k
+      air and void keys just become dead weight.
   - `exit_dist_min` went 157.9 m -> 193.6 m over the same window. That is straight-line distance, and 0-1's route
     does not run straight at the pit, so it is not yet evidence of anything; it matters only if it keeps rising
     while checkpoints stop.

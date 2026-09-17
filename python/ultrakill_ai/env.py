@@ -28,7 +28,7 @@ from ultrakill_ai.spaces import ObsLayout, action_space, decode_action, pack_obs
 CYBERGRIND_SCENE = "Endless"
 # Per-episode info the campaign Monitor records (scripts/train.py); every key is in every campaign info.
 CAMPAIGN_INFO_KEYS = ("kills", "style", "deaths", "completed", "fresh_start", "level_seconds",
-                      "checkpoints_level", "cells_new", "exit_dist_min")
+                      "checkpoints_level", "cells_new", "exit_dist_min", "oob_frac")
 
 
 def _known_fields(cls, d: dict[str, Any]) -> dict[str, Any]:
@@ -150,6 +150,7 @@ class UltrakillEnv(gym.Env):
         self._fresh_start = False  # this episode began with a fresh level load
         self._positions: list[list[float]] = []  # fresh-start episodes only, for best runs
         self._cells_new = 0
+        self._oob_steps = 0  # steps with no ground under the player: off the map, or in a fall
         self._exit_dist_min = math.inf
         self._episodes = 0
 
@@ -217,10 +218,13 @@ class UltrakillEnv(gym.Env):
             self.path_progress.reset()
             self._positions = []
             self._cells_new = 0
+            self._oob_steps = 0
             self._exit_dist_min = math.inf
             player = self._raw.get("player")
             if player:
-                self.archive.visit(player["pos"])  # the spawn cell is entered, but pays nothing
+                ground = self._ground_point(self._raw)
+                if ground is not None:
+                    self.archive.visit(ground)  # the spawn cell is entered, but pays nothing
                 if self._fresh_start:
                     self._positions.append(self._rounded(player["pos"]))
 
@@ -248,10 +252,12 @@ class UltrakillEnv(gym.Env):
         )
         # Milestones, novelty and path progress are measured before the reward, from the frame the policy caused.
         campaign_step = self._campaign_progress(cur) if campaign else None
-        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, died=died, campaign=campaign_step)
+        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, died=died,
+                                campaign=campaign_step, buttons=command["buttons"])
 
+        completed = bool(campaign and (cur.get("stats", {}).get("level_complete") or (cur.get("campaign") or {}).get("level_over")))
         if campaign:
-            if died and player is not None and not (cur.get("campaign") or {}).get("level_over"):
+            if died and player is not None and not completed:
                 # A death does not end a campaign episode: the penalty is paid above, then the player respawns at
                 # the checkpoint and the level clock keeps running, as in real play.
                 cur = self._respawn()
@@ -273,12 +279,16 @@ class UltrakillEnv(gym.Env):
         stuck = campaign and self._steps_since_progress >= int(self.cfg.stuck_seconds * self.cfg.fixed_fps / self.cfg.frameskip)
         terminated, truncated, reason = False, False, ""
         stats = cur.get("stats", {})
-        if died:
+        if completed:
+            # Graded before death and scene change, because a completion arrives as the level unloads: the same
+            # frame can have no player (which reads as a death) and a new scene name. Grading either of those
+            # first would pay 0 instead of `level_complete`, leave info["completed"] at 0 and never save the best
+            # run -- silently losing the one event this whole run exists to produce.
+            terminated, reason = True, "level_complete"
+        elif died:
             terminated, reason = True, "death"
         elif cur.get("scene") != self.scene:
             terminated, reason = True, "scene_changed"
-        elif self.cfg.mode == "campaign" and stats.get("level_complete"):
-            terminated, reason = True, "level_complete"
         elif self.cfg.mode == "cybergrind" and self.cfg.max_wave and (cur.get("cybergrind") or {}).get("wave", 0) > self.cfg.max_wave:
             terminated, reason = True, "max_wave"
         elif stuck:
@@ -510,6 +520,31 @@ class UltrakillEnv(gym.Env):
             self._track_enemies(raw)
         return raw
 
+    def _ground_point(self, raw: dict[str, Any]) -> tuple[float, float, float] | None:
+        """The point on the ground under the player, or None when there is no ground within reach.
+
+        Exploration is meant to pay for ground covered, not for volume occupied, and the cheapest volume in a
+        3-D game is vertical. Keying the archive on the raw player position paid the full 1/sqrt(N+1) = 1.0 for
+        every cell of a jump and, far worse, for every cell of a fall: the first 2.5M-step run banked 47% of all
+        its novelty below y = -60 m, in cells 99.98% of which were entered exactly once, reaching 57 km under the
+        map. Free fall is an unbounded supply of never-visited cells, it never dies, and it kept resetting the
+        stuck clock, so diving off the level strictly beat playing it. Projecting onto the ground fixes both: a
+        fall pays nothing (no ground within range), a jump on the spot pays once instead of once per cell of
+        height, and running forward still pays for every new patch of floor -- including while airborne, which
+        matters because fast movement in this game is mostly airborne.
+        """
+        player = raw.get("player")
+        if not player:
+            return None
+        rays = raw.get("ground_rays") or ()
+        if not rays:
+            return None
+        drop = min(rays)
+        if drop >= self.cfg.layout.ground_ray_length - 0.5:
+            return None  # the mod writes ground_ray_length exactly when the ray hits nothing: off the map
+        x, y, z = player["pos"]
+        return (x, y - drop, z)
+
     def _campaign_progress(self, raw: dict[str, Any]) -> CampaignStep:
         """What the level did this step. Any progress restarts the stuck clock."""
         camp = raw.get("campaign") or {}
@@ -518,7 +553,11 @@ class UltrakillEnv(gym.Env):
         player = raw.get("player")
         if player:
             pos = player["pos"]
-            novelty = self.archive.visit(pos)
+            ground = self._ground_point(raw)
+            if ground is None:
+                self._oob_steps += 1
+            else:
+                novelty = self.archive.visit(ground)
             if novelty > 0:
                 self._cells_new += 1
             if self._fresh_start:
@@ -588,7 +627,11 @@ class UltrakillEnv(gym.Env):
 
     def _pack(self, raw: dict[str, Any]) -> np.ndarray:
         player = raw.get("player")
-        explore = self.archive.features(player["pos"], player["yaw"]) if self.cfg.mode == "campaign" and player else None
+        explore = None
+        if self.cfg.mode == "campaign" and player:
+            # The same ground projection the archive is keyed on, so the map the policy reads addresses the cells
+            # novelty is actually paid for. Falling back to the raw position off the map keeps the map defined.
+            explore = self.archive.features(self._ground_point(raw) or player["pos"], player["yaw"])
         return pack_observation(raw, self.cfg.layout, self._enemy_max_health, explore)
 
     def _info(self, raw: dict[str, Any]) -> dict[str, Any]:
@@ -628,6 +671,9 @@ class UltrakillEnv(gym.Env):
             info["fresh_start"] = int(self._fresh_start)
             info["checkpoints_level"] = self.milestones.checkpoints_reached  # distinct checkpoints this level load
             info["cells_new"] = self._cells_new  # cells entered for the first time this episode
+            # Steps with no ground beneath: falling, or off the map entirely. The first campaign run banked 47%
+            # of its novelty in the void below the level, so this is the number that says whether that is over.
+            info["oob_frac"] = self._oob_steps / steps
             info["exit_dist_min"] = None if math.isinf(self._exit_dist_min) else self._exit_dist_min
             info["completed"] = 0  # set to 1 on the step that ends with level_complete
             info["level_seconds"] = None  # official time, only for a fresh-start completion

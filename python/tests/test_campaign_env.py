@@ -16,6 +16,7 @@ from ultrakill_ai.spaces import noop_action  # noqa: E402
 
 LEVEL = "Level 0-1"
 EXIT_Z = 60.0
+GROUND_RAY_LENGTH = 30.0  # what the mod writes when a ground ray hits nothing (ObsLayout.ground_ray_length)
 CHECKPOINT_ID = "0,1,20"
 ARENA_KEY = "0,1,30"
 RESPAWN_DOOR_KEY = "0,0,25"
@@ -44,10 +45,12 @@ class FakeLevel:
         self.kill_enemy_next = False  # the next step removes the room's enemy, if alive, and pays a kill
         self.lock_steps = 0  # the next N steps report input_locked
         self.drop_campaign_steps = 0  # the next N obs omit "campaign", as the mod does when building it throws
+        self.falling = False  # off the map: the ground rays miss and the player sinks, as in a real void fall
         self._load()
 
     def _load(self) -> None:
         self.z = 0.0
+        self.y = 1.0
         self.seconds = 0.0
         self.kills = 0
         self.restarts = 0
@@ -87,6 +90,8 @@ class FakeLevel:
 
     def step(self, action: dict) -> dict:
         self.steps += 1
+        if self.falling:
+            self.y -= 20.0  # terminal velocity through the void, a brand-new 4 m cell every step
         self.locked = self.lock_steps > 0
         if self.locked:
             self.lock_steps -= 1
@@ -120,7 +125,7 @@ class FakeLevel:
             "scene": LEVEL,
             "ready": not self.dead,
             "player": {
-                "pos": [0.0, 1.0, self.z], "vel": [0.0, 0.0, 0.0], "local_vel": [0.0, 0.0, 0.0],
+                "pos": [0.0, self.y, self.z], "vel": [0.0, 0.0, 0.0], "local_vel": [0.0, 0.0, 0.0],
                 "forward": [0.0, 0.0, 1.0], "yaw": 0.0, "pitch": 0.0, "hp": 0 if self.dead else 100,
                 "anti_hp": 0.0, "stamina": 300.0, "grounded": True, "sliding": False, "dead": self.dead,
                 "activated": True, "level_over": over, "weapon_slot": 0, "weapon_variation": 0,
@@ -128,7 +133,10 @@ class FakeLevel:
             },
             "enemies": enemies,
             "rays": [50.0] * 16,
-            "ground_rays": [0.0] * 8,
+            # The mod measures down from the player to the floor (y = 1 in this corridor) and writes
+            # ground_ray_length exactly when the ray hits nothing, which is what being off the map looks like.
+            "ground_rays": [GROUND_RAY_LENGTH] * 8 if self.falling
+                           else [min(GROUND_RAY_LENGTH, max(0.0, self.y - 1.0))] * 8,
             "stats": {"kills": self.kills, "style": 0, "seconds": self.seconds, "restarts": self.restarts, "level_complete": over},
             "campaign": {
                 "mission": 1, "difficulty": 3, "seconds": self.seconds, "timer_running": not over,
@@ -435,6 +443,55 @@ def test_bridge_client_kill_sends_the_kill_command():
     client.request = lambda msg: sent.append(msg) or {"type": "obs", "event": "kill"}
     assert client.kill() == {"type": "obs", "event": "kill"}
     assert sent == [{"type": "kill"}]
+
+
+def test_falling_off_the_map_pays_no_novelty():
+    """The exploit that broke the first campaign run, pinned so it cannot come back.
+
+    Novelty used to be keyed on the raw player position, so a fall through the void entered a brand-new 4 m cell
+    every single step and paid the full 1/sqrt(0+1) = 1.0 for each one. It never decayed (those cells are never
+    revisited), the fall never ended, and any novelty > 0 reset the stuck clock, so diving off the level was an
+    unbounded income stream that strictly beat playing it. The real run banked 47% of all its novelty below
+    y = -60 m, reaching 57 km under the map, and completed the level zero times in 397 episodes.
+    """
+    env, level = make_env()
+    env.reset()
+    level.falling = True
+    parts: dict[str, float] = {}
+    for _ in range(20):
+        _, _, terminated, truncated, info = env.step(forward())
+        add_parts(parts, info)
+        if terminated or truncated:
+            break
+    env.close()
+    assert level.y <= -300.0, "the fake level should have fallen well below the map"
+    assert "novelty" not in parts, f"a fall must pay no novelty, got {parts.get('novelty')}"
+    assert info["cells_new"] == 0
+    assert info["oob_frac"] > 0.9  # nearly every step of this episode had no ground beneath
+
+
+def test_novelty_pays_for_new_ground_not_for_height():
+    """Jumping on the spot pays once; running forward keeps paying.
+
+    Keying on the ground point is what separates the two: the real run's playable footprint was 1,397 columns
+    but 15,251 cells, ~11 stacked per column, so 90% of what it earned inside the level was for being airborne
+    over ground it had already been paid for.
+    """
+    env, level = make_env()
+    env.reset()
+    # Hovering 12 m up over the same spot: the ground point never moves, so only the first step pays.
+    paid = []
+    for _ in range(4):
+        level.y += 3.0
+        _, _, _, _, info = env.step(noop_action())
+        paid.append(info["reward_parts"].get("novelty", 0.0))
+    assert paid[0] == 0.0 and sum(paid) == 0.0, f"height alone must not pay, got {paid}"
+    # Moving forward over new floor still pays, airborne or not -- fast movement in this game is airborne.
+    before = env._cells_new
+    for _ in range(4):
+        env.step(forward())
+    env.close()
+    assert env._cells_new > before, "covering new ground must still pay while airborne"
 
 
 def test_human_routes_are_retired():

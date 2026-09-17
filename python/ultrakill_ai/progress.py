@@ -219,6 +219,7 @@ class ProgressCallback(BaseCallback):
             "level_seconds": field("level_seconds"),
             "checkpoints_level": field("checkpoints_level"),
             "cells_new": field("cells_new"),
+            "oob_frac": field("oob_frac"),
             "exit_dist_min": field("exit_dist_min"),
             "end_reason": info.get("end_reason"),
             "reset_seconds": _num(info.get("reset_seconds")),
@@ -285,7 +286,7 @@ class ProgressCallback(BaseCallback):
         eta = remaining / steps_per_s if steps_per_s and self.state == "running" else None
 
         recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "kills_per_min", "deaths", "wave", "style", "reset_seconds",
-                                                 "completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "exit_dist_min",
+                                                 "completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "oob_frac", "exit_dist_min",
                                                  "firing_frac", "on_target_frac", "firing_on_target_frac",
                                                  "enemy_visible_frac", "enemy_angle_mean", "enemy_dist_mean",
                                                  "enemy_close_frac", "yaw_per_step_mean", "enemy_yaw_angle_mean", "enemy_pitch_err_mean", "pitch_abs_mean",

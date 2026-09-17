@@ -107,6 +107,7 @@ class FakeCampaignEnv(gym.Env):
             "level_seconds": round(self.steps * 2 / 15, 3) if completed and self.fresh else None,
             "checkpoints_level": min(3, self.steps // 4),
             "cells_new": self.steps * 2,
+            "oob_frac": 0.1,  # fraction of steps with no ground under the player
             "exit_dist_min": max(0.0, 60.0 - self.steps),
             "reward_parts": {"time": -0.01, "novelty": 0.5},
         }

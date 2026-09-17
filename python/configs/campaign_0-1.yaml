@@ -26,12 +26,13 @@ env:
   stuck_seconds: 45
   stuck_repeats: 3
   cell_size: 4.0
-  rewards: {time: 0.01, level_complete: 100.0, checkpoint: 10.0, arena_clear: 10.0, door_unlock: 3.0,
-            novelty: 0.5, path: 0.1, kill: 0.5, damage_dealt: 0.5, damage_taken: 0.01, death: 5.0, style: 0.0}
+  rewards: {time: 0.02, level_complete: 100.0, checkpoint: 10.0, arena_clear: 10.0, door_unlock: 3.0,
+            novelty: 0.5, path: 0.1, kill: 0.5, damage_dealt: 0.5, damage_taken: 0.01, death: 5.0, style: 0.0,
+            punch: 0.01}
 train:
   algo: ppo
   num_envs: 5
-  run_name: campaign_ppo
+  run_name: campaign_ppo_ground
   timesteps: 20000000
   save_every: 50000
   policy_kwargs: {net_arch: [512, 512]}

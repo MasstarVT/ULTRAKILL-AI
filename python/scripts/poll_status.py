@@ -32,13 +32,13 @@ FIELDS = [
     "enemy_angle_mean", "enemy_yaw_angle_mean", "enemy_pitch_err_mean",
     "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac",
     "enemy_dist_mean", "enemy_close_frac", "reset_seconds",
-    "completed", "fresh_start", "checkpoints_level", "cells_new", "exit_dist_min",
+    "completed", "fresh_start", "checkpoints_level", "cells_new", "oob_frac", "exit_dist_min",
 ]
 # Campaign runs only (status["campaign"]): completion rate and median time over the last 50 fresh starts.
 CAMPAIGN_FIELDS = ["fresh_window", "fresh_completion_rate", "median_time_50", "best_time"]
 PPO_FIELDS = ["entropy_loss", "approx_kl", "clip_fraction", "explained_variance", "value_loss", "learning_rate"]
 PART_FIELDS = ["aim_yaw", "aim_pitch", "aim_locked", "aim", "kill", "damage_dealt", "damage_taken", "death", "wave", "style", "step",
-               "time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path", "level_complete"]
+               "time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path", "level_complete", "punch"]
 
 
 def row(status: dict) -> dict:

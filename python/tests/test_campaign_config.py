@@ -35,7 +35,8 @@ def test_campaign_env_has_479_inputs_and_the_yaml_settings():
     assert (cfg.explore_dir, cfg.best_runs_dir) == ("", "")  # train.py fills these per run
     for name, value in env_dict["rewards"].items():
         assert getattr(cfg.rewards, name) == value, name
-    assert cfg.rewards.style == 0.0 and cfg.rewards.time == 0.01 and cfg.rewards.level_complete == 100.0
+    assert cfg.rewards.style == 0.0 and cfg.rewards.time == 0.02 and cfg.rewards.level_complete == 100.0
+    assert cfg.rewards.punch == 0.01  # the punch button is charged for, so the policy stops flailing
 
     env = UltrakillEnv(cfg)  # builds without a game: nothing connects until the first reset
     try:
@@ -57,7 +58,7 @@ def test_every_campaign_setting_is_a_real_field():
 
 def test_train_section_matches_the_spec():
     _, t = train.load_config(str(CONFIG))
-    assert (t["algo"], t["num_envs"], t["run_name"], t["timesteps"], t["save_every"]) == ("ppo", 5, "campaign_ppo", 20_000_000, 50_000)
+    assert (t["algo"], t["num_envs"], t["run_name"], t["timesteps"], t["save_every"]) == ("ppo", 5, "campaign_ppo_ground", 20_000_000, 50_000)
     assert t["policy_kwargs"] == {"net_arch": [512, 512]}
     assert t["hyperparams"] == {
         "learning_rate": 0.0002, "n_steps": 2048, "batch_size": 512, "n_epochs": 5,

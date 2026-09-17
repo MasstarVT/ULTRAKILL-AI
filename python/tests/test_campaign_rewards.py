@@ -111,7 +111,29 @@ def test_route_terms_are_retired():
     names = {f.name for f in fields(RewardConfig)}
     assert not {"route_point", "stuck"} & names
     assert not hasattr(RewardConfig(), "route_point") and not hasattr(RewardConfig(), "stuck")
-    assert list(inspect.signature(compute_reward).parameters) == ["cfg", "prev", "cur", "enemy_max_health", "died", "campaign"]
+    assert list(inspect.signature(compute_reward).parameters) == [
+        "cfg", "prev", "cur", "enemy_max_health", "died", "campaign", "buttons"]
+
+
+def test_punch_is_charged_per_press_and_only_when_pressed():
+    cfg = RewardConfig(punch=0.01)
+    assert compute_reward(cfg, snapshot(), snapshot(), {}, buttons=("punch",)).parts["punch"] == -0.01
+    assert "punch" not in compute_reward(cfg, snapshot(), snapshot(), {}, buttons=("fire1", "jump")).parts
+    assert "punch" not in compute_reward(cfg, snapshot(), snapshot(), {}).parts  # default: no buttons, no charge
+    # A zero weight (Cyber Grind, and any config that does not set it) pays nothing even when pressed.
+    assert "punch" not in compute_reward(RewardConfig(), snapshot(), snapshot(), {}, buttons=("punch",)).parts
+
+
+def test_level_complete_pays_even_when_the_frame_has_no_player():
+    """The frame that ends a level arrives as the scene unloads and often has no player object.
+
+    Before this, compute_reward returned early on a missing player and the +100 was simply never paid -- so the
+    one outcome the campaign run exists to produce could have scored zero.
+    """
+    cfg = RewardConfig(level_complete=100.0)
+    cur = dict(snapshot(level_complete=True))
+    cur.pop("player")  # no player at all
+    assert compute_reward(cfg, snapshot(), cur, {}).parts["level_complete"] == 100.0
 
 
 if __name__ == "__main__":

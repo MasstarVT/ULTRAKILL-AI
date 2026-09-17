@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,6 +16,7 @@ class RewardConfig:
     death: float = 10.0
     style: float = 0.002  # per style point gained
     step_penalty: float = 0.0  # small per-step cost to discourage idling
+    punch: float = 0.0  # charged per decision that presses the punch button (see compute_reward)
 
     # Early-training shaping for aiming at the nearest visible enemy.
     # `aim` is paid on a slope from facing away (0) to facing straight at it (full), so turning the right
@@ -128,8 +130,21 @@ def compute_reward(
     *,
     died: bool | None = None,
     campaign: CampaignStep | None = None,
+    buttons: Sequence[str] = (),
 ) -> RewardResult:
     r = RewardResult()
+    ps, cs = prev.get("stats", {}), cur.get("stats", {})
+    if cs.get("level_complete") and not ps.get("level_complete"):
+        # Paid before the player check, on the rising edge. The frame that ends a level arrives while the scene
+        # is unloading and often has no player, and returning early there would pay nothing for the one outcome
+        # the campaign run is for. It reads only the stats, so it is safe this early.
+        r.add("level_complete", cfg.level_complete)
+    if "punch" in buttons:
+        # The punch button is an independent coin flip in the action space with no cost and, outside a parry, no
+        # effect, so nothing ever taught the policy to stop pressing it and it flails constantly. A small charge
+        # per press is a gradient it can actually act on, unlike a flat per-step cost, which the value baseline
+        # absorbs. Fights the game forces still pay far more through `arena_clear`.
+        r.add("punch", -cfg.punch)
     if campaign is not None:
         # Paid before the player check: the env has already marked these milestones paid, so a step that
         # arrives without a player (a level load) must not drop them.
@@ -153,7 +168,6 @@ def compute_reward(
         if before is not None and before > e["health"]:
             dealt += (before - e["health"]) / max(enemy_max_health.get(e["id"], before), 1e-3)
 
-    ps, cs = prev.get("stats", {}), cur.get("stats", {})
     new_kills = max(0, cs.get("kills", 0) - ps.get("kills", 0))
     if new_kills:
         # Enemies killed in one hit vanish before a health drop is ever observed. Credit the health they
@@ -190,8 +204,5 @@ def compute_reward(
     pcg, ccg = prev.get("cybergrind"), cur.get("cybergrind")
     if pcg and ccg:
         r.add("wave", cfg.wave * max(0, ccg["wave"] - pcg["wave"]))
-
-    if cs.get("level_complete") and not ps.get("level_complete"):
-        r.add("level_complete", cfg.level_complete)
 
     return r
