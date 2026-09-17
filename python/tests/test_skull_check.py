@@ -23,6 +23,34 @@ import test_campaign_env as corridor  # noqa: E402  the FakeLevel the campaign e
 
 PEDESTAL = [f"{v:g}" for v in corridor.PEDESTAL_POS]
 ALTAR = [f"{v:g}" for v in corridor.ALTAR_POS]
+CHECKPOINT = ["0", "1", "20"]  # corridor.CHECKPOINT_ID's position, which is also the pedestal's
+
+
+class CheckpointLevel(corridor.FakeLevel):
+    """`FakeLevel` with Level 1-1's shape: the skull's room stays switched OFF until a checkpoint RESPAWN.
+
+    Measured on 1-1 (2026-09-17): teleporting onto checkpoint `81,-6,231` makes it `activated`/`current` within a
+    few decisions while the pedestal 44 m away still reads `active: false` -- so a probe that only teleports onto
+    the checkpoint sees a dead item and blames the punch. Only the `reset(checkpoint=True)` that follows brings the
+    room up. That two-step shape is what `--from-checkpoint` exists for, so it is what the fake reproduces.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.teleports: list[list[float]] = []
+        self.item_active = False
+
+    def teleport(self, pos):
+        self.teleports.append(list(pos))
+        self.y, self.z = pos[1], pos[2]
+        return self._obs("teleport")
+
+    def reset(self, scene=None, checkpoint=False):
+        super().reset(scene, checkpoint)
+        # `_load` clears `self.checkpoint`, so it still reading True means the respawn branch ran.
+        self.item_active = bool(checkpoint and self.checkpoint)
+        self.y = 1.0  # a respawn puts the player back on the corridor floor, undoing the teleport's metre of lift
+        return self._obs("reset")
 
 
 def load_script():
@@ -32,16 +60,19 @@ def load_script():
     return module
 
 
-def run(*extra: str, skulls: dict | None = None, cfg_overrides: dict | None = None, **attrs):
+def run(*extra: str, skulls: dict | None = None, cfg_overrides: dict | None = None,
+        client_cls=corridor.FakeLevel, **attrs):
     """Runs the three checks against a fresh skull room. `attrs` are set on the FakeLevel after enable_skulls."""
     script = load_script()
+    # `--camera-height 0`: the fake corridor has no camera, and its player position IS the point everything is
+    # measured from, so the real game's 0.9 m of eye offset would aim these punches under a floor-level target.
     args = script.parse_args(["--level", corridor.LEVEL, "--target", *PEDESTAL, "--altar", *ALTAR,
-                              "--gate", corridor.SKULL_GATE_KEY, *extra])
+                              "--gate", corridor.SKULL_GATE_KEY, "--camera-height", "0", *extra])
     cfg = script.build_config(args)
     if cfg_overrides:
         cfg = replace(cfg, **cfg_overrides)
     env = UltrakillEnv(cfg)
-    game = corridor.FakeLevel()
+    game = client_cls()
     game.enable_skulls(**(skulls or {}))
     for name, value in attrs.items():
         setattr(game, name, value)
@@ -118,6 +149,53 @@ def test_the_control_run_marks_itself_as_not_counting():
     assert "control run" in results[0][3] and "rendering OFF" in results[0][3]
 
 
+def test_from_checkpoint_switches_the_room_on_and_the_whole_carry_then_passes():
+    """1-1's shape end to end: without the respawn the item is dead, with it the carry works."""
+    script, game, results = run("--from-checkpoint", *CHECKPOINT, client_cls=CheckpointLevel)
+    assert statuses(results) == ["PASS", "PASS", "PASS"], results
+    assert game.teleports == [[0.0, 2.0, 20.0]], "teleported onto the checkpoint, one metre up, and nowhere else"
+    assert game.item_active is True, "the respawn is what switched the room on"
+    assert "active=True" in results[0][3] and "held" in results[0][3]
+    assert script.exit_code(results) == 0
+
+
+def test_the_checkpoint_teleport_alone_is_not_enough():
+    """The control for the option: teleporting onto the checkpoint without the respawn leaves the item dead.
+
+    This is the trap the last in-game attempt fell into, so it is pinned rather than described in a comment.
+    """
+    script, game, results = run(client_cls=CheckpointLevel)
+    assert statuses(results) == ["FAIL", "SKIP", "SKIP"], results
+    assert game.teleports == [], "nothing was teleported at all without --from-checkpoint"
+    assert "the item is NOT active" in results[0][3] and "still switched off" in results[0][3]
+
+
+def test_approach_stages_by_teleport_but_the_last_metres_are_still_walked():
+    script, game, results = run("--from-checkpoint", *CHECKPOINT, "--approach", "0", "1", "8",
+                                client_cls=CheckpointLevel)
+    assert statuses(results) == ["PASS", "PASS", "PASS"], results
+    assert game.teleports == [[0.0, 2.0, 20.0], [0.0, 1.0, 8.0]], "the checkpoint, then the staging point"
+    assert "staged by teleport to (0.0, 1.0, 8.0)" in results[0][3]
+    assert "the last metres to the item were walked from there" in results[0][3]
+    walked = int(results[0][3].split("walked ", 1)[1].split(" ", 1)[0])
+    assert walked >= 4, f"only {walked} decisions of walking from 12 m out: it did not walk in"
+
+
+def test_the_punch_is_aimed_from_the_camera_not_from_the_player_transform():
+    """`Punch.ActiveFrame` rays from `cc.GetDefaultPos()`. Aiming from `player.pos` is what made the first two
+    in-game attempts FAIL at a live pedestal 1.8 m away, with rendering both off AND on."""
+    script = load_script()
+    assert script.CAMERA_HEIGHT == 0.9, "measured in game on 1-1's red pedestal, 2026-09-17"
+    assert script.eye({"pos": [10.0, -3.0, 20.0]}, script.CAMERA_HEIGHT) == [10.0, -2.1, 20.0]
+    assert script.eye({"pos": [10.0, -3.0, 20.0]}, 0.0) == [10.0, -3.0, 20.0], "0 is the old, wrong behaviour"
+    # The error this corrects, at the range it was measured at: a skull 0.8 m up and 1.57 m away reads +27 deg
+    # of elevation from the player transform and -3 deg from the camera -- 30 degrees apart at punch range.
+    from_player = script.elevation_to([81.2, -3.0, 273.4], [81.0, -2.2, 275.0])
+    from_camera = script.elevation_to(script.eye({"pos": [81.2, -3.0, 273.4]}, 0.9), [81.0, -2.2, 275.0])
+    assert 25 < from_player < 28 and -5 < from_camera < -2, (from_player, from_camera)
+    assert from_player - from_camera > 25, "the correction is worth ~30 degrees at punch range"
+
+
 def test_command_line_defaults_are_the_specs_coordinates():
     script = load_script()
     args = script.parse_args([])
@@ -125,6 +203,8 @@ def test_command_line_defaults_are_the_specs_coordinates():
     assert args.target == [81.0, -2.2, 275.0], "section 8 check 1's red pedestal"
     assert args.altar == [0.0, -6.76, 381.0] and args.gate == "20,-10,381", "check 2's altar and its gate"
     assert args.via is None and args.teleport_assist is False, "it walks; the nudge is opt-in"
+    assert args.from_checkpoint is None and args.approach is None, "both teleporting options are opt-in too"
+    assert args.altar_approach is None and args.camera_height == 0.9, "and the eye offset defaults to the game's"
 
     cfg = script.build_config(args)
     assert (cfg.mode, cfg.level, cfg.fixed_fps, cfg.frameskip) == ("campaign", "Level 1-1", 30, 2)

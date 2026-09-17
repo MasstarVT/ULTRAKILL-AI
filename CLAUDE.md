@@ -175,10 +175,14 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   (`altars[].filled`, gate `20,-10,381`'s `needs_item`, then 100 decisions of punch spam pressed **through
   `env.step`**, so `_protect_carry` is what is under test — every decision is inspected, not just the last, since
   an unprotected punch pulls the skull out and the next one puts it back), 3 what a held skull does across a
-  death. `--target/--altar/--gate/--via/--level/--render/--teleport-assist/--skip-kill`; PASS/FAIL/SKIP per check,
-  a `summary:` line and exit 1 on any FAIL, like `campaign_check.py`, whose helpers it reuses.
-  `python/tests/test_skull_check.py` runs all three against `FakeLevel`'s skull room, so the script is proven
-  before a game is ever launched.
+  death. `--target/--altar/--gate/--via/--level/--port/--render/--teleport-assist/--skip-kill`, plus, added
+  2026-09-17 when it was first pointed at the game: `--from-checkpoint X Y Z` (teleport onto a checkpoint, let it
+  activate, **then respawn there** — the respawn is what switches the pedestal's room on), `--approach` /
+  `--altar-approach` (stage by teleport into an already-lit room, still walking the last metres) and
+  `--camera-height` (the 0.9 m from `player.pos` up to where the punch ray actually starts; `eye()` applies it).
+  PASS/FAIL/SKIP per check, a `summary:` line and exit 1 on any FAIL, like `campaign_check.py`, whose helpers it
+  reuses. `python/tests/test_skull_check.py` runs all three against `FakeLevel`'s skull room, so the script is
+  proven before a game is ever launched.
 - `python/scripts/transfer_weights.py`: campaign starting weights from a Cyber Grind checkpoint. Widens the 448 inputs to 479 (first-layer columns 0-442 copied, 443-478 zero, so Cyber Grind inputs give the same hidden features), scales the action head by `--action-scale` (default 0.5) to raise entropy, and keeps a fresh final value layer and optimizer. It now also builds the destination with the **campaign** action space and zero-pads the three new logit rows, so the documented Cyber Grind -> campaign path still produces a model `train.py --resume` can load. Output: `models/campaign_ppo/transfer_init.zip` (committed).
 - `python/scripts/add_look_mode.py`: migrates a **campaign** checkpoint across the look-mode action dimension and the re-used target slots, so the run continues instead of restarting. Appends three zero action rows (all modes equally likely), zeroes first-layer columns 448-455 in both hidden stacks and **folds the removed inputs' mean into the first-layer bias** -- the fold is required, not optional: it roughly halves the displacement. Carries `num_timesteps`, `_n_updates` and the full Adam state (zero rows for the new logits, zeroed moments for the changed columns, `step` preserved). `--stats <run_raw.jsonl>` recomputes MU and measures the displacement on real observations. Output: `models/campaign_gates/look_init.zip` (committed). **This is the only migration path**: the action-space change makes every earlier campaign checkpoint unloadable. Cyber Grind is untouched.
 - `python/ultrakill_ai/times.py`: reads and updates `times.md` (`record` is pure, `record_file` edits in place). Level cells use the short form (`0-1`), times are `mm:ss.mmm`, the leaderboard is sorted by campaign order and only a faster time replaces a row.
@@ -277,14 +281,24 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   under Status for what its in-game readouts actually returned).
 - TensorBoard: `tensorboard --logdir runs`.
 - Campaign in-game check (one game, nothing else connected to its port): `python scripts/games.py launch --count 1 --monitor 1`, then `python scripts/campaign_check.py` (Level 0-1) and `python scripts/campaign_check.py --level "Level 1-1"` (full arsenal), then `python scripts/games.py stop`. Six checks: level load, arsenal, checkpoint trigger, death respawn, exit, and **the gates block** (present, ordered, hop-monotone and unchanged after a respawn; SKIP rather than FAIL against a pre-0.6.0 mod). Prints PASS/FAIL/SKIP per check and a `summary:` line, exits 1 on any FAIL -- **check 5 (exit) is a known standing FAIL on both levels** (the exit's room is switched off at load, so a teleport onto its collider fires nothing; real play does trigger it, confirmed on a human run), so exit code 1 is expected today. `--fixed-fps 60 --frameskip 4` and `--render` repeat the trigger checks at other speed settings. Rerun after game updates and after mod changes to the campaign block; `python tests/test_campaign_check.py` tests the script without the game.
-- Skull-carry in-game check (branch `next-levels`, one game, nothing else connected to its port, and the **only**
-  thing that unblocks raising `item_pickup` / `item_placed` off 0.0):
-  `python scripts/games.py launch --count 1 --monitor 1`, then `python scripts/skull_check.py`
-  (Level 1-1, rendering **off**, which is the point of check 1), then `python scripts/games.py stop`. Add
-  `--render` for the control run, and `--via X Y Z` (repeatable) when the direct line to the pedestal does not
-  walk. Check 1 failing while the pre-punch line says `active=False` means the Skull Field room is still switched
-  off and the **walk** failed, not the punch -- route it with `--via` before concluding anything about
-  `ActiveStart`. `python tests/test_skull_check.py` tests the script without the game.
+- Skull-carry in-game check (one game, nothing else connected to its port). **All three checks passed on
+  2026-09-17** -- see the S4 entry under Status for the readouts and for the two fixes still owed before
+  `item_pickup` / `item_placed` may leave 0.0. The command that reproduces it, on Level 1-1:
+  ```
+  python scripts/skull_check.py --port 47808 --from-checkpoint 46 0 388 --from-checkpoint 81 -6 231 \
+      --approach 81 -1 255 --altar-approach 0 -4 374 --altar 0 -8 381 --budget 700
+  ```
+  `--from-checkpoint` teleports onto a checkpoint, waits for it to activate **and then respawns there**, which is
+  what actually switches the pedestal's room on; `--approach` / `--altar-approach` stage into a room already lit
+  and the last metres are still walked; `--altar 0 -8 381` is the ~1.25 m downward aim offset a placement needs.
+  `--render` is the control run, `--via X Y Z` a walked waypoint, `--camera-height` the 0.9 m eye offset the
+  punch ray starts from. Check 1 failing while the pre-punch line says `active=False` means the room is still
+  switched off and the **walk** failed, not the punch. `python tests/test_skull_check.py` tests it without a game.
+  - **To run it while a training run is live, never use `games.py launch`/`stop`** -- both call `stop_all()` and
+    kill every game. Start one extra instance by hand on a free port with games.py's own arguments
+    (`-aibridge-port N -screen-fullscreen 0 -screen-width 368 -screen-height 207 -job-worker-count 3`,
+    `SteamAppId`/`SteamGameId` 1229490, detached + below-normal, cwd the game folder), note its PID, and at the
+    end `taskkill /PID <pid> /F` that PID alone. Verify before and after with `games.py status` (netstat-based).
 - Campaign eval (one game on port 47800, e.g. `python scripts/games.py launch --count 1 --monitor 1`):
   `python scripts/eval.py models/campaign_gates/best.zip --level "Level 0-1" --episodes 10`. Fresh level loads,
   deterministic actions, real deaths; prints completed, official time, rank, kills, style, restarts and deaths per
@@ -1156,3 +1170,79 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       decisions on average, 88% of the 9,000 cap (600 game seconds), so deep runs are near-misses against the
       clock. Candidate for the next planned pause, as its own change: `max_steps` 9,000 -> 12,000. Not done
       mid-climb because it needs a trainer restart and the run is improving on its own.
+
+- **S4 skull carry VERIFIED IN GAME on Level 1-1, 2026-09-17 — all three of spec section 8's checks pass, and
+  the blocking question was never the one everyone was watching.** Run on a **ninth** game instance on port
+  47808, launched by hand with `games.py`'s own arguments (`-aibridge-port 47808 -screen-fullscreen 0
+  -screen-width 368 -screen-height 207 -job-worker-count 3`, `SteamAppId` set, detached + below-normal) while
+  the `campaign_gates` run kept using 47800-47807 untouched. **Never run `games.py launch` or `stop` for this:
+  both call `stop_all()`, which kills every game including the trainer's eight.** Training held 158-175 steps/s
+  throughout.
+  - **Check 1 pickup — PASS with `render: false`.** One aimed punch at 1-1's red pedestal `81,-2,275`
+    (reading `active=True active_self=True inactive_ancestors=0`) flips `items[].held` true. **So the
+    `ActiveStart`/AnimationEvent worry is dead**: `TrainingSpeed.ForcePlayerAnimators` does keep the fist
+    Animator running with every camera disabled, and S4 is not inert under training settings. The `--render`
+    control behaves identically, which is how the real cause was found.
+  - **Check 2 placement — PASS.** Carried to the red altar `0,-7,381`: one aimed punch sets `filled: true` and
+    **the gate `20,-10,381` goes `open: true`** — the door really unlocks. The placement then survived
+    **100 decisions of punch spam issued through `env.step`**, so **`_protect_carry` holds in the live game**,
+    not just against `FakeLevel`.
+  - **Check 3 held skull on death — PASS, and the answer is "it comes with you".** `kill()` while holding, then
+    the respawn: the skull reads `held: true` still, at the checkpoint (`81.7,-3.6,229.6`, 2.3 m from the
+    player), `deaths` 0 -> 1, the episode does not end. The level's other `SkullRed` entry is the destination
+    altar's decoration (`active_self: false`). **A death mid-carry costs the carry nothing** — no re-fetch, and
+    no unsolvable-puzzle failure mode to design around.
+  - **THE REAL BUG, and it is Python-side: every aim at a skull or an altar is taken from the wrong point.**
+    `Punch.ActiveFrame` (`decompiled/Punch.cs:547`) rays from **`cc.GetDefaultPos()` — the camera** — along
+    camera forward for 4 m. `skull_check.py` and **`env._look_at_target` (look mode 2)** both compute the
+    elevation from `player.pos`, i.e. `NewMovement.transform.position`, which sits **0.9 m below the camera**.
+    At punch range that is a ~30 degree error and the ray passes clean over the target: measured on the pedestal
+    at 1.57 m, aiming from `player.pos` asks for +27.0 deg and fails, the camera wants -3.0 deg and picks it up;
+    at 2.71 m, +11.3 fails and +8.0 works. Both solve to **0.88-0.90 m**. The two earlier in-game attempts —
+    including the one that concluded "the walk failed, not the punch" — were **59 aimed punches at a live
+    pedestal 1.8 m away that all flew overhead**, with rendering on *and* off.
+    - `scripts/skull_check.py` is fixed: new `eye(player, height)` helper, `CAMERA_HEIGHT = 0.9`, a
+      `--camera-height` override (the offline tests pass `0`, since `FakeLevel` has no camera).
+    - **`ultrakill_ai/env.py` is NOT fixed and needs the same correction before `item_pickup`/`item_placed` ever
+      leave 0.0.** `_look_at_target` must aim from `player.pos + (0, 0.9, 0)` whenever `wide` is set, and
+      `_near_subgoal`'s range test is measured from `player.pos` too. Left alone deliberately: the trainer
+      imports this file and the live curriculum (0-1/0-3/0-4) has no wired altar, so mode 2 only ever aims at
+      doors, where 0.9 m is under 3 degrees at 20 m and harmless. **It is not harmless at 4 m**, so as it stands
+      the agent could never place a skull even with the weights raised.
+    - **A second aim offset, not yet explained.** Aiming at `altars[].pos` exactly does not place: the placement
+      only fired when aimed **~1.25 m below** the zone's reported position (`0,-7,381` -> aim y -8.0). Likely
+      the ray hits the zone's decoration skull, which carries an `ItemIdentifier`, and `AltHit` bails on
+      `if (itemIdentifier && hasHeldItem) return;` (`decompiled/Punch.cs:1341`). Pickup needs no such offset.
+      Whatever `env` ends up doing for mode 2 has to clear this too; `skull_check.py` takes it as `--altar`.
+  - **Data oddity 1 (M14) CONFIRMED AND REPRODUCED, on the red leg as well: `needs_item` does NOT clear after a
+    real placement.** With `0,-7,381` filled and its door open, gate `20,-10,381` still read
+    `needs_item: 'SkullRed'`. Cause measured directly: **`inactive_ancestors` conflates "my room is switched
+    off" with "I am a dead twin"**, and the number moves when the room switches on. On a fresh load the live
+    altar `81,-4,251` reads 1 and its twin `#2` reads 2; **after the checkpoint respawn switches that room on,
+    the live one reads 0 and the twin reads 1**. `CampaignObserver.NeedsItem` skips only `> 1`, so the twin
+    stops being filtered exactly when the player arrives, and holds the lock set forever. This is a **mod fix**:
+    the dead-twin test must be relative, not a constant — a zone is dead when another zone with the same `item`
+    and the same `doors` reports strictly fewer `inactive_ancestors` (equivalently, once the room is on, the
+    live zone is the `active` one). Until it is fixed a skull-locked gate never reports itself solved, so
+    `GateProgress._is_reached` refuses the gate forever and the fetch/carry machine cannot advance to `open`.
+  - **Data oddity 2 (0-2's `-60,-6,236 needs=SkullBlue hops=None`) — cannot become a target; no mod fix needed
+    for that.** `GateProgress._choose_target` filters on `g.get("hops") is not None` (campaign.py:709) and
+    `_is_reached` returns False for `hops is None`, so a `hops: null` gate is invisible to targeting and to the
+    ladder. **But there is a latent trap if 0-2 is ever added to the curriculum:** `_protect_carry` keys on
+    `campaign.wanting_altars`, which does not look at gates at all, so picking that blue skull up drops the
+    punch button — while `_near_subgoal` can never release it, because releasing needs a `subgoal` target and
+    0-2 has no targetable gate to build one from. Fix when 0-2 is trained, not before: either give the phase-2
+    gate a usable `hops` mod-side, or release the punch near any unfilled altar that accepts the held item when
+    there is no sub-goal.
+  - **How to reach the pedestal at all** (the previous attempt's blocker, now solved and folded into the
+    script): 1-1's route to `81,-2,275` runs **through the skull-locked door `81,-6,240` itself**, so no walk
+    from spawn can get there. `--from-checkpoint 81 -6 231` teleports onto that checkpoint and lets it activate,
+    **and then respawns** — and the respawn is the part that matters: after the teleport alone the pedestal
+    still reads `active: false`, and only `reset(checkpoint=True)` brings the room up to
+    `active: true, inactive_ancestors: 0`. Activating `46,0,388` first also lights the red altar's room, and it
+    survives the later respawn elsewhere. `--approach` / `--altar-approach` then stage into those now-live rooms
+    and the last metres are still walked. The whole run:
+    `python scripts/skull_check.py --port 47808 --from-checkpoint 46 0 388 --from-checkpoint 81 -6 231
+    --approach 81 -1 255 --altar-approach 0 -4 374 --altar 0 -8 381 --budget 700`
+  - **`item_pickup` / `item_placed` stay at 0.0** — the lead decides, and the `NeedsItem` mod fix and the
+    `env._look_at_target` aim fix both have to land first or a raised weight buys nothing.
