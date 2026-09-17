@@ -16,6 +16,7 @@ from ultrakill_ai.campaign import (
     CAMPAIGN_LEVELS_SHIPPED,
     SUBGOAL_ALTAR,
     SUBGOAL_ITEM,
+    ExitGuard,
     ExplorationArchive,
     GateProgress,
     MilestoneTracker,
@@ -44,7 +45,8 @@ CYBERGRIND_SCENE = "Endless"
 # Per-episode info the campaign Monitor records (scripts/train.py); every key is in every campaign info.
 CAMPAIGN_INFO_KEYS = ("kills", "style", "deaths", "completed", "fresh_start", "level_seconds",
                       "checkpoints_level", "cells_new", "exit_dist_min", "oob_frac",
-                      "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac")
+                      "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac",
+                      "targets_parked", "exit_banished")
 
 YAW_CAP = max(abs(b) for b in YAW_BINS)  # 90 degrees per decision, the widest look bin
 PITCH_CAP = max(abs(b) for b in PITCH_BINS)  # 20 degrees per decision
@@ -119,6 +121,12 @@ class EnvConfig:
     gate_reach_v_m: float = 6.0  # vertical half-height of the same test, so a roof over a door is not "reached"
     gate_min_gain_m: float = 0.5  # metres of new best closeness below which gate_approach pays nothing
     gate_hops_min_frac: float = 0.5  # share of gates that must carry `hops` before the ladder is trusted at all
+    # Target patience, the answer to a ladder collapsed by multi-room doors (0-3, 1-1, 1-2, 2-3, 4-3, 8-1); see
+    # docs/superpowers/specs/2026-09-17-ladder-patience-and-exit-guard.md. 0 restores the pre-patience tracker.
+    gate_target_patience_s: float = 20.0  # game seconds a target may go without getting closer before it is parked
+    gate_unpark_m: float = 2.0  # metres nearer than it was parked at that bring a parked gate back
+    gate_fallback_hysteresis_m: float = 10.0  # metres a rival must beat the sticky fallback target by
+    exit_max_shift_m: float = 100.0  # metres the exit may legitimately move inside one level load (ExitGuard)
     # Skull carry. 0 disables both carry-protection rules; they are inert on any level with no ItemPlaceZone.
     subgoal_punch_range_m: float = 4.0  # Punch.ActiveFrame's own 4 m reach: inside it a punch can pick up or place
     camera_height_m: float = 0.9  # metres from player.pos up to the camera, where every ray starts (see _eye)
@@ -234,9 +242,18 @@ class UltrakillEnv(gym.Env):
         self._curriculum: dict = {}  # last curriculum table read successfully, kept as the fallback
         self._curriculum_warned = False
         self.milestones = MilestoneTracker()
+        # Patience is configured in game SECONDS and kept here in decisions, so the same config behaves the same
+        # at any fixed_fps/frameskip. 20 s at 30/2 is 300 decisions, well under `stuck_seconds` 45.
+        patience_steps = max(0, int(round(self.cfg.gate_target_patience_s * self.cfg.fixed_fps
+                                          / max(1, self.cfg.frameskip))))
         self.gates = GateProgress(self.cfg.gate_reach_m, self.cfg.gate_reach_v_m, self.cfg.gate_min_gain_m,
-                                  self.cfg.gate_hops_min_frac, self.cfg.target_kind_slots)
+                                  self.cfg.gate_hops_min_frac, self.cfg.target_kind_slots,
+                                  patience_steps=patience_steps, unpark_m=self.cfg.gate_unpark_m,
+                                  fallback_hysteresis_m=self.cfg.gate_fallback_hysteresis_m)
+        self.exit_guard = ExitGuard(self.cfg.exit_max_shift_m)
         self.path_progress = PathProgress()
+        self._parks_at_start = 0  # GateProgress.parks when this episode began, so info reports the difference
+        self._exit_banished = False  # the guard rejected at least one exit report during this episode
         self._rng = random.Random()
         self._stuck_streak = 0  # episodes in a row that ended stuck at the same current checkpoint
         self._stuck_checkpoint: str | None = None
@@ -349,6 +366,8 @@ class UltrakillEnv(gym.Env):
             self._cells_new = 0
             self._oob_steps = 0
             self._exit_dist_min = math.inf
+            self._parks_at_start = self.gates.parks
+            self._exit_banished = self.exit_guard.banished  # a load that is already banished stays flagged
             self._start_checkpoint = self._current_checkpoint(self._raw)
             self._level_started = bool((self._raw.get("campaign") or {}).get("level_started"))
             player = self._raw.get("player")
@@ -416,7 +435,7 @@ class UltrakillEnv(gym.Env):
         campaign = self.cfg.mode == "campaign"
         cur = self.client.step(command)
         if campaign:
-            cur = self._skip_locked(cur)
+            cur = self._guard_exit(self._skip_locked(cur))
         self._raw = cur
         self._steps += 1
         self._lifetime_steps += 1
@@ -608,6 +627,8 @@ class UltrakillEnv(gym.Env):
         self._last_end_reason = "bridge_reset"
         if self.cfg.mode != "campaign":
             return
+        self.exit_guard.new_level_load()  # a recovery reload IS a fresh level load, for the exit as for the gates
+        self._guard_exit(raw)
         pos = (raw.get("player") or {}).get("pos")
         self.milestones.new_level_load(raw.get("campaign"))
         self.gates.new_level_load(raw.get("campaign"), pos)
@@ -1090,6 +1111,11 @@ class UltrakillEnv(gym.Env):
             # load that no longer exists.
             fresh = True
         raw = self._skip_locked(raw)
+        if fresh:
+            # Before the guard sees the block: a real level load puts the FinalPit back, so whatever this fresh
+            # scene reports is the truth however far it is from the exit the last load ended on.
+            self.exit_guard.new_level_load()
+        raw = self._guard_exit(raw)
         pos = (raw.get("player") or {}).get("pos")
         if fresh:
             self.milestones.new_level_load(raw.get("campaign"))
@@ -1118,7 +1144,7 @@ class UltrakillEnv(gym.Env):
             # stats, its best-run positions, its gate approach -- describes a level load that is gone. Ending
             # the episode is the only honest move; step()'s wrapper turns this into end_reason "bridge_reset".
             raise BridgeRecovered(raw)
-        raw = self._skip_locked(raw)
+        raw = self._guard_exit(self._skip_locked(raw))
         self.milestones.mark_paid(raw.get("campaign"))
         player = raw.get("player")
         # No reset_episode here: the episode continues, so the gate approach it has already earned stands.
@@ -1148,6 +1174,18 @@ class UltrakillEnv(gym.Env):
                 break
             raw = self.client.step({})
             self._track_enemies(raw)
+        return raw
+
+    def _guard_exit(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Runs the banished-exit guard over an observation the env is about to adopt, in place.
+
+        Called on every campaign observation that becomes `self._raw` -- a reset, a step, a respawn, a recovery
+        reload -- because the exit is read in three places (the gate target, observation slots 0-4 and
+        `exit_dist_min`) and rewriting the block once covers all of them. `ExitGuard.apply` is a no-op without a
+        `campaign` block or an exit, so a Cyber Grind frame or a dropped block costs one dict lookup.
+        """
+        if self.cfg.mode == "campaign" and self.exit_guard.apply(raw.get("campaign")):
+            self._exit_banished = True
         return raw
 
     def _ground_point(self, raw: dict[str, Any]) -> tuple[float, float, float] | None:
@@ -1219,7 +1257,11 @@ class UltrakillEnv(gym.Env):
         novelty = 0.0
         player = raw.get("player")
         pos = player["pos"] if player else None
-        gates_new, approach = self.gates.update(raw.get("campaign"), pos)
+        # Kills and style restart the stuck clock (see below) and, for the same reason, suspend the gate
+        # tracker's patience clock: a door an ActivateArena wave is holding shut cannot be approached at all.
+        stats, before = raw.get("stats", {}), prev.get("stats", {})
+        fought = stats.get("kills", 0) > before.get("kills", 0) or stats.get("style", 0) > before.get("style", 0)
+        gates_new, approach = self.gates.update(raw.get("campaign"), pos, fought=fought)
         if player:
             self._last_pos = list(pos)
             ground = self._ground_point(raw)
@@ -1240,8 +1282,6 @@ class UltrakillEnv(gym.Env):
         # where novelty runs out, and the live probe recorded 193 s of fighting after checkpoint 3 that the clock
         # truncated. Damage dealt deliberately does NOT count -- rewards.py attributes none of it to the player
         # and ULTRAKILL enemies damage each other, so a crossfire tail would simply never truncate.
-        stats, before = raw.get("stats", {}), prev.get("stats", {})
-        fought = stats.get("kills", 0) > before.get("kills", 0) or stats.get("style", 0) > before.get("style", 0)
         if (checkpoints or arenas or doors or pickups or placements
                 or novelty > 0 or path_gain > 0 or gates_new or approach > 0 or fought):
             self._steps_since_progress = 0
@@ -1367,6 +1407,11 @@ class UltrakillEnv(gym.Env):
             # respawn episode from its level load, so judge them on fresh starts.
             info["gates_reached"] = self.gates.gates_reached
             info["gate_hops_best"] = self.gates.best_hops
+            # The two mechanisms of the 2026-09-17 patience/exit-guard spec, so the monitor can see them fire.
+            # `targets_parked` counts parks during THIS episode (the tracker's counter is env-lifetime); it is
+            # expected to be 0 on a monotone level such as 0-1 and to rise on a collapsed one such as 0-3.
+            info["targets_parked"] = self.gates.parks - self._parks_at_start
+            info["exit_banished"] = int(self._exit_banished)
             info["wedged_steps"] = self._wedged_steps
             info["level_started"] = int(self._level_started)
             info["look_free_frac"] = b["look_free"] / steps

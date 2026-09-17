@@ -612,23 +612,64 @@ class GateProgress:
     `gates[].controller_active` is reported by the mod (a door whose `ActivateArena` has not run is neither
     locked nor approachable) but no rule here reads it yet; every field is read with `.get`, so a 0.5.x mod
     without it -- or without `gates` at all -- simply produces no target and pays nothing.
+
+    **`hops` is a lower bound, not a route.** It is the shortest path in a room graph that multi-room doors
+    over-connect, so on six of the shipped levels (0-3, 1-1, 1-2, 2-3, 4-3, 8-1) the gate nearest the spawn
+    already sits near `hops` 0 and the monotone rule above locks onto a door that cannot be walked to -- on 0-3,
+    one 66 m straight up through a ceiling, for 175 of 177 training episodes. `patience_steps` is the answer
+    (docs/superpowers/specs/2026-09-17-ladder-patience-and-exit-guard.md): a target that goes that many
+    decisions without getting closer is PARKED for this level load, the target becomes the nearest unreached,
+    unparked gate at any hop count, and reaching one of those pays a `gate` instalment for each NEW RUNG, so the
+    forward legs of a non-monotone route earn something. `patience_steps` 0 disables all of it and restores this
+    class exactly as it was before that spec, which is how the 0-1 inertness proof is written.
+
+    The four rules that keep the park from becoming a second wedge, each of them a reproduced failure rather
+    than a precaution -- see `_tick_patience`, `_unpark`, `_pay_fallback` and `mark_paid`:
+
+      - a park is only ever a SWITCH for a LADDER pick, but a FALLBACK pick parks unconditionally, because the
+        fallback is by construction the nearest candidate and "is something nearer?" can never be true for it;
+      - `park_best` keeps falling while a gate is parked and the un-park bar doubles per park, so bobbing about
+        under an unreachable door cannot un-park it;
+      - the clock runs on its own baseline, not on `gate_approach`, so a death respawn does not park the one
+        door the route needs;
+      - the arena suspension is bounded at `2 * patience_steps`, and a carry leg is never parked at all.
     """
 
+    UNPARK_ESCALATION = 2.0  # each further park of one key doubles the improvement needed to undo it
+
     def __init__(self, reach_m: float = 8.0, reach_v_m: float = 6.0, min_gain_m: float = 0.5,
-                 hops_min_frac: float = 0.5, target_kind_slots: bool = False):
+                 hops_min_frac: float = 0.5, target_kind_slots: bool = False,
+                 patience_steps: int = 0, unpark_m: float = 2.0, fallback_hysteresis_m: float = 10.0):
         self.reach_h = float(reach_m)
         self.reach_v = float(reach_v_m)
         self.min_gain = float(min_gain_m)
         self.hops_min_frac = float(hops_min_frac)
         self.target_kind_slots = bool(target_kind_slots)
+        # Target patience (docs/superpowers/specs/2026-09-17-ladder-patience-and-exit-guard.md). 0 turns parking
+        # and the fallback off completely, which is byte for byte the tracker before that spec.
+        self.patience_steps = int(patience_steps)
+        self.unpark_m = float(unpark_m)
+        self.fallback_hysteresis = float(fallback_hysteresis_m)
         # Per level load
         self.best_hops: int | None = None  # lowest hops reached
         self.paid_hops: int | None = None  # lowest hops already paid or absorbed
         self.reached: set[str] = set()  # gate keys ever reached this level load
         self.hops_reached: set[int] = set()  # their hop values, which is what `gates_reached` counts
+        self.parked: set[str] = set()  # gate keys the patience rule gave up on this level load
+        self.park_best: dict[str, float] = {}  # ... and the closest the player has been since it was parked
+        self.park_count: dict[str, int] = {}  # times each key has been parked, which escalates its un-park bar
+        self.paid_fallback: set[str] = set()  # gate keys that have already paid a fallback `gate` instalment
+        # Per env lifetime, so the env can report parks per episode by difference
+        self.parks = 0
         # Per episode
         self.best_dist: dict[str, float] = {}  # gate key (or "exit") -> closest approach made this episode
         self.target: dict | None = None
+        self._fallback = False  # whether `target` came from the fallback rather than the ladder rung
+        self._fallback_key: str | None = None  # the sticky fallback choice, kept until it is reached or parked
+        self._clock_key: str | None = None  # the target the patience clock is timing
+        self._clock = 0  # decisions it has gone without a new best approach
+        self._clock_suspended = 0  # ... plus decisions the arena rule refused to count, bounded in _tick_patience
+        self._clock_best = math.inf  # closest approach to it in THIS attempt; never `best_dist`, see _tick_patience
 
     # -- lifecycle ---------------------------------------------------------------------------
 
@@ -637,20 +678,48 @@ class GateProgress:
         self.best_hops = self.paid_hops = None
         self.reached.clear()
         self.hops_reached.clear()
+        self.parked.clear()
+        self.park_best.clear()
+        self.park_count.clear()
+        self.paid_fallback.clear()  # before mark_paid, which seeds it from `reached`
         self.best_dist.clear()
         self.target = None
+        self.reset_episode()
         self.mark_paid(campaign, player_pos)
 
     def mark_paid(self, campaign: dict | None, player_pos=None) -> None:
         """Absorbs the gates the player already stands at (a checkpoint respawn, or any reset) without paying."""
         self._note_reached(campaign, player_pos)
         self.paid_hops = self.best_hops
+        # The fallback instalment is absorbed the same way the ladder's is: a respawn that lands the player on
+        # the gate the fallback was pointing at reveals it, it does not earn it. A gate already in `reached` can
+        # never become a fallback target again, so this only ever blocks the one step the respawn creates.
+        self.paid_fallback |= {str(key) for key in self.reached}
         # best_dist is deliberately untouched: a respawn inside an episode must not re-earn the approach.
+        # The patience CLOCK is restarted, which is the opposite call and the right one for it. A respawn puts
+        # the player back at a checkpoint, so every metre between there and the target has to be re-walked -- and
+        # by ruling R1 that re-walk pays no `gate_approach`, because `best_dist` still holds the pre-death
+        # minimum. Timing the clock off the reward would therefore run it out during a flawless approach and park
+        # the one door the route needs (measured: parked at decision 299 of 389 with 101 m still to go). The
+        # clock measures the CURRENT attempt; the reward measures the episode. They are different questions.
+        self._clock = self._clock_suspended = 0
+        self._clock_best = math.inf
 
     def reset_episode(self) -> None:
-        """A new episode: pick the target again from scratch, and let it re-earn its approach (ruling R1)."""
+        """A new episode: pick the target again from scratch, and let it re-earn its approach (ruling R1).
+
+        `parked` / `park_best` / `paid_fallback` deliberately survive: a park is a fact about this level load's
+        geometry (that door is not reachable from here), while the patience clock measures the current attempt,
+        whose `best_dist` baseline has just been cleared. Carrying a stale clock across the boundary would park
+        a gate the new episode never had a chance to approach.
+        """
         self.target = None
         self.best_dist.clear()
+        self._fallback = False
+        self._fallback_key = None
+        self._clock_key = None
+        self._clock = self._clock_suspended = 0
+        self._clock_best = math.inf
 
     def retarget(self, campaign: dict | None, player_pos=None) -> None:
         """Chooses the current target. Pays nothing; call it before packing any observation."""
@@ -662,18 +731,27 @@ class GateProgress:
 
     # -- per step ----------------------------------------------------------------------------
 
-    def update(self, campaign: dict | None, player_pos=None) -> tuple[int, float]:
-        """(new hop values crossed, metres of new best closeness to the target) for this step."""
-        prev_key = self._key_of(self.target)
+    def update(self, campaign: dict | None, player_pos=None, *, fought: bool = False) -> tuple[int, float]:
+        """(gate instalments, metres of new best closeness to the target) for this step.
+
+        `fought` is "a kill or a style event landed this step", which the env already computes for the stuck
+        clock. It suspends the patience clock, because a door held shut by an `ActivateArena` wave cannot be
+        approached until the wave is dead (§3 of the patience spec).
+        """
+        prev_target, prev_fallback = self.target, self._fallback
+        prev_key = self._key_of(prev_target)
         prev_best = self.best_dist.get(prev_key, math.inf) if prev_key is not None else math.inf
+        prev_floor = self.best_hops
+        # Judged before `retarget`, which is what adds this step's gates to `reached`.
+        paid = self._pay_fallback(campaign, prev_target, prev_fallback, prev_floor, player_pos)
+        self._unpark(campaign, player_pos)
         self.retarget(campaign, player_pos)
 
-        paid = 0
         if self.best_hops is not None:
             if self.paid_hops is None:
-                paid = 1
+                paid += 1
             elif self.best_hops < self.paid_hops:
-                paid = self.paid_hops - self.best_hops
+                paid += self.paid_hops - self.best_hops
             self.paid_hops = self.best_hops if self.paid_hops is None else min(self.paid_hops, self.best_hops)
 
         approach = 0.0
@@ -685,12 +763,212 @@ class GateProgress:
             if distance < prev_best - self.min_gain:
                 approach = prev_best - distance
                 self.best_dist[key] = distance
+
+        self._tick_patience(campaign, player_pos, fought)
         return paid, approach
 
     @property
     def gates_reached(self) -> int:
         """Distinct hop values reached in this level load (0 when none)."""
         return len(self.hops_reached)
+
+    # -- patience, parking and the fallback ---------------------------------------------------
+
+    @staticmethod
+    def _park_key(target: dict | None) -> str | None:
+        """The GATE a target belongs to: itself, or, for a fetch/carry leg, the door that leg opens.
+
+        Parking a stalled sub-goal by its own key would achieve nothing -- `_choose_target` would pick the same
+        gate and `_subgoal` would rebuild the same leg -- and sub-goal keys are not stable anyway, since
+        `CheckPoint.ResetRoom` re-instantiates skulls. Parking the gate moves the whole carry machine on.
+        """
+        if not target:
+            return None
+        return str(target.get("gate_key") or target.get("key"))
+
+    def _gate_by_key(self, campaign: dict | None, key: str | None) -> dict | None:
+        return next((g for g in self._gates(campaign) if str(g.get("key")) == key), None) if key else None
+
+    def _pay_fallback(self, campaign: dict | None, target: dict | None, was_fallback: bool,
+                      floor: int | None, pos) -> int:
+        """A4: reaching a gate the FALLBACK chose pays one `gate` instalment, once per NEW RUNG per level load.
+
+        Without this a forward leg of a non-monotone route earns nothing, because its `hops` is at or above
+        `best_hops` and the ladder rule only pays new lower rungs. `hops >= floor` keeps the two rules from ever
+        paying for the same reach: a fallback gate that does lower `best_hops` is paid by the ladder instead.
+
+        **The instalment is bounded by the ladder's own unit, not by the gate key.** A4 asks for "no incentive to
+        tour doors", and per-key payment does not deliver it: `_pick` re-selects the nearest unreached, unparked
+        gate every step, so door after door becomes the fallback target in turn and pays. Measured on eight side
+        doors sharing one rung, a tour collected 6 instalments where the ladder's own depth was 2 -- 90 points
+        against `level_complete` 100, re-earned on every fresh load, and on 8-1's 52 phase-1 gates the ceiling is
+        780. `hops in hops_reached` closes it exactly: every forward leg of 0-3's real route (hops 2 -> 3 -> 4 ->
+        5 -> 6) is a new rung and still pays, while a second door on a rung already reached pays nothing, so the
+        total stays bounded by the ladder depth just as the monotone rule is. `hops_reached` is already
+        level-load scoped and already absorbed by `mark_paid` through `_note_reached`, so the respawn semantics
+        come for free.
+
+        `hops` is read defensively, as it is everywhere else in this class: `_gate_by_key` searches the FULL
+        array, which deliberately carries `altar_only` doors with `hops: null`, and an unguarded `int(...)` here
+        would raise out of `update` -- past `env.step`, which catches only `BridgeRecovered`, past SubprocVecEnv's
+        worker and into all twelve games.
+        """
+        gate_key = self._park_key(target)
+        if not (was_fallback and pos is not None and gate_key and gate_key != GATE_EXIT_KEY):
+            return 0
+        if gate_key in self.paid_fallback or floor is None:
+            return 0  # floor None: nothing is reached yet, so the ladder's own first instalment covers this
+        gate = self._gate_by_key(campaign, gate_key)
+        hops = gate.get("hops") if gate else None
+        if hops is None or int(hops) < floor or not self._is_reached(gate, pos):
+            return 0
+        self.paid_fallback.add(gate_key)
+        if int(hops) in self.hops_reached:
+            return 0  # this rung has already been paid for; touring its other doors is worth nothing
+        return 1
+
+    def _unpark(self, campaign: dict | None, pos) -> None:
+        """A3: a parked gate comes back when the player passively gets genuinely nearer than it has ever been.
+
+        Never on a timer: the situation has to have changed -- the agent has climbed toward the high door some
+        other way. What makes "genuinely" hold up is that the bar DOUBLES with each park of that key
+        (`UNPARK_ESCALATION`), so a door that has already proved unreachable twice needs 4 m, then 8 m, then
+        16 m. A flat 2 m is less than one ULTRAKILL jump, and on the recorded 0-3 probe that let the collapsed
+        ladder re-form on a roughly 50% duty cycle: episode 0 parked and un-parked three times (40.87 -> 38.16
+        -> 35.98 -> 29.16 -> 26.13 -> 23.25 m), ended with the door fully back and still spent 40.4% of its
+        decisions pointed at it. With the escalation it un-parks once, on a genuine 24 m climb, and parks again
+        when that stalls too. `park_count` is level-load scoped like the rest of the ladder.
+
+        `park_best` is the closest the player has been to that gate at any park of it this level load: it is
+        fixed while the gate stays parked, and a later park can only lower it (`_tick_patience` takes the `min`).
+        Both halves matter, and the second is where the reviewer's proposal went wrong.
+
+        It must not follow the player's running minimum every step, because such a baseline is beaten by at most
+        one decision's travel, so no gradual approach can clear a bar wider than that: walking 1 m per decision
+        straight at a door with a 2 m bar gives `d < (d + 1) - 2`, false at every distance. Measured, that kept
+        the door parked while the agent climbed 34 m to stand on it, which breaks A3 outright.
+
+        It must equally not be re-read from wherever the player happens to stand when the clock next runs out.
+        On the probe the second park was taken at 77.5 m, having wandered away from the 40.9 m the first one
+        recorded, and walking back into the pit then cleared the bar for free. Keeping the minimum makes each
+        un-park cost strictly more than the last, and with the doubling bar the sequence converges: the probe's
+        episode 0 goes 40.9 -> 38.4 -> 29.2 -> 17.6 m, each one a real climb, and the fourth park would need the
+        agent to stand inside 2 m of the door.
+        """
+        if pos is None or not self.parked:
+            return
+        for gate in self._gates(campaign):
+            key = str(gate.get("key"))
+            if key not in self.parked or not gate.get("pos"):
+                continue
+            bar = self.unpark_m * self.UNPARK_ESCALATION ** max(0, self.park_count.get(key, 1) - 1)
+            if _dist3(pos, gate["pos"]) < self.park_best.get(key, math.inf) - bar:
+                self.parked.discard(key)  # park_best is KEPT: the next park of this key measures from it
+
+    def _nearer_unreached(self, campaign: dict | None, pos, target: dict | None) -> dict | None:
+        """An unreached, unparked, active gate strictly nearer than `target`, or None.
+
+        Parking is only ever a SWITCH, never a loss: with no better candidate the ladder's own answer is still
+        the best guess available and the target is kept. Measured on the 32,022 recorded Level 0-1 decisions,
+        this test is what takes the parks per episode from 0-13 to 0-1 and leaves 6 of 7 episodes byte-identical.
+        """
+        if pos is None or not target or not target.get("pos"):
+            return None
+        here = _dist3(pos, target["pos"])
+        skip = self._park_key(target)
+        candidates = [g for g in self._gates(campaign)
+                      if g.get("hops") is not None and g.get("active") and g.get("pos")
+                      and str(g.get("key")) not in self.reached and str(g.get("key")) not in self.parked
+                      and str(g.get("key")) != skip and _dist3(pos, g["pos"]) < here]
+        return self._nearest(candidates, pos)
+
+    def _tick_patience(self, campaign: dict | None, pos, fought: bool) -> None:
+        """A1: park the current target once it has gone `patience_steps` decisions without getting closer.
+
+        The clock has its OWN baseline, `_clock_best`, rather than reading `gate_approach`. They look like the
+        same question and are not: `best_dist` is episode scoped by ruling R1 and deliberately survives an
+        in-episode death, so after a respawn the whole re-walk of ground already covered pays no approach at all
+        -- and a clock reading the reward would run out on a target the agent is walking straight at. See
+        `mark_paid`, which restarts the clock for exactly that reason. Within one uninterrupted attempt the two
+        agree by construction, because both are "a new best by more than `min_gain_m`".
+
+        The arena suspension is BOUNDED. `arena_enemies_alive` counts every enemy whose `ActivateNextWave` has
+        not run (CampaignObserver.cs), scoped neither to the target's own arena nor to the player's room, so an
+        un-cleared wave anywhere on the level used to freeze the clock for the rest of the level load: 20,000
+        decisions under an unreachable door produced zero parks, and the telemetry read `targets_parked = 0`,
+        which on the dashboard is indistinguishable from "monotone level, correctly inert". Suspended decisions
+        are counted instead, and the park is forced once clock + suspended reaches `2 * patience_steps` -- 600
+        decisions at the shipped settings, still inside the 675 of `stuck_seconds` 45, so the episode is still
+        the outer bound. Below that bound the suspension does its job: on the recorded 0-1 run four stalls of up
+        to 2,543 decisions ran with an arena alive on 96-100% of their steps, where no approach is possible
+        however well the agent plays. On 0-3's unreachable door the arena count is 0 on 100% of the locked steps.
+
+        Two targets are never parked:
+
+          - the exit, which is terminal: parking it would leave nothing to aim at;
+          - a fetch or carry leg, and any gate still reporting `needs_item`. That one is a safety rule, not a
+            tuning choice. `env._protect_carry` keys the punch-drop on `gates.target` being the ALTAR sub-goal of
+            a held item, because protection and release have to come from one source or the button can be taken
+            away and never given back. Parking the gate deletes the leg, `_subgoal` never rebuilds it, and the
+            protection silently switches off while the skull is still in the player's hands -- and the policy
+            presses punch on ~35% of decisions, which `Punch.ActiveStart` turns into a throw. Reproduced end to
+            end. A skull-locked door is held shut by its altar, not by geometry, which is the same reason the
+            arena case is exempt; the difference is that here the cost of being wrong is the level load.
+        """
+        key = self._key_of(self.target)
+        if key != self._clock_key:
+            # Not a `return`, and the baseline is seeded HERE rather than on the first tick: the step a target is
+            # taken is its first decision, so `patience_steps` decisions holding one target is exactly
+            # `patience_steps` calls, with no off-by-one against the config.
+            self._clock_key, self._clock, self._clock_suspended = key, 0, 0
+            self._clock_best = _dist3(pos, self.target["pos"]) \
+                if pos is not None and (self.target or {}).get("pos") else math.inf
+        gate_key = self._park_key(self.target)
+        if not self.patience_steps or pos is None or key is None or gate_key in (None, GATE_EXIT_KEY):
+            return  # the exit is never parked: it is the terminal target, and parking it leaves nothing
+        if (self.target or {}).get("subgoal") in (SUBGOAL_ITEM, SUBGOAL_ALTAR):
+            return  # a carry in progress: see the docstring. Never park the machine holding the skull.
+        gate = self._gate_by_key(campaign, gate_key)
+        if (gate or {}).get("needs_item"):
+            return  # blocked by an altar rather than by geometry, exactly like an arena-held door
+        distance = _dist3(pos, self.target["pos"]) if self.target.get("pos") else math.inf
+        if distance < self._clock_best - self.min_gain:
+            self._clock_best = distance
+            self._clock = self._clock_suspended = 0
+            return
+        held = ((campaign or {}).get("arena_enemies_alive") or 0) > 0 or fought
+        if held:
+            self._clock_suspended += 1
+        else:
+            self._clock += 1
+        forced = self._clock + self._clock_suspended >= 2 * self.patience_steps
+        if (self._clock < self.patience_steps and not forced) or gate_key in self.parked:
+            return
+        self._clock = self._clock_suspended = 0  # park or not, the next one is another full window away
+        # A2 + A1: the ladder's own pick is only ever SWITCHED away from, never abandoned -- with nothing better
+        # to aim at, its answer remains the best guess available. A FALLBACK pick gets no such protection, and
+        # must not: `_pick` chose it as the nearest unreached, unparked, active gate and `_nearer_unreached`
+        # filters that identical set, so nothing can ever be strictly nearer and the test would make every
+        # fallback target permanent. That turned the wedge into a wedge one door over -- reproduced as 4,000
+        # consecutive decisions aimed through a ceiling with `targets_parked` reading 1, the mechanism showing
+        # as fired. A parked fallback simply hands over to the next-nearest, which is the A2 rule already.
+        if not self._fallback and self._nearer_unreached(campaign, pos, self.target) is None:
+            return
+        here = _dist3(pos, gate["pos"]) if gate and gate.get("pos") else math.inf
+        if key == gate_key:  # a plain gate target: the clock's own baseline is this attempt's closest approach
+            here = min(here, self._clock_best)
+        self.parked.add(gate_key)
+        # Monotone across parks: a re-park can lower the baseline the un-park bar is measured from, never raise
+        # it, so wandering away and stalling somewhere farther off cannot buy a cheap un-park. See `_unpark`.
+        self.park_best[gate_key] = min(here, self.park_best.get(gate_key, math.inf))
+        self.park_count[gate_key] = self.park_count.get(gate_key, 0) + 1
+        self.parks += 1
+        self.retarget(campaign, pos)
+        self._clock_key = self._key_of(self.target)
+        # The replacement target starts its own full window against its own baseline, taken here so its first
+        # decision counts the same as any other target's.
+        self._clock_best = _dist3(pos, self.target["pos"]) \
+            if self.target is not None and self.target.get("pos") else math.inf
 
     # -- helpers -----------------------------------------------------------------------------
 
@@ -790,6 +1068,36 @@ class GateProgress:
     def _nearest(gates: list[dict], pos) -> dict | None:
         return min(gates, key=lambda g: _dist3(pos, g["pos"])) if gates else None
 
+    def _ladder_pick(self, target: dict | None) -> dict | None:
+        """Marks `target` as the ladder's own choice, so reaching it cannot pay a fallback instalment."""
+        self._fallback, self._fallback_key = False, None
+        return target
+
+    def _pick(self, campaign: dict | None, active: list[dict], rung: list[dict], pos) -> dict | None:
+        """A2: the nearest unparked gate on `rung`, else the fallback. None when neither exists.
+
+        The fallback is STICKY within `fallback_hysteresis` metres rather than re-picking the nearest every
+        step: pure "nearest" flaps between two near-equidistant doors 23-59 times per 0-3 episode, which is
+        noise in observation slots 448-455 and in look mode 2. At 10 m the flapping halves to 9-20 with no
+        instalment lost on a walk of 0-3's real route (8 either way, against full stickiness's 5).
+        """
+        free = [g for g in rung if str(g.get("key")) not in self.parked]
+        if free:
+            return self._ladder_pick(self._nearest(free, pos))
+        if not self.patience_steps:
+            return None  # parking off: no fallback exists, so the choice is byte for byte the pre-patience one
+        candidates = [g for g in active
+                      if str(g.get("key")) not in self.reached and str(g.get("key")) not in self.parked]
+        if not candidates:
+            return None
+        nearest = self._nearest(candidates, pos)
+        sticky = next((g for g in candidates if str(g.get("key")) == self._fallback_key), None)
+        pick = nearest
+        if sticky is not None and _dist3(pos, nearest["pos"]) > _dist3(pos, sticky["pos"]) - self.fallback_hysteresis:
+            pick = sticky
+        self._fallback, self._fallback_key = True, str(pick.get("key"))
+        return pick
+
     def _choose_target(self, campaign: dict | None, pos) -> dict | None:
         if pos is None:
             return self.target  # no player this frame: keep pointing where we were
@@ -797,13 +1105,33 @@ class GateProgress:
         if not active:
             return self.target  # keep the previous target rather than flapping while the graph is rebuilt
         if self.best_hops is None:
-            return self._nearest(active, pos)
+            return self._pick(campaign, active, active, pos) or self._exhausted(campaign)
         if self.best_hops == 0:
-            return self._exit(campaign) or self._nearest([g for g in active if int(g["hops"]) == 0], pos) or self.target
+            exit_ = self._exit(campaign)
+            if exit_ is not None:
+                return self._ladder_pick(exit_)
+            zero = [g for g in active if int(g["hops"]) == 0]
+            return self._pick(campaign, active, zero, pos) or self._exhausted(campaign)
         lower = {int(g["hops"]) for g in active if int(g["hops"]) < self.best_hops}
         if not lower:
-            return self._exit(campaign) or self.target
-        return self._nearest([g for g in active if int(g["hops"]) == max(lower)], pos)
+            exit_ = self._exit(campaign)
+            if exit_ is not None:
+                return self._ladder_pick(exit_)
+            return self._pick(campaign, active, [], pos) or self._exhausted(campaign)
+        rung = [g for g in active if int(g["hops"]) == max(lower)]
+        return self._pick(campaign, active, rung, pos) or self._exhausted(campaign)
+
+    def _exhausted(self, campaign: dict | None) -> dict | None:
+        """Nothing left to pick: A2's "then the exit when none remain", else the target we already had.
+
+        Only reachable with patience ON, and only once every unreached gate has been parked -- which Finding 1's
+        relaxation makes possible, since a parked fallback now hands over to the next candidate and can walk the
+        list to the end. Keeping a parked target there would aim at a door already proved unreachable, whereas
+        the exit is at worst a straight line the novelty and path terms already point along. With patience off
+        `_pick` only returns None in the branches that have already tested `_exit` and found nothing, so this is
+        byte for byte the old `_ladder_pick(self.target)`.
+        """
+        return self._ladder_pick(self._exit(campaign) or self.target)
 
     def _subgoal(self, campaign: dict | None, gate: dict | None, pos) -> dict | None:
         """The chosen gate, or the rung below it when a skull has to be fetched to open it.
@@ -865,6 +1193,76 @@ class GateProgress:
         return {"key": key, "pos": pos, "hops": gate.get("hops"),
                 "open": bool(kinds and kind == SUBGOAL_ITEM), "locked": bool(kinds and kind == SUBGOAL_ALTAR),
                 "active": True, "subgoal": kind, "gate_key": gate.get("key"), "item": need}
+
+
+class ExitGuard:
+    """Freezes `campaign.exit.pos` per level load, so a banished `FinalPit` cannot move the goal.
+
+    `CheckPoint.Start` (decompiled/CheckPoint.cs:132) and `CheckPoint.ResetRoom` (:681) clone every room the
+    checkpoint owns and then move the ORIGINAL by `transform.position.x + 10000f`. The clone -- and the real
+    `FinalPit` trigger -- stay where they were, but the mod's frozen exit reference follows the original, so on
+    `Level 0-2` the reported exit jumps (-199.0, -86.1, 277.0) -> (9801.0, -86.1, 277.0) the moment checkpoint
+    `-55,-11,277` activates, which is exactly when the gate ladder hands the target over to the exit.
+    `ResetRoom` runs again on every respawn, so the offset is k * 10000 for k >= 1.
+
+    The guard rewrites the block IN PLACE, which is what lets one call cover all three consumers with no
+    signature change: `GateProgress._exit` (targeting), `spaces.campaign_block` slots 0-4 (the observation) and
+    `env._exit_dist_min`. The proper fix is mod-side, at the next rebuild.
+
+    Recovery matters as much as rejection: the banish only ever ADDS to x, so a later report a whole multiple of
+    10000 BELOW the frozen one is the true pit coming back (the mod re-scanned and found the live clone), and
+    that is accepted rather than ignored -- otherwise a load whose first report was already banished would stay
+    wrong for its whole life.
+    """
+
+    BANISH_X = 10000.0  # CheckPoint.Start / ResetRoom, read from the decompiled game
+    AXIS_EPS = 1.0  # how far y and z may differ and still read as "the same pit, moved along x"
+
+    def __init__(self, max_shift_m: float = 100.0, banish_x: float = BANISH_X, axis_eps: float = AXIS_EPS):
+        self.max_shift = float(max_shift_m)
+        self.banish_x = float(banish_x)
+        self.axis_eps = float(axis_eps)
+        self.frozen: list[float] | None = None
+        self.banished = False  # whether any report has been rejected since the level loaded
+        self.rejections = 0
+
+    def new_level_load(self) -> None:
+        """A real level load: whatever the fresh scene reports is the truth, however far it is from the last."""
+        self.frozen = None
+        self.banished = False
+
+    def apply(self, campaign: dict | None) -> bool:
+        """Rewrites `campaign["exit"]["pos"]` to the frozen position. Returns whether this report was rejected."""
+        exit_ = (campaign or {}).get("exit")
+        pos = exit_.get("pos") if isinstance(exit_, dict) else None
+        if not pos or len(pos) < 3 or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in pos[:3]):
+            return False
+        if self.frozen is None:
+            self.frozen = [float(v) for v in pos[:3]]
+            return False
+        dx, dy, dz = (float(pos[i]) - self.frozen[i] for i in range(3))
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6 and abs(dz) < 1e-6:
+            return False
+        multiples = self._banish_multiples(dx, dy, dz)
+        if multiples < 0:  # a whole multiple back toward x = 0: the live pit, not a banished twin
+            self.frozen = [float(v) for v in pos[:3]]
+            return False
+        if multiples > 0 or math.sqrt(dx * dx + dy * dy + dz * dz) > self.max_shift:
+            exit_["pos"] = list(self.frozen)
+            self.banished = True
+            self.rejections += 1
+            return True
+        self.frozen = [float(v) for v in pos[:3]]  # a small, plausible move: the mod found a better reference
+        return False
+
+    def _banish_multiples(self, dx: float, dy: float, dz: float) -> int:
+        """How many 10,000 m banish steps this displacement is, signed; 0 when it is not one at all."""
+        if abs(dy) > self.axis_eps or abs(dz) > self.axis_eps:
+            return 0
+        k = round(dx / self.banish_x)
+        if k == 0 or abs(dx - k * self.banish_x) > self.axis_eps:
+            return 0
+        return int(k)
 
 
 class PathProgress:
