@@ -53,6 +53,15 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - `python/scripts/`: `bridge_test.py` (`--drive`, `--campaign`), `random_agent.py` (`--mode campaign` prints completed / checkpoints_level / cells_new per episode), `train.py` (PPO / RecurrentPPO, `--num-envs` uses SubprocVecEnv), `eval.py`, `games.py` (launch/tile/status/stop training instances), `dashboard.py` (Tkinter live view of `status.json`).
 - `python/ultrakill_ai/windows.py`: monitor work-area lookup shared by `games.py` and `dashboard.py`.
 - `python/scripts/campaign_check.py`: in-game campaign checks on one game (difficulty, arsenal, checkpoint trigger, death respawn, exit and official time). `python/tests/test_campaign_check.py` runs the same five checks against a fake level (no game needed).
+- `python/scripts/watch_completion.py`: watches a **human** playthrough read-only (never takes control, never
+  configures, never writes) and reports when `level_started`, `exit.active` and `level_over` change, so a real run
+  can prove the completion signal works. This is what cleared the exit blocker on 0-1; reach for it whenever a
+  question is about what real play does, since the AI cannot yet reach the end of a level.
+- `python/scripts/walk_to_exit.py`: drives a level toward its exit with scripted movement (waypoints are the
+  level's checkpoints in nearest-neighbour order, shooting what gets in the way) and reports whether the level
+  reports complete. Kept for the diagnosis it produced rather than for routine use: it cannot leave 0-1's sealed
+  starting room, and its teleport ancestor showed that teleporting never activates rooms at all. Both failures
+  are documented in the pilot entry under Status.
 - `python/scripts/transfer_weights.py`: campaign starting weights from a Cyber Grind checkpoint. Widens the 448 inputs to 479 (first-layer columns 0-442 copied, 443-478 zero, so Cyber Grind inputs give the same hidden features), scales the action head by `--action-scale` (default 0.5) to raise entropy, and keeps a fresh final value layer and optimizer. Output: `models/campaign_ppo/transfer_init.zip` (committed).
 - `python/ultrakill_ai/times.py`: reads and updates `times.md` (`record` is pure, `record_file` edits in place). Level cells use the short form (`0-1`), times are `mm:ss.mmm`, the leaderboard is sorted by campaign order and only a faster time replaces a row.
 - `python/tests/test_progress.py`: `ProgressCallback`, dashboard and `poll_status.py` tests against fake Cyber Grind and campaign envs (no game needed).
@@ -538,7 +547,27 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
        up from 10% at 1.13M.
     3. **+2.0M steps (~4.59M): `campaign.fresh_completion_rate` > 0** with `fresh_window` >= 20.
     Gate every comparison on `window >= 50`.
-  - **Open, and worth 15 minutes before more GPU time: nobody has ever seen a completion register through the
+  - **BLOCKER CLEARED 2026-09-16: a completion does register through the bridge, confirmed on a human
+    playthrough of 0-1.** Watched read-only with `scripts/watch_completion.py` while the user played:
+    `level_started` false -> true at t 0.23 s; **`exit.active` false -> true at t 122.2 s**, after all 6
+    checkpoints; `level_over` true at **t 146.582 s** with 59 kills. So the exit room *is* switched on by real
+    play, `stats.level_complete || campaign.level_over` fires in the pit, and the whole path `env.py` grades a
+    completion on works end to end. `campaign_check.py` check 5's FAIL was an artifact of the check itself
+    (teleporting onto a collider in a room that is still switched off), not a broken chain.
+    - **Human reference time for 0-1: 2:26.58 (146.58 s), 59 kills, 6 checkpoints.** That is the bar.
+    - The run reported `cleared_arenas` 0 and `unlocked_doors` 0, which is expected and not a discrepancy:
+      `CampaignPatches.RecordArenaClear` and `RecordDoorUnlock` are both gated on `EpisodeController.InControl`,
+      so they only record while the AI is driving. The training run's `arena_clear` / `door_unlock` payments are real.
+    - **Two automated attempts could not answer this, and the reasons are worth keeping.** (1) *Teleporting cannot
+      play the level.* Hops of 5 m walked the player through 0-1's entire geometry to the pit while `enemies`,
+      `locked_doors` and `cleared_arenas` all stayed empty and the exit stayed inactive: rooms ahead of the player
+      are switched off, so their trigger volumes are off too, and a teleport into dead space fires nothing. The
+      player then fell to y -507 and kept going, independently confirming there is no kill plane under this level.
+      (2) *Scripted movement cannot leave the starting room.* Dropping to 1.2 m hops jammed the player against a
+      closed door at z 347 that the 5 m hops had been tunnelling through, and a scripted walk-and-shoot spent
+      63,000 decisions inside a 6 m box with 0 kills. A probe at spawn shows why: `level_started` false,
+      `slot_counts` all zero, and walls 3.5-6.6 m away in all 16 ray directions. 0-1 spawns you sealed in.
+  - **Was open, now answered by the above: nobody had ever seen a completion register through the
     bridge.** `part_level_complete` is blank in all 544 rows of the pre-fix run and `best_runs/` is empty. The code
     path reads right -- `FinalPit.OnTriggerEnter` sets `nmov.levelOver`, `ObservationBuilder.cs:274` reads
     `sm.infoSent || nm.levelOver` (so detection does not depend on the campaign `exit` block), and `Door.Open()`
