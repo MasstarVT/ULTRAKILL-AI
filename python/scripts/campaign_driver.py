@@ -68,6 +68,10 @@ from typing import Callable, Iterable, NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
+
+cap_blas_threads()  # before ultrakill_ai.campaign; the driver only reads JSON and starts processes
+
 import yaml  # noqa: E402
 
 import supervise  # noqa: E402

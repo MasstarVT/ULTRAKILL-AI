@@ -20,10 +20,14 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-import yaml
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
+
+cap_blas_threads()  # before numpy: OpenBLAS reserves ~785 MB of commit for thread buffers at load
+
+import numpy as np  # noqa: E402
+import yaml  # noqa: E402
 
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS, ExplorationArchive, safe_name  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402

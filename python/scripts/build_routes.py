@@ -65,10 +65,17 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from ultrakill_ai.procmem import cap_blas_threads, refuse_if_commit_high  # noqa: E402
+
+cap_blas_threads()  # before numpy: OpenBLAS reserves ~785 MB of commit for thread buffers at load
+# This one parses every shipped scene bundle and is the heaviest offline script in the repo. It is safe
+# beside a live run only while the box HAS room; at 85% commit it is the thing that tips it over.
+refuse_if_commit_high("build_routes.py")
+
+import numpy as np  # noqa: E402
 
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS, CAMPAIGN_LEVELS_SHIPPED, safe_name  # noqa: E402
 

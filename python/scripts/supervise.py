@@ -95,6 +95,10 @@ from typing import Callable, Iterable, NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
+
+cap_blas_threads()  # a watchdog must never be the process that runs the box out of commit
+
 from ultrakill_ai.envlog import tail as envlog_tail  # noqa: E402
 
 HOUR = 3600.0

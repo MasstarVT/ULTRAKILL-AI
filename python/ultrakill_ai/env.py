@@ -48,6 +48,9 @@ from ultrakill_ai.protocol import (
     BridgeTimeout,
 )
 from ultrakill_ai.envlog import EnvLog, env_log_path
+from ultrakill_ai.procmem import GB as PROC_GB
+from ultrakill_ai.procmem import MB as PROC_MB
+from ultrakill_ai.procmem import derive_game_limit, private_bytes
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
 from ultrakill_ai.spaces import PITCH_BINS, YAW_BINS, ObsLayout, action_space, decode_action, pack_observation, yaw_frame
 
@@ -231,6 +234,16 @@ class EnvConfig:
     bridge_relaunch_slots: int = 2
     bridge_relaunch_stagger_s: float = 4.0  # per-port stagger, the same one `games.launch` uses for cold starts
     env_log_dir: str = ""  # runs/<run>/, where env_<port>.log is written ("" = no attribution log)
+    # Recycle THIS env's own game at an EPISODE BOUNDARY once it has grown this many GB above the freshest
+    # copy running (0 = off). ULTRAKILL leaks under training -- measured 2026-09-18 at ~0.5-0.8 GB per game
+    # per hour, which is what took a 60 GB commit limit down twice -- and `scripts/mem_guard.py` already
+    # recycles a fat game from outside. The difference is WHEN: the guard kills the game at an arbitrary
+    # moment and the env truncates that episode as `bridge_reset`, while this fires inside `reset()`, where
+    # the episode has already ended and the level is about to be loaded anyway. Same boot cost, no episode
+    # lost. It rides the existing relaunch rung, so it inherits the cross-process permits and the per-port
+    # stagger, and it is inert without `bridge_relaunch` -- which only `train.py` ever sets, so an eval or a
+    # test can no more recycle a game this way than it can relaunch one.
+    game_memory_growth_gb: float = 0.0
 
     layout: ObsLayout = field(default_factory=ObsLayout)
     rewards: RewardConfig = field(default_factory=RewardConfig)
@@ -388,6 +401,8 @@ class UltrakillEnv(gym.Env):
         self._recovery_logged = False  # ... and whether anything has actually failed inside it yet
         self._recovery_reason = ""
         self._relaunches = 0  # times this env relaunched its OWN game instance
+        self._mem_recycles = 0  # times it replaced its own game between episodes for leaking
+        self._mem_recycle_off = False  # latched off if a freshly booted game is still over the limit
 
         self._raw: dict[str, Any] = {}
         self._enemy_max_health: dict[int, float] = {}
@@ -516,6 +531,7 @@ class UltrakillEnv(gym.Env):
         self.envlog.event("reset_start", level=self.level)
         deadline, owned = self._begin_recovery("reset")
         try:
+            self._recycle_own_game_if_fat(deadline)
             try:
                 out = self._reset(seed=seed, options=options)
             except BridgeRecovered as rebuilt:
@@ -858,6 +874,68 @@ class UltrakillEnv(gym.Env):
             release_relaunch_slot(permit)
         self.envlog.event("relaunch_end", ok=bool(ok))
         return bool(ok)
+
+    def _recycle_own_game_if_fat(self, deadline: float) -> None:
+        """Restarts this env's own game between episodes when it has leaked past the fleet-derived limit.
+
+        Called from `reset()` and nowhere else, so the game is replaced at the one moment when nothing is
+        lost: the episode has ended and a level load is about to happen regardless. `scripts/mem_guard.py`
+        does the same job from outside for the cases this cannot reach (a worker wedged mid-episode, a
+        run with `bridge_relaunch` off, a game nobody is stepping), and both derive the limit from the same
+        `procmem.derive_game_limit`, so they cannot disagree about what "too fat" means.
+
+        Every failure here is swallowed: a memory optimisation may not be a new way for a reset to die.
+        """
+        if self.cfg.game_memory_growth_gb <= 0 or not self.cfg.bridge_relaunch or self._mem_recycle_off:
+            return
+        try:
+            sizes = self._fleet_memory_hook()
+            mine = sizes.get(self.cfg.port)
+            if not mine:
+                return
+            limit = derive_game_limit(sizes, int(self.cfg.game_memory_growth_gb * PROC_GB))
+            if mine <= limit:
+                return
+            self.envlog.event("mem_recycle_start", private_mb=mine // PROC_MB, limit_mb=limit // PROC_MB)
+            if not self._relaunch_own_game(deadline):
+                return
+            self._reconnect()  # the process it was talking to is gone; never reuse that socket
+            after = self._fleet_memory_hook().get(self.cfg.port) or 0
+            self._mem_recycles += 1
+            self.envlog.event("mem_recycle_end", n=self._mem_recycles, before_mb=mine // PROC_MB,
+                              after_mb=after // PROC_MB, freed_mb=(mine - after) // PROC_MB)
+            print("UltrakillEnv[%d]: recycled a leaking game between episodes, %.2f -> %.2f GB (freed %.2f GB)"
+                  % (self.cfg.port, mine / PROC_GB, after / PROC_GB, (mine - after) / PROC_GB), flush=True)
+            if after > limit:
+                # A fresh game that is already over the limit means the limit is wrong, not that the game is
+                # fat. Relaunching again would be an infinite loop that never trains, so this env stops.
+                self._mem_recycle_off = True
+                self.envlog.event("mem_recycle_disabled", after_mb=after // PROC_MB, limit_mb=limit // PROC_MB)
+        except Exception as exc:  # noqa: BLE001 - never turn a memory check into a failed reset
+            self._mem_recycle_off = True
+            self.envlog.event("mem_recycle_error", error="%s: %s" % (type(exc).__name__, exc))
+
+    def _fleet_memory_hook(self) -> dict[int, int]:
+        """port -> committed private bytes for every listening game. Replaced in tests; never opens a port."""
+        import sys as _sys
+
+        scripts = Path(__file__).resolve().parents[1] / "scripts"
+        if str(scripts) not in _sys.path:
+            _sys.path.insert(0, str(scripts))
+        import games  # noqa: PLC0415 - lazy on purpose, exactly as `_relaunch_hook` does
+
+        # Only ULTRAKILL processes. `listening_pids` is every listening port on the machine -- 19 of them with
+        # no game running at all -- and a stray 1 GB service answering on some port would otherwise be taken
+        # for the "freshest game" and drag the derived limit down onto healthy copies.
+        game_pids = set(games.working_sets())
+        sizes = {}
+        for port, pid in games.listening_pids().items():
+            if pid not in game_pids:
+                continue
+            size = private_bytes(pid)
+            if size:
+                sizes[port] = size
+        return sizes
 
     def _relaunch_hook(self, port: int, wait_s: float) -> bool:
         """The live relaunch, then the boot gate. Split out so the tests replace it and never start a game.
