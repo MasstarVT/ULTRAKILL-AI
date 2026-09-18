@@ -87,10 +87,13 @@ def wired(lines, sends_raise=None, **kwargs) -> tuple[BridgeClient, FakeSocket]:
 def test_a_reset_waits_far_longer_than_a_step():
     # The whole root cause in one assertion: a reset blocks on a Unity scene load and a step on one frame, so
     # they cannot share a deadline. They used to, at 120 s -- the same number as the mod's own reset timeout.
+    # Each request arms its bound TWICE, once for the send and once for the read: a socket timeout is sticky,
+    # so a reset that armed only the read left its bound on the socket for the next send (see test_freeze).
     client, sock = wired(['{"type":"obs"}\n', '{"type":"obs"}\n'])
     client.step({})
     client.reset(LEVEL)
-    assert sock.timeouts == [DEFAULT_STEP_TIMEOUT, DEFAULT_RESET_TIMEOUT]
+    assert sock.timeouts == [DEFAULT_STEP_TIMEOUT, DEFAULT_STEP_TIMEOUT,
+                             DEFAULT_RESET_TIMEOUT, DEFAULT_RESET_TIMEOUT]
     assert DEFAULT_RESET_TIMEOUT > DEFAULT_STEP_TIMEOUT
 
 

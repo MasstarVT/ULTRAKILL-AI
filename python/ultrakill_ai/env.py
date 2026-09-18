@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import time
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -37,9 +38,12 @@ from ultrakill_ai.protocol import (
     DEFAULT_STEP_TIMEOUT,
     RECOVERABLE,
     BridgeClient,
+    BridgeClosed,
     BridgeError,
     BridgeSceneUnknown,
+    BridgeTimeout,
 )
+from ultrakill_ai.envlog import EnvLog, env_log_path
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
 from ultrakill_ai.spaces import PITCH_BINS, YAW_BINS, ObsLayout, action_space, decode_action, pack_observation, yaw_frame
 
@@ -162,12 +166,52 @@ class EnvConfig:
     # pipe reads EOF and every other game's rollout dies with it. See the timeout gotcha in CLAUDE.md.
     step_timeout_s: float = DEFAULT_STEP_TIMEOUT  # one frame; generous, but a step is not a scene load
     reset_timeout_s: float = DEFAULT_RESET_TIMEOUT  # a scene load, with 12 games loading at once
-    bridge_retries: int = 3  # reconnect attempts before a bridge failure is finally raised
+    bridge_retries: int = 3  # reconnect attempts before the relaunch rung is tried
     bridge_backoff_s: float = 5.0  # first backoff; the nth attempt waits n times this
     # How long `unknown scene` is tolerated on a reset before it counts as a failure. It means the game is still
     # booting (its Addressables locators are empty while the bridge port is already up), so the cure is waiting.
     unknown_scene_wait_s: float = 300.0
-    connect_retry_s: float = 180.0  # how long connect() keeps retrying while a relaunched game starts
+    # How long connect() keeps retrying while a relaunched or still-booting game starts. This is a RETRY
+    # WINDOW, not a blocking bound -- each attempt is capped by `DEFAULT_CONNECT_TIMEOUT` (10 s) and the
+    # ladder clamps the window to whatever is left of the recovery budget -- so it is set by how long a cold
+    # Unity instance takes to open its port, not by how long a worker may block. It was briefly 60 s, which
+    # is less patience than `supervise.await_boot` assumes when it gives up on a cold copy and starts the
+    # trainer anyway ("the env retries for 300s"): that start then lost the race and burned a restart.
+    connect_retry_s: float = 180.0
+    # THE TOTAL a recovery may take, wall clock, every attempt and the relaunch included. Everything above is a
+    # per-step bound; without a total, three retries of (close + connect + handshake + reset) composed to about
+    # 70 minutes, and `reset()` retried the whole ladder on top of that. The supervisor's patience is 900 s, so
+    # a recovery that outlasts this budget is not a recovery -- it is a hang, and it should end the worker
+    # promptly instead. See the freeze gotcha in CLAUDE.md for the arithmetic.
+    bridge_recovery_budget_s: float = 540.0
+    # What the MOD is told to tolerate before it drops a silent client (`EpisodeController.commandTimeoutMs`,
+    # 300 s by default). This is why the 2026-09-17 freeze left eleven games running free with no connection:
+    # they were not broken, they were idle behind one blocked worker -- vectorized envs step in lockstep -- and
+    # the mod dropped each of them after five minutes of hearing nothing. Their workers then had to recover too,
+    # so ONE sick game cost twelve episodes. It must outlast one worker's whole recovery: the step that faults
+    # 120 + the recovery budget 540 = 660 s, so 900 leaves four minutes of margin. The mod reads the key at
+    # `EpisodeController.cs:266`, so this is live -- but a DLL built before that line keeps its own 300 s and
+    # the siblings are dropped whatever is set here. Confirmed present in the installed mod on 2026-09-17.
+    mod_command_timeout_s: int = 900
+    # Last rung of the ladder: relaunch THIS env's own game and wait for it to boot. Never touches another port.
+    # OFF by default and turned on by `train.py` alone, so nothing else that builds an env -- eval.py,
+    # bridge_test.py, campaign_check.py, every test -- can ever restart a game process. A relaunch is a real
+    # side effect on a real machine; only the process whose job is to keep twelve games running gets it.
+    bridge_relaunch: bool = False
+    bridge_relaunch_boot_mb: int = 600  # working set an instance must pass before it counts as booted (~1 GB when up)
+    bridge_relaunch_wait_s: float = 240.0  # longest wait for the relaunched instance to open its port and boot
+    # Budget RESERVED for the relaunch rung, so the reconnect rung above it cannot spend the lot. Without a
+    # reserve the relaunch was unreachable in the one fault shape it exists for: rung 0's three attempts each
+    # cost a full reset timeout against a game that answers nothing, so the budget was always negative by the
+    # time the rung was tested and the loop broke instead. Measured on a fake clock: a game that answered
+    # `hello` and never answered a reset reached the relaunch on 0 of 1 runs before this, 1 of 1 after.
+    bridge_relaunch_reserve_s: float = 240.0
+    # At most this many workers may be inside a relaunch at once, across processes (a lock file in
+    # `env_log_dir`). Twelve workers step in lockstep, so a fault that drops the games hits all twelve within
+    # one step, and twelve simultaneous cold Unity starts on an already-thrashing box boot none of them in time.
+    bridge_relaunch_slots: int = 2
+    bridge_relaunch_stagger_s: float = 4.0  # per-port stagger, the same one `games.launch` uses for cold starts
+    env_log_dir: str = ""  # runs/<run>/, where env_<port>.log is written ("" = no attribution log)
 
     layout: ObsLayout = field(default_factory=ObsLayout)
     rewards: RewardConfig = field(default_factory=RewardConfig)
@@ -179,14 +223,91 @@ class EnvConfig:
         rewards = RewardConfig(**_known_fields(RewardConfig, d.pop("rewards", None) or {}))
         return cls(**_known_fields(cls, d), layout=layout, rewards=rewards)
 
+    # Settings that belong to ONE running trainer and must never travel in a file. `train.py` writes
+    # `models/<run>/env_config.yaml` from `to_dict`, and `eval.py` loads exactly that file -- so serializing
+    # these handed every eval the power to kill a game process (`bridge_relaunch`) and a path into the live
+    # run's attribution log (`env_log_dir`). An eval against port 47800 during a run would then `taskkill` a
+    # TRAINING game on the first bridge hiccup. `fill_run_dirs` puts them back for the trainer, in memory,
+    # every time it starts.
+    RUN_ONLY_FIELDS = ("bridge_relaunch", "env_log_dir")
+
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        out = asdict(self)
+        for key in self.RUN_ONLY_FIELDS:
+            out.pop(key, None)
+        return out
 
 
 BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "yaw_err_sum", "dist_sum", "yaw_sum",
                   "pitch_steps", "pitch_sum", "pitch_signed_sum", "look_up_sum", "elev_steps", "elev_sum", "elev_abs_sum", "elev_over15", "pitch_err_sum",
                   "yaw_track", "yaw_track_n", "pitch_track", "pitch_track_n",
                   "look_free", "look_enemy", "look_gate", "slide_forced")
+
+
+_NO_SLOT = "<none>"  # the sentinel for "nothing to serialize against", never a real path
+
+
+def acquire_relaunch_slot(directory: str, slots: int, stale_age_s: float,
+                          deadline: float, *, now=time.monotonic, sleep=time.sleep,
+                          wall=time.time) -> str | None:
+    """Takes one of `slots` cross-process relaunch permits, or None if none came free in time.
+
+    Twelve workers step in lockstep, so a fault that drops the games hits all twelve within one step and every
+    one of them reaches the relaunch rung at the same moment. Twelve simultaneous cold Unity starts on a box
+    that is already thrashing boot none of them inside the per-worker wait, so each `relaunch_one` returns
+    False, each worker dies anyway -- and twelve games have been killed and restarted behind the supervisor's
+    back for nothing. `games.launch` staggers its twelve cold starts by 4 s for the same reason.
+
+    A permit is a file created with `O_EXCL` (atomic on Windows as on POSIX) holding the pid and the wall
+    clock. A permit older than `stale_age_s` is assumed to belong to a worker that died holding it and is
+    taken over, so a crash cannot wedge the rung shut for the rest of the run.
+
+    Returns the permit path to pass to `release_relaunch_slot`, or None when the caller should give up the
+    rung cleanly. With no `directory` (eval, tests, any env with no run log) there is nothing to serialize
+    against and the permit is free: `_NO_SLOT`.
+    """
+    if not directory:
+        return _NO_SLOT
+    base = Path(directory)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return _NO_SLOT  # an unwritable run directory may not be the reason a game is not restarted
+    while True:
+        freed = False
+        for index in range(max(1, slots)):
+            path = base / ("relaunch.%d.lock" % index)
+            try:
+                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:  # a permit whose holder died is taken over rather than waited on forever
+                    if wall() - path.stat().st_mtime > stale_age_s:
+                        path.unlink()
+                        freed = True
+                except OSError:
+                    pass
+                continue
+            except OSError:
+                return _NO_SLOT
+            try:
+                os.write(fd, ("pid=%d t=%.0f\n" % (os.getpid(), wall())).encode("utf-8"))
+            finally:
+                os.close(fd)
+            return str(path)
+        if freed:
+            continue  # a permit was just reclaimed; take it before sleeping or giving up
+        if deadline - now() <= 0:
+            return None
+        sleep(min(2.0, max(0.1, deadline - now())))
+
+
+def release_relaunch_slot(permit: str | None) -> None:
+    if not permit or permit == _NO_SLOT:
+        return
+    try:
+        os.unlink(permit)
+    except OSError:
+        pass
 
 
 class BridgeRecovered(Exception):
@@ -236,6 +357,13 @@ class UltrakillEnv(gym.Env):
                                    timeout=self.cfg.step_timeout_s, reset_timeout=self.cfg.reset_timeout_s)
         self._connected = False
         self._bridge_resets = 0  # times this env rebuilt its connection (episodes.jsonl end_reason bridge_reset)
+        # Attribution: one line per reset, recovery attempt, relaunch and timeout, in runs/<run>/env_<port>.log.
+        # `print` is not enough -- the supervisor's detached spawn discards the trainer's stdout entirely.
+        self.envlog = EnvLog(env_log_path(self.cfg.env_log_dir, self.cfg.port), self.cfg.port)
+        self._recovery_deadline: float | None = None  # set while ONE recovery is in flight, shared by its layers
+        self._recovery_logged = False  # ... and whether anything has actually failed inside it yet
+        self._recovery_reason = ""
+        self._relaunches = 0  # times this env relaunched its OWN game instance
 
         self._raw: dict[str, Any] = {}
         self._enemy_max_health: dict[int, float] = {}
@@ -311,7 +439,12 @@ class UltrakillEnv(gym.Env):
     def _ensure_connected(self) -> None:
         if self._connected:
             return
-        self.client.connect(retry_seconds=self.cfg.connect_retry_s)
+        # Clamped to the recovery budget when one is live: a connect that retried past the deadline is how the
+        # "total" budget was overspent by a whole retry window.
+        retry = self.cfg.connect_retry_s
+        if self._recovery_deadline is not None:
+            retry = self._clamp(retry, self._recovery_deadline)
+        self.client.connect(retry_seconds=retry)
         mod_layout = self.cfg.layout.mod_config()
         # Ask the mod for more enemies than the policy sees so damage rewards aren't missed.
         mod_layout["max_enemies"] = max(32, self.cfg.layout.max_enemies)
@@ -322,6 +455,8 @@ class UltrakillEnv(gym.Env):
             mute=self.cfg.mute,
             block_human_input=self.cfg.block_human_input,
             reset_settle_frames=self.cfg.reset_settle_frames,
+            # So one worker's recovery does not get the other eleven games' clients dropped (see the field).
+            command_timeout_s=int(self.cfg.mod_command_timeout_s),
             soft_death=self.cfg.soft_death and self.cfg.mode == "cybergrind",
             render=self.cfg.render,
             windowed=self.cfg.windowed,
@@ -340,16 +475,34 @@ class UltrakillEnv(gym.Env):
         `_resilient_reset` already reconnects around the reset request itself; this outer layer catches the
         rest of a reset -- `_skip_locked`'s steps, `_enter_arena`'s -- so no part of starting an episode can
         kill a worker while the other eleven games are mid-rollout.
+
+        The retry runs inside ONE recovery budget with the inner ladder, not on top of it: the budget opens
+        HERE, at the outermost frame, before `_reset` runs, so `_resilient_reset` and this tail handler both
+        JOIN it rather than each opening their own. A `reset()` therefore costs at most
+        `bridge_recovery_budget_s` in total, however many layers of it end up retrying. Two nested ladders,
+        each paying a full budget, are how a single bad reset became a 19-minute freeze.
+
+        The first connect is inside the budget too. `_ensure_connected` runs at the top of `_reset`, so a game
+        whose port is not listening yet -- a cold copy the supervisor's boot gate gave up on -- now gets the
+        whole budget's patience through this handler instead of raising out of the worker.
         """
+        started = time.monotonic()
+        self.envlog.event("reset_start", level=self.level)
+        deadline, owned = self._begin_recovery("reset")
         try:
-            return self._reset(seed=seed, options=options)
-        except BridgeRecovered as rebuilt:
-            self._adopt_fresh_load(rebuilt.raw)
-            return self._reset(seed=seed, options=options)
-        except RECOVERABLE as exc:
-            self._note_bridge_reset("%s while resetting: %s" % (type(exc).__name__, exc))
-            self._reconnect()
-            return self._reset(seed=seed, options=options)
+            try:
+                out = self._reset(seed=seed, options=options)
+            except BridgeRecovered as rebuilt:
+                self._adopt_fresh_load(rebuilt.raw)
+                out = self._reset(seed=seed, options=options)
+            except RECOVERABLE as exc:
+                self._note_bridge_reset("%s while resetting: %s" % (type(exc).__name__, exc))
+                self._reconnect_within(deadline)
+                out = self._reset(seed=seed, options=options)
+        finally:
+            self._end_recovery(owned, "reset_done")
+        self.envlog.event("reset_end", level=self.level, dt_s=time.monotonic() - started)
+        return out
 
     def _reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
@@ -423,9 +576,16 @@ class UltrakillEnv(gym.Env):
         except BridgeRecovered as rebuilt:
             return self._end_on_bridge_reset(rebuilt.raw)
         except RECOVERABLE as exc:
-            self._note_bridge_reset("%s while stepping: %s" % (type(exc).__name__, exc))
-            raw, _ = self._resilient_reset(checkpoint=False, reconnect_first=True)
-            return self._end_on_bridge_reset(raw)
+            # The budget opens HERE, before the first log line, so the event log says the fault began in a
+            # step rather than inheriting the reason of the reset that started this episode, and so the whole
+            # recovery -- ladder, relaunch and all -- is closed by this frame and not by one inside it.
+            _, owned = self._begin_recovery("step")
+            try:
+                self._note_bridge_reset("%s while stepping: %s" % (type(exc).__name__, exc))
+                raw, _ = self._resilient_reset(checkpoint=False, reconnect_first=True)
+                return self._end_on_bridge_reset(raw)
+            finally:
+                self._end_recovery(owned, "step_done")
 
     def _step(self, action):
         prev = self._raw
@@ -547,20 +707,162 @@ class UltrakillEnv(gym.Env):
         return self._pack(cur), float(reward.total), terminated, truncated, info
 
     def close(self) -> None:
+        """Bounded teardown: this runs while eleven other workers wait to exit, and one sick game may not
+        hold the trainer open. `BridgeClient.close` waits at most `close_timeout` for the release reply."""
         try:
             self._save_archive()
         finally:
             # Release the game even if the archive could not be written, so it never stays in lockstep.
             if self._connected:
-                self.client.close()
+                try:
+                    self.client.close()
+                except (OSError, BridgeError, ValueError) as exc:
+                    self.envlog.event("close_failed", error="%s: %s" % (type(exc).__name__, exc))
                 self._connected = False
+            self.envlog.event("closed", bridge_resets=self._bridge_resets or None,
+                              relaunches=self._relaunches or None)
 
     # Bridge recovery ---------------------------------------------------
 
     def _note_bridge_reset(self, message: str) -> None:
-        """Counts a rebuilt bridge and says so in the training log, tagged with the port that broke."""
+        """Counts a rebuilt bridge and says so, tagged with the port that broke.
+
+        Written to `runs/<run>/env_<port>.log` as well as printed, because the supervisor spawns the trainer
+        detached and a detached shell redirect silently discards stdout: for seven hours on 2026-09-17 every
+        one of these lines went nowhere and the freeze could not be attributed. See the freeze gotcha.
+        """
         self._bridge_resets += 1
+        self._recovery_noticed()
+        self.envlog.event("bridge_reset", n=self._bridge_resets, why=message)
         print("UltrakillEnv[%d]: %s (bridge reset #%d)" % (self.cfg.port, message, self._bridge_resets), flush=True)
+
+    # -- the recovery budget ----------------------------------------------
+
+    def _begin_recovery(self, reason: str) -> tuple[float, bool]:
+        """Opens (or joins) the ONE wall-clock budget a recovery gets. Returns `(deadline, opened_here)`.
+
+        Joining matters: `reset()` catches what `_resilient_reset` finally raises and calls it again, so
+        without a shared deadline the budget is paid twice -- and the pair of them then outlast the supervisor,
+        which is the whole failure.
+
+        `opened_here` is what makes the deadline authoritative instead of advisory. Only the frame that OPENED
+        a budget may close it. `_resilient_reset` used to close every budget it touched, including one opened
+        above it, so `reset()`'s tail handler -- which fires when `_skip_locked` hits a frozen game after a
+        reset that DID answer -- found a cleared deadline and opened a SECOND full budget. Measured on a fake
+        clock before this change: two budgets, 1000->1540 and 1183->1723, for one fault.
+
+        Silent on the happy path: every reset passes through here, and a reset that works first time is not a
+        recovery. `_recovery_noticed` is what puts a line in the log, on the first thing that actually fails.
+        """
+        if self._recovery_deadline is None:
+            self._recovery_deadline = time.monotonic() + max(1.0, self.cfg.bridge_recovery_budget_s)
+            self._recovery_reason = reason  # the reason the budget OPENED, not the layer that joined it
+            return self._recovery_deadline, True
+        return self._recovery_deadline, False
+
+    def _recovery_noticed(self) -> None:
+        """Logs `recover_start` once per recovery, at the first failure rather than at every reset."""
+        if not self._recovery_logged:
+            self._recovery_logged = True
+            self.envlog.event("recover_start", reason=self._recovery_reason,
+                              budget_s=self.cfg.bridge_recovery_budget_s)
+
+    def _end_recovery(self, owned: bool, outcome: str, **fields: Any) -> None:
+        """Closes the budget, but only from the frame that opened it (see `_begin_recovery`)."""
+        if not owned:
+            return
+        if self._recovery_logged:
+            self.envlog.event("recover_end", outcome=outcome, **fields)
+        self._recovery_deadline = None
+        self._recovery_logged = False
+        self._recovery_reason = ""
+
+    def _budget_left(self, deadline: float) -> float:
+        return deadline - time.monotonic()
+
+    def _clamp(self, want: float, deadline: float) -> float:
+        """`want`, cut down to what is left of the budget (never below 1 s, so a call is always really made).
+
+        This is what turns the deadline from advisory into authoritative. A call admitted with a moment of
+        budget left used to run its own full bound on top of it -- a reset timeout of 180 s past a spent
+        budget, twice over if a connect went first -- so "bounded by 540 s" meant 780 s in the worst case.
+        """
+        return max(1.0, min(want, self._budget_left(deadline)))
+
+    def _relaunch_own_game(self, deadline: float) -> bool:
+        """Restarts THIS env's instance and waits for it to boot. Never touches another port.
+
+        The rung below a reconnect: a game that answers nothing after three rebuilt connections is not going to
+        start answering, and `games.relaunch_one` restarts exactly the one process listening on this env's port,
+        leaving the other eleven games and their rollouts alone. A whole-set relaunch is the supervisor's job and
+        costs four minutes; this costs one game.
+        """
+        if not self.cfg.bridge_relaunch:
+            return False
+        wait = min(self.cfg.bridge_relaunch_wait_s, max(0.0, self._budget_left(deadline)))
+        if wait < 30.0:  # not enough budget left to boot a game; let the caller give up cleanly instead
+            self.envlog.event("relaunch_skipped", budget_left_s=max(0.0, self._budget_left(deadline)))
+            return False
+        # De-synchronise the twelve workers that all reached this rung on the same step, then take one of the
+        # few cross-process permits. Both exist so a fault that drops every game does not become twelve
+        # simultaneous cold Unity starts; see `acquire_relaunch_slot`.
+        stagger = (self.cfg.port % 4) * max(0.0, self.cfg.bridge_relaunch_stagger_s)
+        if stagger:
+            self._sleep_within(stagger, deadline)
+        permit = acquire_relaunch_slot(self.cfg.env_log_dir, self.cfg.bridge_relaunch_slots,
+                                       self.cfg.bridge_relaunch_wait_s + 120.0, deadline)
+        if permit is None:
+            self.envlog.event("relaunch_no_slot", budget_left_s=max(0.0, self._budget_left(deadline)))
+            return False
+        wait = min(self.cfg.bridge_relaunch_wait_s, max(0.0, self._budget_left(deadline)))
+        if wait < 30.0:  # the queue ate the budget: give up the rung cleanly rather than half-boot a game
+            release_relaunch_slot(permit)
+            self.envlog.event("relaunch_skipped", budget_left_s=max(0.0, self._budget_left(deadline)))
+            return False
+        self._relaunches += 1
+        self._recovery_noticed()
+        self.envlog.event("relaunch_start", n=self._relaunches, wait_s=wait)
+        try:
+            ok = self._relaunch_hook(self.cfg.port, wait)
+        except Exception as exc:  # noqa: BLE001 - a failed relaunch must not be a new kind of crash
+            self.envlog.event("relaunch_failed", error="%s: %s" % (type(exc).__name__, exc))
+            return False
+        finally:
+            release_relaunch_slot(permit)
+        self.envlog.event("relaunch_end", ok=bool(ok))
+        return bool(ok)
+
+    def _relaunch_hook(self, port: int, wait_s: float) -> bool:
+        """The live relaunch, then the boot gate. Split out so the tests replace it and never start a game.
+
+        Imported lazily and by port: `games.launch`/`games.stop` both call `stop_all()`, which would take down
+        every other game in the run, so only `relaunch_one` may ever be called from here.
+
+        A listening port is NOT a booted game -- the plugin opens the bridge server long before Addressables
+        finish, and a reset against a half-booted instance answers `unknown scene`. The working set is the
+        signal the supervisor's own boot gate uses (a booted copy sits near 1 GB), so the same one is used
+        here before the reset is attempted.
+        """
+        import sys as _sys
+
+        scripts = Path(__file__).resolve().parents[1] / "scripts"
+        if str(scripts) not in _sys.path:
+            _sys.path.insert(0, str(scripts))
+        import games  # noqa: PLC0415 - lazy on purpose: nothing else in the env needs it
+
+        deadline = time.monotonic() + wait_s
+        if not games.relaunch_one(port, timeout=max(1.0, deadline - time.monotonic())):
+            return False
+        want = self.cfg.bridge_relaunch_boot_mb * 1024 * 1024
+        while time.monotonic() < deadline:
+            pid = games.listening_pids().get(port)
+            if pid is not None and games.working_sets().get(pid, 0) >= want:
+                self.envlog.event("boot_gate", pid=pid, mb=self.cfg.bridge_relaunch_boot_mb)
+                return True
+            time.sleep(2.0)
+        # Out of budget rather than out of hope: `_reset_while_booting` waits out `unknown scene` anyway.
+        self.envlog.event("boot_gate_timeout", mb=self.cfg.bridge_relaunch_boot_mb)
+        return True
 
     def _reconnect(self) -> None:
         """Rebuilds this env's connection to its OWN port and re-sends its config.
@@ -577,8 +879,48 @@ class UltrakillEnv(gym.Env):
         self._connected = False
         self._ensure_connected()
 
+    def _reconnect_within(self, deadline: float) -> None:
+        """Rebuilds the connection, retrying while budget remains, and raises a RECOVERABLE error if it cannot.
+
+        `reset()`'s tail handler used a bare `_reconnect()`, whose `connect` failure is a `BridgeClosed` that
+        the handler is already inside the `except` of -- so a game that had not opened its port simply killed
+        the worker. Here the retry is the budget's, and what finally comes out is still RECOVERABLE, so the
+        caller's own contract (a bounded failure, not a surprise exception class) holds.
+
+        The retry stops short of the relaunch reserve, because a port that never opens is precisely what the
+        relaunch rung is for: spending the whole budget asking a dead port to answer, and never restarting the
+        instance behind it, is the same unreachable-rung bug one layer up.
+        """
+        reserve = self.cfg.bridge_relaunch_reserve_s if self.cfg.bridge_relaunch else 0.0
+        last = self._try_reconnect_until(deadline - max(0.0, reserve))
+        if last is None:
+            return
+        if self._relaunch_own_game(deadline):
+            last = self._try_reconnect_until(deadline)
+            if last is None:
+                return
+        raise BridgeClosed("could not rebuild the bridge on port %d inside the recovery budget: %s"
+                           % (self.cfg.port, last))
+
+    def _try_reconnect_until(self, deadline: float) -> Exception | None:
+        """Reconnects with a growing backoff until `deadline`. None on success, else the last error."""
+        attempt = 0
+        last: Exception | None = BridgeClosed("no time left to reconnect")
+        while self._budget_left(deadline) > 0:
+            attempt += 1
+            try:
+                self._reconnect()
+                return None
+            except (BridgeError, OSError) as exc:
+                last = exc
+                self._recovery_noticed()
+                self.envlog.event("reconnect_failed", rung="tail", attempt=attempt,
+                                  error="%s: %s" % (type(exc).__name__, exc))
+                self._sleep_within(self.cfg.bridge_backoff_s * attempt, deadline)
+        return last
+
     def _resilient_reset(self, *, checkpoint: bool, reconnect_first: bool = False) -> tuple[dict[str, Any], bool]:
-        """One reset request that survives a booting game and a dead socket.
+        """One reset request that survives a booting game, a dead socket and a game that has to be relaunched.
 
         Returns `(observation, recovered)`. `recovered` is True when the connection had to be rebuilt, and then
         the observation is a FRESH level load whatever `checkpoint` asked for: after a reconnect the game's
@@ -586,50 +928,107 @@ class UltrakillEnv(gym.Env):
         trackers describing a level the player is no longer in. Callers must treat a recovered observation as a
         fresh level load (see `_adopt_fresh_load`).
 
-        The waiting is deliberate even though a blocked worker stalls every other game (vectorized envs step in
-        lockstep): a stall of minutes costs one rollout, and the crash it replaces cost the whole run.
+        **Bounded, in total.** The waiting is deliberate -- a blocked worker stalls every other game, and a
+        stall of minutes costs one rollout where the crash it replaces cost the whole run -- but it now runs
+        against one wall-clock deadline (`bridge_recovery_budget_s`) that covers every attempt, every backoff
+        and the relaunch. Before that, three attempts of (close + connect + handshake + reset) at the old
+        bounds composed to ~70 minutes for a single reset, seven times the supervisor's patience, so every
+        recovery this was built for was killed mid-flight and paid for as a twelve-game restart.
+
+        The ladder, in order, each rung only while budget remains:
+          1. ask again on the connection there is (a booting game answers `unknown scene`; the cure is time);
+          2. rebuild the connection and ask again, `bridge_retries` times with a growing backoff;
+          3. relaunch THIS env's own game, wait for it to boot, rebuild and ask again.
+
+        Rung 2 gets its own RESERVE (`bridge_relaunch_reserve_s`) rather than rung 1's leftovers. Rung 1's
+        attempts each cost a full reset timeout against a game that answers nothing, so they always spent the
+        whole budget and the relaunch -- the rung that exists for exactly that fault -- was never reached. The
+        only shape that did reach it was an instantly-refused connection, which is the shape the test used and
+        not the shape production sees.
         """
-        boot_deadline = time.monotonic() + self.cfg.unknown_scene_wait_s
+        deadline, owned = self._begin_recovery("reset" if reconnect_first else "episode_boundary")
         boot_poll = min(5.0, max(0.0, self.cfg.bridge_backoff_s))
         attempts = max(1, self.cfg.bridge_retries)
         recovered = False
+        relaunched = False
         last: Exception | None = None
+        # What rung 1 may spend, so rung 2 still has enough left to boot a game and ask it once.
+        reserve = self.cfg.bridge_relaunch_reserve_s if self.cfg.bridge_relaunch else 0.0
+        rung_deadline = deadline - max(0.0, reserve)
 
-        for attempt in range(attempts):
-            if reconnect_first or recovered:
+        for rung in (0, 1):
+            if rung == 1:
+                if not self._relaunch_own_game(deadline):
+                    break
+                relaunched, recovered, reconnect_first = True, True, True
+                rung_deadline = deadline  # the last rung may use everything that is left
+            boot_deadline = min(time.monotonic() + self.cfg.unknown_scene_wait_s, rung_deadline)
+            for attempt in range(attempts):
+                if self._budget_left(rung_deadline) <= 0:
+                    self._recovery_noticed()
+                    self.envlog.event("budget_spent", rung=rung, attempt=attempt + 1,
+                                      reserved_s=reserve if rung == 0 else None)
+                    last = last or BridgeTimeout("recovery budget spent before the bridge answered")
+                    break
+                if reconnect_first or recovered:
+                    try:
+                        self._reconnect()
+                        recovered = True
+                    except (BridgeError, OSError) as exc:
+                        last = exc
+                        self._recovery_noticed()
+                        self.envlog.event("reconnect_failed", rung=rung, attempt=attempt + 1,
+                                          error="%s: %s" % (type(exc).__name__, exc))
+                        self._sleep_within(self.cfg.bridge_backoff_s * (attempt + 1), rung_deadline)
+                        # `recovered` too, not just `reconnect_first`: a reconnect that FAILED leaves the
+                        # game's state as unknown as one that succeeded, and `recovered` is what stops a
+                        # checkpoint respawn into a level the player may no longer be in.
+                        recovered, reconnect_first = True, True
+                        continue
+                reconnect_first = False
                 try:
-                    self._reconnect()
-                    recovered = True
-                except (BridgeError, OSError) as exc:
+                    raw = self._reset_while_booting(checkpoint and not recovered, boot_deadline, boot_poll,
+                                                    rung_deadline)
+                    self._end_recovery(owned, "ok", rung=rung, relaunched=relaunched or None)
+                    return raw, recovered
+                except RECOVERABLE as exc:
                     last = exc
-                    time.sleep(self.cfg.bridge_backoff_s * (attempt + 1))
+                    wait = self.cfg.bridge_backoff_s * (attempt + 1)
+                    self._note_bridge_reset("%s on reset: %s; reconnecting in %.0fs (attempt %d/%d%s)"
+                                            % (type(exc).__name__, exc, wait, attempt + 1, attempts,
+                                               ", after a relaunch" if relaunched else ""))
+                    self._sleep_within(wait, rung_deadline)
                     recovered, reconnect_first = True, True
-                    continue
-            reconnect_first = False
-            try:
-                return self._reset_while_booting(checkpoint and not recovered, boot_deadline, boot_poll), recovered
-            except RECOVERABLE as exc:
-                last = exc
-                wait = self.cfg.bridge_backoff_s * (attempt + 1)
-                self._note_bridge_reset("%s on reset: %s; reconnecting in %.0fs (attempt %d/%d)"
-                                        % (type(exc).__name__, exc, wait, attempt + 1, attempts))
-                time.sleep(wait)
-                recovered, reconnect_first = True, True
+            if relaunched or not self.cfg.bridge_relaunch or self._budget_left(deadline) <= 0:
+                break
 
-        raise BridgeError("bridge on port %d did not come back after %d attempts: %s"
-                          % (self.cfg.port, attempts, last))
+        self._end_recovery(owned, "failed", relaunched=relaunched or None,
+                           budget_left_s=max(0.0, self._budget_left(deadline)))
+        raise BridgeError("bridge on port %d did not come back within %.0fs (%d attempts%s): %s"
+                          % (self.cfg.port, self.cfg.bridge_recovery_budget_s, attempts,
+                             ", one relaunch" if relaunched else "", last))
 
-    def _reset_while_booting(self, checkpoint: bool, deadline: float, poll: float) -> dict[str, Any]:
+    def _sleep_within(self, seconds: float, deadline: float) -> None:
+        """A backoff never eats the budget it is backing off inside."""
+        time.sleep(max(0.0, min(seconds, self._budget_left(deadline))))
+
+    def _reset_while_booting(self, checkpoint: bool, deadline: float, poll: float,
+                             budget_deadline: float | None = None) -> dict[str, Any]:
         """Sends the reset, waiting out a game that has not finished booting.
 
         A half-booted instance answers every reset `unknown scene '<level>'`, because
         `EpisodeController.SceneExists` searches Addressables locators that stay empty until boot completes
         while the bridge port is already listening. That is not a bad level name and not a broken connection:
         it is a game that needs another minute, so it is asked again rather than raised at the trainer.
+
+        The request is CLAMPED to what is left of `budget_deadline`, so the reset in flight when the recovery
+        budget expires ends with the budget instead of adding a full reset timeout on top of it.
         """
         while True:
             try:
-                return self.client.reset(self.scene, checkpoint=checkpoint)
+                bound = (self.cfg.reset_timeout_s if budget_deadline is None
+                         else self._clamp(self.cfg.reset_timeout_s, budget_deadline))
+                return self.client.reset(self.scene, checkpoint=checkpoint, timeout=bound)
             except BridgeSceneUnknown as exc:
                 if time.monotonic() >= deadline:
                     raise

@@ -347,17 +347,59 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   consistency tests that matter — the reload re-baselines the trackers, its milestones pay again and only once,
   the archive keeps its counts, and the truncated episode's `info` describes the episode that was lost
   (no game needed; `python tests/test_bridge_recovery.py`).
+- `python/tests/test_freeze_recovery.py` also holds **`_fake_clock_ladder`**, which runs a real `reset()` on a
+  fake clock with every blocking call charged its REAL bound (a wedged game costs a full reset timeout, a dead
+  port costs a full connect window) and returns the elapsed seconds, whether the relaunch rung fired and how it
+  ended. Reach for it before changing any recovery bound: the suite's older fakes fail *instantly*, so a ladder
+  that overshot its budget by 15 s and never reached its last rung passed them cleanly for a day. Anything that
+  claims a time bound should be asserted on measured elapsed, not on a sum of the knobs.
+- **The recovery ladder's budget (`env.py`) is authoritative, not advisory.** `_begin_recovery` returns
+  `(deadline, opened_here)` and **only the frame that opened a budget may close it** — `reset()` opens one at the
+  top (so the first connect, the ladder and the reset tail all share it) and `step()` opens one in its catch.
+  `_clamp(want, deadline)` cuts every blocking call to what is left, so the call in flight when the budget
+  expires ends *with* it: `client.reset(timeout=…)`, `connect(retry_seconds=…)`. Rung 2 (relaunch this env's own
+  game) gets a reserve rung 1 may not spend (`bridge_relaunch_reserve_s`), because otherwise three slow attempts
+  always spent the budget first and the rung was unreachable in the one shape it exists for. At most
+  `bridge_relaunch_slots` workers relaunch at once, through `O_EXCL` permit files in `env_log_dir`
+  (`acquire_relaunch_slot`, stale-age takeover so a crash cannot wedge the rung shut), plus a per-port stagger.
+  `EnvConfig.RUN_ONLY_FIELDS` keeps `bridge_relaunch` and `env_log_dir` OUT of `to_dict`, so the
+  `env_config.yaml` train.py writes can never hand `eval.py` the power to kill a training game.
+- `python/ultrakill_ai/envlog.py`: `EnvLog`, one size-bounded timestamped event log per worker at
+  `runs/<run>/env_<port>.log` (reset start/end with level and duration, recovery start/end, reconnect failures,
+  relaunches, boot gate, budget spent). Filled in by `train.py` alone (`env_log_dir`), so eval and the tests
+  write nothing. It exists because the 2026-09-17 freeze could not be attributed: the trainer's stdout was being
+  thrown away by the supervisor's detached spawn and nobody could tell, since the stale log tail looked fresh.
+  Rolls to `<name>.1` at 2 MB and never raises — a log that failed would turn a recoverable fault into a dead
+  worker. `supervise.py` quotes each file's tail into its restart report.
 - `python/scripts/post_times.py`: posts a training run's best official level times to `times.md` from files the run already writes (no game, idempotent). `python/tests/test_post_times.py` covers first post, repeat post, only-faster and a missing `episodes.jsonl` (no game needed).
 - `python/scripts/supervise.py`: **the crash supervisor** — restarts the run when it dies, with no LLM and no
-  tokens. Health is three things at once: a `train.py` process for this run exists (matched on the command line),
-  `runs/<run>/status.json` moved within `--stale-seconds`, and its `state` is `running`. A process that exists
-  while `status.json` stays stale is HUNG and is killed by PID with its SubprocVecEnv workers; a process that is
-  gone is DEAD. A restart logs the last 30 lines of the train log, stops the games, relaunches `--count N
+  tokens. Health is four things at once: a `train.py` process for this run exists (matched on the command line),
+  `runs/<run>/status.json` moved within `--stale-seconds`, **its `timesteps` moved within the same window**, and
+  its `state` is `running`. **Honestly about the step test:** it would NOT have fired first on 2026-09-17 —
+  `ProgressCallback` writes `status.json` only from SB3's own callbacks, so a worker blocked inside `env.step()`
+  stops the writes too and the mtime went stale by itself. It is there because mtime is a proxy for liveness
+  while `timesteps` is the thing actually being asked about, and because the file is already written off the step
+  loop in places (`_on_rollout_start` after a step-free PPO update, `mark_stopped` on the way out) — a heartbeat
+  thread, the obvious next improvement, would blind the mtime test completely. Any change counts, up or down,
+  because a restart resumes from a checkpoint and the count goes backwards. A draining trainer (`state` `stopped`/`finished`) is exempt: it is *supposed* to have stopped
+  stepping. **`--stale-seconds` is 900 s, and the number is derived, not chosen**: the step that faults pays its
+  own 120 s bound, then `EnvConfig.bridge_recovery_budget_s` 540 s caps everything after it (reconnects,
+  backoffs, resets and the relaunch, every call clamped to what is left of the budget), plus one 60 s poll =
+  **720 s**. It was 600 s, which was shorter than a single old reset timeout, so the supervisor killed every
+  recovery that was about to fix one game locally and paid twelve games for it. The derivation is not taken on
+  trust: `test_the_measured_ladder_fits_inside_the_supervisors_patience` runs the real ladder on a fake clock,
+  each blocking call charged its real bound, and asserts the measured elapsed fits inside the window.
+  A process that exists while the run stops progressing is HUNG and is killed by PID with its SubprocVecEnv
+  workers; a process that is gone is DEAD. **Before any restart it writes an attribution block**: one line per
+  bridge port with pid, working set, ESTABLISHED connection count and CPU cores over a 5 s window — all from
+  `netstat` and CIM, never by connecting to a bridge port, which would drop that game's trainer — then the tail
+  of every `runs/<run>/env_<port>.log`. A restart logs the last 30 lines of the train log, stops the games, relaunches `--count N
   --monitor M` through `games.launch()` (readiness from netstat — it never opens a TCP connection to a bridge
   port), resumes from whichever of `latest.zip` and the newest `ckpt_*_steps.zip` holds **more timesteps**
   (`latest.zip`'s count is read out of the `num_timesteps` field of the `data` member inside the zip, so it costs
-  no torch import), and starts the trainer detached with the same `cmd /c ... >> log 2>&1` line a human would
-  type. **A boot health gate runs between the launch and the trainer** (`await_boot`): a listening port is not a
+  no torch import), and starts the trainer with the same `cmd /c ... >> log 2>&1` line a human would type —
+  **without `DETACHED_PROCESS`**, which silently discards everything that line's program prints (`CREATE_NEW_
+  PROCESS_GROUP | CREATE_NO_WINDOW` instead; see the freeze gotcha). **A boot health gate runs between the launch and the trainer** (`await_boot`): a listening port is not a
   booted game, so it waits until every copy's working set has been over `--boot-min-mb` (600 MB; a booted copy
   sits near 1 GB) for `--boot-polls` consecutive polls, and restarts a laggard **on its own port** with
   `games.relaunch_one`, leaving the other eleven running. A laggard that never opened a port cannot be addressed
@@ -377,6 +419,19 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   its streak, a vanished game being forgotten, `laggard_ports` naming only laggards it can address, a single
   laggard being restarted on its own port while the others keep running, and a game that never boots not
   blocking training forever (no game, no real process; `python tests/test_supervise.py`).
+- `python/tests/test_freeze_recovery.py`: **the 17:52 freeze, and every bound that now stops it** (no game, no
+  socket, no process, no real clock). The protocol bounds one by one — `close()` honours `close_timeout` and not
+  `self.timeout`, a timed-out release still drops the socket without raising, a broken client skips the release
+  entirely, the handshake has its own bound, a reset leaves no sticky bound on the socket, `_LineReader` bounds
+  wall clock rather than each `recv`, and the reset bound sits between the mod's own 120 s give-up and its 300 s
+  client drop. Then the recovery: one total budget, shared by `reset()`'s outer retry so it is not paid twice;
+  the relaunch rung restarting **this env's port and no other**; no relaunch when the budget could not boot a
+  game; and `bridge_relaunch` off unless `train.py` turned it on. Then the attribution log, the bounded teardown
+  (a wedged worker terminated, a healthy one clean, never a blocking `recv`), the supervisor (a frozen run with a
+  perfectly fresh status file caught by its step count, a backwards resume counted as progress, a draining
+  trainer exempt, the stale-window arithmetic pinned against the env's budget, the per-port sick report written
+  before anything is killed, and `DETACHED_PROCESS` asserted absent from the spawn flags), and `games.py`
+  repairing one laggard port instead of failing a whole launch (`python tests/test_freeze_recovery.py`).
 - `python/tests/test_times.py`: `times.md` updates against the committed file's exact text: placeholders, records, deltas, level order (no game needed; `python tests/test_times.py`).
 - `python/tests/test_campaign_env.py`: campaign episodes against `FakeLevel`, a fake corridor level standing in for the bridge: completion and best run, no official time for a completion after a checkpoint respawn, respawn and reload after a death, the stuck rule, input-lock skipping, the 479 observation, retired config keys, archive save and load, and the two novelty-measure tests that pin the void exploit shut (`test_falling_off_the_map_pays_no_novelty`, `test_novelty_pays_for_new_ground_not_for_height`). `FakeLevel` reports ground rays the way the mod does, so its floor is at y 1 and `falling` makes every ray miss (no game needed). Its `enable_skulls(fields=, altars=, item_type=)` plus `item_active` cover the shapes a carryable comes in: the wired puzzle, a 0.6.x mod, 0-4's altar-free `CustomKey1`, an item no zone accepts, and an item whose room is still switched off.
 - `python/tests/test_skull_check.py`: `skull_check.py`'s three checks against `FakeLevel`'s skull room — the whole carry green, an item whose room is off named as the reason, a placement undone by the spam caught as a FAIL (run with the carry protection disabled, which is what makes it the regression test for `_protect_carry`), a pre-0.7.0 mod, `--skip-kill`, the `--render` control run and the default coordinates (no game needed).
@@ -510,6 +565,16 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     pause file is the only thing that holds across a whole pause.
   - It restarts `poll_status.py` and `keep_best.py` whenever they are missing, so do not count on stopping a
     helper by hand while the supervisor is up.
+  - **The supervisor's own code changes are not picked up by a trainer restart.** It is a long-lived process
+    started by hand, so a change to `supervise.py` needs the supervisor itself stopped and started again — see
+    the freeze-fix activation steps below.
+- **Reading a stall (2026-09-17 onward).** Three files, none of which needs a game or a console:
+  `runs/<run>_supervisor.log` (the decision and, before every restart, one line per port with pid, working set,
+  ESTABLISHED connections and CPU cores), `runs/<run>/env_<port>.log` (that worker's own account: reset start
+  and end with durations, `recover_start`/`bridge_reset`/`reconnect_failed`/`relaunch_*`/`recover_end`), and
+  `runs/<run>/episodes.jsonl` (`end_reason` `bridge_reset` and the `bridge_resets` counter per episode).
+  **Do not trust `runs/<run>_train.log`'s tail without checking its `LastWriteTime`** — that is exactly what
+  made the 17:52 post-mortem quote a seven-hour-old traceback as current.
   - After `--max-restarts-per-hour` (3) restarts inside an hour it logs `GIVING UP` and exits non-zero: read
     `runs/campaign_gates_supervisor.log` and the train-log tail it copied in, because restarting is not the fix.
   - **Judge a curriculum run per level**, on the dashboard's `levels` rows and `status.json`'s `campaign.levels`
@@ -571,7 +636,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **parked/ep + exit-banished row** for the two ladder-patience mechanisms, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 14 trunks walked end to end). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**21 files; 499 named tests** as of 2026-09-17, of which `test_progress.py`'s 21 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, and `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run. `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 14 trunks walked end to end). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**22 files; 548 named tests** as of 2026-09-17, of which `test_progress.py`'s 21 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run, and `tests/test_freeze_recovery.py` the bounds that keep a sick game from FREEZING it (the 17:52 incident). `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code. **`test_campaign.py`'s `test_save_best_run_serialises_two_racing_writers` is load-sensitive**: it races two real threads against a 5 s lock timeout, and on a box already running twelve games it failed once in eight suite runs on 2026-09-17 (then passed 6/6 when re-run on its own). A single failure of that one test under load is not a regression -- re-run the file before believing it -- but it is worth making the race deterministic rather than timed if it recurs.
   **In a worktree, set `PYTHONPATH` to that worktree's `python/`** or `import ultrakill_ai` resolves to the main tree and every test measures the wrong code: `$env:PYTHONPATH = "F:\Github\ULTRAKILL-AI-route\python"`.
 - Regenerate the route data (no game, no port, safe beside a live run): `python scripts/build_routes.py --validate` from `python/`. ~2 min for all 33 levels; it rewrites only `ultrakill_ai/routes/` and exits non-zero if any shipped level changes shape. Run it after every game update, then `python tests/test_route_files.py`.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
@@ -629,6 +694,146 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   — see the bridge-resilience entry under `env.py`. The blast radius was the real bug: SB3's `SubprocVecEnv._worker`
   does not catch, so the worker process exited, the parent read `BrokenPipeError`/`EOFError`, and all twelve games
   went down together while `train.py` hung in teardown.
+- **THE 17:52 FREEZE (2026-09-17): the run stalled for 19 minutes and nothing in the logs could say why.**
+  Reported by the user as "the AI has stalled". `campaign_gates` stopped at **12,441,598 steps at 17:52:29** with
+  `state: "running"`; the supervisor did not act until **18:02:58** (629 s), relaunched all twelve games, and the
+  relaunch itself then failed and had to be repeated twice — training resumed at **18:11:41**. It was the sixth
+  stall of the day (episode gaps of 2097, 2057, 1571, 1483, 1057 and 1334 s are in `episodes.jsonl`).
+  **What was measured during the freeze:** game pid 14896 on port 47800 `Responding=False`, CPU delta over 5 s
+  **0.00**, working set 1397 MB (fully booted), and the **only** port of the twelve with an ESTABLISHED
+  connection; the other eleven `Responding=True`, ~0.7-1.0 core each, **no connection at all**.
+  - **The eleven free-running games were a CONSEQUENCE, not the cause.** `EpisodeController.commandTimeoutMs` is
+    300 s: the mod drops a client it has heard nothing from for five minutes and releases control, after which
+    the game runs its normal loop at ~1 core. Vec envs step in lockstep, so when one worker blocked, the other
+    eleven sat idle behind it and were dropped one by one at 17:57. A game at **0.00 cores and Not Responding is
+    the mod in lockstep waiting for a command** — that is the healthy idle state, not a hang.
+  - **The exact blocking call is NOT determined, and the reason it is not is itself a bug.** Two evidence
+    channels were both dead. (1) The supervisor spawns the trainer with `DETACHED_PROCESS` (0x8), and a detached
+    `cmd /s /c "... >> log 2>&1"` **creates the log file and then silently discards everything the program
+    prints**: with no console and no inherited handles the grandchild's `sys.stdout` is `None` and every `print`
+    is a no-op. Reproduced three ways on 2026-09-17 (0x8 → 0 bytes; 0x200, 0x08000000 and 0 → every line
+    written). So `campaign_gates_train.log` had **not been written to since 10:57** — its last
+    `total_timesteps` is 7,602,826, it contains no `entropy floor:` line and no `curriculum: 30 levels` line,
+    both of which every run since 16:43 prints — while the supervisor printed its seven-hour-old tail as
+    evidence on every restart. **The "TimeoutError on reset → BrokenPipeError → EOFError" traceback quoted in
+    the 17:52 report is from the 10:57 crash, 4.8M steps earlier.** (2) BepInEx disk logging is off for 12
+    games, so the mod's own `No command for 300s, dropping client` warnings had nowhere to go either.
+  - **What IS established, by reading and by reproduction on a private game:** the client had no total time
+    bound, so any bridge hiccup presented as a hang. Measured live with the game suspended via
+    `NtSuspendProcess`: `close()` blocked **20.0 s** against a client whose `timeout` was 20 (it set
+    `settimeout(5.0)` and `recv()` armed `self.timeout` straight back over it) — 120 s live, ×12 envs in a
+    teardown; the `hello` handshake was bounded by the same 120 s; a socket timeout is **sticky**, so a
+    `reset`'s 600 s stayed on the socket for the next `send`. Composed, `_resilient_reset`'s three attempts of
+    (close + connect + handshake + reset) ran to **~70 minutes**, and `reset()` retried the whole ladder on top
+    — against a supervisor that gave up at 600 s. **Every local recovery this machinery existed for was killed
+    mid-flight and paid for as a twelve-game restart.** `_resilient_reset` also ended in a bare `BridgeError`,
+    which is *not* in `RECOVERABLE`, so the final failure killed the worker instead of truncating an episode —
+    and `SubprocVecEnv.close()` does `remote.recv()` and `process.join()` with no timeout, so `train.py`'s
+    `finally` then **hung**, turning a crash the supervisor catches in one poll into a hang it catches in ten.
+  - **A single laggard port cost the other 14 minutes.** `games.launch` waits for ALL ports and `sys.exit`s if
+    one is missing; the supervisor answers a failed launch with another full stop-and-launch. At 18:08 eleven
+    games were up and healthy and the run still would not start, because pid 2588 on 47800 sat at 242 MB
+    burning a core with no bridge port. Three such rounds exhaust `--max-restarts-per-hour` and the supervisor
+    exits for the night.
+  - **Fixed (2026-09-17, branch `freeze-fix`), all of it verified live on one private game on port 47812:**
+    every blocking call in `protocol.py` is bounded in every state (`close_timeout` 5 s, `handshake_timeout`
+    20 s, `connect_timeout` 10 s, step 120 s, reset **600 → 180** s, and `_LineReader` bounds wall clock rather
+    than each `recv`); `reset_timeout` 180 s is comfortably above the mod's own 120 s give-up and below its
+    300 s client drop — real resets on the live 12-game run are **median 1.94 s, max 5.38 s** over 181 samples,
+    so 600 s was 110× the observed maximum; one **total** `bridge_recovery_budget_s` (540 s) covers every
+    attempt, backoff and layer of a recovery; the last rung **relaunches this env's own game** via
+    `games.relaunch_one` and waits out a working-set boot gate; the mod is told `command_timeout_s: 900` so one
+    worker's recovery no longer gets its eleven siblings dropped (accepted by the installed mod v0.7.0, no
+    rebuild); `train.py` tears the vec env down in bounded time and terminates a wedged worker; `games.launch`
+    repairs a laggard port instead of failing the whole launch; the supervisor judges **steps, not mtime**,
+    spawns without `DETACHED_PROCESS`, and writes a per-port sick report before it kills anything. Measured
+    after the fix: `close()` 5.00 s, handshake 20.00 s, a whole failed ladder 51 s against its 60 s budget, and
+    a game **killed outright** mid-episode recovered in 47.7 s with all twelve training ports' owning pids
+    unchanged.
+  - **And the attribution hole is closed:** every worker writes `runs/<run>/env_<port>.log` (see `envlog.py`).
+    The next incident is readable from that file plus the supervisor's sick report, with no console attached.
+  - **IT HAPPENED AGAIN AT 19:13 WHILE THE FIX WAS BEING WRITTEN, and the recurrence is the best evidence we
+    have** — because main was still running the pre-fix code and the whole shape was captured live. The run
+    froze at **13,261,282 steps at 19:13:09**; the supervisor killed the trainer at **19:23:26** (617 s) and
+    relaunched all twelve. The socket table during the freeze, from `netstat` alone (never connect to a
+    training port):
+
+    | what | port 47809 | the other eleven |
+    |---|---|---|
+    | game side | **ESTABLISHED** | `FIN_WAIT_2` |
+    | worker side | `ESTABLISHED` | `CLOSE_WAIT` |
+    | `Responding` | **False** | True |
+    | CPU delta / 5 s | **0.109** | ~1 core each |
+
+    `FIN_WAIT_2` on the game side with `CLOSE_WAIT` on the worker side means **the mod sent FIN and the worker
+    never closed** — the mod's 300 s `commandTimeoutMs` dropping eleven clients that were merely idle behind
+    one blocked worker. It pins the causal direction the first post-mortem could only infer: one sick game,
+    eleven dropped siblings, twelve recoveries. `mod_command_timeout_s: 900` is the fix, and
+    `EpisodeController.cs:266` does read the key, so it is live without a rebuild.
+    **The deadlock itself:** the frozen game sat at 0.109 cores / 5 s (idle in lockstep, *waiting for a
+    command*) while its worker and the trainer parent both showed a CPU delta of **exactly 0.00** (blocked in
+    a syscall). Both sides waiting on the other, with an empty receive buffer on the client — so the reply was
+    never sent, not merely missed. That is a genuine request/reply deadlock against a wedged Unity main
+    thread, not a lost message.
+  - **Second-pass audit (2026-09-17): six findings, all six verified by measurement before being fixed.** The
+    first pass got the bounds right but left the *total* advisory, so four of these are the same bug wearing
+    different hats. Every number below was measured on a fake clock (`_fake_clock_ladder`, no game, no
+    sockets), with each blocking call charged its real bound:
+    1. **The "one TOTAL budget" was not a total.** `_resilient_reset` checked the budget only at the TOP of
+       each attempt, so an attempt admitted with a moment left ran its own full bound anyway — and `request`
+       arms the bound for the send *and* the read. Measured: a game that answered `hello` and never answered a
+       reset ran **555.6 s** against a 540 s budget, and up to 780 s in the worst case. Worse, the ladder
+       closed every budget it touched, including one opened above it, so `reset()`'s tail handler — the one
+       that fires when `_skip_locked` hits a frozen game after a reset that DID answer — found a cleared
+       deadline and opened a **second full budget** (measured: two, 1000→1540 and 1183→1723, for one fault).
+       Fixed by making the deadline authoritative: `_begin_recovery` returns `(deadline, opened_here)` and
+       only the opening frame may close it, the budget opens at the top of `reset()` and in `step()`'s catch,
+       and `_clamp` cuts every call — `client.reset(timeout=…)`, `connect(retry_seconds=…)` — to what is left.
+       Measured after: **540.0 s exactly**, one budget, for every shape.
+    2. **The relaunch rung was unreachable in the fault shape it exists for.** Rung 1 was gated on the budget
+       left *after* rung 0's three attempts, and those attempts each cost a full reset timeout against a
+       wedged game, so the budget was always negative and the loop broke. Measured: relaunch called on a
+       fast-failing bridge (which is what the test faked), **not called** on a slow-failing one (which is what
+       production sees) — the only covered path was the one that does not occur. Fixed with an explicit
+       `bridge_relaunch_reserve_s` (240 s) that rung 0 may not spend. Measured after: reached in both shapes.
+    3. **`train.py` wrote the eval a loaded gun.** `fill_run_dirs` sets `bridge_relaunch=True` and
+       `env_log_dir`, and those went into `models/<run>/env_config.yaml`, which `eval.py` loads verbatim.
+       Round-trip verified: `bridge_relaunch=True`, `env_log_dir='runs/campaign_gates'` on the far side. One
+       `BridgeTimeout` during the documented eval command and the env would `taskkill` a **training** game on
+       port 47800. Fixed with `EnvConfig.RUN_ONLY_FIELDS`, excluded from `to_dict`, plus a defensive clear in
+       `eval.py`.
+    4. **Every `subprocess.run` in `games.py` was unbounded** — `tasklist`, `netstat`, `taskkill`, seven of
+       them, one with a timeout. These are now called from *inside* the recovery whose module docstring
+       promises it cannot hang, and from the supervisor. `netstat` blocking under Tcpip/WMI contention is
+       normal on exactly the loaded box this runs on. All bounded at 30 s, `TimeoutExpired` caught and
+       returned as an empty map so the caller falls to its next rung, and the snapshots are **cached with a
+       2 s TTL** (twelve workers polling once a second was ~18 process spawns a second).
+    5. **`connect_retry_s` had been cut 180 → 60 with no justification**, and a connect failure raised a bare
+       `BridgeError`, which is *not* in `RECOVERABLE` — so the first `_ensure_connected`, which runs above the
+       ladder, killed the worker outright. Measured: a port that was not listening killed the worker in
+       **60 s** with no ladder and no relaunch. That is precisely the state `supervise.await_boot` creates on
+       purpose when it gives up on a cold copy and starts the trainer anyway, on the stated grounds that the
+       env waits a cold game out. Fixed three ways: `connect` raises `BridgeClosed` (which *is* recoverable),
+       `reset()`'s tail reconnects through `_reconnect_within` (which retries inside the budget and then
+       relaunches), and the retry window is back to 180 s. Measured after: **540 s of patience, and the
+       instance gets relaunched.**
+    6. **Nothing serialized the per-worker relaunch.** Twelve workers step in lockstep, so a fault that drops
+       the games reaches all twelve within one step, and twelve simultaneous cold Unity starts boot none of
+       them in time — so every `relaunch_one` returns False, every worker dies anyway, and twelve games have
+       been killed behind the supervisor's back for nothing. Now at most `bridge_relaunch_slots` (2) workers
+       hold a relaunch at once, through `O_EXCL` permit files in `env_log_dir` with a stale-age takeover, plus
+       a per-port stagger. Separately, `relaunch_one`'s "no process is listening; starting one anyway" branch
+       started a replacement **without reaping the wedged portless instance** (`launch` calls
+       `kill_unlistening` for exactly this; the env path did not), leaving it at ~1 core for the rest of the
+       run; it now reaps first.
+    **Not changed, and why:** the worker still *dies* when a recovery genuinely fails. That is the design —
+    `train.py`'s teardown is bounded, so the supervisor sees a DEAD trainer within a poll instead of a HUNG
+    one after ten — and it is what makes a 540 s cap safe to enforce.
+    **The arithmetic, re-derived:** a worker's worst silence is the step that faults (120 s, paid before the
+    budget opens) + the recovery budget (540 s) = **660 s**; the supervisor may notice one poll late (60 s) =
+    **720 s** against its 900 s window. `test_the_measured_ladder_fits_inside_the_supervisors_patience` does
+    not take that sum on trust — it runs the real ladder on a fake clock for each fault shape and asserts the
+    measured elapsed fits.
 - **A listening bridge port is NOT a booted game.** The plugin opens its socket early in startup, while
   Addressables' resource locators are still empty — and `EpisodeController.SceneExists` searches exactly those
   locators. So a half-booted instance answers *every* reset with `unknown scene 'Level 0-1'`, which used to reach
@@ -2207,3 +2412,81 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     the newest `ckpt_*_steps.zip` (at most 50k steps old; the supervisor picks the file with the most steps by itself).
     Also: PowerShell's safety check rejects a long combined command that mixes `Remove-Item` with a `cmd /c` argument
     list; run those as separate commands.
+- **`freeze-fix`: bounded bridge recovery, attributable stalls (branch, 2026-09-17, NOT YET MERGED).** Answers the
+  17:52 freeze — read its gotcha entry above for the evidence and the root cause. Ten changes, no observation,
+  reward or action semantics touched, and no mod rebuild:
+  1. `protocol.py`: every blocking call bounded in every state (`close_timeout` 5 s, `handshake_timeout` 20 s,
+     `connect_timeout` 10 s, reset **600 → 180** s), each request arming its own bound for the send as well as
+     the read (a socket timeout is sticky), and `_LineReader` bounding wall clock instead of each `recv`.
+  2. `env.py`: one **total** `bridge_recovery_budget_s` (540 s) across every attempt, backoff and layer,
+     shared with `reset()`'s outer retry so it cannot be paid twice.
+  3. `env.py`: the last rung **relaunches this env's own game** (`games.relaunch_one`, never another port) and
+     waits out a working-set boot gate. Off by default; `train.py` alone turns it on, so nothing else that
+     builds an `EnvConfig` can restart a game.
+  4. `env.py`: `mod_command_timeout_s` 900 is sent on connect, so the mod's 300 s silent-client drop no longer
+     costs the other eleven games their connections while one worker recovers.
+  5. `envlog.py` + `train.py`: `runs/<run>/env_<port>.log`, the per-worker attribution log.
+  6. `train.py`: `close_vec_env`, a bounded teardown that terminates a wedged worker, so a crash reaches the
+     supervisor as an exit code in one poll rather than a hang in ten.
+  7. `supervise.py`: health judged on **`timesteps` moving** as well as on `status.json`'s mtime (defence in
+     depth, not the thing that would have caught 17:52 — see the supervisor's Layout entry).
+  8. `supervise.py`: `--stale-seconds` 600 → **900**, derived as step 120 + budget 540 + poll 60 = **720** plus
+     margin, and pinned by a test that RUNS the ladder on a fake clock rather than re-adding the knobs.
+  9. `supervise.py`: a per-port sick report (pid, working set, ESTABLISHED connections, CPU cores) plus every
+     `env_*.log` tail, written **before** the kill; and the spawn no longer uses `DETACHED_PROCESS`, which had
+     been discarding the trainer's entire stdout.
+  10. `games.py`: a laggard port is repaired with `relaunch_one` (and a wedged portless instance killed) instead
+      of failing the whole launch and costing another full stop-and-launch round.
+  - **Second pass (2026-09-17, same branch): six more findings, all six measured, all six fixed.** The first
+    ten got the individual bounds right and left the *total* advisory, which is why four of the six are the
+    same bug in different places. Full detail and the measurements are in the freeze gotcha; in brief:
+    11. `env.py`: the deadline is **authoritative**, not advisory — `_begin_recovery` returns
+        `(deadline, opened_here)`, only the opening frame closes it (the reset tail was opening a second full
+        budget), and `_clamp` cuts `client.reset(timeout=…)` and `connect(retry_seconds=…)` to what is left.
+        Measured 555.6 s → **540.0 s exactly**, one budget instead of two.
+    12. `env.py`: `bridge_relaunch_reserve_s` (240 s) that rung 0 may not spend, because the relaunch rung was
+        **unreachable** whenever the bridge failed slowly — i.e. in the shape it exists for.
+    13. `env.py` + `eval.py`: `EnvConfig.RUN_ONLY_FIELDS` keeps `bridge_relaunch` and `env_log_dir` out of
+        `env_config.yaml`, so an eval can no longer `taskkill` a **training** game or write into a live run's
+        attribution log.
+    14. `games.py`: every `subprocess.run` bounded at 30 s and the `netstat`/`tasklist` snapshots cached with a
+        2 s TTL — these are called from inside the recovery that promises it cannot hang.
+    15. `protocol.py` + `env.py`: a connect failure is `BridgeClosed` (RECOVERABLE), `connect_retry_s` back to
+        180 s, and `reset()`'s tail reconnects through `_reconnect_within`, which retries inside the budget and
+        then relaunches. A cold port used to kill the worker in 60 s flat — the 18:08 pathology.
+    16. `env.py`: at most 2 workers relaunch at once (`O_EXCL` permits in `env_log_dir`, stale-age takeover)
+        with a per-port stagger; and `relaunch_one` reaps a wedged portless instance before replacing it.
+  - **Verified (second pass):** the full no-game suite green — 22 files, **0 failures** — with the ladder's
+    behaviour pinned by measurement rather than by arithmetic: `test_the_measured_ladder_fits_inside_the_
+    supervisors_patience`, `test_the_relaunch_rung_is_reached_when_the_bridge_fails_SLOWLY`,
+    `test_a_cold_port_at_startup_does_not_kill_the_worker`, `test_run_only_settings_never_travel_in_the_
+    config_file`, and `test_against_a_real_silent_socket_every_bound_is_honoured` (a real loopback peer that
+    accepts and then says nothing — the client's-eye view of the frozen game). No private game was needed:
+    **the incident reproduced itself on main at 19:13** while this was being written, and the socket-state
+    capture from that recurrence is stronger evidence than a synthetic freeze would have been.
+  - **Verified:** the full no-game suite (22 files, 534 named tests, 0 failures) plus five live reproductions on
+    ONE private game on port 47812 while the 12-game run kept training at 209-234 steps/s — `close()` 5.00 s
+    (was 20.0 s at `timeout=20`), handshake 20.00 s (was 120), no sticky bound after a reset, a step timing out
+    at its own bound and reconnecting, a whole failed ladder in 51 s against its 60 s budget, and a game
+    **killed outright** mid-episode recovered in 47.7 s with all twelve training ports' owning pids unchanged.
+  - **ACTIVATION (the lead does this; it restarts the supervisor, which the usual procedure does not).**
+    ```powershell
+    # from python/  --  1. pause, so nothing restarts underneath the merge
+    New-Item runs\campaign_gates\SUPERVISOR_PAUSE
+    ```
+    2. **Stop `supervise.py` itself** — Ctrl+C its console and wait for it to exit. This is the step the normal
+       config-switch procedure does not have: `supervise.py` is a long-lived process and a trainer restart does
+       not reload its code, so the running one would keep the old 600 s window and the old detached spawn.
+    3. **Merge `freeze-fix` into main and run the full no-game suite against the merged tree.** The supervisor
+       restarts the trainer from main's code, so main must be left in a state that runs.
+    4. **Stop the trainer** — Ctrl+C and wait for `Saved models\campaign_gates\latest.zip`, then for the new
+       `vec env teardown: clean` line. After a hard stop, resume from the newest `ckpt_*_steps.zip` instead.
+    5. `Remove-Item runs\campaign_gates\SUPERVISOR_PAUSE`
+    6. **Start the supervisor again** (this is what picks up the new code), from `python/`:
+       `python scripts/supervise.py --run campaign_gates --config configs/campaign_gates_full.yaml --count 12 --monitor 1`.
+       It finds no trainer, treats it as DEAD, relaunches the twelve games, waits out the boot gate and resumes
+       from the checkpoint with the most timesteps. Same run name, same weights, same `best.zip`, same archives.
+    7. **Confirm within ten minutes**: `runs/campaign_gates_train.log` is **growing** (it is the regression test
+       for the detached-spawn fix and had been dead for seven hours), twelve `runs/campaign_gates/env_*.log`
+       files exist and are each getting `reset_start`/`reset_end` pairs, and `status.json`'s `timesteps` is
+       climbing. Rollback is steps 1-2 and 4-6 with `git revert` of the merge.
