@@ -103,6 +103,19 @@ speed:
   # through status.json. A level may be overridden here -- `"Level 0-1": 95.0` -- and the env then reports THAT
   # number down the same path, so the reward and the promotion rule always agree. Empty: read every level's own.
   targets: {}
+  # ... TIMES THIS (spec §8b). An S-rank time is what a competent human run scores, not a fast one: the 0-2
+  # specialist's best is 139.5 s and 0-2's S threshold is above that, so a bare S target would have promoted
+  # 0-2's speed stage on its first observation with zero improvement. 0.75 asks for a quarter off the game's
+  # own idea of good. Applied in exactly ONE place -- the env -- so the reward and the promotion rule cannot
+  # drift apart; a `targets:` override above is a decision already made and is NOT scaled.
+  target_scale: 0.75
+# THE HOLD LINE (spec §8a). No stage at or after this level starts until EVERY stage before it is "done".
+# The lead, 2026-09-18: "dont have it promote to 0-4 untell it gets better times on these levels". Without this
+# key a speed stage that burns its 8M-step cap is recorded "unfinished" and the ladder walks on to 0-4 carrying
+# exactly the slow policies the instruction forbids. While the line is up the driver keeps training the stages
+# in front of it in ROUND ROBIN -- fewest rounds first, ties in plan order -- each round a fresh step budget
+# resumed from that stage's own newest weights. Set it to null (or delete it) to let the ladder walk on.
+hold_before: "Level 0-4"
 env:
   mode: campaign
   level: "Level 0-1"   # the driver overwrites this per stage; `levels` is deliberately absent

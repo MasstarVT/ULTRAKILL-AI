@@ -121,7 +121,18 @@ def test_the_speed_rule_is_the_stage_rule_with_the_clock_added():
     assert (speed.min_fresh_window, speed.settle_steps) == (30, 300_000), "inherited from `stage:`"
     assert (speed.count, speed.monitor, speed.seed_explore_from) == (12, 1, "campaign_gates")
     assert p.targets == {}, "no hand-picked seconds: every level's target is its own S-rank time"
+    assert p.target_scale == 0.75, "... times 0.75 (§8b): an S-rank time is a competent run, not a fast one"
     assert p.rule_for(campaign_driver.COMPLETE) == p.rule, "a complete stage's rule is untouched"
+
+
+def test_the_hold_line_sits_in_front_of_every_stage_past_0_3():
+    """§8a, and the reason the plan file has the key at all: the ladder may not reach 0-4 on slow policies."""
+    p = plan()
+    assert p.hold_before == "Level 0-4"
+    hold = p.hold_index()
+    assert hold == 6, "the six 0-1..0-3 stages are in front of it and nothing else is"
+    assert {s.level for s in p.stages[:hold]} == {"Level 0-1", "Level 0-2", "Level 0-3"}
+    assert all(s.level not in ("Level 0-1", "Level 0-2", "Level 0-3") for s in p.stages[hold:])
 
 
 def test_a_speed_stage_only_adds_the_bonus_switch_to_the_env():
@@ -129,10 +140,12 @@ def test_a_speed_stage_only_adds_the_bonus_switch_to_the_env():
     p = plan()
     complete = campaign_driver.stage_config(p, "Level 0-2")["env"]
     speed = campaign_driver.stage_config(p, "Level 0-2", kind=campaign_driver.SPEED)["env"]
-    assert set(speed) - set(complete) == {"speed_bonus"} and speed["speed_bonus"] is True
-    assert {k: v for k, v in speed.items() if k != "speed_bonus"} == complete
+    added = {"speed_bonus", "speed_target_scale"}
+    assert set(speed) - set(complete) == added and speed["speed_bonus"] is True
+    assert {k: v for k, v in speed.items() if k not in added} == complete
     cfg = EnvConfig.from_dict(speed)
     assert cfg.speed_bonus is True and cfg.speed_target_seconds == 0.0, "0 = read the level's own S-rank time"
+    assert cfg.speed_target_scale == 0.75, "the plan's target_scale (§8b), applied in the env and nowhere else"
     assert cfg.rewards == EnvConfig.from_dict(complete).rewards, "every reward weight is the complete stage's"
     env = UltrakillEnv(cfg)
     try:

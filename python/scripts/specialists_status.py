@@ -37,6 +37,16 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
     state.reconcile(plan)  # read-only: the same (level, kind) match the driver does on its own start
     out: dict = {"levels": len(plan.order), "stages": len(plan.stages), "rule": plan.rule.__dict__,
                  "speed_rule": plan.rule_for(SPEED).__dict__, "history": state.history, "current": None}
+    # THE HOLD LINE (spec §8a). `hold_before` is the level the ladder will not pass, and `held_by` is what it is
+    # still waiting on -- rebuilt here from the same state and plan the driver reads, so this report cannot
+    # disagree with the driver about whether the line is up.
+    hold = plan.hold_index()
+    out["hold_before"] = plan.hold_before
+    out["held_by"] = ([{"level": s.level, "kind": s.kind, "rounds": state.rounds(s.key),
+                        "status": state.stage_status(s.key)}
+                       for s in plan.stages[:hold]
+                       if state.stage_status(s.key) not in ("done", "skipped")] if hold is not None else [])
+    out["target_scale"] = plan.target_scale
     stage = state.current
     if stage is not None:
         rule = plan.rule_for(stage.kind)
@@ -52,6 +62,7 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
             "stage_steps": (sample.timesteps - stage.start_steps) if sample.timesteps is not None else None,
             "fresh_completion_rate": sample.fresh_rate, "fresh_window": sample.fresh_window,
             "best_time": sample.best_time, "best_at": sample.best_at, "target_seconds": target,
+            "s_rank_seconds": stage.s_rank_seconds or sample.s_rank_seconds, "round": stage.round,
             "target_rate": rule.target_rate, "max_steps_per_stage": rule.max_steps_per_stage,
             "settle_steps": rule.settle_steps, "min_fresh_window": rule.min_fresh_window,
             "target_reached_at": reached, "verdict": verdict,
@@ -79,9 +90,10 @@ def render(data: dict) -> str:
         lines.append("no stage running (%d of %d stages left in the plan)"
                      % (len(data["remaining"]), data.get("stages", data["levels"])))
     else:
-        lines.append("STAGE %d/%d  %s  [%s]  run %s  [%s]"
+        lines.append("STAGE %d/%d  %s  [%s, round %d]  run %s  [%s]"
                      % (current["index"] + 1, data.get("stages", data["levels"]), current["level"],
-                        current.get("kind", "complete"), current["run"], current["verdict"]))
+                        current.get("kind", "complete"), current.get("round", 1), current["run"],
+                        current["verdict"]))
         lines.append("  steps into the stage: %s of %s (total %s)"
                      % ("{:,.0f}".format(current["stage_steps"] or 0),
                         "{:,}".format(current.get("max_steps_per_stage", rule["max_steps_per_stage"])),
@@ -95,10 +107,12 @@ def render(data: dict) -> str:
                      % (format_time(best) if best is not None else "-",
                         "{:,.0f}".format(current["best_at"]) if current["best_at"] is not None else "-"))
         if current.get("kind") == SPEED:
-            target = current.get("target_seconds")
+            target, s_rank = current.get("target_seconds"), current.get("s_rank_seconds")
             lines.append("  SPEED stage: it promotes only once the best time is at or under %s%s"
-                         % (format_time(target) if target else "the level's own S-rank time",
-                            "" if target else " (not read from the run yet)"))
+                         % (format_time(target) if target else
+                            "%.2f x the level's own S-rank time" % data.get("target_scale", 0.75),
+                            (" (S is %s)" % format_time(s_rank)) if s_rank else
+                            ("" if target else " (not read from the run yet)")))
         settle = current.get("settle_steps", rule["settle_steps"])
         if current["target_reached_at"] is None:
             lines.append("  target not reached yet: the stage ends on the rule above, or at the %s-step cap"
@@ -110,14 +124,29 @@ def render(data: dict) -> str:
                          % ("{:,.0f}".format(current["target_reached_at"]), "{:,.0f}".format(max(0.0, left))))
         lines.append("  resumed from %s" % current["init"])
 
+    held = data.get("held_by") or []
+    if data.get("hold_before"):
+        lines.append("")
+        if held:
+            lines.append("holding before %s: waiting on %s"
+                         % (data["hold_before"],
+                            ", ".join("%s (%s, round %d, %s)"
+                                      % (h["level"], h["kind"], h["rounds"], h["status"] or "not started")
+                                      for h in held)))
+            lines.append("  no stage at or after %s starts until every one of those is done; they are trained "
+                         "in round robin, fewest rounds first" % data["hold_before"])
+        else:
+            lines.append("hold line before %s is OPEN: every stage in front of it is done"
+                         % data["hold_before"])
+
     lines.append("")
     lines.append("promoted specialists (%s/):" % SPECIALIST_DIR)
     if not data["promoted"]:
         lines.append("  none yet")
     for row in data["promoted"]:
         best, target = row.get("best_time"), row.get("target_seconds")
-        lines.append("  %-12s %-9s %-10s rate %-6s best %-10s target %-10s %s steps  <- %s"
-                     % (row.get("level"), row.get("mode", COMPLETE), row.get("status"),
+        lines.append("  %-12s %-9s r%-2d %-10s rate %-6s best %-10s target %-10s %s steps  <- %s"
+                     % (row.get("level"), row.get("mode", COMPLETE), row.get("round", 1), row.get("status"),
                         fmt(row.get("fresh_completion_rate"), 3),
                         format_time(best) if best is not None else "-",
                         format_time(target) if target else "-",

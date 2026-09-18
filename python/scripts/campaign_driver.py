@@ -43,14 +43,23 @@ BOTH hold:
     keeps training; the stage ends once the peak stops moving. Without the "later of" the settle could be
     already satisfied at the instant the target is reached, by a best saved long before it.
 
-A SPEED stage adds one clause to the first: its `best_time` must also be at or under the level's own S-rank
-time (`target_seconds`, read live off `campaign.ranks.time[-1]` by the env and carried here through
-`status.json`). Its `target_rate` is lower (0.4), because a fast policy that finishes four loads in ten is
-worth more to the ladder than a slow one that finishes six.
+A SPEED stage adds one clause to the first: its `best_time` must also be at or under `target_seconds`, which is
+`speed.target_scale` (0.75) times the level's own S-rank threshold (`campaign.ranks.time[-1]`), computed by the
+env and carried here through `status.json`. Its `target_rate` is lower (0.4), because a fast policy that
+finishes four loads in ten is worth more to the ladder than a slow one that finishes six.
 
 OR the stage has consumed `max_steps_per_stage` (6M, 8M for a speed stage) of its own, at which point it moves
 on REGARDLESS and is recorded as `"unfinished"` so it can be revisited later. A blocked level must not stop
 the other 29.
+
+**The hold line** (`hold_before`, §8a of the spec) is the exception to that last sentence, and it exists because
+the lead's instruction -- "dont have it promote to 0-4 untell it gets better times on these levels" -- is
+precisely a refusal to walk past an unfinished stage. `hold_before: "Level 0-4"` means no stage at or after 0-4
+starts while any stage before it is not `"done"`. While the line is up the driver keeps training the stages in
+front of it in ROUND ROBIN (`choose_stage`): fewest rounds first, ties in plan order, each round a fresh step
+budget resumed from that stage's OWN newest weights (`round_init`), never from scratch and never from another
+level. Every round is one history entry carrying its `round` number, so `specialists_status.py` can report
+"holding before Level 0-4: waiting on ..., round N". Setting `hold_before: null` lifts the line.
 
 **Per stage**: run name `spec_<short level>` (e.g. `spec_0-1`), `models/spec_0-1/`, `runs/spec_0-1/`, the
 generated config at `configs/generated/spec_0-1.yaml`, and the shared run's `explore_<level>_*.npz` copied in
@@ -132,6 +141,9 @@ TIMESTEPS_SLACK = 1_000_000
 COMPLETE = "complete"  # the stage kind that has always existed: promote on the fresh completion RATE
 SPEED = "speed"        # ... and the one that promotes on the CLOCK as well (2026-09-18-speed-stages.md)
 STAGE_KINDS = (COMPLETE, SPEED)
+# A speed stage's target is this times the level's own S-rank threshold (§8b). Duplicated as `EnvConfig`'s
+# default so a stage config that predates the key still means the same thing; the env is where it is APPLIED.
+DEFAULT_TARGET_SCALE = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +211,22 @@ class Plan:
     train: dict
     speed: dict = field(default_factory=dict)     # per-kind overrides of the stage rule for a speed stage
     targets: dict[str, float] = field(default_factory=dict)  # per-level override of the S-rank target time
+    target_scale: float = DEFAULT_TARGET_SCALE    # what a level's own S threshold is multiplied by (§8b)
+    # THE HOLD LINE (§8a): the level at which the ladder stops until everything before it is "done". `None`
+    # lifts it. The lead's instruction on 2026-09-18 was "dont have it promote to 0-4 untell it gets better
+    # times on these levels", and a stage that hits its step cap is recorded "unfinished" and walked past --
+    # so without this key the ladder reaches 0-4 with exactly the slow policies the instruction forbids.
+    hold_before: str | None = None
+
+    def hold_index(self) -> int | None:
+        """The plan position the hold line sits in front of, or None when there is no line.
+
+        The line is named by a LEVEL, and it bites at that level's FIRST stage, so `hold_before: "Level 0-4"`
+        blocks 0-4's complete stage and everything after it while leaving all six 0-1..0-3 stages runnable.
+        """
+        if not self.hold_before:
+            return None
+        return next((i for i, s in enumerate(self.stages) if s.level == self.hold_before), None)
 
     @property
     def order(self) -> list[str]:
@@ -256,12 +284,21 @@ def load_plan(path: str | Path) -> Plan:
     known = {f.name for f in StageRule.__dataclass_fields__.values()}  # type: ignore[attr-defined]
     speed = dict(data.get("speed", {}) or {})
     targets = {str(k): float(v) for k, v in (speed.pop("targets", {}) or {}).items()}
+    scale = float(speed.pop("target_scale", DEFAULT_TARGET_SCALE))
     for name, block in (("stage", dict(data.get("stage", {}) or {})), ("speed", speed)):
         unexpected = sorted(set(block) - known)
         if unexpected:  # a misspelt knob would silently use its default, exactly as EnvConfig.from_dict would
             raise ValueError("%s: unknown %s settings %s" % (path, name, unexpected))
-    return Plan(stages=stages, rule=StageRule(**dict(data.get("stage", {}) or {})), speed=speed, targets=targets,
+    hold = data.get("hold_before")
+    hold = str(hold) if hold else None
+    if hold is not None and hold not in {s.level for s in stages}:
+        # A typo here would silently lift the hold line and let the ladder walk to 0-4 on slow policies, which
+        # is the one thing this key exists to prevent. It is a hard error, not a warning.
+        raise ValueError("%s: hold_before %r is not a level in the plan" % (path, hold))
+    plan = Plan(stages=stages, rule=StageRule(**dict(data.get("stage", {}) or {})), speed=speed, targets=targets,
+                target_scale=scale, hold_before=hold,
                 env=dict(data.get("env", {}) or {}), train=dict(data.get("train", {}) or {}))
+    return plan
 
 
 def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind: str = COMPLETE) -> dict:
@@ -274,13 +311,16 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
 
     A SPEED stage is the same config with `speed_bonus` on -- no reward weight moves, no observation or action
     changes, so the level's own specialist loads into it unchanged. `speed_target_seconds` is set only when the
-    plan overrides it for this level; 0 tells the env to read the level's own S-rank time live.
+    plan overrides it for this level; 0 tells the env to read the level's own S-rank time live and scale it by
+    `speed_target_scale`. The scale is written into every speed stage's config even when it is the default, so
+    a generated file says what the run was actually measured against.
     """
     rule = plan.rule_for(kind)
     env = {key: value for key, value in plan.env.items() if key not in MULTI_LEVEL_KEYS}
     env["level"] = level
     if kind == SPEED:
         env["speed_bonus"] = True
+        env["speed_target_scale"] = float(plan.target_scale)
         target = plan.target_for(level)
         if target:
             env["speed_target_seconds"] = float(target)
@@ -317,9 +357,13 @@ class StageSample(NamedTuple):
     fresh_window: int            # ... campaign.fresh_window, how many of them there are
     best_time: float | None      # ... campaign.best_time, the fastest fresh-start completion
     best_at: float | None        # models/<run>/best.json's at_timesteps: when keep_best last moved best.zip
-    # ... campaign.target_seconds: the level's own S-rank time, as the ENV read it live off the campaign block.
-    # None on a complete stage and on any run older than 2026-09-18, which is why it carries a default.
+    # ... campaign.target_seconds: the target the ENV computed live off the campaign block -- the level's own
+    # S-rank threshold times `speed_target_scale`, or the plan's per-level override. None on a complete stage
+    # and on any run older than 2026-09-18, which is why it carries a default.
     target_seconds: float | None = None
+    # ... campaign.s_rank_seconds: the UNSCALED threshold behind it. Recorded in the sidecar, never compared
+    # against: the promotion rule only ever reads `target_seconds` (§8b).
+    s_rank_seconds: float | None = None
 
 
 EMPTY_SAMPLE = StageSample(None, None, 0, None, None)
@@ -327,7 +371,7 @@ EMPTY_SAMPLE = StageSample(None, None, 0, None, None)
 
 def read_sample(status_path: Path, best_json: Path) -> StageSample:
     """One `StageSample` from disk. A missing or half-written file reads as "nothing known yet", never raises."""
-    timesteps = rate = best_time = best_at = target = None
+    timesteps = rate = best_time = best_at = target = s_rank = None
     window = 0
     try:
         status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -341,12 +385,13 @@ def read_sample(status_path: Path, best_json: Path) -> StageSample:
             window = int(_num(campaign.get("fresh_window")) or 0)
             best_time = _num(campaign.get("best_time"))
             target = _num(campaign.get("target_seconds"))
+            s_rank = _num(campaign.get("s_rank_seconds"))
     try:
         best = json.loads(best_json.read_text(encoding="utf-8"))
         best_at = _num(best.get("at_timesteps")) if isinstance(best, dict) else None
     except (OSError, ValueError):
         best_at = None
-    return StageSample(timesteps, rate, window, best_time, best_at, target)
+    return StageSample(timesteps, rate, window, best_time, best_at, target, s_rank)
 
 
 def _num(value) -> float | None:
@@ -411,7 +456,7 @@ def promotion_source(model_dir: Path, zip_steps: Callable[[Path], int | None] = 
 
 def promote(model_dir: Path, models_dir: Path, level: str, *, sample: StageSample, status: str,
             start_steps: float, difficulty: int, run: str, kind: str = COMPLETE,
-            target_seconds: float | None = None,
+            target_seconds: float | None = None, s_rank_seconds: float | None = None, round: int = 1,
             zip_steps: Callable[[Path], int | None] = supervise.zip_timesteps,
             copy: Callable[[Path, Path], object] = shutil.copy2) -> tuple[Path | None, dict]:
     """Copies the stage's checkpoint to `models/specialists/<level>.zip` and writes its JSON sidecar.
@@ -430,7 +475,9 @@ def promote(model_dir: Path, models_dir: Path, level: str, *, sample: StageSampl
         "level": level,
         "run": run,
         "mode": kind,                           # "complete" (the rate rule) or "speed" (the rate AND the clock)
-        "target_seconds": target_seconds,       # the level's own S-rank time a speed stage was measured against
+        "target_seconds": target_seconds,       # what a speed stage was actually measured against
+        "s_rank_seconds": s_rank_seconds,       # ... and the raw S threshold it was scaled from (§8b)
+        "round": round,                         # which attempt at this stage produced the file (§8a)
         "status": status,                       # "done" (the target rate was reached) or "unfinished" (the cap)
         "fresh_completion_rate": sample.fresh_rate,
         "fresh_window": sample.fresh_window,
@@ -461,10 +508,16 @@ class Stage:
     start_steps: float = 0.0               # the trainer's step count when the stage began
     started_at: float = 0.0
     target_reached_at: float | None = None  # the latch of the stage rule
-    # A stage written before kinds existed has neither field, and both defaults are what it was: a complete
-    # stage with no clock to beat. That is the whole of the on-disk migration.
+    # A stage written before kinds existed has none of these fields, and every default is what it was: the
+    # first (and only) complete round of a stage with no clock to beat. That is the whole on-disk migration,
+    # and `tests/test_campaign_driver.py` pins it against a copy of the REAL live state file.
     kind: str = COMPLETE
-    target_seconds: float | None = None    # the level's own S-rank time, once the run has reported it
+    target_seconds: float | None = None    # the target the run reported, once it has reported one
+    s_rank_seconds: float | None = None    # ... and the raw S threshold behind it, for the record only
+    # Which attempt at this (level, kind) this is. 1 for every stage the ladder walks through once; a second
+    # and later round only happens while the HOLD LINE is up (§8a), when a stage that ended "unfinished" is
+    # given another budget instead of the ladder moving on to a level it is not allowed to reach yet.
+    round: int = 1
 
     def to_dict(self) -> dict:
         return dict(self.__dict__)
@@ -513,6 +566,25 @@ class DriverState:
         return {(h["level"], str(h.get("kind") or COMPLETE))
                 for h in self.history if isinstance(h.get("level"), str)}
 
+    def entries_for(self, key: tuple[str, str]) -> list[dict]:
+        """Every history entry for one `(level, kind)`, oldest first: one per ROUND of that stage."""
+        return [h for h in self.history
+                if isinstance(h.get("level"), str) and (h["level"], str(h.get("kind") or COMPLETE)) == key]
+
+    def rounds(self, key: tuple[str, str]) -> int:
+        """How many rounds of this stage have already ENDED. The next one is this plus one."""
+        return len(self.entries_for(key))
+
+    def stage_status(self, key: tuple[str, str]) -> str | None:
+        """The status of the LATEST round of this stage, or None when it has never run.
+
+        The hold line reads this and nothing else: only `"done"` counts as satisfied. `"unfinished"` is a stage
+        that ran out of steps, which is exactly the case the line exists to catch, and `"skipped"` is an
+        operator's explicit `--start-at` decision, which the line respects rather than second-guessing.
+        """
+        entries = self.entries_for(key)
+        return str(entries[-1].get("status") or "") if entries else None
+
     def reconcile(self, plan: "Plan") -> list[str]:
         """Matches this state to `plan` by `(level, kind)` and re-numbers the indices. Returns what it could not place.
 
@@ -523,9 +595,14 @@ class DriverState:
         """
         positions = {s.key: i for i, s in enumerate(plan.stages)}
         missing: list[str] = []
+        seen: dict[tuple, int] = {}
         for entry in self.history:
             key = (entry.get("level"), str(entry.get("kind") or COMPLETE))
             entry.setdefault("kind", key[1])
+            # Round numbers are filled in for entries written before rounds existed, in history order, so
+            # `specialists_status.py` can count them without knowing which driver version wrote which row.
+            seen[key] = seen.get(key, 0) + 1
+            entry.setdefault("round", seen[key])
             if key in positions:
                 entry["index"] = positions[key]
             elif isinstance(key[0], str):
@@ -694,6 +771,86 @@ class Driver:
         stage = self.next_stage()
         return stage.level if stage is not None else None
 
+    def stage_blocked(self, spec: StageSpec) -> str:
+        """Why this stage cannot start yet, or `""` when it can.
+
+        Only a SPEED stage is ever blocked, and only by its own level: it resumes from that level's promoted
+        specialist, so a level whose complete stage has not finished has nothing for it to resume FROM. Starting
+        it anyway would either train the clock on a policy that cannot reach the exit or, worse, silently pick up
+        some other level's weights.
+        """
+        if spec.kind != SPEED:
+            return ""
+        if self.state.stage_status((spec.level, COMPLETE)) != "done":
+            return "its complete stage is not done yet"
+        if not specialist_path(self.cfg.cwd / self.cfg.models_dir, spec.level).exists():
+            return "no specialist file for the level yet"
+        return ""
+
+    def held_by(self) -> list[StageSpec]:
+        """The stages in front of the hold line that are not `"done"`, in plan order. Empty = the line is open.
+
+        THE HOLD LINE (§8a). `hold_before: "Level 0-4"` means no stage at or after 0-4 starts while any stage
+        before it is still unfinished or unrun. Without it a stage that burns its 8M-step cap is recorded
+        `"unfinished"` and the ladder walks on to 0-4 regardless -- which is exactly what the lead's
+        "dont have it promote to 0-4 untell it gets better times on these levels" forbids.
+        """
+        hold = self.plan.hold_index()
+        if hold is None:
+            return []
+        return [s for s in self.plan.stages[:hold]
+                if self.state.stage_status(s.key) not in ("done", "skipped")]
+
+    def choose_stage(self) -> tuple[StageSpec | None, list[StageSpec], str]:
+        """`(the stage to start, the stages the hold line is waiting on, why nothing can start)`.
+
+        With the line open (or absent) this is the ladder's own order, skipping a speed stage whose level is
+        not ready for one. With the line up it is a ROUND ROBIN over the stages still in front of it: fewest
+        rounds first, ties in plan order, so every not-done stage gets a fresh step budget before any of them
+        gets a second. A stage picked for another round resumes from its OWN newest weights (`round_init`).
+        """
+        waiting = self.held_by()
+        if waiting:
+            eligible = [s for s in waiting if not self.stage_blocked(s)]
+            if not eligible:
+                # Every stage in front of the line is blocked by another one that is also in front of it. That
+                # cannot resolve itself, so say which and let the driver stop rather than spin.
+                return None, waiting, "; ".join("%s (%s): %s" % (s.level, s.kind, self.stage_blocked(s))
+                                                for s in waiting)
+            pick = min(eligible, key=lambda s: (self.state.rounds(s.key), self.plan.index_of(s.level, s.kind)))
+            return pick, waiting, ""
+        done = self.state.finished_stages()
+        for spec in self.plan.stages:
+            if spec.key in done:
+                continue
+            why = self.stage_blocked(spec)
+            if why:
+                self.log_once("blocked:%s/%s" % spec.key,
+                              "skipping %s (%s) for now: %s" % (spec.level, spec.kind, why))
+                continue
+            return spec, [], ""
+        return None, [], ""
+
+    def round_init(self, spec: StageSpec) -> Path | None:
+        """The weights a stage resumes from, preferring its OWN: never from scratch, never another level's.
+
+        A repeat round (§8a) must not restart the level: the order is what `ensure_trainer` will actually load
+        (`choose_resume`: the highest-step checkpoint in the stage's own model directory), then what `promote`
+        treats as authoritative (`best.zip`), then the level's own promoted specialist. Only when the stage has
+        never run does this fall through to `initial_checkpoint`, the ladder's walk backwards.
+        """
+        model_dir = self.model_dir(spec.level, spec.kind)
+        resume, _ = supervise.choose_resume(model_dir, self.zip_steps)
+        if resume is not None:
+            return resume  # exactly what the trainer will load, so `start_steps` matches the resume point
+        source, _ = promotion_source(model_dir, self.zip_steps)
+        if source is not None:
+            return source  # best.zip, when the checkpoints were pruned but keep_best's peak was kept
+        own = specialist_path(self.cfg.cwd / self.cfg.models_dir, spec.level)
+        if self.state.rounds(spec.key) and own.exists():
+            return own  # this stage ran before and promoted; that file is its own newest weights
+        return self.initial_checkpoint(spec.level, spec.kind)
+
     def begin_stage(self, level: str, init: Path, kind: str = COMPLETE) -> Stage:
         """Prepares a stage's files and records it as current. Starting the trainer is `ensure_trainer`."""
         model_dir = self.model_dir(level, kind)
@@ -714,18 +871,26 @@ class Driver:
             path = write_stage_config(self.plan, level, self.cfg.cwd, init_steps=init_steps,
                                       generated_dir=self.cfg.generated_dir, kind=kind)
             self.log("stage config %s (init %s steps)" % (path, "{:,}".format(init_steps) if init_steps else "?"))
+        round_n = self.state.rounds((level, kind)) + 1
         stage = Stage(level=level, run=stage_run_name(level, kind), index=self.plan.index_of(level, kind),
                       init=init.as_posix(), start_steps=float(init_steps or 0), started_at=self.now(),
-                      kind=kind, target_seconds=self.plan.target_for(level) if kind == SPEED else None)
+                      kind=kind, target_seconds=self.plan.target_for(level) if kind == SPEED else None,
+                      round=round_n)
         self.state.current = stage
         self.save_state()
         self.sup = None  # the next supervisor_for() builds one for this stage
-        self.log("STAGE %d/%d %s (%s): run %s, resuming from %s"
-                 % (stage.index + 1, len(self.plan.stages), level, kind, stage.run, init))
+        self.log("STAGE %d/%d %s (%s, round %d): run %s, resuming from %s"
+                 % (stage.index + 1, len(self.plan.stages), level, kind, round_n, stage.run, init))
+        if round_n > 1:
+            # The budget is measured from `start_steps`, which is this init file's own step count, so a repeat
+            # round gets a whole fresh cap rather than resuming into an already-spent one.
+            self.log("round %d of %s (%s): a fresh %s-step budget from %s, the stage's own newest weights"
+                     % (round_n, level, kind, "{:,}".format(self.plan.rule_for(kind).max_steps_per_stage), init))
         if kind == SPEED:
             self.log("%s is a SPEED stage: it promotes only once best_time <= %s"
                      % (level, ("%.2f s (the plan's override)" % stage.target_seconds) if stage.target_seconds
-                        else "the level's own S-rank time, read live from the first observation"))
+                        else "%.2f x the level's own S-rank time, read live from the first observation"
+                             % self.plan.target_scale))
         return stage
 
     def seed_archives(self, level: str, model_dir: Path, kind: str = COMPLETE) -> list[str]:
@@ -842,6 +1007,7 @@ class Driver:
             self.model_dir(stage.level, stage.kind), self.cfg.cwd / self.cfg.models_dir, stage.level,
             sample=sample, status=status, start_steps=stage.start_steps, difficulty=difficulty,
             run=stage.run, kind=stage.kind, target_seconds=stage.target_seconds,
+            s_rank_seconds=stage.s_rank_seconds, round=stage.round,
             zip_steps=self.zip_steps, copy=self.copy)
         if destination is None:
             # Nothing to promote means nothing ever trained: promoting the init file would hide that, and the
@@ -851,10 +1017,11 @@ class Driver:
             return "no_checkpoint"
         self.log("promoted %s -> %s" % (sidecar.get("source_checkpoint", "?"), destination))
         entry = {"level": stage.level, "kind": stage.kind, "run": stage.run, "status": status,
-                 "index": stage.index,
+                 "index": stage.index, "round": stage.round,
                  "start_steps": stage.start_steps, "end_steps": sample.timesteps,
                  "fresh_completion_rate": sample.fresh_rate, "fresh_window": sample.fresh_window,
-                 "best_time": sample.best_time, "target_seconds": stage.target_seconds, "init": stage.init,
+                 "best_time": sample.best_time, "target_seconds": stage.target_seconds,
+                 "s_rank_seconds": stage.s_rank_seconds, "init": stage.init,
                  "specialist": destination.as_posix() if destination else None,
                  "source_checkpoint": sidecar.get("source_checkpoint"),
                  "finished_at": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -862,15 +1029,22 @@ class Driver:
         self.state.current = None
         self.save_state()
 
-        nxt = self.next_stage()
-        if nxt is None:
+        nxt, waiting, blocked = self.choose_stage()
+        if nxt is None and not waiting:
             self.log("EVERY STAGE FINISHED: %d specialists in %s"
                      % (len(self.state.history), self.cfg.cwd / self.cfg.models_dir / SPECIALIST_DIR))
             return "finished"
-        # A speed stage starts from ITS OWN level's specialist, which `initial_checkpoint` knows and this
-        # stage's promotion does not: the file just written belongs to the level that ended, not to the next
-        # one. The freshly promoted checkpoint stays the fallback for the ordinary "next level up" case.
-        init = self.initial_checkpoint(nxt.level, nxt.kind) or destination or Path(stage.init)
+        if nxt is None:
+            self.log("HELD before %s and nothing can run: %s. Stopping so a human can look."
+                     % (self.plan.hold_before, blocked))
+            return "held"
+        if waiting:
+            self.log("holding before %s: waiting on %s"
+                     % (self.plan.hold_before, ", ".join("%s (%s)" % (s.level, s.kind) for s in waiting)))
+        # A speed stage starts from ITS OWN level's specialist and a repeat round from its own newest weights,
+        # neither of which is the file this stage just promoted: that one belongs to the level that ended.
+        # The freshly promoted checkpoint stays the fallback for the ordinary "next level up" case.
+        init = self.round_init(nxt) or destination or Path(stage.init)
         started = self.begin_stage(nxt.level, init, nxt.kind)
         self.ensure_trainer(started, self.supervisor_for(started), self.processes())
         return "advanced"
@@ -885,11 +1059,20 @@ class Driver:
 
         stage = self.state.current
         if stage is None:
-            spec = self.next_stage()
-            if spec is None:
+            spec, waiting, blocked = self.choose_stage()
+            if spec is None and not waiting:
                 self.log_once("finished", "every stage in the plan is finished; nothing to drive")
                 return "finished"
-            init = self.initial_checkpoint(spec.level, spec.kind)
+            if spec is None:
+                self.log("HELD before %s and nothing can run: %s. Stopping so a human can look."
+                         % (self.plan.hold_before, blocked))
+                return "held"
+            if waiting:
+                self.log_once("holding:%s" % spec.key[0] + spec.key[1],
+                              "holding before %s: waiting on %s"
+                              % (self.plan.hold_before,
+                                 ", ".join("%s (%s)" % (s.level, s.kind) for s in waiting)))
+            init = self.round_init(spec)
             if init is None:
                 self.log("NO INIT CHECKPOINT for %s (%s): pass --init on the first start. Stopping."
                          % (spec.level, spec.kind))
@@ -917,7 +1100,13 @@ class Driver:
                 and not self.plan.target_for(stage.level) and stage.target_seconds != sample.target_seconds):
             stage.target_seconds = sample.target_seconds
             self.save_state()
-            self.log("%s target time: %.2f s (the level's own S-rank time, read live)" % (stage.level, sample.target_seconds))
+            self.log("%s target time: %.2f s (%.2f x the level's own S-rank time, read live by the env)"
+                     % (stage.level, sample.target_seconds, self.plan.target_scale))
+        if stage.kind == SPEED and sample.s_rank_seconds is not None and stage.s_rank_seconds != sample.s_rank_seconds:
+            # Carried for the record only -- the sidecar says what the game itself calls S beside what the
+            # stage was actually measured against. Nothing compares against this number.
+            stage.s_rank_seconds = sample.s_rank_seconds
+            self.save_state()
         verdict, reached = stage_verdict(sample, stage.start_steps, stage.target_reached_at, rule,
                                          kind=stage.kind, target_seconds=stage.target_seconds)
         if reached != stage.target_reached_at:
@@ -978,9 +1167,16 @@ class Driver:
                     "{:,}".format(self.plan.rule.max_steps_per_stage)))
         speed_stages = [s.level for s in self.plan.stages if s.kind == SPEED]
         if speed_stages:
-            self.log("speed stages (%d): %s -- rate %.2f AND best_time <= the level's own S-rank time, cap %s"
-                     % (len(speed_stages), ", ".join(speed_stages), speed.target_rate,
+            self.log("speed stages (%d): %s -- rate %.2f AND best_time <= %.2f x the level's own S-rank "
+                     "time, cap %s"
+                     % (len(speed_stages), ", ".join(speed_stages), speed.target_rate, self.plan.target_scale,
                         "{:,}".format(speed.max_steps_per_stage)))
+        if self.plan.hold_before:
+            waiting = self.held_by()
+            self.log("HOLD LINE before %s: no stage at or after it starts until every stage before it is "
+                     "done%s" % (self.plan.hold_before,
+                                 "; waiting on " + ", ".join("%s (%s)" % (s.level, s.kind) for s in waiting)
+                                 if waiting else " -- the line is open"))
         if self.unplanned:
             self.log("state entries the plan no longer lists (kept, not reordered): %s" % ", ".join(self.unplanned))
         self.log("pause with: New-Item %s" % self.pause_path)
@@ -993,7 +1189,7 @@ class Driver:
             except Exception as exc:  # noqa: BLE001 - a driver that dies on a hiccup is worse than none
                 self.log("tick failed (%s: %s); continuing" % (type(exc).__name__, exc))
                 action = "error"
-            if action in ("budget", "no_resume", "no_init", "no_checkpoint"):
+            if action in ("budget", "no_resume", "no_init", "no_checkpoint", "held"):
                 return 1
             if action == "finished":
                 return 0
