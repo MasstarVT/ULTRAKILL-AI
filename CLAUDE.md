@@ -2207,3 +2207,16 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     the newest `ckpt_*_steps.zip` (at most 50k steps old; the supervisor picks the file with the most steps by itself).
     Also: PowerShell's safety check rejects a long combined command that mixes `Remove-Item` with a `cmd /c` argument
     list; run those as separate commands.
+- **Weights rolled back to `ckpt_9553510` (2026-09-17 19:30), code kept.** The 1.4M steps of unconditional patience
+  (9.59M-11.63M) taught 0-1 a bad habit that 1.6M steps of corrected targeting did not undo: fresh 0-1 since 16:51
+  n=39, completion 0.13 (0.55 before 9.58M), 19 of 39 dying at gates 1-2 near (40,0,400-480) against 4 of 43 before,
+  kills 47 -> 32; 0-2 0.22 and 0-3 0.05 over the same window. So training resumed from the last checkpoint before the
+  misdirection with every fix in place (conditional patience, exit guard, route files, entropy floor). The 73
+  post-9.55M checkpoints and the 12.44M `latest.zip` are in `models/campaign_gates/rolled_back_2026-09-17/`
+  (gitignored); `best.zip` (10.93M, pooled score 0.70) is from inside the bad window and should NOT be used to resume.
+  Falsifier for the rollback: within ~1M steps 0-1's fresh rate should sit near 0.5 again and 0-3's gates_reached should
+  climb past 2 under patience; if 0-1 degrades again WITHOUT parking, the cause is multi-level interference or
+  entropy, not the misdirection.
+- **User priority restated 2026-09-17: speed, not kills.** The objective is finishing each level, and the game, as fast
+  as possible. Kill / damage rewards stay minimal (arena-gated doors are the only reason they exist); once a level's
+  fresh completion rate is reliable, the next tuning is a completion bonus scaled by official time, then movement tech.
