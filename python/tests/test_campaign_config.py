@@ -207,12 +207,13 @@ def test_the_full_config_is_the_main_config_with_more_levels():
     assert {k for k in set(train_cfg) & set(main_train) if train_cfg[k] != main_train[k]} == set(), \
         "the optimiser, the run name and num_envs are character for character main's"
 
-    # And the parsed effect of those keys: patience is level-conditional, the route preference is OFF, and the
-    # two new settings hold their defaults, so the only EnvConfig field that actually differs is `levels`.
+    # And the parsed effect of those keys: patience is level-conditional (its default), and the route preference
+    # is ON since 2026-09-17 21:58 (0-3 sat at 0 of 75 fresh completions under gates + patience), so the EnvConfig
+    # fields that differ are the levels list and that one flag.
     differing = {f.name for f in dataclasses.fields(EnvConfig)
                  if getattr(cfg, f.name) != getattr(main, f.name)}
-    assert differing == {"levels"}, f"only the levels list may change, got {sorted(differing)}"
-    assert cfg.gate_patience_mode == "collapsed" and cfg.prefer_route_when_collapsed is False
+    assert differing == {"levels", "prefer_route_when_collapsed"},         f"only the levels list and the route preference may change, got {sorted(differing)}"
+    assert cfg.gate_patience_mode == "collapsed" and cfg.prefer_route_when_collapsed is True
     assert cfg.gate_target_patience_s == 20.0, "the window itself does not move; only where it may act"
     assert cfg.rewards == main.rewards, "no reward weight moves: the fallback adds no term"
     assert train_cfg["num_envs"] == 12 and train_cfg["run_name"] == RUN_NAME

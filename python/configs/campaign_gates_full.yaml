@@ -4,7 +4,7 @@
 # test_campaign_config.test_the_full_config_is_the_main_config_with_more_levels:
 #   - `levels`, 11 -> 30 (the whole routed campaign);
 #   - `gate_patience_mode: collapsed`, the 2026-09-17 revision after target patience regressed Level 0-1;
-#   - `prefer_route_when_collapsed: false`, the lead's ruling, written out so flipping it is a deliberate act;
+#   - `prefer_route_when_collapsed: true` (false until 2026-09-17 21:58): 0-3 and 4-3 follow their room-trunk route files;
 #   - `ent_floor: 5.0` (+ `ent_coef_max`), the adaptive entropy floor. `ent_coef` itself is UNCHANGED at 0.004.
 # No reward weight and no other hyperparameter moves. Same run name, same models/campaign_gates/, same weights,
 # same policy: this is the main run continuing with a longer ladder in front of it, exactly as
@@ -106,7 +106,7 @@ env:
   # 0-3 and 4-3 ship a room trunk as well as a collapsed gate ladder. FALSE keeps them on gates plus patience,
   # which is what took 0-3's fresh gates_reached from 1.0 to 4.5 live; flip it per run, on evidence, to hand
   # those two levels their trunk instead. A level with a healthy ladder never reads its file either way.
-  prefer_route_when_collapsed: false
+  prefer_route_when_collapsed: true  # flipped 2026-09-17 21:58: 0-3 sat at 0 of 75 fresh completions with 8 parks per episode under gates+patience
   # configs/campaign_gates_main.yaml's weights, unchanged. A test pins every one of them equal, because the
   # same policy continues on the same weights and the route fallback adds no reward term at all: a room rung
   # pays through `gate` and `gate_approach`, exactly as a door does.
