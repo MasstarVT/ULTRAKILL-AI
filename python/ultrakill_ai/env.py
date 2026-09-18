@@ -30,6 +30,7 @@ from ultrakill_ai.campaign import (
     choose_fresh_start,
     choose_level,
     compute_rank,
+    exit_ground_point,
     load_route,
     read_curriculum,
     safe_name,
@@ -1793,7 +1794,7 @@ class UltrakillEnv(gym.Env):
                 # keeps its definition, so its history stays comparable across this change, but it is a
                 # distance to a transform 61-75 m below the floor and therefore has a floor of its own that
                 # it can never go under. This one really does approach zero as the agent reaches the exit.
-                ground_exit = camp["exit"].get("ground_pos")
+                ground_exit = exit_ground_point(camp["exit"])
                 if ground_exit:
                     self._exit_ground_dist_min = min(self._exit_ground_dist_min,
                                                      math.dist(pos, ground_exit))

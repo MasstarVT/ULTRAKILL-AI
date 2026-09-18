@@ -70,6 +70,16 @@ namespace UltrakillAIBridge.Obs
         /// </summary>
         private static readonly float[] ExitSnapRadii = { 55f, 95f };
 
+        /// <summary>
+        /// Heights above the pit that <see cref="UpdateExitGround"/> samples from, nearest first, looking for
+        /// the ground the player stands on before dropping in. Sized from the two measured gaps: 61-75 m on
+        /// <c>Level 0-2</c> (its completions triggered at y -25 to -27.5 against a pit at y -86.1) and 70 m on
+        /// <c>Level 0-3</c>. 0 is first so a pit that already sits on walkable ground is unchanged.
+        /// </summary>
+        private static readonly float[] ExitGroundHeights = { 0f, 20f, 40f, 60f, 80f, 100f };
+        private const float ExitGroundRadius = 30f;         // generous: the ledge can be well off the shaft's axis
+        private const float ExitGroundBelowTolerance = 1f;  // a hit this far under the pit still counts as level with it
+
         private readonly List<FinalPit> pits = new List<FinalPit>();
         private readonly List<CheckPoint> checkpoints = new List<CheckPoint>();
         // Id strings for checkpoints, same index as checkpoints. Computed once per Scan() rather than
@@ -1361,21 +1371,39 @@ namespace UltrakillAIBridge.Obs
         /// for the 150-250 steps/s this runs at across five games.
         /// </summary>
         /// <summary>
-        /// Refreshes <see cref="exitGround"/>: the nearest NavMesh point to the chosen pit, which is the
-        /// nearest standable ground to the exit. A <c>FinalPit</c>'s own transform sits INSIDE the drop it
-        /// triggers, far below anything you can walk on -- 61-75 m below on <c>Level 0-2</c> and 70 m on
-        /// <c>Level 0-3</c> -- so a target built from <c>exit.pos</c> points the agent at a killing fall,
-        /// and a distance measured to it can never reach zero. <see cref="SampleExit"/> already finds the
-        /// standable point for the path hint; this just keeps it, so Python can aim at it instead.
-        /// Cheap: it shares that one call, on the same <see cref="PathEvery"/> cadence.
+        /// Refreshes <see cref="exitGround"/>: standable ground ABOVE the chosen pit, which is where the
+        /// player is when they drop into it. A <c>FinalPit</c>'s own transform sits INSIDE the drop it
+        /// triggers, far below anything you can walk on -- measured 61-75 m below the floor on
+        /// <c>Level 0-2</c> and 70 m on <c>Level 0-3</c> -- so a target built from <c>exit.pos</c> points the
+        /// agent down a killing fall, and a distance to it can never reach zero.
+        ///
+        /// It deliberately does NOT reuse <see cref="SampleExit"/>, and the difference is the whole point.
+        /// That method wants the nearest mesh in ANY direction, which is right for the path hint's endpoint;
+        /// measured on <c>Level 0-2</c> it returns <c>(-199, -133.5, 277)</c>, another 47.4 m DOWN the pit
+        /// shaft -- a target 47 m worse than the pit itself. The ground the player actually completes from is
+        /// 60 m the other way: 0-2's two real completions triggered at y -25 to -27.5.
+        ///
+        /// So this searches UPWARD, in <see cref="ExitGroundHeights"/> steps from the pit, and accepts only a
+        /// hit at or above the pit's own y. Nothing found means <c>ground_pos</c> is null and every consumer
+        /// falls back to <c>exit.pos</c>, which is exactly today's behaviour -- so the worst case of this
+        /// whole mechanism is a no-op, never a regression. Bounded to
+        /// <c>ExitGroundHeights.Length</c> SamplePosition calls on the <see cref="PathEvery"/> cadence.
         /// </summary>
         private void UpdateExitGround(FinalPit exit)
         {
             exitGroundValid = false;
             if (exit == null) return;
-            if (!SampleExit(exit.transform.position, out var hit)) return;
-            exitGround = hit.position;
-            exitGroundValid = true;
+            var pit = exit.transform.position;
+            foreach (var height in ExitGroundHeights)
+            {
+                var from = new Vector3(pit.x, pit.y + height, pit.z);
+                if (!NavMesh.SamplePosition(from, out var hit, ExitGroundRadius, NavMesh.AllAreas)) continue;
+                // Below the pit is the shaft, not the ledge over it. Keep looking.
+                if (hit.position.y < pit.y - ExitGroundBelowTolerance) continue;
+                exitGround = hit.position;
+                exitGroundValid = true;
+                return;
+            }
         }
 
         private static bool SampleExit(Vector3 exitPos, out NavMeshHit hit)

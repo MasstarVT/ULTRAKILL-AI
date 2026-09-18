@@ -780,6 +780,9 @@ ROUTE_SEED_M = 150.0  # how near a rung the player may start and still have it a
 #     standing over the main room's void ("10 - Main Room - Floor 2")     30.0 = ground_ray_length
 # 8.0 is the only round number above every legitimate measurement and below every illegitimate one.
 ROUTE_GROUND_M = 8.0
+# How far under the `FinalPit`'s own y a reported `exit.ground_pos` may sit and still be believed. Below that
+# it is a point down the pit SHAFT, which is a worse target than the pit itself; see `GateProgress._exit`.
+EXIT_GROUND_BELOW_TOL_M = 1.0
 ROUTE_DIR = Path(__file__).resolve().parent / "routes"  # the packaged files; `route_dir` "" means this one
 
 # `route_source`: which of the three layers is driving the target. An INTEGER, because it travels through
@@ -856,6 +859,31 @@ def _point(value) -> list[float] | None:
     except (TypeError, ValueError, KeyError, IndexError):
         return None
     return out if all(math.isfinite(v) for v in out) else None
+
+
+def exit_ground_point(exit_block: dict | None) -> list[float] | None:
+    """The believable standable point near the pit (mod 0.7.2's `exit.ground_pos`), or None.
+
+    One rule in one place, because two callers apply it -- `GateProgress._exit`, which turns it into the
+    target, and `env._campaign_progress`, which measures `exit_ground_dist_min` to it -- and the two
+    disagreeing would make the metric describe a point the agent is not being sent to.
+
+    **BELOW the pit is the shaft, never the ledge over it.** Found by the first in-game run of this code, on
+    the level it was built for: a nearest-mesh-in-any-direction snap at `Level 0-2`'s pit returns
+    (-199, -133.5, 277), **47.4 m further DOWN** than the pit's own (-199, -86.1, 277), while the ground the
+    level is really completed from is 60 m the other way (its two completions triggered at y -25 to -27.5).
+    A target down the shaft is strictly worse than the bug this whole mechanism exists to fix, so such a
+    report is refused and the caller falls back to `exit.pos` -- which is exactly the behaviour before
+    `ground_pos` existed. The mod searches upward and refuses these too; this repeats the rule so that an
+    older, differently tuned or future mod cannot reintroduce it.
+    """
+    if not isinstance(exit_block, dict):
+        return None
+    pos = _point(exit_block.get("pos"))
+    ground = _point(exit_block.get("ground_pos"))
+    if pos is None or ground is None:
+        return None
+    return ground if ground[1] >= pos[1] - EXIT_GROUND_BELOW_TOL_M else None
 
 
 def route_path(scene: str, route_dir: str = "") -> Path:
@@ -1655,8 +1683,7 @@ class GateProgress:
         exit_ = (campaign or {}).get("exit")
         if not exit_ or not exit_.get("pos"):
             return None
-        pos = _point(exit_.get("ground_pos")) or list(exit_["pos"])
-        return {"key": GATE_EXIT_KEY, "pos": pos, "hops": None,
+        return {"key": GATE_EXIT_KEY, "pos": exit_ground_point(exit_) or list(exit_["pos"]), "hops": None,
                 "open": False, "locked": False, "active": True}
 
     def _is_reached(self, gate: dict, pos) -> bool:

@@ -2767,3 +2767,18 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     readout for the rung move: a fresh 0-3 load should now stop crediting rung 9 from the main room.
   - **`metrics_log.csv` gained a column** (`exit_ground_dist_min`), and `poll_status.py` keeps an existing
     header, so the old file was moved aside at the pause.
+  - **The in-game check caught a regression IN THE FIX, and it is the reason the check exists.** The first
+    build reused `SampleExit` — nearest NavMesh in ANY direction, which is right for the path hint's endpoint
+    — and on `Level 0-2` that returned **(-199, -133.5, 277)**, another **47.4 m DOWN the pit shaft**. That
+    would have made the exit target 47 m worse than the bug being fixed, and every no-game test passed, because
+    a fake bridge cannot know which way the real mesh lies. `UpdateExitGround` now searches **upward** from the
+    pit (heights 0/20/40/60/80/100 at a 30 m radius) and accepts only a hit at or above it; `SampleExit` is
+    left exactly as it was for the path. `campaign.exit_ground_point` repeats the same rule in Python, so an
+    older or future mod cannot reintroduce it, and both callers — the target and `exit_ground_dist_min` —
+    share that one rule. Nothing found means `null` and a fall back to `exit.pos`, so the worst case of the
+    whole mechanism is a no-op.
+  - **Measured on all three levels, and the number is a constant: the `FinalPit` transform sits exactly
+    62.2 m below its own room's floor.** 0-2 pit y -86.1 -> ground y -23.9; 0-3 19.9 -> 82.1; 0-1 -17.1 ->
+    45.1. Same prefab, same offset, which is why the "61-75 m" estimate was in the right band, and it is a
+    cheap sanity check on any future reading: a `ground_pos` that is not ~62 m above its pit is suspect.
+    0-2's is 1.1 m in y from where the level's two real completions triggered (y -25).

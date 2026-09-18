@@ -1010,6 +1010,39 @@ def test_an_old_mod_without_ground_pos_behaves_exactly_as_today():
     old.close()
 
 
+def test_a_ground_pos_below_the_pit_is_refused():
+    """Found by the first in-game run of this code, on the level it was built for. A nearest-mesh-in-any-
+    direction snap at `Level 0-2`'s pit returns (-199, -133.5, 277) -- **47.4 m further DOWN the shaft** than
+    the pit's own (-199, -86.1, 277), while the ground the level is actually completed from is 60 m the other
+    way, at y -25 to -27.5. Aiming at that would have been strictly worse than the bug being fixed.
+
+    Below the pit is the shaft, never the ledge over it. The mod now searches upward and refuses such a hit;
+    this is the same rule repeated in Python, so an older or differently-tuned mod cannot reintroduce it. The
+    fall-back is `pos`, which is exactly the behaviour before `ground_pos` existed.
+    """
+    env, fake = make_env()
+    fake.exit_ground_pos = [0.0, -50.0, EXIT_Z]  # a point 51 m down the shaft, as 0-2 really reported
+    env.reset(seed=0)
+    for _ in range(24):
+        _, _, _, _, info = env.step(forward())
+    assert env.gates.target["pos"] == [0.0, 1.0, EXIT_Z], \
+        f"the target went down the shaft: {env.gates.target['pos']}"
+    assert info["exit_ground_dist_min"] is None, "a refused ground_pos must not be measured to either"
+    env.close()
+
+
+def test_a_ground_pos_level_with_the_pit_is_still_accepted():
+    """The boundary, so the guard above cannot quietly become 'only strictly above'. A pit that already sits
+    on walkable ground reports a `ground_pos` at its own height, and that is the normal case."""
+    env, fake = make_env()
+    fake.exit_ground_pos = [0.0, 1.0, EXIT_Z - 8.0]  # same y as the pit, 8 m nearer
+    env.reset(seed=0)
+    for _ in range(24):
+        env.step(forward())
+    assert env.gates.target["pos"] == [0.0, 1.0, EXIT_Z - 8.0]
+    env.close()
+
+
 def test_a_banished_exit_takes_its_standable_point_with_it():
     """`ground_pos` is sampled AROUND the position being reported, so a banished twin's sample belongs to the
     twin. `ExitGuard` restores `pos` and must drop `ground_pos`, or the target would follow a standable point
