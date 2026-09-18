@@ -1,0 +1,126 @@
+"""What the specialist driver is doing, in one screen. Read-only: it opens files, never a port.
+
+    python scripts/specialists_status.py
+    python scripts/specialists_status.py --json        # the same thing, machine readable
+
+Prints the current stage (level, run, steps into it, how far off the stage rule it is), the live fresh
+completion rate and window, the best official time so far, and the table of specialists already promoted to
+`models/specialists/`. Safe to run beside the driver and beside a trainer: it reads `driver_state.json`,
+`status.json`, `best.json` and the promoted sidecars, and touches nothing else.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from campaign_driver import (  # noqa: E402
+    DRIVER_RUN, SPECIALIST_DIR, DriverState, load_plan, read_sample, specialist_path, stage_run_name,
+    stage_verdict)
+from ultrakill_ai.times import format_time  # noqa: E402
+
+
+def fmt(value, digits=2, dash="-"):
+    return dash if value is None else "%.*f" % (digits, value)
+
+
+def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
+    """Everything the report prints, as plain data, so `--json` and the text share one source."""
+    plan = load_plan(cwd / plan_path)
+    state = DriverState.load(cwd / runs_dir / DRIVER_RUN / "driver_state.json")
+    out: dict = {"levels": len(plan.order), "rule": plan.rule.__dict__, "history": state.history, "current": None}
+    stage = state.current
+    if stage is not None:
+        sample = read_sample(cwd / runs_dir / stage_run_name(stage.level) / "status.json",
+                             cwd / models_dir / stage_run_name(stage.level) / "best.json")
+        verdict, reached = stage_verdict(sample, stage.start_steps, stage.target_reached_at, plan.rule)
+        out["current"] = {
+            "level": stage.level, "run": stage.run, "index": stage.index, "init": stage.init,
+            "start_steps": stage.start_steps, "timesteps": sample.timesteps,
+            "stage_steps": (sample.timesteps - stage.start_steps) if sample.timesteps is not None else None,
+            "fresh_completion_rate": sample.fresh_rate, "fresh_window": sample.fresh_window,
+            "best_time": sample.best_time, "best_at": sample.best_at,
+            "target_reached_at": reached, "verdict": verdict,
+        }
+    promoted = []
+    for level in plan.order:
+        sidecar = specialist_path(cwd / models_dir, level).with_suffix(".json")
+        if sidecar.exists():
+            try:
+                promoted.append(json.loads(sidecar.read_text(encoding="utf-8")))
+            except ValueError:
+                continue
+    out["promoted"] = promoted
+    out["remaining"] = [level for level in plan.order
+                        if level not in {h.get("level") for h in state.history}]
+    return out
+
+
+def render(data: dict) -> str:
+    lines = []
+    rule = data["rule"]
+    current = data["current"]
+    if current is None:
+        lines.append("no stage running (%d of %d levels left in the plan)"
+                     % (len(data["remaining"]), data["levels"]))
+    else:
+        lines.append("STAGE %d/%d  %s  run %s  [%s]"
+                     % (current["index"] + 1, data["levels"], current["level"], current["run"], current["verdict"]))
+        lines.append("  steps into the stage: %s of %s (total %s)"
+                     % ("{:,.0f}".format(current["stage_steps"] or 0),
+                        "{:,}".format(rule["max_steps_per_stage"]),
+                        "{:,.0f}".format(current["timesteps"] or 0)))
+        lines.append("  fresh completion rate: %s over %d fresh episodes (target %s, needs %d)"
+                     % (fmt(current["fresh_completion_rate"], 3), current["fresh_window"],
+                        fmt(rule["target_rate"], 2), rule["min_fresh_window"]))
+        best = current["best_time"]
+        lines.append("  best official time: %s   best.zip last moved at %s"
+                     % (format_time(best) if best is not None else "-",
+                        "{:,.0f}".format(current["best_at"]) if current["best_at"] is not None else "-"))
+        if current["target_reached_at"] is None:
+            lines.append("  target not reached yet: the stage ends on the rate, or at the %s-step cap"
+                         % "{:,}".format(rule["max_steps_per_stage"]))
+        else:
+            hold_from = max(current["target_reached_at"], current["best_at"] or 0.0)
+            left = rule["settle_steps"] - ((current["timesteps"] or 0) - hold_from)
+            lines.append("  target reached at %s steps; %s settle steps left (a new best restarts this)"
+                         % ("{:,.0f}".format(current["target_reached_at"]), "{:,.0f}".format(max(0.0, left))))
+        lines.append("  resumed from %s" % current["init"])
+
+    lines.append("")
+    lines.append("promoted specialists (%s/):" % SPECIALIST_DIR)
+    if not data["promoted"]:
+        lines.append("  none yet")
+    for row in data["promoted"]:
+        best = row.get("best_time")
+        lines.append("  %-12s %-10s rate %-6s best %-10s %s steps  <- %s"
+                     % (row.get("level"), row.get("status"),
+                        fmt(row.get("fresh_completion_rate"), 3),
+                        format_time(best) if best is not None else "-",
+                        "{:,.0f}".format(row.get("stage_steps") or 0),
+                        row.get("source_checkpoint")))
+    remaining = data["remaining"]
+    lines.append("")
+    lines.append("remaining (%d): %s" % (len(remaining), ", ".join(remaining[:8]) + (" ..." if len(remaining) > 8 else "")))
+    return "\n".join(lines)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--plan", default="configs/specialists.yaml")
+    ap.add_argument("--runs-dir", default="runs")
+    ap.add_argument("--models-dir", default="models")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+    data = collect(Path.cwd(), a.plan, a.runs_dir, a.models_dir)
+    print(json.dumps(data, indent=2, default=str) if a.json else render(data))
+
+
+if __name__ == "__main__":
+    main()

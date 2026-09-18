@@ -811,13 +811,22 @@ class Supervisor:
 
     # -- the helper processes ---------------------------------------------------------------------
 
+    def helper_specs(self) -> list[tuple[str, list[str], str]]:
+        """(script, arguments, log file name) of every read-only helper that belongs beside this trainer.
+
+        A method rather than a literal so a caller that supervises a different KIND of run can add to it --
+        `campaign_driver.StageSupervisor` adds `post_times.py` for its per-level runs -- without a second copy
+        of `ensure_helpers`, which is the part that must not drift (matching, the self-exclusion, dry-run).
+        """
+        return [("scripts/poll_status.py", ["--run", self.cfg.run], "%s_poll.log" % self.cfg.run),
+                ("scripts/keep_best.py", ["--run", self.cfg.run, "--metric", "campaign"],
+                 "%s_keep_best.log" % self.cfg.run)]
+
     def ensure_helpers(self, procs: list[Proc]) -> list[str]:
         """Starts poll_status.py / keep_best.py when they are not running. Checked every poll: a
         helper can die on its own, and keep_best.py is what protects the weights."""
         started = []
-        helpers = [("scripts/poll_status.py", ["--run", self.cfg.run], "%s_poll.log" % self.cfg.run),
-                   ("scripts/keep_best.py", ["--run", self.cfg.run, "--metric", "campaign"],
-                    "%s_keep_best.log" % self.cfg.run)]
+        helpers = self.helper_specs()
         mine = self_and_ancestors(procs, self.pid)
         for script, args, log_name in helpers:
             name = Path(script).name

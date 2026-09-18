@@ -486,6 +486,70 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   its streak, a vanished game being forgotten, `laggard_ports` naming only laggards it can address, a single
   laggard being restarted on its own port while the others keep running, and a game that never boots not
   blocking training forever (no game, no real process; `python tests/test_supervise.py`).
+- `python/scripts/campaign_driver.py` (branch `specialists`): **the per-level specialist driver — one policy per
+  level, trained sequentially.** It REPLACES `supervise.py` while it runs (never run both: they would fight over
+  the games and over which trainer should exist) and embeds a `supervise.Supervisor` per stage, so the health
+  test, the hung/dead/draining split, the sick report, the boot gate, the resume-file rule and the restart budget
+  are the supervisor's own code, not a second copy. `StageSupervisor` adds exactly one thing: `post_times.py
+  --watch --push` to the helper set, beside `poll_status.py` and `keep_best.py --metric campaign`. The seam for
+  that is `Supervisor.helper_specs()`, a method rather than a literal, which is the only change made to
+  `supervise.py`.
+  - **The stage rule** (`stage_verdict`, pure, numbers in `configs/specialists.yaml`). A stage ends when BOTH:
+    the level's fresh completion rate over its last 50 fresh episodes reaches `target_rate` 0.5 over at least
+    `min_fresh_window` 30 of them — **latched**, because a later dip must not deadlock a stage that peaked and
+    then collapsed (this project has watched exactly that twice), and `keep_best.py` is holding the peak — AND
+    `settle_steps` 300k have passed since the **later** of that moment and the last time `keep_best.py` moved
+    `best.zip` (`best.json`'s `at_timesteps`). A run still setting new bests keeps resetting its own clock and
+    keeps training. Without the "later of", a best saved long before the target would satisfy the settle the
+    instant the target was reached. OR the stage has consumed `max_steps_per_stage` 6M, at which point it moves
+    on **regardless** and is recorded `"unfinished"` so it can be revisited: one blocked level may not block 29.
+  - **Per stage**: run `spec_<short level>` (`spec_0-1`), `models/spec_0-1/`, `runs/spec_0-1/`, the generated
+    config at `configs/generated/spec_0-1.yaml` (written from the plan, with `timesteps` budgeted **from where
+    the stage starts** — `timesteps` is the run total in `train.py` and every stage resumes from the last one).
+    The shared run's `explore_<level>_*.npz` are copied in when the stage has none of its own. The init
+    checkpoint is also seeded as the stage's `latest.zip`, so `choose_resume` can answer from the first tick —
+    without it a crash inside the first 50k steps, before the first checkpoint rotation, meets `NO RESUME FILE`
+    and stops the supervisor dead.
+  - **On stage end**: kill the trainer, its workers and its three helpers (never another run's — the live shared
+    trainer is a `train.py` on another config and matching is by run name AND config file), then promote
+    `best.zip` — or, with no `best.zip`, the newest checkpoint by `choose_resume`'s rule, since a killed trainer
+    leaves `latest.zip` stale — to `models/specialists/<level>.zip` with a JSON sidecar (rate, best time, steps,
+    source checkpoint, difficulty). The next stage resumes from that file. **The games are NOT relaunched
+    between stages**: twelve cold starts are four minutes and the env loads the new scene on its next reset.
+  - State in `runs/specialists/driver_state.json` (current stage, its start step count, the history), so
+    restarting the driver resumes the stage it was on. `runs/specialists/DRIVER_PAUSE` is its `SUPERVISOR_PAUSE`.
+    `--start-at <level>` and `--init <checkpoint>` are first-launch only; after that the state file wins.
+- `python/configs/specialists.yaml`: the plan the driver reads — the level order (the 30 levels of
+  `campaign_gates_full.yaml`, mission order) and a per-stage template that is that config's `env:` and `train:`
+  **minus the multi-level keys** (`levels`, `unlock_rate`, `unlock_window`, `unlock_after_fresh_episodes`,
+  `level_weight_floor`, `curriculum_weighting`) and minus the per-stage ones (`run_name`, `timesteps`). Not a
+  training config: do not pass it to `train.py`.
+- `python/scripts/full_run.py`: **chains the specialists over one game** — walks the plan's order, loads each
+  level's specialist, plays it from a fresh load, records the official time and prints the table plus the total.
+  A level with no specialist is skipped and reported. Read-only like `eval.py`: it reads each specialist's
+  exploration archive and never writes it, never writes a `best_runs` file and never touches a curriculum file.
+  `--record-times` posts each completed level through `ultrakill_ai.times` under the generation
+  `specialists@<date>`; the leaderboard row only moves when the time is faster, which is that helper's own rule.
+  One game, one port, and **never a port a trainer is using** — the bridge drops its current client.
+- `python/scripts/specialists_status.py`: the driver's state in one screen (stage, steps into it, fresh rate and
+  window, best time, how much settle is left, the promoted specialists table, what is left). Read-only: it opens
+  files, never a port, so it is safe beside the driver and beside a trainer.
+- `python/tests/test_campaign_driver.py`: the stage rule in every shape (below target, too few fresh episodes,
+  the settle, a new best restarting the settle, the latch, the cap, no status at all), the plan loader refusing
+  an unshipped level and a misspelt knob, the generated config being single-level and budgeted from its start,
+  promotion preferring `best.zip` and falling back to the newest checkpoint, state round-tripping — and the
+  driver end to end against fakes: first tick prepares and starts a stage, a healthy stage is left alone, the
+  rule promotes and starts the next level, an unfinished stage does not block the ladder, a driver restart
+  resumes its stage without starting a second trainer, the pause file, a dry run, games launched only when a
+  port is missing, and **another run's trainer never matched or killed** (no game, no real process, no real clock).
+- `python/tests/test_full_run.py`: the chaining logic against an injected `play` (order, skips, the total, the
+  table, the times.md posting) and `play_level` itself against `test_campaign_env.FakeLevel` — a completed level
+  reports an official time, a truncated one reports none and invents nothing (no game needed).
+- `python/tests/test_specialists_config.py`: pins `configs/specialists.yaml` equal to `campaign_gates_full.yaml`
+  — the order is that config's levels list, every env setting that is not a curriculum key is identical, every
+  reward weight is identical, the train section is identical bar `run_name`/`timesteps`, every key is a real
+  field, and a generated stage config builds a 479-input single-level env with the same action space as the
+  shared policy it is initialised from (no game needed).
 - `python/tests/test_freeze_recovery.py`: **the 17:52 freeze, and every bound that now stops it** (no game, no
   socket, no process, no real clock). The protocol bounds one by one — `close()` honours `close_timeout` and not
   `self.timeout`, a timed-out release still drops the socket without raising, a broken client skips the release
@@ -664,6 +728,52 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - **The supervisor's own code changes are not picked up by a trainer restart.** It is a long-lived process
     started by hand, so a change to `supervise.py` needs the supervisor itself stopped and started again — see
     the freeze-fix activation steps below.
+- **Per-level specialist training — the driver (branch `specialists`).** One policy per level, trained
+  sequentially on all twelve games, each initialised from the previous level's best. **It replaces
+  `supervise.py` while it runs; never run both.** It supervises each stage itself, using the supervisor's own
+  code, and it starts `poll_status.py`, `keep_best.py --metric campaign` and `post_times.py --watch --push` for
+  the stage's run.
+  ```powershell
+  # from python/, the same detached shape as the supervisor
+  Start-Process -FilePath cmd.exe -WorkingDirectory F:\Github\ULTRAKILL-AI\python -WindowStyle Minimized `
+    -ArgumentList '/c', '"F:\Github\ULTRAKILL-AI\python\.venv\Scripts\python.exe" -u scripts/campaign_driver.py --start-at "Level 0-1" --init models\campaign_gates\best.zip --monitor 1 >> runs\specialists_driver.log 2>&1'
+  ```
+  `--start-at` and `--init` are read on the FIRST launch only; after that `runs/specialists/driver_state.json`
+  decides, so a restart of the driver resumes the stage it was on rather than the top of the ladder. Run it once
+  with `--dry-run` first: it reports the decision and exits, changing nothing.
+  - **Pause it before any planned pause**, exactly as with the supervisor and for the same reason (a deliberate
+    stop looks like a crash to it):
+    ```powershell
+    New-Item runs\specialists\DRIVER_PAUSE        # from python/; it then does nothing at all
+    Remove-Item runs\specialists\DRIVER_PAUSE     # when the pause is over
+    ```
+  - **Watch it**: `python scripts/specialists_status.py` (stage, steps into it, rate and window, best time,
+    settle left, the promoted table) and the monitor's `report.py --run spec_0-1` for the stage's own numbers.
+    `python scripts/dashboard.py --run spec_0-1 --monitor 1` works unchanged — a stage is a single-level run, so
+    its campaign block is the one the dashboard has always drawn.
+  - **Chain the specialists into a full-game run**, on ONE game and never a port a trainer is using:
+    ```
+    python scripts/games.py launch --count 1 --monitor 1
+    python scripts/full_run.py --record-times
+    python scripts/games.py stop
+    ```
+    It prints a per-level table (time, rank, kills, deaths) and the total of the completed times, skips and
+    reports any level with no specialist yet, and with `--record-times` posts each completed level to `times.md`
+    under the generation `specialists@<date>`. `--levels "Level 0-1" "Level 0-2"` runs part of the ladder and
+    `--episodes N` takes the fastest of N attempts per level.
+  - **ACTIVATION CHECKLIST — switching the live shared run over to the driver** (the lead picks the exact init
+    file; `models/campaign_gates/best.zip` is the default choice, the newest `ckpt_*_steps.zip` the alternative
+    when `best.json` is behind):
+    1. `New-Item runs\campaign_gates\SUPERVISOR_PAUSE` — or the supervisor will restart the shared trainer under
+       you the moment you stop it.
+    2. Stop `supervise.py` (it is a long-lived process started by hand; a pause file alone is not enough if you
+       want it gone), then Ctrl+C the shared trainer and wait for `Saved models\campaign_gates\latest.zip`.
+    3. Kill the shared run's helpers: `poll_status.py`, `keep_best.py`, `post_times.py`, `dashboard.py`.
+    4. `python scripts/games.py stop` (the driver launches its own twelve; it will not relaunch them between
+       stages, only when a port is not listening).
+    5. Start the driver with `--start-at "Level 0-1" --init models\campaign_gates\<best or newest ckpt>`.
+    6. Confirm from `runs/specialists_driver.log`: a `STAGE 1/30 Level 0-1: run spec_0-1` line, then
+       `started trainer for Level 0-1`, then `specialists_status.py` showing the stage with a rising step count.
 - **Reading a stall (2026-09-17 onward).** Three files, none of which needs a game or a console:
   `runs/<run>_supervisor.log` (the decision and, before every restart, one line per port with pid, working set,
   ESTABLISHED connections and CPU cores), `runs/<run>/env_<port>.log` (that worker's own account: reset start
@@ -732,7 +842,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **parked/ep + exit-banished row** for the two ladder-patience mechanisms, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight `w` and, since branch `curriculum-progress`, the progress score `prog` the weighting rule reads -- a `w` at the retention floor next to a flat `prog` is a level the rule has damped for being blocked) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 14 trunks walked end to end). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**22 files; 594 named tests** as of 2026-09-18, of which `test_progress.py`'s 26 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run, and `tests/test_freeze_recovery.py` the bounds that keep a sick game from FREEZING it (the 17:52 incident). `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code. **`test_campaign.py`'s `test_save_best_run_serialises_two_racing_writers` is load-sensitive**: it races two real threads against a 5 s lock timeout, and on a box already running twelve games it failed once in eight suite runs on 2026-09-17 (then passed 6/6 when re-run on its own). A single failure of that one test under load is not a regression -- re-run the file before believing it -- but it is worth making the race deterministic rather than timed if it recurs.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 14 trunks walked end to end), and the three specialist files `python tests/test_specialists_config.py` (the plan pinned against `campaign_gates_full.yaml`), `python tests/test_campaign_driver.py` (the stage rule and the driver against fakes) and `python tests/test_full_run.py` (the chaining, and `play_level` against `FakeLevel`). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**25 files; 612 named tests** as of 2026-09-18 on branch `specialists`, plus `test_progress.py`'s 26 that print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run, and `tests/test_freeze_recovery.py` the bounds that keep a sick game from FREEZING it (the 17:52 incident). `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code. **`test_campaign.py`'s `test_save_best_run_serialises_two_racing_writers` is load-sensitive**: it races two real threads against a 5 s lock timeout, and on a box already running twelve games it failed once in eight suite runs on 2026-09-17 (then passed 6/6 when re-run on its own). A single failure of that one test under load is not a regression -- re-run the file before believing it -- but it is worth making the race deterministic rather than timed if it recurs.
   **In a worktree, set `PYTHONPATH` to that worktree's `python/`** or `import ultrakill_ai` resolves to the main tree and every test measures the wrong code: `$env:PYTHONPATH = "F:\Github\ULTRAKILL-AI-route\python"`.
 - Regenerate the route data (no game, no port, safe beside a live run): `python scripts/build_routes.py --validate` from `python/`. ~2 min for all 33 levels; it rewrites only `ultrakill_ai/routes/` and exits non-zero if any shipped level changes shape. Run it after every game update, then `python tests/test_route_files.py`.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
@@ -2813,3 +2923,46 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     be told from a cross-room leak offline. 88 of 114 rungs are clean, and a further 12 are clean only
     **because of** the ground rule (8.3-66.6% raw air, 0.0-3.6% after it) — those would all have been
     suspects a day ago.
+
+- **Per-level SPECIALISTS: one policy per level, trained sequentially (branch `specialists`, 2026-09-18, BUILT,
+  NOT YET ACTIVATED).** The lead's decision, on twelve hours of measurement from the live twelve-game run: a
+  single shared policy on a multi-level mixture **thrashes**. Whichever level receives the fresh-start share
+  improves while the others regress.
+  - **The numbers.** Level 0-1's fresh completion rate went **0.65 -> 0.13 -> 0.36** as the draws moved around
+    it, and Level 0-3 fell from **7.3 gates reached to 3.6** as soon as its share was damped. Learning-progress
+    weighting (the 2026-09-18 change above) did what it was designed to do — it moved the draws to the levels
+    that were moving — but it changed WHICH level is starved, not that one is. One set of weights cannot hold
+    twelve levels' worth of route at once, and every hour spent on the mixture is an hour of one level being
+    forgotten while another is learned.
+  - **The plan.** Train ONE SPECIALIST PER LEVEL, one level at a time, all twelve games on the current level,
+    each specialist initialised from the previous level's best (the first from the current shared policy), and
+    chain the specialists afterwards for a full-game run — one policy per level. `scripts/campaign_driver.py`
+    is the driver and `scripts/full_run.py` the chainer; see their Layout entries for the mechanism and the
+    Commands entry for how to start, pause and watch it.
+  - **Nothing about the environment changes.** No observation, action or reward semantics move: a stage is the
+    existing single-level env mode (`level:`, no `levels:` list), which is what `configs/campaign_0-1.yaml` has
+    always used. `tests/test_specialists_config.py` pins every setting, every reward weight and every
+    hyperparameter of `configs/specialists.yaml`'s stage template equal to `configs/campaign_gates_full.yaml`,
+    so a specialist cannot silently drift away from the policy it was initialised from.
+  - **The stage rule, as implemented.** A stage ends when the level's fresh completion rate over its last 50
+    fresh episodes reaches 0.5 with `fresh_window >= 30` — latched, so a later dip cannot deadlock it — AND 300k
+    steps have passed since the later of that moment and the last time `keep_best.py` moved `best.zip`, so a run
+    still setting new bests keeps training and the peak is what gets promoted. OR the stage has consumed 6M
+    steps, in which case it moves on regardless and is recorded `"unfinished"` for a later revisit.
+  - **Evidence:** full no-game suite green — **25 files, 612 named tests (plus `test_progress.py`'s 26 that
+    print no count), 0 failures**, run in the `specialists` worktree with `PYTHONPATH` pointed at it. 42 of
+    those tests are new (26 driver, 9 chainer, 7 config).
+  - **Risks, in the order they would show.** (1) **30 stages x 6M steps is 180M steps at ~200 steps/s ≈ 250
+    days** if every stage runs to its cap; the cap is a backstop, not a plan, and the early levels are expected
+    to finish on the rate in well under 1M. Watch the first three stages' actual cost before trusting the
+    ladder's total. (2) **Forward transfer is assumed, not measured** — each specialist starts from the
+    previous level's best, and if that turns out to be worse than starting from the shared policy every time,
+    the `--init` of a stage is the lever and the sidecars record exactly which file each one used. (3) **A
+    specialist is only as good as its stage's last 50 fresh episodes**: `best.zip` is chosen by
+    `keep_best.py --metric campaign`, which needs `fresh_window >= 20`, so a stage that ends on the step cap
+    with no completions promotes a checkpoint nothing ever scored. The sidecar says `"unfinished"` and
+    `source_kind: "newest"` when that happens. (4) **The driver and `supervise.py` must never run together**;
+    the activation checklist under Commands stops the supervisor first for exactly this reason. (5) **30 stages
+    means 30 model directories** of checkpoints — `ckpt_*` files are gitignored, but the disk is not infinite,
+    and a stage's numbered checkpoints are worth pruning once its specialist is promoted (keep the one
+    `best.json` names).
