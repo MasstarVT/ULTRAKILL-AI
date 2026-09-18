@@ -143,9 +143,12 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   against a completion's 100. Trimmed to the 4 rungs every recorded completion used (2026-09-18, `route-0-3`);
   `rung_overrides.json` now carries `drop` entries; trainer bounced onto it at **21,701,566** steps. Judge at
   +400k on wing endings and `exit_ground_dist_min` (131.8 m at the bounce), never on `gates_reached` — see the log.
-- In flight: branch **`speed-stages`** (currently level with `main`, nothing built yet) for the S-rank time
-  targets and the time-scaled completion bonus; guard T's mid-name-fork blind spot still unfixed campaign-wide;
-  and the memory work — another engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
+- In flight: branch **`speed-stages`** — built and green (full no-game suite), awaiting review, NOT merged and
+  not driving anything: speed stages, the 0.75 x S-rank time target, and a `hold_before: "Level 0-4"` line that
+  round-robins 0-1..0-3 instead of walking on. Spec + §8 in
+  `docs/superpowers/specs/2026-09-18-speed-stages.md`, log entry 2026-09-18. Also: guard T's mid-name-fork blind
+  spot still unfixed campaign-wide; a **0-3 mid-level wall probe** still to run; and the memory work above —
+  another engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
   (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2** installed; **33 of 35**
   levels ship; Violent, with all weapons unlocked in memory for AI runs only.

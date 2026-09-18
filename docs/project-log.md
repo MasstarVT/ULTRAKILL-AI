@@ -1798,3 +1798,40 @@ current state.
     ladder that pointed at rooms no completion has ever entered; that is not the same as a fix for 0-3. The
     generator's blind spot itself (`RX_G_BR` sees only a LEADING branch letter) is NOT fixed -- it is a
     campaign-wide correctness change and is documented in the `OVERRIDES_NAME` comment for whoever takes it.
+- **Speed stages built on branch `speed-stages` (2026-09-18, NOT merged, NOT live).** The interrupted WIP
+  (`db384dc`) was rebased onto `origin/main` at `59ccf91` — one conflict, `scripts/full_run.py`, where the
+  memory refactor's `cap_blas_threads()` before `import numpy` and the speed branch's `COMPLETE` import both
+  had to survive. Nothing of the speed work touched `scripts/train.py`, so the light-worker split
+  (`ultrakill_ai/training.py`, `ultrakill_ai/envfactory.py`, `EpisodeMonitor`) needed no re-application; the
+  speed reporting lives in `ultrakill_ai/progress.py`, which `training.py` still owns, and `envfactory.py`'s
+  import set is untouched (`tests/test_light_workers.py` green).
+  The spec is `docs/superpowers/specs/2026-09-18-speed-stages.md`, §1-7 as approved plus a §8 for two
+  additions the lead made afterwards:
+  - **§8a, the hold line.** As specced, a speed stage that hit its 8M cap was recorded `"unfinished"` and the
+    ladder walked on to 0-4 anyway — the exact opposite of "dont have it promote to 0-4 untell it gets better
+    times on these levels". `configs/specialists.yaml` now carries `hold_before: "Level 0-4"` (nullable to lift
+    it). No stage at or after that level starts while any stage in front of it is not `"done"`; while the line
+    is up, `Driver.choose_stage` round-robins the not-done stages in front of it, fewest ended rounds first and
+    ties in plan order, each round a whole fresh step budget. `Driver.round_init` resumes a round from the
+    stage's OWN newest weights (`choose_resume` on its model dir, else `best.zip`, else that level's promoted
+    specialist) — never from scratch, never from another level. A `(level, speed)` stage is only eligible once
+    `(level, complete)` is `"done"` and `models/specialists/<level>.zip` exists; if everything in front of the
+    line is blocked the driver logs it and stops (`"held"`, exit 1) rather than spinning. Rounds are recorded
+    in `Stage.round`, in one history entry per round, and in the promoted sidecar, so
+    `specialists_status.py` prints `holding before Level 0-4: waiting on <stages>, round N`.
+  - **§8b, the target scale.** Measured: the 0-2 specialist's 139.5 s already scores rank S, so a bare S
+    threshold would have promoted 0-2's speed stage on its first observation with zero improvement. New plan
+    key `speed.target_scale` (default **0.75**): `target_seconds = scale x campaign.ranks.time[-1]`, applied in
+    exactly one place — `UltrakillEnv._note_speed_target` — so the reward and the driver's rule keep agreeing
+    through `info["target_seconds"] -> status.json -> driver_state.json -> the sidecar`. A per-level
+    `speed.targets` override is NOT scaled. The raw threshold travels beside it as `s_rank_seconds` and is
+    recorded in the sidecar, never compared against.
+  **Verified against the live run without touching it.** The real `runs/specialists/driver_state.json` (stage 3
+  `Level 0-3` running at 18,752,038 steps, 0-1 and 0-2 `"done"`, no `kind` field anywhere) was read, never
+  written. `tests/test_campaign_driver.py` loads a COPY of that real file against the new 33-stage plan and
+  pins that `reconcile` keeps it at index 2, that `tick` keeps driving it, and that nothing is killed,
+  launched or spawned. A `campaign_driver.py --dry-run` was then run from an isolated scratch cwd holding only
+  copies (plan, state, `runs/spec_0-3/status.json`): it reported `STAGE ... Level 0-3 (complete): ok,
+  2,724,960 steps into the stage, rate 0.000 over 38 fresh`, printed the hold line as waiting on 0-3 complete
+  plus the three speed stages, and exited 0 having spawned and killed nothing. Whole no-game suite green, one
+  file at a time, 28 files.

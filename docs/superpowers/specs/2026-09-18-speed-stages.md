@@ -134,3 +134,63 @@ The driver is LIVE on stage 3/30 and must restart into the new plan without losi
 - `tests/test_progress.py`: `target_seconds` / `completion_bonus` survive the numeric pipeline and reach
   `status.json`'s campaign block.
 - `tests/test_full_run.py`: a specialist promoted by a speed stage is played with the speed run's env config.
+
+## 8. Two additions the lead made after this spec was approved (2026-09-18)
+
+### 8a. The hold line
+
+§4 says a speed stage that reaches its 8M cap is recorded `"unfinished"`, and §6's `next_stage()` then walks
+on. Together those two sentences promote the ladder to 0-4 with exactly the slow policies the instruction --
+"dont have it promote to 0-4 untell it gets better times on these levels" -- forbids. The cap was written as a
+guard against ONE blocked level stopping the other 29; here the blocked levels are the whole point.
+
+A plan key, `hold_before: "Level 0-4"` (nullable -- `null` or absent lifts the line, and it is the whole
+upgrade path back):
+
+- **The line.** No stage at or after `hold_before`'s FIRST plan position starts while any stage in front of it
+  has a latest status other than `"done"`. `"skipped"` (an operator's `--start-at`) counts as satisfied;
+  `"unfinished"` and "never run" do not. `load_plan` refuses a `hold_before` that names no level in the plan,
+  because a typo there would silently lift the line.
+- **Round robin while held** (`Driver.choose_stage`): among the not-done stages in front of the line, the one
+  with the FEWEST ended rounds, ties in plan order. Each round is a whole fresh step budget, because
+  `begin_stage` measures `start_steps` from the file it resumes from and the rule measures the cap from
+  `start_steps`.
+- **A round resumes from that stage's OWN newest weights** (`Driver.round_init`): `supervise.choose_resume` on
+  the stage's own model directory (what `ensure_trainer` will actually load, so `start_steps` matches the
+  resume point), else `best.zip` via `promotion_source`, else the level's own promoted specialist. Never from
+  scratch, and never from another level.
+- **Eligibility.** A `(level, speed)` stage may only run once `(level, complete)` is `"done"` AND
+  `models/specialists/<level>.zip` exists -- it resumes from that file, so without it there is nothing to
+  resume. An ineligible stage is skipped over (logged once); if EVERY stage in front of the line is blocked the
+  driver logs it and stops (`"held"`, exit 1) rather than spinning.
+- **Rounds are recorded.** `Stage.round`, one history entry per round carrying `round`, and `round` in the
+  promoted sidecar. `reconcile` numbers rounds for entries written before the key existed.
+  `specialists_status.py` prints `holding before Level 0-4: waiting on Level 0-1 (speed, round 1, unfinished),
+  ...` and the running stage's `[speed, round N]`.
+
+The live `driver_state.json` -- stage 3 `Level 0-3` running, 0-1 and 0-2 `"done"`, no `kind` anywhere -- loads
+into all of this unchanged and keeps running: `tick` never consults `choose_stage` while a stage is current.
+`tests/test_campaign_driver.py` pins that against a COPY of the real file.
+
+### 8b. The target scale
+
+§3's bare S threshold is too weak to be a speed target. Measured 2026-09-18: the 0-2 specialist's best is
+**139.5 s**, which already scores rank S, so a speed stage on 0-2 would have latched on its first observation
+and promoted with zero improvement. An S-rank time is what a competent human run scores, not a fast one.
+
+`speed.target_scale` (default **0.75**), so
+
+    target_seconds = speed_target_scale * campaign.ranks.time[-1]
+
+applied in exactly **one** place, `UltrakillEnv._note_speed_target`, so the reward (§2) and the driver's
+promotion rule (§4) still read the same number through `info["target_seconds"] -> status.json ->
+driver_state.json -> the sidecar`. A per-level `speed.targets` override is a decision already made and is
+**not** scaled. The raw threshold travels beside the target as `s_rank_seconds` (env info -> `status.json` ->
+`StageSample` -> `Stage` -> the sidecar) and is recorded, never compared against -- a sidecar that says
+"target 82 s" without saying what S is cannot be read a month later. A zero or negative scale means "no
+target", which §3's rule already handles as a loud, safe failure.
+
+Tests: `tests/test_campaign_env.py` (the scale at 1.0/0.75/0.5, the raw threshold reported, an override not
+scaled), `tests/test_progress.py` (`s_rank_seconds` through the numeric pipeline into the campaign block),
+`tests/test_campaign_driver.py` (the generated config carries the scale; the sidecar carries both numbers),
+`tests/test_specialists_config.py` (the plan's own 0.75 and its hold line).
