@@ -59,6 +59,11 @@ namespace UltrakillAIBridge.Env
         private readonly Stopwatch resetTimer = new Stopwatch();
         private int readyFrames;
         private bool sceneRequested;
+        // The asset sweep that runs once per reset; see SweepAssetsDone. Default ON for training instances:
+        // the leak it answers is what took the machine down, and a human's game never reaches it because the
+        // sweep is also gated on the AI having control.
+        private bool unloadAssetsOnReset = true;
+        private AsyncOperation sweep;
 
         // Settings restored on release
         private int savedVSync, savedTargetFps;
@@ -269,6 +274,7 @@ namespace UltrakillAIBridge.Env
             if (msg["command_timeout_s"] != null) commandTimeoutMs = Mathf.Max(1, msg["command_timeout_s"].Value<int>()) * 1000;
             windowed = msg["windowed"]?.Value<bool>() ?? windowed;
             TrainingSpeed.SoftDeathEnabled = msg["soft_death"]?.Value<bool>() ?? TrainingSpeed.SoftDeathEnabled;
+            unloadAssetsOnReset = msg["unload_assets_on_reset"]?.Value<bool>() ?? unloadAssetsOnReset;
             UnwedgePatch.Enabled = msg["unwedge"]?.Value<bool>() ?? UnwedgePatch.Enabled;
             UnwedgePatch.HoldFrames = Mathf.Max(1, msg["unwedge_frames"]?.Value<int>() ?? UnwedgePatch.HoldFrames);
             // PrefsManager's own validator clamps a stored difficulty above 4 down to 4, but the Harmony
@@ -375,6 +381,9 @@ namespace UltrakillAIBridge.Env
             resetTimer.Restart();
             readyFrames = 0;
             sceneRequested = false;
+            // A reset that timed out mid-sweep would otherwise leave a FINISHED operation here, and the next
+            // reset would see isDone and skip its own sweep. One reset, one sweep.
+            sweep = null;
             ApplyTimeSettings();
 
             var sm = MonoSingleton<StatsManager>.Instance;
@@ -396,6 +405,40 @@ namespace UltrakillAIBridge.Env
             state = State.Resetting;
         }
 
+        /// <summary>
+        /// Unloads assets the newly loaded level no longer references, once per reset, before the reply.
+        ///
+        /// **Why this is the mod's business at all.** ULTRAKILL never sweeps: a grep over all 1178 decompiled
+        /// files finds `Resources.UnloadUnusedAssets` in exactly one, the sandbox saver, and nothing on the
+        /// level-change path. `SceneHelper.LoadSceneCoroutine` also discards its `Addressables.LoadSceneAsync`
+        /// handle, and `SetUpFootstepPhysicsScene` rebuilds a parallel physics scene per load, duplicating
+        /// every qualifying MeshCollider into native PhysX memory. A human loads 10-20 scenes in a session and
+        /// never notices; a training instance loads 40-150 and was measured growing 1.2-1.4 GB an HOUR, from
+        /// 1.2 GB at boot to the 5.8-6.1 GB that took this machine down on 2026-09-18.
+        ///
+        /// Returns false while the sweep is still running, so `TickReset` keeps ticking and the 100 ms - 2 s
+        /// stall lands inside a reset the client is already blocked on rather than in the middle of a rollout.
+        /// `resetTimeoutSeconds` still bounds the whole reset, so a sweep that somehow never finished degrades
+        /// into the ordinary reset timeout rather than a hang.
+        ///
+        /// Gated on `unloadAssetsOnReset` AND on the AI having control, so a human's game is never touched.
+        /// </summary>
+        private bool SweepAssetsDone()
+        {
+            if (!unloadAssetsOnReset || !InControl) return true;
+            if (sweep == null)
+            {
+                sweep = Resources.UnloadUnusedAssets();
+                return false;
+            }
+            if (!sweep.isDone) return false;
+            sweep = null;
+            // Boehm is non-moving, so this does not compact -- it returns the managed side of what the
+            // unload just orphaned, which is what keeps the heap's high-water mark from ratcheting.
+            System.GC.Collect();
+            return true;
+        }
+
         private void TickReset()
         {
             if (!sceneRequested)
@@ -412,6 +455,7 @@ namespace UltrakillAIBridge.Env
 
             if (readyFrames >= resetSettleFrames)
             {
+                if (!SweepAssetsDone()) return;  // pay the sweep inside the reset Python is already waiting on
                 step = 0;
                 injector.ResolveBindings();
                 ApplyTimeSettings();

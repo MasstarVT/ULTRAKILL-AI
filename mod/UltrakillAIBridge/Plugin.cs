@@ -97,7 +97,10 @@ namespace UltrakillAIBridge
             // keys survive them, which is what lets Python ignore an arena cleared again after a death.
             SceneManager.sceneLoaded += (scene, mode) =>
             {
-                if (mode == LoadSceneMode.Single) CampaignPatches.OnSceneLoaded();
+                if (mode != LoadSceneMode.Single) return;
+                CampaignPatches.OnSceneLoaded();
+                // The cameras of the scene that just went away are destroyed; drop their wrappers.
+                TrainingSpeed.OnSceneLoaded();
             };
 
             // ULTRAKILL destroys BepInEx's manager GameObject during startup, which would take this

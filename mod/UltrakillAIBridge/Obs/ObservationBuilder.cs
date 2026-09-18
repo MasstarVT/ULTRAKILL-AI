@@ -83,6 +83,7 @@ namespace UltrakillAIBridge.Obs
             RayLength = cfg["ray_length"]?.Value<float>() ?? RayLength;
             GroundRayRadius = cfg["ground_ray_radius"]?.Value<float>() ?? GroundRayRadius;
             GroundRayLength = cfg["ground_ray_length"]?.Value<float>() ?? GroundRayLength;
+            ReportMemory = cfg["report_memory"]?.Value<bool>() ?? ReportMemory;
         }
 
         public static bool PlayerReady()
@@ -124,6 +125,7 @@ namespace UltrakillAIBridge.Obs
             obs["ground_rays"] = BuildGroundRays(nm, playerPos, envMask);
             obs["ground_ray_center"] = GroundRayCenter(nm, playerPos, envMask);
             obs["stats"] = BuildStats(nm);
+            if (ReportMemory) obs["mem"] = BuildMemory();
 
             var sm = MonoSingleton<StatsManager>.Instance;
             if (CampaignObserver.IsCampaignScene(sm))
@@ -314,6 +316,55 @@ namespace UltrakillAIBridge.Obs
             };
         }
 
-        internal static JArray Vec(Vector3 v) => new JArray(v.x, v.y, v.z);
+        /// <summary>
+        /// Three floats, without the params-array and the boxing the obvious version costs.
+        ///
+        /// `new JArray(v.x, v.y, v.z)` binds JArray(params object[]) -- an object[3] plus THREE BOXED FLOATS
+        /// per call, on top of the JArray, its backing List and the three JValues. This runs ~40 times a step
+        /// at ~20 steps a second forever, and the per-step JSON tree is the mod's one allocation of the right
+        /// order of magnitude to matter on Unity 2022.3's non-compacting Boehm GC (~1.8 MB/s, ~35 GB over a
+        /// 5.5 h session). Nothing here is RETAINED -- see docs/notes/2026-09-18-memory.md -- but the heap's
+        /// high-water mark is a function of the churn, so the churn is worth cutting where it is free.
+        /// </summary>
+        internal static JArray Vec(Vector3 v)
+        {
+            var a = new JArray();
+            a.Add(new JValue(v.x));
+            a.Add(new JValue(v.y));
+            a.Add(new JValue(v.z));
+            return a;
+        }
+
+        /// <summary>
+        /// Whether the observation carries the `mem` block. Off by default: it is a diagnostic for the leak
+        /// hunt, set through the config key `report_memory`, and Python ignores an unknown obs field either way.
+        /// </summary>
+        public static bool ReportMemory { get; set; }
+
+        /// <summary>
+        /// Unity's own memory counters, which is what decides WHERE the games' 1.2-1.4 GB an hour goes.
+        ///
+        /// The mod retains almost nothing across scene loads (audited 2026-09-18), so the growth is one of two
+        /// things and they need opposite fixes: the Mono heap's high-water mark growing under per-step JSON
+        /// churn, or native asset memory accumulating because nothing on the game's level-change path ever
+        /// calls Resources.UnloadUnusedAssets (grep over all 1178 decompiled files hits one file, and it is
+        /// the sandbox saver). Logging these four beside the process's private bytes across 60 fresh level
+        /// loads separates them in one session:
+        ///
+        ///     mono_heap tracks private bytes      -> the JSON churn; stop building a JObject tree
+        ///     native_reserved tracks private bytes -> assets and bundles; sweep them after a level load
+        ///
+        /// All four are cheap native reads of counters Unity already maintains.
+        /// </summary>
+        private static JObject BuildMemory()
+        {
+            return new JObject
+            {
+                ["mono_used"] = UnityEngine.Profiling.Profiler.GetMonoUsedSizeLong(),
+                ["mono_heap"] = UnityEngine.Profiling.Profiler.GetMonoHeapSizeLong(),
+                ["native_alloc"] = UnityEngine.Profiling.Profiler.GetTotalAllocatedMemoryLong(),
+                ["native_reserved"] = UnityEngine.Profiling.Profiler.GetTotalReservedMemoryLong(),
+            };
+        }
     }
 }

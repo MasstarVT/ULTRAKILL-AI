@@ -119,6 +119,21 @@ namespace UltrakillAIBridge.Env
         }
 
         /// <summary>
+        /// Drops the managed wrappers of cameras that died with the last scene.
+        ///
+        /// This list is the mod's ONE never-cleared cross-scene collection: ApplyRendering appends every
+        /// camera it disables and nothing removes them until RestoreRendering, which during training is only
+        /// reached when the AI gives up control -- hours, or never. Each entry is a list slot plus an orphaned
+        /// ~40-byte wrapper, so this is worth tens of bytes per scene load rather than the gigabytes the games
+        /// actually leak; it is fixed because it is three lines and it is genuinely a leak, not because it
+        /// explains anything. `== null` is Unity's overloaded comparison, which is true for a destroyed object.
+        /// </summary>
+        internal static void OnSceneLoaded()
+        {
+            disabledCameras.RemoveAll(cam => cam == null);
+        }
+
+        /// <summary>
         /// Keeps the player's fist and camera Animators running while every camera is disabled.
         ///
         /// Punch.ActiveFrame is the only caller of Punch.AltHit, which is the only way an item is picked up
