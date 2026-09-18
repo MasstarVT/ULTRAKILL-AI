@@ -218,7 +218,7 @@ def test_the_full_config_is_the_main_config_with_more_levels():
     assert cfg.rewards == main.rewards, "no reward weight moves: the fallback adds no term"
     assert train_cfg["num_envs"] == 12 and train_cfg["run_name"] == RUN_NAME
     assert train_cfg["hyperparams"]["ent_coef"] == 0.004, "the BASE coefficient is unchanged"
-    assert (train_cfg["ent_floor"], train_cfg["ent_coef_max"]) == (5.0, 0.02)
+    assert (train_cfg["ent_floor"], train_cfg["ent_coef_max"]) == (6.5, 0.02)
 
     # The 30 levels: every shipped level with a gate ladder OR a route file, in mission order.
     unrouted = {"Level 1-3", "Level 5-4", "Level 6-2"}  # spec §11.1: no route signal of any kind
@@ -503,7 +503,7 @@ def test_the_entropy_floor_is_wired_into_the_run_and_reported():
     """Config -> callback -> status.json, and the resume behaviour stated in the docstring."""
     _, t = train.load_config(str(GATES_FULL))
     cb = train.EntropyFloorCallback(t["ent_floor"], t["hyperparams"]["ent_coef"], t.get("ent_coef_max", 0.02))
-    assert (cb.floor, cb.base, cb.maximum) == (5.0, 0.004, 0.02)
+    assert (cb.floor, cb.base, cb.maximum) == (6.5, 0.004, 0.02)
     assert "train/ent_coef_live" in PPO_METRICS, "so it reaches status.json, the dashboard and poll_status"
     assert "does not survive a resume" in train.EntropyFloorCallback.__doc__, \
         "the resume behaviour is deliberate and has to be stated where it is read"

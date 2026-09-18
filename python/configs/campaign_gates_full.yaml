@@ -5,7 +5,7 @@
 #   - `levels`, 11 -> 30 (the whole routed campaign);
 #   - `gate_patience_mode: collapsed`, the 2026-09-17 revision after target patience regressed Level 0-1;
 #   - `prefer_route_when_collapsed: true` (false until 2026-09-17 21:58): 0-3 and 4-3 follow their room-trunk route files;
-#   - `ent_floor: 5.0` (+ `ent_coef_max`), the adaptive entropy floor. `ent_coef` itself is UNCHANGED at 0.004.
+#   - `ent_floor: 6.5` (+ `ent_coef_max`), the adaptive entropy floor (5.0 until 2026-09-18 00:25). `ent_coef` itself is UNCHANGED at 0.004.
 # No reward weight and no other hyperparameter moves. Same run name, same models/campaign_gates/, same weights,
 # same policy: this is the main run continuing with a longer ladder in front of it, exactly as
 # campaign_gates_main.yaml was to campaign_gates_prelude.yaml.
@@ -130,5 +130,5 @@ train:
   # the Cyber Grind run collapsed this way twice -- peak near 3.5 nats, then worse while it kept sharpening.
   # 5.0 sits just under the live value, so the controller is inert while nothing is wrong. It does not survive
   # a resume: every restart begins at the base and re-adapts over the first few updates.
-  ent_floor: 5.0
+  ent_floor: 6.5  # raised from 5.0 at 2026-09-18 00:25: every peak sat at 7-9 nats, every decline below ~6
   ent_coef_max: 0.02
