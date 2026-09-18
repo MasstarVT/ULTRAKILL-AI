@@ -152,7 +152,10 @@ def level_lines(campaign: dict) -> list[str]:
 
     R6 of the design spec: once two levels of different size run together the pooled `mean_100` numbers are
     cross-level means that say nothing, so this table is what a multi-level run is judged on. `cp` is
-    checkpoints per level load and `w` the share of fresh draws the curriculum is giving the level.
+    checkpoints per level load, `w` the share of fresh draws the curriculum is giving the level and `prog` the
+    progress score behind that share (0..1 of the level reached per fresh episode, a dash while the statistics
+    are cold or on a status.json written before they existed). Under `curriculum_weighting: "progress"` a `w`
+    at the retention floor next to a flat `prog` is a level the rule has damped for being blocked.
     """
     levels = campaign.get("levels")
     if not isinstance(levels, dict):
@@ -166,6 +169,7 @@ def level_lines(campaign: dict) -> list[str]:
         rows.append(f"    {short_level(name):<4} fresh {fmt_pct(row.get('fresh_completion_rate'))}"
                     f" ({fmt_int(row.get('fresh_window'))})  best {fmt_time(row.get('best_time'))}"
                     f"  cp {fmt_float(row.get('checkpoints_level'), 1)}  w {fmt_float(row.get('weight'))}"
+                    f"  prog {fmt_float(row.get('progress_score'))}"
                     f"  col {fmt_float(row.get('ladder_collapsed'), 0)}"
                     f"  pk {fmt_float(row.get('targets_parked'), 1)}")
     return rows if len(rows) > 1 else []

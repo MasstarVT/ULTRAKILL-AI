@@ -126,7 +126,28 @@ def compute_rank(seconds: float, kills: int, style: int, restarts: int, ranks: d
 # One trainer process writes runs/<run>/curriculum.json; the SubprocVecEnv workers read it at every fresh level
 # load and nowhere else. The two functions below are the whole policy, kept pure so they are tested offline.
 
-CURRICULUM_VERSION = 1
+CURRICULUM_VERSION = 1  # still 1: every field below is ADDITIVE, and an old reader ignores what it cannot use
+
+# Learning-progress weighting (`curriculum_weighting: "progress"`).
+#
+# The rule it replaces weighted a level by `1 - fresh_completion_rate`, so the level with the LOWEST rate got the
+# MOST fresh starts. Measured on the live `campaign_gates` run over 2026-09-17/18: Level 0-3, blocked at 0
+# completions, took 41-51% of every fresh start for hours while 0-1 and 0-2, which had been completing at
+# 0.55-0.69, slid to 0.24-0.30. Attention has to follow where the policy is still MOVING, not where it is worst.
+#
+# `|fast - slow|` alone does not fix it, and this is worth stating because it is the obvious first design: 0-3's
+# measured value was 0.095, as large as 0-1's 0.063, because its gate score swings from load to load without ever
+# finishing the level. The damping below reads the SIGN of the same pair, which does separate them.
+PROGRESS_FAST_SPAN = 10   # fresh episodes in the fast average (EMA alpha 2/(span+1))
+PROGRESS_SLOW_SPAN = 50   # ... and in the slow one, the same depth as FRESH_WINDOW
+PROGRESS_MIN_SAMPLES = 20  # fresh episodes behind the averages before a level's learning progress is trusted
+PROGRESS_CHECKPOINT_SCALE = 6.0  # the `checkpoints_level` fallback denominator (0-1, the measured level, ships 6)
+PROGRESS_IMPROVEMENT = 0.02  # how far the slow average may sit below its own record and still count as improving
+PROGRESS_FLAT = 0.005  # |fast - slow| at or below which a level's score is not moving at all
+CURRICULUM_BLOCKED_FRESH_EPISODES = 100  # fresh episodes with no completion at all before a level is "blocked"
+CURRICULUM_WEIGHT_CAP = 0.5  # no level takes more than this share of the fresh draws
+CURRICULUM_FLOOR_MASS = 0.5  # the retention floors together never take more than this share, whatever `n` is
+CURRICULUM_WEIGHTINGS = ("inverse_rate", "progress")
 
 
 def _level_stat(stats: dict | None, level: str, first: str) -> dict:
@@ -144,38 +165,185 @@ def _level_stat(stats: dict | None, level: str, first: str) -> dict:
     return record
 
 
-def level_weights(order, stats: dict | None, *, floor: float = 0.1) -> list[tuple[str, float]]:
-    """(level, weight) for every unlocked level, in `order`. Weight is max(floor, 1 - fresh completion rate).
+def progress_score(*, completed, gates_reached, gates_total, checkpoints_level) -> float | None:
+    """0..1 for ONE fresh episode: how far through the level it got. None when nothing says anything.
 
-    A level with no data has rate None and so weight 1.0 (maximum attention); a mastered level falls to `floor`,
-    which is what keeps a completed level in the mix so the policy does not forget it. Shared by `choose_level`
-    (which samples from these) and the dashboard (which shows the normalised share).
+    A completion is 1.0 and is the only thing worth the top of the scale. Below it the gate ladder is the
+    informative signal the run already records per episode: `gates_reached` counts the rungs descended and
+    `gates_total` (`gates_reached + gate_hops_best`, ratcheted per level by `ProgressCallback`) is the ladder's
+    own length, so dividing makes 0-1's 10 rungs and 0-2's 8 comparable. `checkpoints_level` is the rough
+    fallback for a level whose ladder never reported, and it is rough on purpose: measured over the live run's
+    fresh episodes it reads 0 on 337 of 451 of 0-3's, where `gates_reached` averages 2.5 -- which is exactly why
+    the gates are preferred wherever they exist.
+    """
+    if completed:
+        return 1.0
+    if gates_reached is not None and gates_total:
+        return min(1.0, max(0.0, float(gates_reached) / float(gates_total)))
+    if checkpoints_level is not None:
+        return min(1.0, max(0.0, float(checkpoints_level) / PROGRESS_CHECKPOINT_SCALE))
+    if completed is None:
+        return None
+    return 0.0
+
+
+def progress_drift(record: dict, *, min_samples: int = PROGRESS_MIN_SAMPLES) -> float | None:
+    """SIGNED fast minus slow average of the progress score, or None while the statistics are cold.
+
+    None is what makes the whole change backward compatible: a `curriculum.json` written before these fields
+    existed has neither average, so every level reads None and `level_weights` falls back to today's rule.
+    """
+    fast, slow = record.get("progress_fast"), record.get("progress_slow")
+    if not isinstance(fast, (int, float)) or not isinstance(slow, (int, float)):
+        return None
+    if int(record.get("progress_samples") or 0) < min_samples:
+        return None
+    return float(fast) - float(slow)
+
+
+def learning_progress(record: dict, *, min_samples: int = PROGRESS_MIN_SAMPLES) -> float | None:
+    """|fast - slow|, the size of the change either way: a level that is collapsing needs attention too."""
+    drift = progress_drift(record, min_samples=min_samples)
+    return None if drift is None else abs(drift)
+
+
+def level_blocked(record: dict, *, blocked_fresh_episodes: int = CURRICULUM_BLOCKED_FRESH_EPISODES,
+                  min_samples: int = PROGRESS_MIN_SAMPLES, improvement: float = PROGRESS_IMPROVEMENT,
+                  flat: float = PROGRESS_FLAT) -> bool:
+    """True when a level has finished nothing for `blocked_fresh_episodes` fresh tries AND is not progressing.
+
+    `dry_fresh_episodes` (fresh episodes since its last completion) is the hard half: it is a count, not an
+    average, so no amount of noise moves it. A level whose statistics have never warmed up is never called
+    blocked, because None means "no evidence", not "no progress".
+
+    "Not progressing" is then two clauses, and the choice between them was measured on the live run rather than
+    guessed. Over Level 0-3's 301 dry samples in the 8 hours before this was written:
+      - **the high-water clause**, `progress_best - progress_slow > improvement`: the level's sustained progress
+        has fallen more than `improvement` below the best it has ever held, so it is not on its way anywhere.
+        Blocks **93%** of those samples. This is the one that does the work.
+      - **the flat clause**, `|fast - slow| <= flat`: a score that does not move at all. It covers the case the
+        high-water clause cannot see -- a hard wall where every fresh episode reaches the same rung, so
+        `slow == best` forever and the level would otherwise keep half the run for a constant.
+    The obvious first design, `fast - slow <= improvement` (is it climbing right now), was **rejected on the
+    data**: it blocks only 65% of the same samples, because a 10-deep average of a swinging score crosses any
+    small threshold about a third of the time. 0-3's own drift ranges over +/-0.19 with a median of -0.027.
+    """
+    if progress_drift(record, min_samples=min_samples) is None:
+        return False
+    if int(record.get("dry_fresh_episodes") or 0) < int(blocked_fresh_episodes):
+        return False
+    fast, slow, best = record.get("progress_fast"), record.get("progress_slow"), record.get("progress_best")
+    if isinstance(fast, (int, float)) and isinstance(slow, (int, float)) and abs(fast - slow) <= flat:
+        return True
+    if not isinstance(best, (int, float)) or not isinstance(slow, (int, float)):
+        return False  # a hand-written table with no high-water mark: again, no evidence
+    return float(best) - float(slow) > improvement
+
+
+def _floor_share(n: int, floor: float) -> float:
+    """The retention share every unlocked level keeps, shrunk so the floors never take the whole distribution.
+
+    `floor` per level is impossible past `1/floor` unlocked levels, and on the 30-level config the floors would
+    eat everything and turn the rule into uniform sampling. Capping their total at `CURRICULUM_FLOOR_MASS`
+    leaves the progress term at least half the mass to allocate at every ladder length.
+    """
+    if n <= 0:
+        return 0.0
+    return min(max(0.0, floor), CURRICULUM_FLOOR_MASS / n)
+
+
+def level_weights(order, stats: dict | None, *, floor: float = 0.1, rule: str = "inverse_rate",
+                  cap: float = CURRICULUM_WEIGHT_CAP,
+                  blocked_fresh_episodes: int = CURRICULUM_BLOCKED_FRESH_EPISODES,
+                  min_samples: int = PROGRESS_MIN_SAMPLES) -> list[tuple[str, float]]:
+    """(level, weight) for every unlocked level, in `order`. `rule` picks the policy.
+
+    `"inverse_rate"` (the default, and what every config but the full campaign uses) is unchanged: the weight is
+    `max(floor, 1 - fresh completion rate)`, unnormalised, a level with no data taking the full 1.0.
+
+    `"progress"` returns SHARES that already sum to 1 (`choose_level` does not care, the dashboard divides by the
+    total either way) and is built in this order, because the three rules are not equals:
+      - every unlocked level gets `_floor_share` -- retention, hard;
+      - a **blocked** level gets that and nothing more -- damping, hard;
+      - the rest of the mass is split between the other unlocked levels in proportion to their learning
+        progress, evenly when none of them has any;
+      - `cap` then clamps each share and the surplus goes to the other levels that are still learning. The cap
+        is the one SOFT rule: when no other unlocked, non-blocked level has any learning progress to receive the
+        surplus, the cap yields rather than pushing the mass onto a level that cannot use it. With ten or more
+        unlocked levels `CURRICULUM_FLOOR_MASS` bounds any one share below the cap anyway.
+    Any other `rule` string is today's rule: a typo must not invent a third policy.
     """
     order = list(order)
     if not order:
         return []
     first = order[0]
-    out = []
-    for level in order:
-        record = _level_stat(stats, level, first)
-        if level != first and not record.get("unlocked"):
-            continue
-        out.append((level, max(floor, 1.0 - (record.get("fresh_completion_rate") or 0.0))))
-    return out
+    unlocked = [(level, _level_stat(stats, level, first)) for level in order]
+    unlocked = [(level, record) for level, record in unlocked if level == first or record.get("unlocked")]
+    inverse = [(level, max(floor, 1.0 - (record.get("fresh_completion_rate") or 0.0)))
+               for level, record in unlocked]
+    if rule != "progress" or not unlocked:
+        return inverse
+
+    lp = {level: learning_progress(record, min_samples=min_samples) for level, record in unlocked}
+    if all(value is None for value in lp.values()):
+        return inverse  # nothing has warmed up yet, so this is today's rule exactly -- see the tests
+    # A level with no statistics of its own is assumed to be learning as fast as the best level that does have
+    # them, so a freshly unlocked level is explored rather than left on its floor for its first 20 fresh tries.
+    prior = max(value for value in lp.values() if value is not None)
+    terms = {level: (lp[level] if lp[level] is not None else prior) for level, _ in unlocked}
+
+    n = len(unlocked)
+    share_floor = _floor_share(n, floor)
+    blocked = {level for level, record in unlocked
+               if level_blocked(record, blocked_fresh_episodes=blocked_fresh_episodes, min_samples=min_samples)}
+    free = [level for level, _ in unlocked if level not in blocked]
+    shares = {level: share_floor for level, _ in unlocked}
+    pool = max(0.0, 1.0 - share_floor * n)
+    if not free:  # every unlocked level is blocked: nothing to steer by, so spread the mass evenly
+        for level, _ in unlocked:
+            shares[level] += pool / n
+        return [(level, shares[level]) for level, _ in unlocked]
+    total = sum(max(0.0, terms[level]) for level in free)
+    for level in free:
+        shares[level] += pool * (max(0.0, terms[level]) / total if total > 0 else 1.0 / len(free))
+
+    # The cap, and the surplus it frees. Only levels that are unlocked, not blocked and still learning may
+    # receive it, which is why this is a loop: taking one level to the cap can push another over it.
+    for _ in range(n):
+        over = {level: shares[level] - cap for level in free if shares[level] > cap + 1e-12}
+        if not over:
+            break
+        takers = [level for level in free if shares[level] < cap - 1e-12 and terms[level] > 0.0]
+        if not takers:
+            break  # the cap yields: there is nobody else who can use the mass
+        surplus = sum(over.values())
+        for level in over:
+            shares[level] = cap
+        weight = sum(terms[level] for level in takers)
+        for level in takers:
+            shares[level] += surplus * terms[level] / weight
+    return [(level, shares[level]) for level, _ in unlocked]
 
 
-def choose_level(rng: random.Random, order, stats: dict | None, *, floor: float = 0.1) -> str:
+def choose_level(rng: random.Random, order, stats: dict | None, *, floor: float = 0.1,
+                 rule: str = "inverse_rate", cap: float = CURRICULUM_WEIGHT_CAP,
+                 blocked_fresh_episodes: int = CURRICULUM_BLOCKED_FRESH_EPISODES,
+                 min_samples: int = PROGRESS_MIN_SAMPLES) -> str:
     """The level the next fresh load uses, sampled from the unlocked set by `level_weights`.
 
     The weight controls fresh *draws*, not episodes: a worker only re-draws at a fresh start, and
     `choose_fresh_start` keeps it on the level it reached a checkpoint in for about 1/fresh_start_prob
     episodes. The number to read is the per-level `episodes` count, not the weight.
     """
-    weighted = level_weights(order, stats, floor=floor)
+    weighted = level_weights(order, stats, floor=floor, rule=rule, cap=cap,
+                             blocked_fresh_episodes=blocked_fresh_episodes, min_samples=min_samples)
     if not weighted:
         raise ValueError("choose_level needs a non-empty level order")
     levels = [level for level, _ in weighted]
-    return rng.choices(levels, weights=[w for _, w in weighted], k=1)[0]
+    weights = [w for _, w in weighted]
+    if not any(w > 0.0 for w in weights):  # a hand-written floor of 0 on every level
+        weights = [1.0] * len(levels)
+    return rng.choices(levels, weights=weights, k=1)[0]
 
 
 def unlock_next(order, stats: dict | None, *, unlock_rate: float = 0.5, unlock_window: int = 20,
