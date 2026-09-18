@@ -40,7 +40,7 @@ CMD_WORKER = ('"python.exe" "-c" "from multiprocessing.spawn import spawn_main; 
               'spawn_main(parent_pid=32324, pipe_handle=1536)" "--multiprocessing-fork"')
 CMD_POLL = "F:\\...\\python.exe -u scripts/poll_status.py --run campaign_gates"
 CMD_KEEP_BEST = "F:\\...\\python.exe -u scripts/keep_best.py --run campaign_gates --metric campaign"
-CMD_MEM_GUARD = "F:\...\python.exe -u scripts/mem_guard.py --run campaign_gates"
+CMD_MEM_GUARD = "F:\\...\\python.exe -u scripts/mem_guard.py --run campaign_gates"
 # The supervisor itself, and the query it uses to list processes. Both MENTION the trainer; neither IS one.
 CMD_SELF = ('"C:\\WINDOWS\\system32\\cmd.exe" /c "F:\\...\\python.exe" -u scripts/supervise.py --run campaign_gates '
             "--config configs/campaign_gates_main.yaml --count 12 --monitor 1 >> runs\\campaign_gates_supervisor.log")
