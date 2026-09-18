@@ -15,6 +15,9 @@ import numpy as np
 
 from ultrakill_ai.campaign import (
     CAMPAIGN_LEVELS_SHIPPED,
+    CURRICULUM_BLOCKED_FRESH_EPISODES,
+    CURRICULUM_WEIGHT_CAP,
+    CURRICULUM_WEIGHTINGS,
     ROUTE_SOURCE_NAMES,
     SUBGOAL_ALTAR,
     SUBGOAL_ITEM,
@@ -113,6 +116,14 @@ class EnvConfig:
     # episodes, whatever its rate, so one level the policy cannot crack does not block the whole campaign.
     unlock_after_fresh_episodes: int = 0
     level_weight_floor: float = 0.1  # a mastered level keeps this much of the sampling weight, so it is not forgotten
+    # How the fresh-load weights are computed. "inverse_rate" is what every run before 2026-09-18 used: weight
+    # `max(floor, 1 - fresh completion rate)`, so the WORST level gets the most attention -- which starved the
+    # levels that were learning as soon as one level blocked. "progress" weights by learning progress instead,
+    # with a retention floor, a cap and a damping for blocked levels (see campaign.level_weights).
+    curriculum_weighting: str = "inverse_rate"
+    curriculum_weight_cap: float = CURRICULUM_WEIGHT_CAP  # `progress` only: most of the mass one level may take
+    # `progress` only: fresh episodes a level may go without a completion before it counts as blocked.
+    curriculum_blocked_fresh_episodes: int = CURRICULUM_BLOCKED_FRESH_EPISODES
     difficulty: int = -1  # difficulty the game reads while the AI has control (3 = Violent, -1 = leave the game's own)
     unlock_all_gear: bool = False  # every weapon and variant while the AI has control, in memory only
     fresh_start_prob: float = 0.2  # chance of a fresh level load when a checkpoint respawn would also do
@@ -342,6 +353,11 @@ class UltrakillEnv(gym.Env):
             # Caught here rather than at the first reset, where it would strand a worker waiting for a scene the
             # game cannot load. `Level 9-1` and `Level 9-2` ship no scene bundle in this build.
             raise ValueError(f"levels contains scenes this game build cannot load: {unknown}")
+        if self.cfg.curriculum_weighting not in CURRICULUM_WEIGHTINGS:
+            # Caught here, not swallowed: a typo would silently hand the run back to the rule that starved the
+            # levels that were learning, and the dashboard would show no sign of it.
+            raise ValueError(f"curriculum_weighting must be one of {CURRICULUM_WEIGHTINGS}, "
+                             f"got {self.cfg.curriculum_weighting!r}")
         # The level is mutable from here on: a curriculum run changes it at a fresh load and nowhere else.
         self.level = (self.cfg.levels[0] if self.cfg.levels else self.cfg.level) if campaign else self.cfg.level
         if self.cfg.layout.campaign != campaign:
@@ -1479,7 +1495,9 @@ class UltrakillEnv(gym.Env):
                           f"this game will train on {self.cfg.levels[0]!r} only")
             else:
                 self._curriculum = stats = table
-        return choose_level(self._rng, list(self.cfg.levels), stats, floor=self.cfg.level_weight_floor)
+        return choose_level(self._rng, list(self.cfg.levels), stats, floor=self.cfg.level_weight_floor,
+                            rule=self.cfg.curriculum_weighting, cap=self.cfg.curriculum_weight_cap,
+                            blocked_fresh_episodes=self.cfg.curriculum_blocked_fresh_episodes)
 
     def _save_archive_on_schedule(self) -> None:
         """Saves the exploration archive every `archive_save_steps` or `archive_save_seconds`, whichever is first.

@@ -186,13 +186,15 @@ def test_the_main_config_carries_the_gates_prelude_run_forward():
 
 
 def test_the_full_config_is_the_main_config_with_more_levels():
-    """configs/campaign_gates_full.yaml: the whole routed campaign, and FOUR listed differences from main.
+    """configs/campaign_gates_full.yaml: the whole routed campaign, and FIVE listed differences from main.
 
     The route fallback adds no reward term and no hyperparameter -- a room rung pays through `gate` and
     `gate_approach` exactly as a door does -- so the differences this config is allowed to carry are named one
-    by one, and anything else is a change nobody decided. The three beyond the levels list are the 2026-09-17
+    by one, and anything else is a change nobody decided. Three beyond the levels list are the 2026-09-17
     revision: where target patience may act, which layer a collapsed level uses, and the entropy floor.
-    `ent_coef` itself is untouched -- the floor raises it only while the policy is sharpening past 5 nats.
+    `ent_coef` itself is untouched -- the floor raises it only while the policy is sharpening past 5 nats. The
+    fifth is 2026-09-18's `curriculum_weighting: progress`, which changes which level a fresh load draws and
+    nothing else: no reward, no hyperparameter, no observation.
     """
     main_env, main_train = train.load_config(str(GATES_MAIN))
     env_dict, train_cfg = train.load_config(str(GATES_FULL))
@@ -200,7 +202,8 @@ def test_the_full_config_is_the_main_config_with_more_levels():
 
     # The raw YAML, which is where "written out on purpose" lives: two of these three are the defaults, and
     # stating them is what makes flipping one a deliberate act rather than a silent inherit.
-    assert set(env_dict) - set(main_env) == {"gate_patience_mode", "prefer_route_when_collapsed"}
+    assert set(env_dict) - set(main_env) == {"gate_patience_mode", "prefer_route_when_collapsed",
+                                             "curriculum_weighting"}
     assert set(main_env) - set(env_dict) == set()
     assert {k for k in set(env_dict) & set(main_env) if env_dict[k] != main_env[k]} == {"levels"}
     assert set(train_cfg) - set(main_train) == {"ent_floor", "ent_coef_max"}
@@ -212,8 +215,14 @@ def test_the_full_config_is_the_main_config_with_more_levels():
     # fields that differ are the levels list and that one flag.
     differing = {f.name for f in dataclasses.fields(EnvConfig)
                  if getattr(cfg, f.name) != getattr(main, f.name)}
-    assert differing == {"levels", "prefer_route_when_collapsed"},         f"only the levels list and the route preference may change, got {sorted(differing)}"
+    assert differing == {"levels", "prefer_route_when_collapsed", "curriculum_weighting"}, \
+        f"only the levels list, the route preference and the weighting rule may change, got {sorted(differing)}"
     assert cfg.gate_patience_mode == "collapsed" and cfg.prefer_route_when_collapsed is True
+    # The weighting rule, and the two numbers it reads. Both are defaults, stated here so that changing one is
+    # a decision with a test behind it rather than an edit nobody notices.
+    assert cfg.curriculum_weighting == "progress" and main.curriculum_weighting == "inverse_rate"
+    assert (cfg.curriculum_weight_cap, cfg.curriculum_blocked_fresh_episodes) == (0.5, 100)
+    assert cfg.level_weight_floor == main.level_weight_floor == 0.1, "the retention floor does not move"
     assert cfg.gate_target_patience_s == 20.0, "the window itself does not move; only where it may act"
     assert cfg.rewards == main.rewards, "no reward weight moves: the fallback adds no term"
     assert train_cfg["num_envs"] == 12 and train_cfg["run_name"] == RUN_NAME

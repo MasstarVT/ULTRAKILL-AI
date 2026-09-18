@@ -18,7 +18,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ultrakill_ai.campaign import (  # noqa: E402
     CAMPAIGN_LEVELS,
     CAMPAIGN_LEVELS_SHIPPED,
+    CURRICULUM_BLOCKED_FRESH_EPISODES,
+    CURRICULUM_FLOOR_MASS,
+    CURRICULUM_WEIGHT_CAP,
     GATE_EXIT_KEY,
+    PROGRESS_CHECKPOINT_SCALE,
+    PROGRESS_FAST_SPAN,
+    PROGRESS_FLAT,
+    PROGRESS_IMPROVEMENT,
+    PROGRESS_MIN_SAMPLES,
+    PROGRESS_SLOW_SPAN,
     RANK_LETTERS,
     ROUTE_SOURCE_GATES,
     ROUTE_SOURCE_NAMES,
@@ -39,8 +48,11 @@ from ultrakill_ai.campaign import (  # noqa: E402
     dead_twin,
     detect_collapsed_ladder,
     grade,
+    learning_progress,
+    level_blocked,
     level_weights,
     load_route,
+    progress_score,
     read_curriculum,
     route_path,
     safe_name,
@@ -209,6 +221,227 @@ def test_a_table_written_before_the_safety_valve_existed_still_loads():
     assert unlock_next(ORDER, old, unlock_after_fresh_episodes=600) is None
     old["Level 0-1"]["fresh_completion_rate"] = 0.6
     assert unlock_next(ORDER, old, unlock_after_fresh_episodes=600) == "Level 0-3", "the rate bar still works"
+
+
+# ---------------------------------------------------------------------------
+# Learning-progress weighting (curriculum_weighting: "progress")
+# ---------------------------------------------------------------------------
+
+
+def warm(*, fast, slow, samples=PROGRESS_MIN_SAMPLES, dry=0, gates_total=10, completions=1, high=None, **kw):
+    """A level record whose progress statistics have warmed up, for the `progress` rule.
+
+    `high` is the high-water mark of the slow average and defaults to the slow average itself: a level sitting
+    at the best progress it has ever held, which is the "still progressing" case.
+    """
+    row = record(**kw)
+    row.update(progress_fast=fast, progress_slow=slow, progress_samples=samples,
+               dry_fresh_episodes=dry, gates_total=gates_total, fresh_completions=completions,
+               progress_best=slow if high is None else high)
+    return row
+
+
+def shares(stats, order=ORDER, **kw):
+    return dict(level_weights(order, stats, rule="progress", **kw))
+
+
+def test_progress_score_prefers_the_gate_ladder_and_falls_back_to_checkpoints():
+    """0..1 for one FRESH episode: a completion is 1, otherwise how far along the level's own ladder it got.
+
+    `gates_total` is what makes the number comparable across levels of different size (0-1's ladder is 10 rungs,
+    0-2's 8), and `checkpoints_level` is the fallback for a level whose ladder never reported anything.
+    """
+    assert progress_score(completed=1, gates_reached=0, gates_total=10, checkpoints_level=0) == 1.0
+    assert progress_score(completed=0, gates_reached=4, gates_total=10, checkpoints_level=0) == 0.4
+    assert progress_score(completed=0, gates_reached=12, gates_total=10, checkpoints_level=0) == 1.0, "clamped"
+    # No ladder for this level: the rough fallback, checkpoints over PROGRESS_CHECKPOINT_SCALE.
+    assert progress_score(completed=0, gates_reached=None, gates_total=0, checkpoints_level=3) == 3 / PROGRESS_CHECKPOINT_SCALE
+    assert progress_score(completed=0, gates_reached=None, gates_total=None, checkpoints_level=9) == 1.0
+    assert progress_score(completed=None, gates_reached=None, gates_total=None, checkpoints_level=None) is None
+    assert progress_score(completed=0, gates_reached=0, gates_total=10, checkpoints_level=None) == 0.0
+
+
+def test_learning_progress_needs_both_averages_and_the_warmup():
+    """|fast - slow| once a level has PROGRESS_MIN_SAMPLES fresh episodes behind the two averages, else None.
+
+    None is the signal the whole backward-compatibility story rests on: a curriculum.json written before this
+    existed has neither average, so every level reads None and `level_weights` hands back today's rule.
+    """
+    assert abs(learning_progress(warm(fast=0.7, slow=0.5)) - 0.2) < 1e-9
+    assert abs(learning_progress(warm(fast=0.3, slow=0.5)) - 0.2) < 1e-9, "a collapsing level changes as fast"
+    assert learning_progress(warm(fast=0.5, slow=0.5)) == 0.0
+    assert learning_progress(warm(fast=0.7, slow=0.5, samples=PROGRESS_MIN_SAMPLES - 1)) is None
+    assert learning_progress(record()) is None, "a table written before the statistics existed"
+    assert learning_progress({}) is None and learning_progress({"progress_fast": 0.5}) is None
+    assert PROGRESS_FAST_SPAN < PROGRESS_SLOW_SPAN, "the fast average has to be the fast one"
+
+
+def test_the_default_weighting_is_todays_rule_untouched():
+    """Every config but the full campaign leaves `curriculum_weighting` alone, so nothing else changes."""
+    stats = {"Level 0-1": warm(fast=0.9, slow=0.5, rate=1.0), "Level 0-3": warm(fast=0.2, slow=0.2, rate=0.0),
+             "Level 0-4": record(unlocked=False)}
+    assert dict(level_weights(ORDER, stats)) == {"Level 0-1": 0.1, "Level 0-3": 1.0}
+    assert dict(level_weights(ORDER, stats, rule="inverse_rate")) == {"Level 0-1": 0.1, "Level 0-3": 1.0}
+    # An unknown name is today's rule too: a typo must not invent a third policy.
+    assert dict(level_weights(ORDER, stats, rule="nonsense")) == {"Level 0-1": 0.1, "Level 0-3": 1.0}
+
+
+def test_progress_weighting_is_todays_rule_until_the_statistics_warm_up():
+    """An old curriculum.json under the new rule: identical weights, so a restart mid-run changes nothing."""
+    old = {"Level 0-1": {"unlocked": True, "fresh_window": 50, "fresh_completion_rate": 0.6, "best_time": 141.2,
+                         "episodes": 800, "fresh_episodes": 300},
+           "Level 0-3": {"unlocked": True, "fresh_window": 46, "fresh_completion_rate": 0.0, "best_time": None,
+                         "episodes": 636, "fresh_episodes": 442},
+           "Level 0-4": {"unlocked": False, "fresh_window": 0, "fresh_completion_rate": None, "best_time": None,
+                         "episodes": 0, "fresh_episodes": 0}}
+    assert shares(old) == dict(level_weights(ORDER, old)), "no statistics anywhere: today's numbers exactly"
+    # One warmed level is enough to switch over, and the cold one is then treated as the best learner there is.
+    old["Level 0-1"] = warm(fast=0.66, slow=0.59, rate=0.6)
+    switched = shares(old)
+    assert abs(sum(switched.values()) - 1.0) < 1e-9
+    assert switched["Level 0-3"] > 0.1, "a level with no statistics is not starved either"
+
+
+def test_progress_weighting_follows_learning_progress():
+    """The level that is moving gets the mass; the one that has stopped moving keeps the retention floor."""
+    stats = {"Level 0-1": warm(fast=0.70, slow=0.50, rate=0.3),   # lp 0.20, learning fast
+             "Level 0-3": warm(fast=0.40, slow=0.38, rate=0.0),   # lp 0.02, nearly flat
+             "Level 0-4": warm(fast=0.95, slow=0.95, rate=1.0)}   # lp 0.00, mastered and done moving
+    got = shares(stats)
+    assert abs(sum(got.values()) - 1.0) < 1e-9
+    assert got["Level 0-1"] > got["Level 0-3"] > got["Level 0-4"]
+    assert abs(got["Level 0-4"] - 0.1) < 1e-9, "the retention floor, so a solved level is not forgotten"
+    assert got["Level 0-1"] <= CURRICULUM_WEIGHT_CAP + 1e-9
+    # And today's rule would do the opposite: 0-3 (rate 0.0) would take the most of the three.
+    inverse = dict(level_weights(ORDER, stats))
+    assert max(inverse, key=inverse.get) == "Level 0-3"
+
+
+def test_a_blocked_level_gets_at_most_the_floor():
+    """The live run's own case, 2026-09-18: 0-3 at 0 completions for 155 fresh episodes while 0-1 and 0-2 learn.
+
+    `|fast - slow|` alone does not fix this -- 0-3's measured 0.095 is as large as 0-1's, because its gate score
+    swings without ever finishing the level. The damping is the dry-episode count plus the high-water test: its
+    slow average has fallen well below the best it ever held, so it is not on its way anywhere.
+    """
+    stats = {"Level 0-1": warm(fast=0.656, slow=0.593, dry=2, gates_total=10, completions=134, rate=0.23),
+             "Level 0-3": warm(fast=0.300, slow=0.395, high=0.46, dry=155, gates_total=11, completions=0,
+                               rate=0.0),
+             "Level 0-4": record(unlocked=False)}
+    got = shares(stats)
+    assert abs(got["Level 0-3"] - 0.1) < 1e-9, "the blocked level keeps the floor and nothing more"
+    assert abs(got["Level 0-1"] - 0.9) < 1e-9, "and the level that is learning gets the rest"
+    assert level_blocked(stats["Level 0-3"]) and not level_blocked(stats["Level 0-1"])
+    # Under today's rule the blocked level takes the LARGER share of the two, which is the bug being fixed.
+    inverse = dict(level_weights(ORDER, stats))
+    assert inverse["Level 0-3"] > inverse["Level 0-1"]
+    assert inverse["Level 0-3"] / sum(inverse.values()) > 0.5
+
+
+def test_a_blocked_level_is_released_when_it_climbs_back_to_its_own_record():
+    """Blocked is not a latch, and what releases it is sustained progress, not one lucky episode.
+
+    A fast average swinging up releases nothing -- on the live run 0-3's `fast - slow` crossed +0.02 a third of
+    the time while it was completing nothing, which is exactly why that test was rejected. The slow average
+    coming back to its own high-water mark does release it, and so does one completion.
+    """
+    blocked = warm(fast=0.30, slow=0.395, high=0.46, dry=155, completions=0)
+    assert level_blocked(blocked)
+    blocked["progress_fast"] = 0.55  # a burst of good episodes, the slow average not yet moved
+    assert level_blocked(blocked), "a swing in the fast average is noise, not progress"
+    blocked["progress_slow"] = 0.46 - PROGRESS_IMPROVEMENT / 2  # ... and now the slow average follows it up
+    assert not level_blocked(blocked), "back within the improvement margin of its record: worth sampling again"
+    # The dry counter is the other half, and a single completion resets it in `ProgressCallback`.
+    assert not level_blocked(warm(fast=0.30, slow=0.395, high=0.46, completions=0,
+                                  dry=CURRICULUM_BLOCKED_FRESH_EPISODES - 1))
+    assert not level_blocked(record()), "a table with no statistics is never called blocked"
+
+
+def test_a_level_that_never_moves_at_all_is_blocked_too():
+    """The hard wall: every fresh episode reaches the same rung, so the score is a constant.
+
+    The high-water test cannot see this one -- a constant slow average IS its own record -- and without the flat
+    clause a level stuck against a wall would keep half of every fresh draw for a number that never changes.
+    """
+    wall = warm(fast=0.2727, slow=0.2727, dry=300, completions=0)
+    assert level_blocked(wall)
+    wall["progress_fast"] = 0.2727 + PROGRESS_FLAT * 2
+    assert not level_blocked(wall), "once it moves at all the flat clause stops applying"
+    assert not level_blocked(warm(fast=0.2727, slow=0.2727, dry=300, completions=0,
+                                  samples=PROGRESS_MIN_SAMPLES - 1)), "cold statistics are never blocked"
+
+
+def test_no_level_takes_more_than_the_cap():
+    """One runaway learner cannot take the whole run: the cap leaves the others their floors and more."""
+    stats = {"Level 0-1": warm(fast=1.0, slow=0.0), "Level 0-3": warm(fast=0.5, slow=0.499),
+             "Level 0-4": warm(fast=0.5, slow=0.4999)}
+    got = shares(stats)
+    assert abs(got["Level 0-1"] - CURRICULUM_WEIGHT_CAP) < 1e-9
+    assert abs(sum(got.values()) - 1.0) < 1e-9
+    assert all(w >= 0.1 - 1e-9 for w in got.values())
+    # Two runaway learners and one flat level: the surplus lands on the other learner until it too is capped,
+    # never on the flat one beyond its floor, and neither ends above the cap.
+    two = {"Level 0-1": warm(fast=1.0, slow=0.0), "Level 0-3": warm(fast=0.9, slow=0.0),
+           "Level 0-4": warm(fast=0.5, slow=0.5)}
+    got = shares(two)
+    assert all(w <= CURRICULUM_WEIGHT_CAP + 1e-9 for w in got.values()), got
+    assert abs(sum(got.values()) - 1.0) < 1e-9
+    assert abs(got["Level 0-4"] - 0.1) < 1e-9
+
+
+def test_the_retention_floor_shrinks_when_it_cannot_fit():
+    """0.10 each is impossible past ten unlocked levels, so the floors are shrunk to half the mass between them.
+
+    Without the shrink the floors would eat the whole distribution on the 30-level config and the progress term
+    would have nothing left to allocate -- the rule would silently become uniform sampling.
+    """
+    order = [f"Level {i}" for i in range(20)]
+    stats = {level: warm(fast=0.5, slow=0.5) for level in order}
+    stats[order[0]] = warm(fast=0.9, slow=0.5)
+    got = dict(level_weights(order, stats, rule="progress"))
+    assert abs(sum(got.values()) - 1.0) < 1e-9 and len(got) == 20
+    expected_floor = min(0.1, CURRICULUM_FLOOR_MASS / 20)
+    assert all(w >= expected_floor - 1e-9 for w in got.values()), "every unlocked level keeps a share"
+    assert abs(sum(w for lv, w in got.items() if lv != order[0]) - 19 * expected_floor) < 1e-9
+    assert got[order[0]] > got[order[1]], "and the one level that is moving still gets the rest"
+
+
+def test_the_progress_rule_never_produces_a_weight_choose_level_cannot_use():
+    """Fuzz: whatever the table says, the shares are finite, non-negative, sum to 1 and cover the unlocked set."""
+    rng = random.Random(7)
+    for _ in range(400):
+        stats = {}
+        for level in ORDER:
+            if rng.random() < 0.2:
+                stats[level] = record(unlocked=rng.random() < 0.5)
+                continue
+            stats[level] = warm(fast=rng.random(), slow=rng.random(), samples=rng.randint(0, 60),
+                                dry=rng.randint(0, 400), completions=rng.randint(0, 5),
+                                rate=rng.choice([None, 0.0, 0.5, 1.0]))
+        got = dict(level_weights(ORDER, stats, rule="progress"))
+        assert set(got) == {lv for lv in ORDER if lv == ORDER[0] or stats[lv].get("unlocked")}
+        assert all(math.isfinite(w) and w >= 0.0 for w in got.values())
+        assert any(w > 0.0 for w in got.values())
+        if any(learning_progress(stats[lv]) is not None for lv in got):
+            assert abs(sum(got.values()) - 1.0) < 1e-9, got
+        else:  # not one warm level in the table, so these are today's unnormalised weights
+            assert got == dict(level_weights(ORDER, stats)), got
+        assert choose_level(rng, ORDER, stats, rule="progress") in got
+
+
+def test_choose_level_samples_the_progress_shares():
+    """The draws themselves, through choose_level: the blocked level is drawn at its floor and no more."""
+    stats = {"Level 0-1": warm(fast=0.66, slow=0.59, dry=2, completions=134),
+             "Level 0-3": warm(fast=0.30, slow=0.40, high=0.46, dry=155, completions=0),
+             "Level 0-4": warm(fast=0.93, slow=0.93, dry=1, completions=54)}
+    rng = random.Random(11)
+    counts = {level: 0 for level in ORDER}
+    for _ in range(6000):
+        counts[choose_level(rng, ORDER, stats, rule="progress")] += 1
+    share = {level: n / 6000 for level, n in counts.items()}
+    assert abs(share["Level 0-3"] - 0.1) < 0.02, share
+    assert abs(share["Level 0-4"] - 0.1) < 0.02, "flat and solved: retention only"
+    assert share["Level 0-1"] > 0.7, share
 
 
 def curriculum_file(path, *, order=ORDER, run_name="campaign_prelude", levels=None):

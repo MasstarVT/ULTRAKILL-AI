@@ -2492,6 +2492,26 @@ def test_levels_must_be_scenes_this_build_ships():
     ok.close()
 
 
+def test_the_weighting_rule_must_be_one_the_code_implements():
+    """A typo in `curriculum_weighting` is refused at construction, not swallowed.
+
+    Swallowing it would silently hand the run back to `inverse_rate` -- the rule that let one blocked level take
+    half of every fresh draw -- with nothing on the dashboard to say so.
+    """
+    for bad in ("progres", "Progress", "learning_progress", ""):
+        try:
+            UltrakillEnv(EnvConfig(mode="campaign", levels=LEVELS, curriculum_weighting=bad))
+        except ValueError as exc:
+            assert "curriculum_weighting" in str(exc), exc
+        else:
+            raise AssertionError(f"{bad!r} should have been refused")
+    for good in ("inverse_rate", "progress"):
+        env = UltrakillEnv(EnvConfig(mode="campaign", levels=LEVELS, curriculum_weighting=good))
+        assert env.cfg.curriculum_weighting == good
+        env.close()
+    assert EnvConfig().curriculum_weighting == "inverse_rate", "every run before 2026-09-18 keeps its rule"
+
+
 def test_human_routes_are_retired():
     """No human demo and no recorded route, which layer 2 does not change: its rungs are level DATA.
 

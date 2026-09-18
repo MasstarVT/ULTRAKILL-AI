@@ -372,13 +372,13 @@ def test_campaign_progress():
 CURRICULUM_LEVELS = ["Level 0-1", "Level 0-3", "Level 0-4"]
 
 
-def episode_info(level, *, fresh=1, completed=0, seconds=None, checkpoints=2, gates=3):
+def episode_info(level, *, fresh=1, completed=0, seconds=None, checkpoints=2, gates=3, hops=1):
     """One finished campaign episode as the env reports it."""
     return {
         "episode": {"r": 1.0, "l": 100.0}, "level": level, "kills": 0, "deaths": 0, "wave": 0, "style": 0,
         "completed": completed, "fresh_start": fresh, "level_seconds": seconds,
         "checkpoints_level": checkpoints, "cells_new": 10, "oob_frac": 0.0, "exit_dist_min": 5.0,
-        "gates_reached": gates, "gate_hops_best": 1, "wedged_steps": 0, "level_started": 1,
+        "gates_reached": gates, "gate_hops_best": hops, "wedged_steps": 0, "level_started": 1,
         "look_free_frac": 0.5, "look_enemy_frac": 0.2, "look_gate_frac": 0.3, "slide_forced_frac": 0.0,
         "start_checkpoint": None, "end_pos": [0.0, 1.0, 2.0],
         "end_reason": "level_complete" if completed else "stuck", "reward_parts": {"gate": 15.0},
@@ -406,8 +406,13 @@ def test_curriculum_file_is_written_before_any_episode_and_lists_every_level():
         assert list(data["levels"]) == CURRICULUM_LEVELS, "every level is listed before it has any episodes"
         assert data["levels"]["Level 0-1"]["unlocked"] is True, "the ladder always has a starting rung"
         assert [data["levels"][lv]["unlocked"] for lv in CURRICULUM_LEVELS[1:]] == [False, False]
-        assert data["levels"]["Level 0-3"] == {"unlocked": False, "fresh_window": 0, "fresh_completion_rate": None,
-                                               "best_time": None, "episodes": 0, "fresh_episodes": 0}
+        assert data["levels"]["Level 0-3"] == {
+            "unlocked": False, "fresh_window": 0, "fresh_completion_rate": None, "best_time": None,
+            "episodes": 0, "fresh_episodes": 0,
+            # The learning-progress fields, all empty before the level has run: additive, so a reader from
+            # before they existed (an older env.py on a resumed run) ignores them and samples as it always did.
+            "progress_fast": None, "progress_slow": None, "progress_best": None, "progress_samples": 0,
+            "gates_total": None, "fresh_completions": 0, "dry_fresh_episodes": 0}
         assert cb.unlocked_levels == ["Level 0-1"]
         assert not list((run).glob("*.tmp"))
 
@@ -554,6 +559,159 @@ def test_inserting_a_level_before_an_unlocked_one_keeps_it_unlocked():
         assert again.unlocked_levels == ["Level 0-1", "Level 0-2", "Level 0-3"]
 
 
+def test_the_curriculum_publishes_the_learning_progress_statistics():
+    """Per level: the two averages, the samples behind them, the ladder length and the dry-episode counter.
+
+    curriculum.json carries the raw statistics because the SubprocVecEnv workers weight their own draws from it;
+    status.json adds the two derived numbers (`progress_score`, `learning_progress`) because the dashboard reads
+    those and nothing else does.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "campaign_multi"
+        cb = curriculum_callback(Path(tmp), curriculum_weighting="progress")
+        for _ in range(10):  # 2 of 10 rungs, nothing finished
+            cb._record_episode(0, episode_info("Level 0-1", gates=2, hops=8, checkpoints=1))
+        for _ in range(15):  # then it starts finishing the level
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=150.0, gates=10, hops=0))
+        cb._write(time.time())
+        row = read_json(run / "curriculum.json")["levels"]["Level 0-1"]
+        assert row["gates_total"] == 10, "gates_reached + gate_hops_best, ratcheted to the ladder's own length"
+        assert row["progress_samples"] == 25 and row["fresh_completions"] == 15
+        assert row["dry_fresh_episodes"] == 0, "it completed the level on its last fresh try"
+        assert row["progress_fast"] > row["progress_slow"], "the fast average leads a level that is improving"
+        assert 0.0 <= row["progress_slow"] <= row["progress_fast"] <= 1.0
+
+        published = read_json(run / "status.json")["campaign"]["levels"]["Level 0-1"]
+        assert abs(published["progress_score"] - row["progress_fast"]) < 1e-9, "the score IS the fast average"
+        assert abs(published["learning_progress"] - (row["progress_fast"] - row["progress_slow"])) < 1e-9
+        assert published["weight"] > 0.0
+
+
+def test_a_blocked_level_stops_taking_the_fresh_starts():
+    """The live run's bug, end to end: 0-3 blocked at 0 completions while 0-1 completes and improves.
+
+    Under today's rule 0-3 would take the larger share of every fresh draw for having the worse rate. Under
+    `curriculum_weighting: "progress"` it keeps the retention floor and 0-1 gets the rest.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "campaign_multi"
+        cb = curriculum_callback(Path(tmp), curriculum_weighting="progress")
+        cb._level_record("Level 0-3")["unlocked"] = True
+        for i in range(40):  # 0-1: climbing, and finishing the level more and more often
+            done = 1 if i >= 20 else 0
+            cb._record_episode(0, episode_info("Level 0-1", completed=done, seconds=160.0 - i if done else None,
+                                               gates=10 if done else 4, hops=0 if done else 6))
+        # 0-3, the shape the live level actually had: it got a good way down the ladder for a while, then slid
+        # back and stayed there, and never once finished. 140 fresh tries, no completion.
+        for i in range(140):
+            gates = 7 if i < 50 else 3 + (i % 3)
+            cb._record_episode(1, episode_info("Level 0-3", gates=gates, hops=10 - gates, checkpoints=0))
+        cb._write(time.time())
+        table = read_json(run / "status.json")["campaign"]["levels"]
+        assert table["Level 0-3"]["dry_fresh_episodes"] == 140
+        assert abs(table["Level 0-3"]["weight"] - 0.1) < 1e-9, "the floor, not 50% of the run"
+        assert table["Level 0-1"]["weight"] > 0.85
+        assert table["Level 0-1"]["fresh_completion_rate"] > table["Level 0-3"]["fresh_completion_rate"]
+
+        # The same table under today's rule: the blocked level takes MORE than the level that is learning.
+        inverse = ProgressCallback(run / "status_inverse.json", 1000, "campaign_multi", 2, update_every_s=0.0,
+                                   levels=CURRICULUM_LEVELS, curriculum_path=run / "curriculum_inverse.json")
+        inverse.per_level = cb.per_level
+        inverse.order = cb.order
+        weights = inverse._level_table(with_weights=True)
+        assert weights["Level 0-3"]["weight"] > weights["Level 0-1"]["weight"]
+
+
+def test_the_progress_statistics_survive_a_restart():
+    """They have to: the supervisor bounces this trainer, and the windows deliberately do not carry.
+
+    Without carrying the two averages every restart would drop the rule back to `inverse_rate` for the next 20
+    fresh episodes per level -- which is the starvation this change exists to stop, handed back every few hours.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "campaign_multi"
+        cb = curriculum_callback(Path(tmp), curriculum_weighting="progress")
+        for i in range(30):
+            cb._record_episode(0, episode_info("Level 0-1", completed=1 if i > 10 else 0,
+                                               seconds=150.0 if i > 10 else None,
+                                               gates=10 if i > 10 else 3, hops=0 if i > 10 else 7))
+        cb._write(time.time())
+        before = read_json(run / "curriculum.json")["levels"]["Level 0-1"]
+
+        again = ProgressCallback(run / "status.json", 1000, "campaign_multi", 2, update_every_s=0.0,
+                                 levels=CURRICULUM_LEVELS, curriculum_path=run / "curriculum.json",
+                                 curriculum_weighting="progress")
+        again._on_training_start()
+        after = read_json(run / "curriculum.json")["levels"]["Level 0-1"]
+        for key in ("progress_fast", "progress_slow", "progress_samples", "gates_total",
+                    "fresh_completions", "dry_fresh_episodes"):
+            assert after[key] == before[key], key
+        assert after["fresh_window"] == 0, "the windows still start empty, exactly as they always have"
+
+
+def test_the_weighting_rule_defaults_to_the_one_that_is_running():
+    """Only the full-campaign config opts in, so every other run's draws are byte for byte what they were."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cb = curriculum_callback(Path(tmp))
+        assert cb.curriculum_weighting == "inverse_rate"
+        cb._level_record("Level 0-3")["unlocked"] = True
+        for _ in range(30):
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=120.0))
+        for _ in range(30):
+            cb._record_episode(1, episode_info("Level 0-3"))
+        table = cb._level_table(with_weights=True)
+        assert abs(table["Level 0-1"]["weight"] - 0.1 / 1.1) < 1e-9, "mastered: the floor weight, as before"
+        assert abs(table["Level 0-3"]["weight"] - 1.0 / 1.1) < 1e-9, "rate 0.0: the whole rest, as before"
+        assert table["Level 0-1"]["progress_score"] is not None, "the statistics are kept either way"
+
+
+def test_replay_curriculum_scores_both_rules_from_an_episode_log():
+    """scripts/replay_curriculum.py: the evidence tool, and read-only -- it must not touch the run it reads.
+
+    Two levels in the log: one completing and improving, one that got a good way in and then stalled for 140
+    fresh tries. The replay has to say that today's rule hands the stalled one the bigger share and the new one
+    hands it the smaller, which is the whole claim the rule change rests on.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "episodes.jsonl"
+        rows = []
+        clock = 1_000_000.0
+        for i in range(60):
+            done = i >= 20
+            rows.append({"t": clock + i, "env": 0, "level": "Level 0-1", "fresh_start": 1,
+                         "completed": 1 if done else 0, "level_seconds": 150.0 if done else None,
+                         "gates_reached": 10 if done else 4, "gate_hops_best": 0 if done else 6,
+                         "checkpoints_level": 4, "reward": 1.0, "length": 100.0})
+        for i in range(250):
+            gates = 7 if i < 50 else 3 + (i % 3)
+            rows.append({"t": clock + 1000 + i * 30, "env": 1, "level": "Level 0-3", "fresh_start": 1,
+                         "completed": 0, "level_seconds": None, "gates_reached": gates,
+                         "gate_hops_best": 10 - gates, "checkpoints_level": 0, "reward": 1.0, "length": 100.0})
+        rows.sort(key=lambda r: r["t"])
+        log.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        before = log.read_bytes()
+
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "replay_curriculum.py"), "--episodes", str(log),
+             "--hours", "0.5", "--drift"],
+            capture_output=True, text=True, timeout=120, cwd=str(ROOT),
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert log.read_bytes() == before, "the replay must never write to the log it reads"
+        assert [p.name for p in Path(tmp).glob("*")] == ["episodes.jsonl"], "and it writes nothing beside it"
+        # hour, level, fresh%, inverse_rate, progress, prog, blocked, dry
+        rows_out = {line.split()[1]: line.split() for line in result.stdout.splitlines()
+                    if line.strip().startswith("-0h")}
+        assert set(rows_out) == {"0-1", "0-3"}, result.stdout
+        inverse = {lv: float(cols[3].rstrip("%")) for lv, cols in rows_out.items()}
+        progress = {lv: float(cols[4].rstrip("%")) for lv, cols in rows_out.items()}
+        assert inverse["0-3"] > inverse["0-1"], "today's rule: the stalled level takes the bigger share"
+        assert progress["0-3"] < progress["0-1"], "learning progress: it takes the smaller one"
+        assert progress["0-3"] <= 11.0, "and that share is the retention floor"
+        assert rows_out["0-3"][6] == "100%", "blocked for the whole hour"
+        assert "signed drift" in result.stdout
+
+
 def test_a_run_with_no_levels_writes_no_curriculum_file():
     with tempfile.TemporaryDirectory() as tmp:
         run = Path(tmp) / "runs" / "single"
@@ -590,10 +748,12 @@ def test_dashboard_renders_the_per_level_block():
             # 0-1's ladder is monotone, so `col 0` and `pk 0.0`; 0-3's collapses, so it is allowed to park.
             "Level 0-1": {"unlocked": True, "fresh_window": 50, "fresh_completion_rate": 0.62, "best_time": 141.2,
                           "episodes": 812, "weight": 0.38, "checkpoints_level": 4.1, "gates_reached": 3.2,
-                          "ladder_collapsed": 0.0, "targets_parked": 0.0},
+                          "ladder_collapsed": 0.0, "targets_parked": 0.0, "progress_score": 0.66,
+                          "learning_progress": 0.063},
             "Level 0-3": {"unlocked": True, "fresh_window": 23, "fresh_completion_rate": 0.13, "best_time": None,
                           "episodes": 188, "weight": 0.62, "checkpoints_level": 1.0, "gates_reached": 0.4,
-                          "ladder_collapsed": 1.0, "targets_parked": 8.3},
+                          "ladder_collapsed": 1.0, "targets_parked": 8.3, "progress_score": None,
+                          "learning_progress": None},
             "Level 0-4": {"unlocked": False, "fresh_window": 0, "fresh_completion_rate": None, "best_time": None,
                           "episodes": 0, "weight": 0.0, "checkpoints_level": None, "gates_reached": None},
         },
@@ -602,9 +762,11 @@ def test_dashboard_renders_the_per_level_block():
     assert lines[0] == "  fresh score      1.34 / 2 levels", lines[0]
     assert "  levels" in lines
     block = lines[lines.index("  levels") + 1:]
+    # `w` is the share of fresh draws and `prog` the progress score the weighting rule reads (a dash while the
+    # statistics are cold, which is also what an older status.json shows).
     assert block[:2] == [
-        "    0-1  fresh 62% (50)  best 02:21.200  cp 4.1  w 0.38  col 0  pk 0.0",
-        "    0-3  fresh 13% (23)  best —  cp 1.0  w 0.62  col 1  pk 8.3",
+        "    0-1  fresh 62% (50)  best 02:21.200  cp 4.1  w 0.38  prog 0.66  col 0  pk 0.0",
+        "    0-3  fresh 13% (23)  best —  cp 1.0  w 0.62  prog —  col 1  pk 8.3",
     ], block
     assert not any("0-4" in line for line in block), "a locked level has no rows to show"
     # A single-level run keeps the old headline and grows no block at all.
