@@ -2576,3 +2576,9 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - Evidence: mod builds clean, and the full no-game suite green twice (before and after the install) —
     **22 files, 554 named tests, 0 failures** (6 new: 5 in `test_games.py` for the flag, the flags file and the
     retired alias, 1 in `test_supervise.py` for the supervisor's launches).
+- **Speed phase plan (user, 2026-09-17): Brutal + a time-scaled completion bonus.** When a level set completes
+  reliably on Violent, the speed phase sets `difficulty: 4` (Brutal, the highest this build exposes; the mod applies
+  it in memory for AI runs only) at the same time as the completion bonus that scales with official time against the
+  human reference, so combat is re-learned once, on the enemy set the records will be set on. Not before: the
+  curriculum/route work is the bottleneck now and Brutal would only lower completion rates. `times.md` rows carry the
+  difficulty, so Violent bests stay as their own rows.
