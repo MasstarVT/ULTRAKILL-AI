@@ -1,0 +1,22 @@
+{
+  "_README": [
+    "Manual rung-position overrides for scripts/build_routes.py, applied AFTER every guard and",
+    "BEFORE every measurement, so a regeneration after a game update keeps a measured fix instead of",
+    "silently undoing it. Read the OVERRIDES_NAME comment in build_routes.py for the three rules.",
+    "An entry moves one rung and never adds, removes or reorders one.",
+    "Keys are the short level form ('0-3'). `name` is the rung's room name, which survives a",
+    "regeneration where an index or a position does not. `was` is the position the generator itself",
+    "produced when the override was measured: if it no longer produces that position the rooms have",
+    "moved, the hand-picked point is no longer known to be inside the room, and the override is",
+    "REFUSED with a note that --validate turns into a failure. A stale override is worse than none.",
+    "tests/test_route_files.py checks that every entry here is present in the file that ships."
+  ],
+  "0-3": [
+    {
+      "name": "2 - Side Hallway - Floor 1",
+      "was": [0.0, 10.0, 331.0],
+      "pos": [0.0, 10.0, 340.0],
+      "why": "The room centroid sits 1.5 m past the main room's far wall (wall face z 329.5; the Side Hallway floor is y 10.4, spanning z 332-362), so the 8 m x 6 m reach cylinder covers the wall face on the MAIN ROOM side down to y 4. Measured live 2026-09-18 over three fresh episodes: 801 credit steps, 680 of them airborne against the wall, and the first credit of every episode was airborne at ground_ray_center 9.5-10.5 m on the main-room side -- the ladder then advanced the target to rung 8 through the wall and the agent dropped into the bowl (26 of 66 fresh route episodes). A scripted hold-forward-and-jump run that never crossed the wall (max z 329.5) credited it 31 times. z 340 is 10.5 m past the wall, so the whole cylinder is inside the hallway: every first credit then lands inside it (z 332.9-333.9), and the two scripted non-crossing runs credit it 0 times. tour_ratio 0.9439 -> 0.9438."
+    }
+  ]
+}

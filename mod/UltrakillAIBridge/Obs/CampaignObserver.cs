@@ -149,6 +149,12 @@ namespace UltrakillAIBridge.Obs
         private float pathLength;
         private Vector3 nextCorner;
 
+        // The NavMesh point nearest the chosen FinalPit, i.e. the nearest STANDABLE ground to the exit.
+        // Refreshed on the same cadence as the path hint, from the same SampleExit call. Reported as
+        // exit.ground_pos, and null when NavMesh has nothing within the widest search radius.
+        private Vector3 exitGround;
+        private bool exitGroundValid;
+
         public static bool IsCampaignScene(StatsManager sm)
         {
             var scene = SceneHelper.CurrentScene;
@@ -170,6 +176,7 @@ namespace UltrakillAIBridge.Obs
                 sceneHandle = handle;
                 builds = 0;
                 pathCached = false;
+                exitGroundValid = false;  // another level's standable point must never be reported here
                 hopsByKey.Clear();
                 itemKeys.Clear();
                 chosenExit = null;
@@ -217,7 +224,14 @@ namespace UltrakillAIBridge.Obs
                 ["restarts"] = sm.restarts,
                 ["input_locked"] = (gsm != null && gsm.PlayerInputLocked) || !nm.activated,
                 ["exit"] = exit != null
-                    ? new JObject { ["pos"] = ObservationBuilder.Vec(exit.transform.position), ["active"] = exit.gameObject.activeInHierarchy }
+                    ? new JObject
+                    {
+                        ["pos"] = ObservationBuilder.Vec(exit.transform.position),
+                        ["active"] = exit.gameObject.activeInHierarchy,
+                        // The nearest standable ground to the pit, or null. `pos` is the pit's own
+                        // transform, which sits far below anything walkable; see UpdateExitGround.
+                        ["ground_pos"] = exitGroundValid ? ObservationBuilder.Vec(exitGround) : null,
+                    }
                     : null,
                 ["checkpoints"] = BuildCheckpoints(sm),
                 ["path"] = BuildPath(),
@@ -1303,12 +1317,17 @@ namespace UltrakillAIBridge.Obs
         {
             pathCached = true;
             pathStatus = "none";
+            // Before the player-end snap, deliberately: the two are independent, and on Level 0-1 the
+            // player's own 25 m snap fails at the level's spawn point. Sampling the exit end first means
+            // exit.ground_pos is still reported there, where the path hint is not.
+            UpdateExitGround(exit);
             if (exit == null) return;
             if (!NavMesh.SamplePosition(playerPos, out var from, PlayerSnapDistance, NavMesh.AllAreas)) return;
-            if (!SampleExit(exit.transform.position, out var to)) return;
+            if (!exitGroundValid) return;
+            var to = exitGround;
 
             if (navPath == null) navPath = new NavMeshPath();
-            if (!NavMesh.CalculatePath(from.position, to.position, NavMesh.AllAreas, navPath)) return;
+            if (!NavMesh.CalculatePath(from.position, to, NavMesh.AllAreas, navPath)) return;
             if (navPath.status == NavMeshPathStatus.PathInvalid) return;
             var corners = navPath.corners;
             if (corners.Length == 0) return;
@@ -1341,6 +1360,24 @@ namespace UltrakillAIBridge.Obs
         /// NavMesh hit. Bounded to at most 1 + <c>ExitSnapRadii.Length</c> SamplePosition calls, cheap enough
         /// for the 150-250 steps/s this runs at across five games.
         /// </summary>
+        /// <summary>
+        /// Refreshes <see cref="exitGround"/>: the nearest NavMesh point to the chosen pit, which is the
+        /// nearest standable ground to the exit. A <c>FinalPit</c>'s own transform sits INSIDE the drop it
+        /// triggers, far below anything you can walk on -- 61-75 m below on <c>Level 0-2</c> and 70 m on
+        /// <c>Level 0-3</c> -- so a target built from <c>exit.pos</c> points the agent at a killing fall,
+        /// and a distance measured to it can never reach zero. <see cref="SampleExit"/> already finds the
+        /// standable point for the path hint; this just keeps it, so Python can aim at it instead.
+        /// Cheap: it shares that one call, on the same <see cref="PathEvery"/> cadence.
+        /// </summary>
+        private void UpdateExitGround(FinalPit exit)
+        {
+            exitGroundValid = false;
+            if (exit == null) return;
+            if (!SampleExit(exit.transform.position, out var hit)) return;
+            exitGround = hit.position;
+            exitGroundValid = true;
+        }
+
         private static bool SampleExit(Vector3 exitPos, out NavMeshHit hit)
         {
             if (NavMesh.SamplePosition(exitPos, out hit, ExitSnapDistance, NavMesh.AllAreas)) return true;

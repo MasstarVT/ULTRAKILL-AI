@@ -52,7 +52,14 @@ def summarize_campaign(obs: dict) -> str:
         f"restarts={c['restarts']} input_locked={c['input_locked']}"
     ]
     exit_ = c.get("exit")
-    lines.append(f"exit: ({vec(exit_['pos'])}) active={exit_['active']}" if exit_ else "exit: null (its room may not be loaded yet)")
+    if exit_:
+        # `ground_pos` (mod 0.7.2) is the standable point near the pit and is what the target aims at;
+        # `pos` is the FinalPit's own transform, 61-75 m below the floor on some levels.
+        ground = exit_.get("ground_pos")
+        lines.append(f"exit: ({vec(exit_['pos'])}) active={exit_['active']} "
+                     f"ground={'(' + vec(ground) + ')' if ground else 'none'}")
+    else:
+        lines.append("exit: null (its room may not be loaded yet)")
     checkpoints = c.get("checkpoints", [])
     lines.append(f"checkpoints: {len(checkpoints)}")
     for cp in checkpoints:

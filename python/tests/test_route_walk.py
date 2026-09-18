@@ -107,7 +107,7 @@ def trajectory(points, step_m: float = STEP_M) -> list[list[float]]:
 
 
 def walk(route: dict, points, *, patience: dict | None = None, progress: GateProgress | None = None,
-         campaign: dict | None = None) -> dict:
+         campaign: dict | None = None, ground: tuple | None = None, **kwargs) -> dict:
     """Drives `GateProgress` along `points` the way `UltrakillEnv` drives it: retarget, then update per step.
 
     Pass `progress` to continue an existing level load (the second-lap control); otherwise a fresh tracker
@@ -116,14 +116,14 @@ def walk(route: dict, points, *, patience: dict | None = None, progress: GatePro
     camp = campaign if campaign is not None else block(route)
     path = trajectory(points)
     if progress is None:
-        progress = GateProgress(route=route, **(patience or {}))
+        progress = GateProgress(route=route, **(patience or {}), **kwargs)
         progress.new_level_load(camp, list(path[0]))
         progress.reset_episode()
         progress.retarget(camp, list(path[0]))
     first = progress.target
     steps = []
     for pos in path[1:]:
-        paid, approach = progress.update(camp, pos)
+        paid, approach = progress.update(camp, pos, ground=ground)
         steps.append({"pos": pos, "paid": paid, "approach": approach,
                       "target": None if progress.target is None else str(progress.target.get("key"))})
     # Every distinct target in the order it was held, starting with the one chosen before the first step.
@@ -333,6 +333,139 @@ def test_a_good_gate_ladder_beats_the_trunk_on_the_same_level():
         assert progress._hops_source == "gates", f"{scene}: hop scale came from {progress._hops_source}"
         assert all(key == GATE_EXIT_KEY or key.startswith("g") for key in result["targets"]), \
             f"{scene}: a room rung was targeted over a gate: {result['targets']}"
+
+
+# ---------------------------------------------------------------------------
+# The ground rule: a room rung is credited only where the player could have landed
+# ---------------------------------------------------------------------------
+#
+# `GateProgress._on_ground`, added 2026-09-18. A room rung is a CENTROID, and a centroid carries no promise
+# that its 8 m x 6 m reach cylinder stays inside the room it names. On `Level 0-3` one did not: the
+# `2 - Side Hallway` rung sat 1.5 m past the main room's far wall, so the cylinder covered the wall FACE and
+# 680 of that rung's 801 live credit steps were the player hanging against the wall on the WRONG SIDE of it,
+# 10-20 m above the floor below. The rung itself has been moved (`rung_overrides.json`), but the general
+# defence is the rule these tests cover. Measured bound, from those same three episodes:
+#
+#     legitimate airborne credits, per rung  max 5.8 5.9 6.0 6.0 6.0 7.9  (six rungs)
+#     against the wall face, first credit of each episode          9.5 10.5 10.5
+#     scripted runs that never crossed the wall, first credit      8.8 9.1
+#
+# so ROUTE_GROUND_M 8.0 is the only round number above every legitimate reading and below every bad one.
+
+GROUNDED = (True, 1.5)          # standing: the centre ray from the player's middle to the floor
+AIRBORNE_OK = (False, 7.9)      # the largest legitimate airborne reading measured, on 0-3's bowl rung
+AIRBORNE_BAD = (False, 9.5)     # the smallest wall-face reading measured
+VOID = (False, 30.0)            # `ground_ray_length` exactly: the mod's "the ray hit nothing" sentinel
+
+
+def test_a_grounded_walk_of_every_shipped_trunk_is_unchanged_by_the_ground_rule():
+    """The control, and the one that matters most: a player who walks the trunk on the floor must get byte
+    for byte what they got before the rule existed. Compared over all fourteen files, on the instalments, the
+    approach metres and the whole target sequence."""
+    for scene, route in shipped():
+        before = full_walk(route)
+        for name, reading in (("grounded", GROUNDED), ("a legal hop", AIRBORNE_OK)):
+            after = full_walk(route, ground=reading)
+            assert after["paid"] == before["paid"], f"{scene} ({name}): paid {after['paid']} vs {before['paid']}"
+            assert abs(after["approach"] - before["approach"]) < 1e-9, f"{scene} ({name}): approach moved"
+            assert after["targets"] == before["targets"], f"{scene} ({name}): the target sequence moved"
+
+
+def test_an_airborne_walk_with_nothing_under_it_credits_no_rung():
+    """The rule's whole point. The same trajectory, flown rather than walked, pays nothing and advances the
+    ladder by nothing -- so a cylinder that overhangs a wall or a void cannot be cashed from the wrong side.
+
+    The ladder does not start empty: `new_level_load` ABSORBS the rung the walk begins at, permissively and
+    on purpose (see `test_a_respawn_still_absorbs_a_rung_from_the_air`). So the assertion is that the flight
+    adds nothing to what the load already knew, which is `1` rung and the trunk's top hop count.
+    """
+    for scene, route in shipped():
+        top = int(chain(route)[0]["hops"])
+        for name, reading in (("the wall face", AIRBORNE_BAD), ("the void", VOID)):
+            result = full_walk(route, ground=reading)
+            assert result["paid"] == 0, f"{scene} ({name}): paid {result['paid']} instalments in the air"
+            progress = result["progress"]
+            assert progress.gates_reached == 1, \
+                f"{scene} ({name}): reached {progress.gates_reached} rungs, only the seeded one was allowed"
+            assert progress.best_hops == top, f"{scene} ({name}): best_hops {progress.best_hops}, not {top}"
+
+
+def test_the_bound_is_the_measured_one():
+    """8.0 m exactly: 7.9 (the largest legitimate airborne credit measured) is in, 8.1 is out. Pinned so the
+    constant cannot drift away from the data without a test saying so."""
+    route = dict(shipped())["Level 0-3"]
+    assert full_walk(route, ground=(False, 8.0))["paid"] == full_walk(route)["paid"]
+    assert full_walk(route, ground=(False, 7.9))["paid"] == full_walk(route)["paid"]
+    assert full_walk(route, ground=(False, 8.1))["paid"] == 0
+
+
+def test_the_grounded_flag_beats_the_ray():
+    """`grounded` is the game's own controller state and short-circuits the ray. It has to: on 0-3's
+    second-floor walkway the centre ray reads the full 30 m while the player is provably standing on it
+    (12 of that rung's 30 live credit steps)."""
+    route = dict(shipped())["Level 0-3"]
+    assert full_walk(route, ground=(True, 30.0))["paid"] == full_walk(route)["paid"]
+
+
+def test_a_mod_that_reports_no_ground_at_all_is_todays_behaviour():
+    """Permissive when it cannot answer: an observation with neither the flag nor a ray must not silently
+    stop paying a trunk. That is the pre-0.6.0 mod, and it is also every caller that passes no `ground`."""
+    for scene, route in shipped():
+        assert full_walk(route, ground=(None, None))["paid"] == full_walk(route)["paid"], scene
+
+
+def test_route_ground_m_zero_switches_the_rule_off():
+    for scene, route in shipped():
+        flown = full_walk(route, ground=VOID, route_ground_m=0.0)
+        assert flown["paid"] == full_walk(route)["paid"], scene
+
+
+def test_a_gate_ladder_is_never_subject_to_the_ground_rule():
+    """A door is a place you pass THROUGH and the mod's own graph says what that means; only a room centroid
+    is a guess. So the same flown walk over a gate ladder must pay exactly what it always did -- this is the
+    property that makes the change inert on the 18 levels layer 1 routes and on all of Cyber Grind."""
+    for scene, route in shipped():
+        rungs = chain(route)
+        gates = [{"key": f"g{i}", "pos": list(r["pos"]), "hops": int(r["hops"]),
+                  "open": False, "locked": False, "active": True} for i, r in enumerate(rungs)]
+        camp = dict(block(route, gates_ordered=True), gates=gates)
+        points = [r["pos"] for r in rungs] + [route["exit_pos"]]
+        grounded = walk(route, points, campaign=camp)
+        flown = walk(route, points, campaign=camp, ground=VOID)
+        assert flown["paid"] == grounded["paid"], f"{scene}: gates paid {flown['paid']} vs {grounded['paid']}"
+        assert flown["targets"] == grounded["targets"], f"{scene}: the gate target sequence moved"
+
+
+def test_a_respawn_still_absorbs_a_rung_from_the_air():
+    """ABSORBING must stay permissive, which is why `self._ground` is only set inside `update()`.
+
+    `mark_paid` records what a respawn REVEALS so it can never be paid for again. If the ground rule reached
+    it, a respawn that put the player anywhere the rule dislikes would leave the rung looking unreached, and
+    walking two metres to it afterwards would pay an instalment for ground the episode never covered -- a
+    farm, which is the exact opposite of what the rule is for.
+    """
+    route = dict(shipped())["Level 0-3"]
+    rungs = chain(route)
+    progress = GateProgress(route=route)
+    camp = block(route)
+    # A respawn that lands on the second rung, mid-air with nothing under it.
+    progress.new_level_load(camp, list(rungs[1]["pos"]))
+    assert str(rungs[1]["key"]) in progress.reached, "the respawn's own rung was not absorbed"
+    assert progress.paid_hops == int(rungs[1]["hops"]) == progress.best_hops
+    # ... and walking back onto it, grounded, pays nothing, because absorbing already recorded it.
+    result = walk(route, [rungs[1]["pos"], rungs[1]["pos"]], progress=progress, ground=GROUNDED)
+    assert result["paid"] == 0, "an absorbed rung was paid for after all"
+
+
+def test_the_0_3_rung_the_rule_was_measured_on_is_where_the_override_put_it():
+    """Belt and braces with `tests/test_route_files.py`: the rung move and the ground rule were measured
+    together and neither one alone fixed 0-3 (the bound alone still credited from a ledge on the main-room
+    side at 3-5 m; the move alone left every other centroid unguarded). If the data half is ever lost, this
+    fails here too, next to the rule it partners."""
+    route = dict(shipped())["Level 0-3"]
+    hallway = next(r for r in route["rungs"] if r["name"].startswith("2 - Side Hallway"))
+    assert hallway["pos"] == [0.0, 10.0, 340.0], hallway["pos"]
+    assert hallway["key"] == "0,10,340", hallway["key"]
 
 
 if __name__ == "__main__":

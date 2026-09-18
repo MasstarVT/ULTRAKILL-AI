@@ -342,14 +342,18 @@ def main() -> None:
                                 levels=env_cfg.levels, curriculum_path=env_cfg.curriculum_path,
                                 unlock_rate=env_cfg.unlock_rate, unlock_window=env_cfg.unlock_window,
                                 unlock_after_fresh_episodes=env_cfg.unlock_after_fresh_episodes,
-                                level_weight_floor=env_cfg.level_weight_floor)
+                                level_weight_floor=env_cfg.level_weight_floor,
+                                curriculum_weighting=env_cfg.curriculum_weighting,
+                                curriculum_weight_cap=env_cfg.curriculum_weight_cap,
+                                curriculum_blocked_fresh_episodes=env_cfg.curriculum_blocked_fresh_episodes)
     if env_cfg.levels:
         # Written before learn(), because SB3's _setup_learn calls env.reset() before _on_training_start ever
         # runs: without this the workers' first fresh start would read whatever happened to be on disk. The
         # unlock set is printed because _restore bails when status.json's run_name differs, so a run rename
         # silently re-locks every level and this is where that shows.
         progress.write_curriculum()
-        print(f"curriculum: {len(env_cfg.levels)} levels, unlocked {progress.unlocked_levels or [env_cfg.levels[0]]}")
+        print(f"curriculum: {len(env_cfg.levels)} levels, unlocked {progress.unlocked_levels or [env_cfg.levels[0]]}"
+              f", weighting {env_cfg.curriculum_weighting}")
     # The entropy floor, if the config asks for one. Before `progress` in the list, so the coefficient it
     # records is in the logger when ProgressCallback copies PPO_METRICS into status.json.
     entropy_floor = EntropyFloorCallback(train_cfg.get("ent_floor", 0.0), hyper["ent_coef"],

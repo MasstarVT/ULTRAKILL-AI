@@ -22,7 +22,16 @@ from typing import Any
 
 from stable_baselines3.common.callbacks import BaseCallback
 
-from ultrakill_ai.campaign import CURRICULUM_VERSION, level_weights, unlock_next
+from ultrakill_ai.campaign import (
+    CURRICULUM_BLOCKED_FRESH_EPISODES,
+    CURRICULUM_VERSION,
+    CURRICULUM_WEIGHT_CAP,
+    PROGRESS_FAST_SPAN,
+    PROGRESS_SLOW_SPAN,
+    level_weights,
+    progress_score,
+    unlock_next,
+)
 
 EPISODE_WINDOW = 100
 FRESH_WINDOW = 50  # campaign completion rate and median time are over this many fresh-start episodes
@@ -95,7 +104,9 @@ class ProgressCallback(BaseCallback):
 
     def __init__(self, status_path: Path, target_timesteps: int, run_name: str, num_envs: int, update_every_s: float = 2.0,
                  *, levels=(), curriculum_path=None, unlock_rate: float = 0.5, unlock_window: int = 20,
-                 unlock_after_fresh_episodes: int = 0, level_weight_floor: float = 0.1):
+                 unlock_after_fresh_episodes: int = 0, level_weight_floor: float = 0.1,
+                 curriculum_weighting: str = "inverse_rate", curriculum_weight_cap: float = CURRICULUM_WEIGHT_CAP,
+                 curriculum_blocked_fresh_episodes: int = CURRICULUM_BLOCKED_FRESH_EPISODES):
         super().__init__()
         self.status_path = Path(status_path)
         # One JSON object per finished episode, appended. Written here rather than in the env because with
@@ -142,6 +153,11 @@ class ProgressCallback(BaseCallback):
         self.unlock_window = int(unlock_window)
         self.unlock_after_fresh_episodes = int(unlock_after_fresh_episodes)
         self.level_weight_floor = float(level_weight_floor)
+        # Which weighting rule the published `weight` and the workers' own draws use. "inverse_rate" is what
+        # every run before 2026-09-18 used and stays the default; "progress" is the learning-progress rule.
+        self.curriculum_weighting = str(curriculum_weighting)
+        self.curriculum_weight_cap = float(curriculum_weight_cap)
+        self.curriculum_blocked_fresh_episodes = int(curriculum_blocked_fresh_episodes)
         self.per_level: dict[str, dict] = {}
         self._curriculum_written: dict | None = None
         self._curriculum_warned = False
@@ -192,6 +208,17 @@ class ProgressCallback(BaseCallback):
             # many fresh tries a level has had in total, and a restart must not hand it a clean slate or a run
             # that is stopped every few hours can never reach the valve at all.
             record["fresh_episodes"] = int(_num(old.get("fresh_episodes")) or 0)
+            # The learning-progress statistics DO carry, unlike the windows, and that is deliberate: they are
+            # exponential averages, not a window, and this trainer is bounced every few hours. Dropping them
+            # would hand the run back to `inverse_rate` -- the starvation this rule exists to stop -- for the
+            # first 20 fresh episodes of every level after every restart.
+            record["progress_fast"] = _num(old.get("progress_fast"))
+            record["progress_slow"] = _num(old.get("progress_slow"))
+            record["progress_best"] = _num(old.get("progress_best"))
+            record["progress_samples"] = int(_num(old.get("progress_samples")) or 0)
+            record["gates_total"] = int(_num(old.get("gates_total")) or 0) or None
+            record["fresh_completions"] = int(_num(old.get("fresh_completions")) or 0)
+            record["dry_fresh_episodes"] = int(_num(old.get("dry_fresh_episodes")) or 0)
             carried = {key: _num(old.get(key))
                        for key in ("checkpoints_level", "gates_reached", "ladder_collapsed", "targets_parked")}
             if any(v is not None for v in carried.values()):
@@ -208,6 +235,15 @@ class ProgressCallback(BaseCallback):
                 "best_time": None,
                 "episodes": 0,
                 "fresh_episodes": 0,  # cumulative fresh starts; what `unlock_after_fresh_episodes` counts
+                # Learning-progress statistics, over this level's FRESH episodes only. All of them are scalars
+                # (no window), which is what lets them survive a restart -- see `_restore_levels`.
+                "progress_fast": None,   # EMA of the progress score, PROGRESS_FAST_SPAN deep
+                "progress_slow": None,   # ... and PROGRESS_SLOW_SPAN deep; the pair is the learning signal
+                "progress_best": None,   # high-water mark of the slow average; what the blocked test compares to
+                "progress_samples": 0,   # fresh episodes folded into the two averages
+                "gates_total": None,     # the gate ladder's own length, ratcheted: max(reached + hops_best)
+                "fresh_completions": 0,  # cumulative fresh-start completions
+                "dry_fresh_episodes": 0,  # fresh episodes since the last completion; what "blocked" counts
             }
             self.per_level[level] = record
         return record
@@ -229,15 +265,31 @@ class ProgressCallback(BaseCallback):
                 "best_time": record["best_time"],
                 "episodes": int(record["episodes"]),
                 "fresh_episodes": int(record["fresh_episodes"]),
+                # The learning-progress statistics `campaign.level_weights(rule="progress")` reads. Additive:
+                # an env from before they existed ignores them and weights the same run by rate, as it always did.
+                "progress_fast": record["progress_fast"],
+                "progress_slow": record["progress_slow"],
+                "progress_best": record["progress_best"],
+                "progress_samples": int(record["progress_samples"]),
+                "gates_total": record["gates_total"],
+                "fresh_completions": int(record["fresh_completions"]),
+                "dry_fresh_episodes": int(record["dry_fresh_episodes"]),
             }
         if not with_weights:
             return table
         times = {level: [s for c, s in self._level_record(level)["fresh"] if c and s is not None] for level in table}
-        weights = dict(level_weights(list(table), table, floor=self.level_weight_floor))
+        weights = dict(level_weights(list(table), table, floor=self.level_weight_floor,
+                                     rule=self.curriculum_weighting, cap=self.curriculum_weight_cap,
+                                     blocked_fresh_episodes=self.curriculum_blocked_fresh_episodes))
         total = sum(weights.values())
         for level, row in table.items():
             row["weight"] = (weights[level] / total) if level in weights and total else 0.0
             row["median_time_50"] = statistics.median(times[level]) if times[level] else None
+            # The two derived numbers, for the dashboard: how far through the level the recent fresh episodes
+            # got, and how fast that is moving. Signed, because the direction is what the damping reads.
+            fast, slow = row["progress_fast"], row["progress_slow"]
+            row["progress_score"] = fast
+            row["learning_progress"] = (fast - slow) if fast is not None and slow is not None else None
             for key in ("checkpoints_level", "gates_reached", "ladder_collapsed", "targets_parked"):
                 row[key] = _mean(ep.get(key) for ep in self._level_record(level)["recent"])
         return table
@@ -370,7 +422,14 @@ class ProgressCallback(BaseCallback):
             "cells_new": field("cells_new"),
             "oob_frac": field("oob_frac"),
             "exit_dist_min": field("exit_dist_min"),
+            # The same measure to the STANDABLE point beside the pit (mod 0.7.2's exit.ground_pos), which is
+            # where a completion actually happens. `exit_dist_min` measures to the FinalPit's own transform,
+            # 61-75 m below the floor on 0-2, so it has a floor it can never go under; this one reaches zero.
+            "exit_ground_dist_min": field("exit_ground_dist_min"),
             "gates_reached": field("gates_reached"),
+            # The LOWEST hops reached this episode. With `gates_reached` it gives the gate ladder's own length,
+            # which is what makes the progress score comparable between levels of different size.
+            "gate_hops_best": field("gate_hops_best"),
             # The 2026-09-17 patience/exit-guard spec's two mechanism counters: parks this episode, and whether
             # the exit guard rejected a banished FinalPit report. Both 0 on a healthy monotone level.
             "targets_parked": field("targets_parked"),
@@ -413,7 +472,7 @@ class ProgressCallback(BaseCallback):
                 reached = stats["gates_reached"]
                 if reached is not None and (self.best_gates_reached is None or reached > self.best_gates_reached):
                     self.best_gates_reached = reached
-                hops = _num(info.get("gate_hops_best"))
+                hops = stats["gate_hops_best"]
                 if hops is not None and (self.best_gate_hops is None or hops < self.best_gate_hops):
                     self.best_gate_hops = hops
         self._record_level_episode(stats)
@@ -458,11 +517,53 @@ class ProgressCallback(BaseCallback):
             record["fresh"].append((completed, seconds))
             if completed and seconds is not None and (record["best_time"] is None or seconds < record["best_time"]):
                 record["best_time"] = seconds
+            self._record_level_progress(record, stats)
         nxt = unlock_next(self.order, self._level_table(), unlock_rate=self.unlock_rate,
                           unlock_window=self.unlock_window,
                           unlock_after_fresh_episodes=self.unlock_after_fresh_episodes)
         if nxt is not None:
             self._level_record(nxt)["unlocked"] = True
+
+    def _record_level_progress(self, record: dict, stats: dict) -> None:
+        """Folds one FRESH episode into a level's learning-progress statistics.
+
+        Fresh episodes only, for the same reason the completion rate counts only those: a checkpoint respawn
+        starts partway up the ladder and its gate count is inherited, so it says nothing about how a whole
+        level goes. The two EMAs are kept whatever the weighting rule is, so switching `curriculum_weighting`
+        on a live run finds them already warm instead of waiting 20 fresh episodes per level.
+
+        `gates_total` ratchets rather than tracking the last episode: `gate_hops_best` is the LOWEST hops
+        reached, so `reached + hops_best` is the ladder's length whenever the walk got anywhere at all, but a
+        collapsed ladder reports a shorter one from a load that locked onto a low rung (measured on the live
+        run's 0-3: 3 on 255 fresh episodes, 11 on 36). The maximum is the level's own length; taking the last
+        would rescale the score from episode to episode and invent learning progress out of the rescaling.
+        """
+        completed = stats["completed"]
+        reached, hops = stats["gates_reached"], stats["gate_hops_best"]
+        if reached is not None and hops is not None:
+            total = int(reached) + int(hops)
+            if total > 0 and (record["gates_total"] is None or total > record["gates_total"]):
+                record["gates_total"] = total
+        score = progress_score(completed=completed, gates_reached=reached, gates_total=record["gates_total"],
+                               checkpoints_level=stats["checkpoints_level"])
+        if completed:
+            record["fresh_completions"] += 1
+            record["dry_fresh_episodes"] = 0
+        else:
+            record["dry_fresh_episodes"] += 1
+        if score is None:
+            return
+        for key, span in (("progress_fast", PROGRESS_FAST_SPAN), ("progress_slow", PROGRESS_SLOW_SPAN)):
+            alpha = 2.0 / (span + 1.0)
+            current = record[key]
+            record[key] = score if current is None else current + alpha * (score - current)
+        record["progress_samples"] += 1
+        # The high-water mark of the SLOW average, which is what `campaign.level_blocked` measures against: the
+        # best progress this level has ever sustained, not the best single episode (one lucky run down the
+        # ladder would raise a per-episode maximum and then never be matched again).
+        best = record["progress_best"]
+        if best is None or record["progress_slow"] > best:
+            record["progress_best"] = record["progress_slow"]
 
     def _log_episode(self, env_index: int, info: dict, stats: dict) -> None:
         """Appends one line to runs/<run>/episodes.jsonl: what happened, and where it ended.
@@ -569,7 +670,7 @@ class ProgressCallback(BaseCallback):
         eta = remaining / steps_per_s if steps_per_s and self.state == "running" else None
 
         recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "kills_per_min", "deaths", "wave", "style", "reset_seconds",
-                                                 "completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "oob_frac", "exit_dist_min",
+                                                 "completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "oob_frac", "exit_dist_min", "exit_ground_dist_min",
                                                  "firing_frac", "on_target_frac", "firing_on_target_frac",
                                                  "enemy_visible_frac", "enemy_angle_mean", "enemy_dist_mean",
                                                  "enemy_close_frac", "yaw_per_step_mean", "enemy_yaw_angle_mean", "enemy_pitch_err_mean", "pitch_abs_mean",

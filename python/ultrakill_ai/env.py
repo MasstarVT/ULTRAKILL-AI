@@ -15,6 +15,9 @@ import numpy as np
 
 from ultrakill_ai.campaign import (
     CAMPAIGN_LEVELS_SHIPPED,
+    CURRICULUM_BLOCKED_FRESH_EPISODES,
+    CURRICULUM_WEIGHT_CAP,
+    CURRICULUM_WEIGHTINGS,
     ROUTE_SOURCE_NAMES,
     SUBGOAL_ALTAR,
     SUBGOAL_ITEM,
@@ -50,7 +53,7 @@ from ultrakill_ai.spaces import PITCH_BINS, YAW_BINS, ObsLayout, action_space, d
 CYBERGRIND_SCENE = "Endless"
 # Per-episode info the campaign Monitor records (scripts/train.py); every key is in every campaign info.
 CAMPAIGN_INFO_KEYS = ("kills", "style", "deaths", "completed", "fresh_start", "level_seconds",
-                      "checkpoints_level", "cells_new", "exit_dist_min", "oob_frac",
+                      "checkpoints_level", "cells_new", "exit_dist_min", "exit_ground_dist_min", "oob_frac",
                       "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac",
                       "targets_parked", "exit_banished", "route_source", "ladder_collapsed")
 
@@ -113,6 +116,14 @@ class EnvConfig:
     # episodes, whatever its rate, so one level the policy cannot crack does not block the whole campaign.
     unlock_after_fresh_episodes: int = 0
     level_weight_floor: float = 0.1  # a mastered level keeps this much of the sampling weight, so it is not forgotten
+    # How the fresh-load weights are computed. "inverse_rate" is what every run before 2026-09-18 used: weight
+    # `max(floor, 1 - fresh completion rate)`, so the WORST level gets the most attention -- which starved the
+    # levels that were learning as soon as one level blocked. "progress" weights by learning progress instead,
+    # with a retention floor, a cap and a damping for blocked levels (see campaign.level_weights).
+    curriculum_weighting: str = "inverse_rate"
+    curriculum_weight_cap: float = CURRICULUM_WEIGHT_CAP  # `progress` only: most of the mass one level may take
+    # `progress` only: fresh episodes a level may go without a completion before it counts as blocked.
+    curriculum_blocked_fresh_episodes: int = CURRICULUM_BLOCKED_FRESH_EPISODES
     difficulty: int = -1  # difficulty the game reads while the AI has control (3 = Violent, -1 = leave the game's own)
     unlock_all_gear: bool = False  # every weapon and variant while the AI has control, in memory only
     fresh_start_prob: float = 0.2  # chance of a fresh level load when a checkpoint respawn would also do
@@ -150,6 +161,13 @@ class EnvConfig:
     route_dir: str = ""  # folder holding route_<scene>.json ("" = the packaged ultrakill_ai/routes/)
     route_exit_tol_m: float = 5.0  # guard I5: metres the live FinalPit may differ before the file is refused
     route_seed_m: float = 150.0  # how near a rung the player may start and still have it absorbed, not paid
+    # Metres of ground that must lie under an airborne player before a ROOM-TRUNK rung counts as
+    # reached. A room centroid's 8 m x 6 m reach cylinder can overhang the wall of the room it names,
+    # and on Level 0-3 one did: 680 of that rung's 801 live credit steps were the player hanging
+    # against the wall from the room BEFORE it. Gates are never subject to this -- a door is a place
+    # you pass through, a room is a place you land in. See `GateProgress._on_ground` for the
+    # measurement behind 8.0; 0 disables the rule.
+    route_ground_m: float = 8.0
     # Skull carry. 0 disables both carry-protection rules; they are inert on any level with no ItemPlaceZone.
     subgoal_punch_range_m: float = 4.0  # Punch.ActiveFrame's own 4 m reach: inside it a punch can pick up or place
     camera_height_m: float = 0.9  # metres from player.pos up to the camera, where every ray starts (see _eye)
@@ -342,6 +360,11 @@ class UltrakillEnv(gym.Env):
             # Caught here rather than at the first reset, where it would strand a worker waiting for a scene the
             # game cannot load. `Level 9-1` and `Level 9-2` ship no scene bundle in this build.
             raise ValueError(f"levels contains scenes this game build cannot load: {unknown}")
+        if self.cfg.curriculum_weighting not in CURRICULUM_WEIGHTINGS:
+            # Caught here, not swallowed: a typo would silently hand the run back to the rule that starved the
+            # levels that were learning, and the dashboard would show no sign of it.
+            raise ValueError(f"curriculum_weighting must be one of {CURRICULUM_WEIGHTINGS}, "
+                             f"got {self.cfg.curriculum_weighting!r}")
         # The level is mutable from here on: a curriculum run changes it at a fresh load and nowhere else.
         self.level = (self.cfg.levels[0] if self.cfg.levels else self.cfg.level) if campaign else self.cfg.level
         if self.cfg.layout.campaign != campaign:
@@ -401,7 +424,8 @@ class UltrakillEnv(gym.Env):
                                   route_exit_tol_m=self.cfg.route_exit_tol_m,
                                   route_seed_m=self.cfg.route_seed_m,
                                   patience_mode=self.cfg.gate_patience_mode,
-                                  prefer_route_when_collapsed=self.cfg.prefer_route_when_collapsed)
+                                  prefer_route_when_collapsed=self.cfg.prefer_route_when_collapsed,
+                                  route_ground_m=self.cfg.route_ground_m)
         self.exit_guard = ExitGuard(self.cfg.exit_max_shift_m)
         self.path_progress = PathProgress()
         self._parks_at_start = 0  # GateProgress.parks when this episode began, so info reports the difference
@@ -414,6 +438,7 @@ class UltrakillEnv(gym.Env):
         self._cells_new = 0
         self._oob_steps = 0  # steps with no ground under the player: off the map, or in a fall
         self._exit_dist_min = math.inf
+        self._exit_ground_dist_min = math.inf
         self._episodes = 0
         self._start_checkpoint: str | None = None  # the checkpoint this episode began at (None on a fresh load)
         self._level_started = False  # campaign.level_started was true at some point this episode
@@ -543,6 +568,7 @@ class UltrakillEnv(gym.Env):
             self._cells_new = 0
             self._oob_steps = 0
             self._exit_dist_min = math.inf
+            self._exit_ground_dist_min = math.inf
             self._parks_at_start = self.gates.parks
             self._exit_banished = self.exit_guard.banished  # a load that is already banished stays flagged
             self._start_checkpoint = self._current_checkpoint(self._raw)
@@ -1479,7 +1505,9 @@ class UltrakillEnv(gym.Env):
                           f"this game will train on {self.cfg.levels[0]!r} only")
             else:
                 self._curriculum = stats = table
-        return choose_level(self._rng, list(self.cfg.levels), stats, floor=self.cfg.level_weight_floor)
+        return choose_level(self._rng, list(self.cfg.levels), stats, floor=self.cfg.level_weight_floor,
+                            rule=self.cfg.curriculum_weighting, cap=self.cfg.curriculum_weight_cap,
+                            blocked_fresh_episodes=self.cfg.curriculum_blocked_fresh_episodes)
 
     def _save_archive_on_schedule(self) -> None:
         """Saves the exploration archive every `archive_save_steps` or `archive_save_seconds`, whichever is first.
@@ -1654,6 +1682,24 @@ class UltrakillEnv(gym.Env):
             self._exit_banished = True
         return raw
 
+    @staticmethod
+    def _ground_drop(raw: dict[str, Any]) -> float | None:
+        """Metres of ground below the player, or None when the observation does not say at all.
+
+        Split out of `_ground_point` because its two consumers need different things from the same
+        reading. Exploration wants a POINT and treats "no ground within the ray" as "no point", so
+        `_ground_point` folds the off-the-map case into the same None. `GateProgress._on_ground` has
+        to tell the two apart -- an observation with no ray at all is unanswerable and stays
+        permissive, while a ray that ran its full `ground_ray_length` without hitting anything is a
+        definite "nothing under you" and must fail the test. So the raw drop is what is returned here
+        and each caller applies its own rule.
+        """
+        centre = raw.get("ground_ray_center")
+        rays = raw.get("ground_rays") or ()
+        if centre is None and not rays:
+            return None
+        return float(centre) if centre is not None else min(rays)
+
     def _ground_point(self, raw: dict[str, Any]) -> tuple[float, float, float] | None:
         """The point on the ground under the player, or None when there is no ground within reach.
 
@@ -1676,12 +1722,8 @@ class UltrakillEnv(gym.Env):
         player = raw.get("player")
         if not player:
             return None
-        centre = raw.get("ground_ray_center")
-        rays = raw.get("ground_rays") or ()
-        if centre is None and not rays:
-            return None
-        drop = float(centre) if centre is not None else min(rays)
-        if drop >= self.cfg.layout.ground_ray_length - 0.5:
+        drop = self._ground_drop(raw)
+        if drop is None or drop >= self.cfg.layout.ground_ray_length - 0.5:
             return None  # the mod writes ground_ray_length exactly when the ray hits nothing: off the map
         x, y, z = player["pos"]
         return (x, y - drop, z)
@@ -1727,7 +1769,13 @@ class UltrakillEnv(gym.Env):
         # tracker's patience clock: a door an ActivateArena wave is holding shut cannot be approached at all.
         stats, before = raw.get("stats", {}), prev.get("stats", {})
         fought = stats.get("kills", 0) > before.get("kills", 0) or stats.get("style", 0) > before.get("style", 0)
-        gates_new, approach = self.gates.update(raw.get("campaign"), pos, fought=fought)
+        # The ground reading rides along so `GateProgress` can refuse to credit a ROOM-TRUNK rung the
+        # player is only touching from the air -- a room centroid's reach cylinder can overhang the
+        # wall of the room it names (Level 0-3). It is inert on every gate and on every level with no
+        # trunk; see `GateProgress._on_ground`.
+        gates_new, approach = self.gates.update(
+            raw.get("campaign"), pos, fought=fought,
+            ground=((player or {}).get("grounded"), self._ground_drop(raw)) if player else None)
         if player:
             self._last_pos = list(pos)
             ground = self._ground_point(raw)
@@ -1741,6 +1789,14 @@ class UltrakillEnv(gym.Env):
                 self._positions.append(self._rounded(pos))
             if camp.get("exit"):
                 self._exit_dist_min = min(self._exit_dist_min, math.dist(pos, camp["exit"]["pos"]))
+                # ... and the same measure to the STANDABLE point near the pit (mod 0.7.2). `exit_dist_min`
+                # keeps its definition, so its history stays comparable across this change, but it is a
+                # distance to a transform 61-75 m below the floor and therefore has a floor of its own that
+                # it can never go under. This one really does approach zero as the agent reaches the exit.
+                ground_exit = camp["exit"].get("ground_pos")
+                if ground_exit:
+                    self._exit_ground_dist_min = min(self._exit_ground_dist_min,
+                                                     math.dist(pos, ground_exit))
         if camp.get("level_started"):
             self._level_started = True
         path_gain = self.path_progress.update(camp.get("path"))
@@ -1866,6 +1922,8 @@ class UltrakillEnv(gym.Env):
             # of its novelty in the void below the level, so this is the number that says whether that is over.
             info["oob_frac"] = self._oob_steps / steps
             info["exit_dist_min"] = None if math.isinf(self._exit_dist_min) else self._exit_dist_min
+            info["exit_ground_dist_min"] = (None if math.isinf(self._exit_ground_dist_min)
+                                            else self._exit_ground_dist_min)
             info["completed"] = 0  # set to 1 on the step that ends with level_complete
             info["level_seconds"] = None  # official time, only for a fresh-start completion
             # Route gates. `gates_reached` is numeric and always present so it can be charted; `gate_hops_best`

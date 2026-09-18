@@ -1,11 +1,13 @@
 # The whole routed campaign: every shipped level that has a route signal, in mission order.
 #
-# This is configs/campaign_gates_main.yaml with FOUR changes and nothing else, each of them listed by name in
+# This is configs/campaign_gates_main.yaml with FIVE changes and nothing else, each of them listed by name in
 # test_campaign_config.test_the_full_config_is_the_main_config_with_more_levels:
 #   - `levels`, 11 -> 30 (the whole routed campaign);
 #   - `gate_patience_mode: collapsed`, the 2026-09-17 revision after target patience regressed Level 0-1;
 #   - `prefer_route_when_collapsed: true` (false until 2026-09-17 21:58): 0-3 and 4-3 follow their room-trunk route files;
 #   - `ent_floor: 6.5` (+ `ent_coef_max`), the adaptive entropy floor (5.0 until 2026-09-18 00:25). `ent_coef` itself is UNCHANGED at 0.004.
+#   - `curriculum_weighting: progress` (2026-09-18): learning-progress weighting for the fresh-load draws, so a
+#     blocked level stops starving the levels that are learning. The only config that opts in.
 # No reward weight and no other hyperparameter moves. Same run name, same models/campaign_gates/, same weights,
 # same policy: this is the main run continuing with a longer ladder in front of it, exactly as
 # campaign_gates_main.yaml was to campaign_gates_prelude.yaml.
@@ -83,6 +85,14 @@ env:
   unlock_window: 20
   unlock_after_fresh_episodes: 600
   level_weight_floor: 0.1
+  # Learning-progress weighting for the fresh-load draws (2026-09-18). The default rule weights a level by
+  # `1 - fresh_completion_rate`, so the level with the LOWEST rate gets the MOST fresh starts: measured on this
+  # very run, Level 0-3 sat at 0 completions and took 41-51% of every fresh start for hours while 0-1 and 0-2
+  # slid from 0.55-0.69 down to 0.24-0.30. This rule follows where the policy is still MOVING instead, keeps a
+  # 0.10 retention floor per unlocked level, caps any one level at 0.5 of the mass, and damps a level that has
+  # completed nothing for 100 fresh episodes and is not climbing back to its own best down to that floor.
+  # `scripts/replay_curriculum.py` replays an episodes.jsonl through both rules; the table is in CLAUDE.md.
+  curriculum_weighting: progress
   difficulty: 3
   unlock_all_gear: true
   fixed_fps: 30
