@@ -33,6 +33,11 @@ FIELDS = [
     "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac",
     "enemy_dist_mean", "enemy_close_frac", "reset_seconds",
     "completed", "fresh_start", "checkpoints_level", "cells_new", "oob_frac", "exit_dist_min",
+    # Mod 0.7.2: the same measure to the nearest STANDABLE ground beside the pit rather than to the pit's own
+    # transform, which sits 61-75 m under the floor on 0-2 and gives `exit_dist_min` a floor it can never go
+    # under. This is the column to read for "did the agent get near the exit". A new column, so an existing
+    # metrics_log.csv must be moved aside to get it.
+    "exit_ground_dist_min",
     "gates_reached", "wedged_steps", "level_started", "look_free_frac", "look_gate_frac", "slide_forced_frac",
     # The 2026-09-17 patience/exit-guard mechanisms. An existing metrics_log.csv keeps its own header, so move
     # the old file aside to get these two columns.

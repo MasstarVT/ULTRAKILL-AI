@@ -109,6 +109,9 @@ class FakeCampaignEnv(gym.Env):
             "cells_new": self.steps * 2,
             "oob_frac": 0.1,  # fraction of steps with no ground under the player
             "exit_dist_min": max(0.0, 60.0 - self.steps),
+            # ... and the same measure to the STANDABLE point beside the pit (mod 0.7.2). It is the
+            # smaller of the two, because the pit's own transform sits far below anything walkable.
+            "exit_ground_dist_min": max(0.0, 55.0 - self.steps),
             # The route gates and the wedge detector (§9.7 of the design spec).
             "gates_reached": min(4, self.steps // 3),
             "gate_hops_best": max(0, 9 - self.steps // 3) if self.steps >= 3 else None,
@@ -317,6 +320,7 @@ def test_campaign_progress():
         m = s["mean_100"]
         assert "route_progress" not in m
         for key in ("completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "exit_dist_min",
+                    "exit_ground_dist_min",
                     "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac",
                     "targets_parked", "exit_banished", "route_source", "ladder_collapsed"):
             assert m[key] is not None, key
@@ -377,7 +381,7 @@ def episode_info(level, *, fresh=1, completed=0, seconds=None, checkpoints=2, ga
     return {
         "episode": {"r": 1.0, "l": 100.0}, "level": level, "kills": 0, "deaths": 0, "wave": 0, "style": 0,
         "completed": completed, "fresh_start": fresh, "level_seconds": seconds,
-        "checkpoints_level": checkpoints, "cells_new": 10, "oob_frac": 0.0, "exit_dist_min": 5.0,
+        "checkpoints_level": checkpoints, "cells_new": 10, "oob_frac": 0.0, "exit_dist_min": 5.0, "exit_ground_dist_min": 3.0,
         "gates_reached": gates, "gate_hops_best": 1, "wedged_steps": 0, "level_started": 1,
         "look_free_frac": 0.5, "look_enemy_frac": 0.2, "look_gate_frac": 0.3, "slide_forced_frac": 0.0,
         "start_checkpoint": None, "end_pos": [0.0, 1.0, 2.0],
@@ -809,7 +813,8 @@ def test_every_campaign_info_key_survives_the_numeric_pipeline():
     """
     info = {
         "kills": 12, "style": 900, "deaths": 1, "completed": 0, "fresh_start": 1, "level_seconds": 146.582,
-        "checkpoints_level": 6, "cells_new": 421, "exit_dist_min": 12.25, "oob_frac": 0.09,
+        "checkpoints_level": 6, "cells_new": 421, "exit_dist_min": 12.25, "exit_ground_dist_min": 4.5,
+        "oob_frac": 0.09,
         "gates_reached": 4, "wedged_steps": 0, "level_started": True, "look_gate_frac": 0.31,
         "slide_forced_frac": 0.0, "targets_parked": 0, "exit_banished": 0, "route_source": 2,
         "ladder_collapsed": 1,

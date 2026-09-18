@@ -15,7 +15,7 @@ namespace UltrakillAIBridge
     {
         public const string Guid = "masstarvt.ultrakill.aibridge";
         public const string Name = "ULTRAKILL AI Bridge";
-        public const string Version = "0.7.1";
+        public const string Version = "0.7.2";
         public const int ProtocolVersion = 1;
 
         internal static ManualLogSource Log;

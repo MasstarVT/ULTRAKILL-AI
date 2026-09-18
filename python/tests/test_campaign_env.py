@@ -119,6 +119,10 @@ class FakeLevel:
         self.drop_campaign_steps = 0  # the next N obs omit "campaign", as the mod does when building it throws
         self.falling = False  # off the map: the ground rays miss and the player sinks, as in a real void fall
         self.wedged = False
+        # Airborne but still MOVING, which `falling` and `wedged` are not: a jump, a dash, or the player
+        # hanging against a wall on the far side of a room they have not entered. Set `ground_center` with it
+        # to say how far the floor is; that pair is what `GateProgress._on_ground` reads.
+        self.airborne = False
         self.mod_flags = True
         self.gates_present = True
         self.gates_ordered = True
@@ -128,6 +132,12 @@ class FakeLevel:
         # mod's frozen FinalPit reference follows the original. This is that displacement, in banish steps:
         # set it mid-load to reproduce Level 0-2's jump, and the level load clears it like a real reload.
         self.exit_banish_steps = 0
+        # Mod 0.7.2's `exit.ground_pos`: the NavMesh-snapped standable point near the pit. None is "NavMesh
+        # found nothing", which is the same fall-back-to-`pos` case as a mod that does not send the field at
+        # all -- so the default emits the key with a null and every test that does not care is unaffected.
+        # `mod_ground_pos = False` drops the key, which is the pre-0.7.2 degradation case.
+        self.exit_ground_pos: list[float] | None = None
+        self.mod_ground_pos = True
         self.yaw = 0.0
         self.enemy_rel = [0.0, 0.0, 5.0]
         self.last_action: dict | None = None  # the command dict the env last sent
@@ -340,6 +350,12 @@ class FakeLevel:
             }],
         }
 
+    def _exit_block(self) -> dict:
+        block = {"pos": [BANISH_X * self.exit_banish_steps, 1.0, EXIT_Z], "active": True}
+        if self.mod_ground_pos:
+            block["ground_pos"] = (list(self.exit_ground_pos) if self.exit_ground_pos is not None else None)
+        return block
+
     def _ground_rays(self) -> list[float]:
         # The mod measures down from the player to the floor (y = 1 in this corridor) and writes
         # ground_ray_length exactly when the ray hits nothing, which is what being off the map looks like.
@@ -355,7 +371,7 @@ class FakeLevel:
                 "id": ENEMY_ID, "type": 0, "health": self.enemy_health, "visible": True,
                 "rel": list(self.enemy_rel), "dist": 5.0, "pos": [0.0, 1.0, self.z + 5.0],
             }]
-        airborne = self.falling or self.wedged
+        airborne = self.falling or self.wedged or self.airborne
         player = {
             "pos": [0.0, self.y, self.z], "vel": [0.0, -20.0 if self.falling else 0.0, 0.0], "local_vel": [0.0, 0.0, 0.0],
             "forward": [0.0, 0.0, 1.0], "yaw": self.yaw, "pitch": 0.0, "hp": 0 if self.dead else 100,
@@ -379,7 +395,7 @@ class FakeLevel:
             "campaign": {
                 "mission": 1, "difficulty": 3, "seconds": self.seconds, "timer_running": not over,
                 "level_started": True, "level_over": over, "restarts": self.restarts, "input_locked": self.locked,
-                "exit": {"pos": [BANISH_X * self.exit_banish_steps, 1.0, EXIT_Z], "active": True},
+                "exit": self._exit_block(),
                 "checkpoints": [{"id": CHECKPOINT_ID, "pos": [0.0, 1.0, 20.0], "activated": self.checkpoint, "current": self.checkpoint}],
                 "path": {"status": "complete", "length": EXIT_Z - self.z, "next_corner": [0.0, 1.0, EXIT_Z]},
                 "locked_doors": [],
@@ -898,6 +914,118 @@ def test_a_new_level_load_accepts_whatever_exit_it_reports():
     assert not env.exit_guard.banished and env.exit_guard.frozen == [0.0, 1.0, EXIT_Z]
     _, _, _, _, info = env.step(forward())
     assert info["exit_banished"] == 0
+    env.close()
+
+
+# -- the exit's STANDABLE point (mod 0.7.2's exit.ground_pos) ---------------------------------------------
+#
+# A `FinalPit`'s transform sits inside the drop it triggers, not on anything you can walk on: 61-75 m below
+# the floor on `Level 0-2` and 70 m on `Level 0-3`. Every consumer of `GateProgress._exit` is a place the
+# agent is being TOLD TO GO -- look mode 2, `gate_approach`, the target slots -- so aiming them at `pos`
+# aims them off the ledge above the pit. Measured live on 0-2: eleven of one episode's eighteen respawns
+# were falls taken at full health while following that vector, and both of that level's real completions
+# triggered at y -25 to -27.5 while `exit.pos` read y -86.1.
+#
+# FakeLevel's corridor is flat, so `ground_pos` is put 8 m short of the pit along +z: near enough to be the
+# same place, far enough that every assertion below can tell which one is being used.
+
+EXIT_GROUND = [0.0, 1.0, EXIT_Z - 8.0]
+
+
+def test_the_exit_target_prefers_the_standable_point():
+    env, fake = make_env()
+    fake.exit_ground_pos = list(EXIT_GROUND)
+    env.reset(seed=0)
+    for _ in range(24):  # z 48: past the hops 0 gate, so the target IS the exit
+        _, _, _, _, info = env.step(forward())
+    assert env.gates.target["key"] == "exit"
+    assert env.gates.target["pos"] == EXIT_GROUND, \
+        f"the exit target is {env.gates.target['pos']}, not the standable point"
+    env.close()
+
+
+def test_the_raw_exit_vector_the_policy_reads_is_unchanged():
+    """Observation slots 0-4 are a learned input column the policy has read since the run began, so they stay
+    on `exit.pos` whatever `ground_pos` says. Only the TARGET slots (448-455) follow the new point."""
+    env, fake = make_env()
+    fake.exit_ground_pos = list(EXIT_GROUND)
+    obs, _ = env.reset(seed=0)
+    plain, _ = make_env()
+    plain.client = FakeLevel()  # the same level with no ground_pos at all
+    plain.client.mod_ground_pos = False
+    obs_plain, _ = plain.reset(seed=0)
+    assert list(obs[443:448]) == list(obs_plain[443:448]), "slots 0-4 moved with ground_pos"
+    assert abs(obs[443 + 2] - EXIT_Z / 100.0) < 1e-6, "slot 2 is still the raw pit's z"
+    env.close()
+    plain.close()
+
+
+def test_the_target_slots_follow_the_standable_point():
+    """The other half of the pair above: the slots that DO change, and by exactly the 8 m offset."""
+    env, fake = make_env()
+    fake.exit_ground_pos = list(EXIT_GROUND)
+    env.reset(seed=0)
+    for _ in range(24):
+        obs, _, _, _, _ = env.step(forward())
+    # Slot 5-8 of the campaign block: rel xyz over 100, then the 3-D distance over 200 (the exit scales).
+    z_rel = obs[GATE_BLOCK + 2] * 100.0
+    assert abs(z_rel - (EXIT_GROUND[2] - 48.0)) < 0.5, f"target slot z is {z_rel}"
+    env.close()
+
+
+def test_exit_ground_dist_min_is_reported_beside_exit_dist_min():
+    env, fake = make_env()
+    fake.exit_ground_pos = list(EXIT_GROUND)
+    env.reset(seed=0)
+    for _ in range(24):
+        _, _, _, _, info = env.step(forward())
+    assert info["exit_ground_dist_min"] is not None
+    assert abs(info["exit_ground_dist_min"] - info["exit_dist_min"]) > 7.0, \
+        "the two distances must be measured to different points"
+    assert info["exit_ground_dist_min"] < info["exit_dist_min"], "the standable point is the nearer one here"
+    env.close()
+
+
+def test_an_old_mod_without_ground_pos_behaves_exactly_as_today():
+    """The degradation case, and the one that has to be airtight: a game still running mod 0.7.1 sends no
+    `ground_pos`, so every consumer must fall back to `pos` and the episode must be identical."""
+    new, fake_new = make_env()
+    fake_new.mod_ground_pos = False          # mod 0.7.1: the key is absent
+    old, fake_old = make_env()
+    fake_old.mod_ground_pos = True
+    fake_old.exit_ground_pos = None          # mod 0.7.2 where NavMesh found nothing: the key is null
+    a = b = None
+    for env in (new, old):
+        env.reset(seed=0)
+        for _ in range(24):
+            _, _, _, _, info = env.step(forward())
+        if a is None:
+            a = (list(env.gates.target["pos"]), info["exit_dist_min"], info["exit_ground_dist_min"])
+        else:
+            b = (list(env.gates.target["pos"]), info["exit_dist_min"], info["exit_ground_dist_min"])
+    assert a == b, f"a null ground_pos and an absent one differ: {a} vs {b}"
+    assert a[0] == [0.0, 1.0, EXIT_Z], "both fall back to the pit's own position"
+    assert a[2] is None, "and neither reports a standable distance"
+    new.close()
+    old.close()
+
+
+def test_a_banished_exit_takes_its_standable_point_with_it():
+    """`ground_pos` is sampled AROUND the position being reported, so a banished twin's sample belongs to the
+    twin. `ExitGuard` restores `pos` and must drop `ground_pos`, or the target would follow a standable point
+    10 km away -- the very failure the guard exists to stop, through the new field."""
+    env, fake = make_env()
+    fake.exit_ground_pos = list(EXIT_GROUND)
+    env.reset(seed=0)
+    for _ in range(24):
+        env.step(forward())
+    assert env.gates.target["pos"] == EXIT_GROUND
+    fake.exit_banish_steps = 1
+    fake.exit_ground_pos = [BANISH_X, 1.0, EXIT_Z - 8.0]  # the sample the mod would take at the twin
+    _, _, _, _, info = env.step(forward())
+    assert info["exit_banished"] == 1
+    assert env.gates.target["pos"] == [0.0, 1.0, EXIT_Z], \
+        f"the target followed the banished twin's standable point: {env.gates.target['pos']}"
     env.close()
 
 
@@ -1445,6 +1573,81 @@ def test_route_fallback_pays_the_ladder():
             add_parts(again, info)
         assert "gate" not in again, f"the trunk is per level load, got {again.get('gate')}"
         assert info["gates_reached"] == 4 and info["route_source"] == 2
+        env.close()
+
+
+def test_a_room_rung_is_not_credited_from_the_air_over_nothing():
+    """`GateProgress._on_ground`, end to end through the env, on the geometry it was measured on.
+
+    The same corridor walk, flown 12 m above the floor instead of walked along it, pays no rung at all. That
+    is Level 0-3's bug: its `2 - Side Hallway` rung sat 1.5 m past the main room's far wall, so 680 of the
+    rung's 801 live credit steps were the player hanging against the wall 10-20 m above the floor of the room
+    BEFORE it, and the ladder then advanced the target to the next rung through the wall.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, fresh_start_prob=0.0, max_steps=29)
+        env.reset(seed=0)
+        fake.airborne, fake.ground_center = True, 12.0  # airborne, floor 12 m down: the wall-face signature
+        parts: dict[str, float] = {}
+        for _ in range(29):
+            _, _, _, _, info = env.step(forward())
+            add_parts(parts, info)
+        assert fake.z == 58.0, "the walk itself still happened"
+        assert "gate" not in parts, f"a rung was paid from the air: {parts.get('gate')}"
+        assert info["gates_reached"] == 1, "only the rung the load absorbed at the spawn"
+        env.close()
+
+
+def test_a_room_rung_is_credited_from_a_legal_hop_and_from_the_floor():
+    """The control the test above needs: the rule is about how far the ground is, not about being airborne.
+    A hop 3 m over the floor pays every rung, exactly as walking does."""
+    with tempfile.TemporaryDirectory() as tmp:
+        walked: dict[str, float] = {}
+        env, fake, _ = route_env(tmp, fresh_start_prob=0.0, max_steps=29)
+        env.reset(seed=0)
+        for _ in range(29):
+            _, _, _, _, info = env.step(forward())
+            add_parts(walked, info)
+        env.close()
+
+        env, fake, _ = route_env(tmp, fresh_start_prob=0.0, max_steps=29)
+        env.reset(seed=0)
+        fake.airborne, fake.ground_center = True, 3.0
+        hopped: dict[str, float] = {}
+        for _ in range(29):
+            _, _, _, _, info = env.step(forward())
+            add_parts(hopped, info)
+        assert hopped["gate"] == walked["gate"] == 45.0, f"{hopped.get('gate')} vs {walked.get('gate')}"
+        assert info["gates_reached"] == 4
+        env.close()
+
+
+def test_a_gate_is_credited_from_the_air_over_nothing():
+    """The other control, and the one that keeps this change off the 18 levels layer 1 routes: the ground rule
+    is for ROOM CENTROIDS only. The identical flight over the corridor's GATE ladder pays every gate."""
+    env, fake = make_env()
+    env.reset(seed=0)
+    fake.airborne, fake.ground_center = True, 12.0
+    parts: dict[str, float] = {}
+    for _ in range(29):
+        _, _, terminated, truncated, info = env.step(forward())
+        add_parts(parts, info)
+        if terminated or truncated:
+            break
+    assert parts["gate"] == 45.0, f"the gate ladder was affected by the ground rule: {parts.get('gate')}"
+    env.close()
+
+
+def test_route_ground_m_zero_restores_the_pre_rule_behaviour_through_the_env():
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake, _ = route_env(tmp, fresh_start_prob=0.0, max_steps=29, route_ground_m=0.0)
+        env.reset(seed=0)
+        fake.airborne, fake.ground_center = True, 12.0
+        parts: dict[str, float] = {}
+        for _ in range(29):
+            _, _, _, _, info = env.step(forward())
+            add_parts(parts, info)
+        assert parts["gate"] == 45.0 and info["gates_reached"] == 4
         env.close()
 
 

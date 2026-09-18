@@ -603,6 +603,15 @@ ROUTE_VERSION = 2  # schema version this loader understands; anything else falls
 ROUTE_MIN_RUNGS = 3  # guard R1, re-checked here so a hand-edited file cannot ship a 1-rung "route"
 ROUTE_EXIT_TOL_M = 5.0  # guard I5: metres the live FinalPit may differ from the one the trunk was built against
 ROUTE_SEED_M = 150.0  # how near a rung the player may start and still have it absorbed rather than paid (§6)
+# Metres of ground that must lie under an AIRBORNE player before a TRUNK rung counts as reached. See
+# `_on_ground`; a gate is never subject to it. Measured on Level 0-3, 2026-09-18, over three fresh
+# episodes (25,204 decisions) and three scripted runs:
+#     legitimate airborne credits, per rung  max 5.8  5.9  6.0  6.0  6.0  7.9   (six rungs)
+#     against the wall face, first credit of each episode          9.5 10.5 10.5
+#     scripted runs that never crossed the wall, first credit      8.8  9.1
+#     standing over the main room's void ("10 - Main Room - Floor 2")     30.0 = ground_ray_length
+# 8.0 is the only round number above every legitimate measurement and below every illegitimate one.
+ROUTE_GROUND_M = 8.0
 ROUTE_DIR = Path(__file__).resolve().parent / "routes"  # the packaged files; `route_dir` "" means this one
 
 # `route_source`: which of the three layers is driving the target. An INTEGER, because it travels through
@@ -878,7 +887,8 @@ class GateProgress:
                  patience_steps: int = 0, unpark_m: float = 2.0, fallback_hysteresis_m: float = 10.0,
                  route: dict | None = None, route_exit_tol_m: float = ROUTE_EXIT_TOL_M,
                  route_seed_m: float = ROUTE_SEED_M, patience_mode: str = "collapsed",
-                 prefer_route_when_collapsed: bool = False):
+                 prefer_route_when_collapsed: bool = False,
+                 route_ground_m: float = ROUTE_GROUND_M):
         self.reach_h = float(reach_m)
         self.reach_v = float(reach_v_m)
         self.min_gain = float(min_gain_m)
@@ -899,6 +909,10 @@ class GateProgress:
         self._route = route
         self.route_exit_tol = float(route_exit_tol_m)
         self.route_seed_m = float(route_seed_m)
+        self.route_ground_m = float(route_ground_m)
+        # This step's ground reading, as (grounded, drop) -- set for the duration of `update()` and
+        # None everywhere else, which is what keeps every ABSORBING call permissive. See `_on_ground`.
+        self._ground: tuple[bool | None, float | None] | None = None
         self._route_warned = False  # the stale-file message, printed at most once per level per worker
         self.route_reads = 0  # env lifetime: times the trunk was used as the ladder, so a test can prove it wasn't
         # Per level load
@@ -1042,13 +1056,28 @@ class GateProgress:
 
     # -- per step ----------------------------------------------------------------------------
 
-    def update(self, campaign: dict | None, player_pos=None, *, fought: bool = False) -> tuple[int, float]:
+    def update(self, campaign: dict | None, player_pos=None, *, fought: bool = False,
+               ground: tuple[bool | None, float | None] | None = None) -> tuple[int, float]:
         """(gate instalments, metres of new best closeness to the target) for this step.
 
         `fought` is "a kill or a style event landed this step", which the env already computes for the stuck
         clock. It suspends the patience clock, because a door held shut by an `ActivateArena` wave cannot be
         approached until the wave is dead (§3 of the patience spec).
+
+        `ground` is this step's `(player.grounded, metres of ground below the player)`, which `_on_ground`
+        applies to ROOM-TRUNK rungs and to nothing else. It is held for the duration of this call and cleared
+        afterwards, so the two PAYING uses of `_is_reached` -- `_note_reached` by way of `retarget`, and
+        `_pay_fallback` -- see it while every ABSORBING call, all of which are outside `update()`, does not.
+        `ground=None` is the default and leaves the tracker exactly as it was; it is what every caller that is
+        not the campaign env passes.
         """
+        self._ground = ground
+        try:
+            return self._update(campaign, player_pos, fought=fought)
+        finally:
+            self._ground = None
+
+    def _update(self, campaign: dict | None, player_pos=None, *, fought: bool = False) -> tuple[int, float]:
         prev_target, prev_fallback = self.target, self._fallback
         prev_key = self._key_of(prev_target)
         prev_best = self.best_dist.get(prev_key, math.inf) if prev_key is not None else math.inf
@@ -1439,11 +1468,27 @@ class GateProgress:
 
     @staticmethod
     def _exit(campaign: dict | None) -> dict | None:
-        """The exit as a target, or None when the mod reports no `FinalPit`. `hops` None marks it as the exit."""
+        """The exit as a target, or None when the mod reports no `FinalPit`. `hops` None marks it as the exit.
+
+        **Aim at `ground_pos`, not at `pos`.** A `FinalPit`'s transform sits inside the drop it triggers, far
+        under anything standable: 61-75 m below the floor on `Level 0-2` and 70 m on `Level 0-3`. Every
+        consumer of this method is a place the agent is being told to GO -- look mode 2, `gate_approach`, and
+        the target slots of the observation -- so pointing them into the pit points the agent off the ledge
+        above it. Measured on 0-2: eleven of one episode's eighteen respawns were falls taken at full health
+        while following that vector, and both of that level's real completions triggered at y -25 to -27.5
+        while `exit.pos` read y -86.1.
+
+        `ground_pos` is mod 0.7.2's NavMesh-snapped point, the nearest standable ground to the pit, and the
+        same point the path hint has always measured its length to. It is absent on an older mod and null
+        wherever NavMesh has nothing near the pit, and both fall back to `pos`, which is what every level did
+        until now. `spaces.campaign_block`'s slots 0-4 read `exit["pos"]` directly and are deliberately NOT
+        changed: that raw vector is a learned input column the policy has read since the run began.
+        """
         exit_ = (campaign or {}).get("exit")
         if not exit_ or not exit_.get("pos"):
             return None
-        return {"key": GATE_EXIT_KEY, "pos": list(exit_["pos"]), "hops": None,
+        pos = _point(exit_.get("ground_pos")) or list(exit_["pos"])
+        return {"key": GATE_EXIT_KEY, "pos": pos, "hops": None,
                 "open": False, "locked": False, "active": True}
 
     def _is_reached(self, gate: dict, pos) -> bool:
@@ -1464,8 +1509,57 @@ class GateProgress:
         if hops is None or not gate.get("active") or not gate_pos or gate.get("needs_item"):
             return False
         margin = 2.0 if gate.get("open") else 1.0
-        return (math.hypot(pos[0] - gate_pos[0], pos[2] - gate_pos[2]) <= margin * self.reach_h
-                and abs(pos[1] - gate_pos[1]) <= margin * self.reach_v)
+        if not (math.hypot(pos[0] - gate_pos[0], pos[2] - gate_pos[2]) <= margin * self.reach_h
+                and abs(pos[1] - gate_pos[1]) <= margin * self.reach_v):
+            return False
+        return not self._is_route_rung(gate) or self._on_ground()
+
+    def _is_route_rung(self, gate: dict) -> bool:
+        """Whether `gate` IS one of the loaded trunk's own rungs -- object identity, never a field.
+
+        The same rule as `_is_room_ladder` and for the same reason: nothing in a JSON document can
+        turn a rooms-only test on for a gate, because the mod's gates are built fresh from the
+        `campaign` block every frame and can never be these objects. `load_route` hands each env a
+        deep copy and `_choose_target` passes a rung out by reference, so identity survives targeting.
+        `self._route is None` (Cyber Grind, `route_fallback: false`, and the 19 levels with no file)
+        short-circuits to False, which is what makes the ground rule provably absent there.
+        """
+        return self._route is not None and any(gate is rung for rung in self._route["rungs"])
+
+    def _on_ground(self) -> bool:
+        """Is there ground under the player -- within `route_ground_m` when airborne? Rooms only.
+
+        A gate is a DOOR: you pass through its frame, and the mod's own `hops` graph says what that
+        means. A trunk rung is a ROOM CENTROID picked offline, and a centroid carries no promise that
+        its 8 m x 6 m cylinder stays inside the room. On `Level 0-3` one did not: the `2 - Side
+        Hallway` rung sat 1.5 m past the main room's far wall, so its cylinder covered the wall FACE,
+        and 680 of the rung's 801 live credit steps were the player hanging against that wall on the
+        wrong side, 10-20 m above the main room's floor. The ladder then advanced the target to the
+        next rung THROUGH the wall and the agent dropped into the bowl. The rung has been moved (see
+        `rung_overrides.json`), but a room centroid can always develop the same overhang, so the
+        general defence is here: a room you have not landed in is a room you have not reached.
+
+        "Ground under you" is read exactly as `env._ground_point` reads it -- the mod's centre ground
+        ray, falling back to the 8-ray ring's minimum -- so the off-the-map sentinel (the ray length,
+        30 m, written when nothing is hit) fails the test by arithmetic and needs no special case.
+        `grounded` is the game's own controller flag and short-circuits: it is authoritative, and on
+        0-3's second-floor walkway the centre ray reads the full 30 m while the player is provably
+        standing on it.
+
+        Permissive whenever it cannot answer, which is what keeps this from being a behaviour change
+        anywhere it was not measured: `self._ground` is None outside `update()`, so every ABSORBING
+        call (`mark_paid`, `new_level_load`, `retarget`) still absorbs -- refusing to absorb would
+        re-arm a rung a respawn revealed, which is a farm, the opposite of what this rule is for.
+        A mod that reports neither the flag nor a ray is the same "cannot answer" case.
+        """
+        if self._ground is None or self.route_ground_m <= 0:
+            return True  # nothing to judge from, or the rule is switched off (`route_ground_m: 0`)
+        grounded, drop = self._ground
+        if grounded is None and drop is None:
+            return True
+        if grounded:
+            return True
+        return drop is not None and drop <= self.route_ground_m
 
     def _note_reached(self, campaign: dict | None, pos) -> None:
         """Adds the rungs the player is standing in to `reached`, and lowers `best_hops` to the lowest of them.
@@ -1771,6 +1865,11 @@ class ExitGuard:
             return False
         if multiples > 0 or math.sqrt(dx * dx + dy * dy + dz * dz) > self.max_shift:
             exit_["pos"] = list(self.frozen)
+            # `ground_pos` was sampled around the position being rejected, so it belongs to the banished
+            # twin, not to the frozen pit. Dropping it sends `_exit` back to `pos`, which has just been
+            # restored, rather than leaving a standable point 10 km away as the target.
+            if "ground_pos" in exit_:
+                exit_["ground_pos"] = None
             self.banished = True
             self.rejections += 1
             return True

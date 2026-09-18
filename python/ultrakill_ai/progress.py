@@ -370,6 +370,10 @@ class ProgressCallback(BaseCallback):
             "cells_new": field("cells_new"),
             "oob_frac": field("oob_frac"),
             "exit_dist_min": field("exit_dist_min"),
+            # The same measure to the STANDABLE point beside the pit (mod 0.7.2's exit.ground_pos), which is
+            # where a completion actually happens. `exit_dist_min` measures to the FinalPit's own transform,
+            # 61-75 m below the floor on 0-2, so it has a floor it can never go under; this one reaches zero.
+            "exit_ground_dist_min": field("exit_ground_dist_min"),
             "gates_reached": field("gates_reached"),
             # The 2026-09-17 patience/exit-guard spec's two mechanism counters: parks this episode, and whether
             # the exit guard rejected a banished FinalPit report. Both 0 on a healthy monotone level.
@@ -569,7 +573,7 @@ class ProgressCallback(BaseCallback):
         eta = remaining / steps_per_s if steps_per_s and self.state == "running" else None
 
         recent = {key: self._recent_mean(key) for key in ("reward", "length", "kills", "kills_per_min", "deaths", "wave", "style", "reset_seconds",
-                                                 "completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "oob_frac", "exit_dist_min",
+                                                 "completed", "fresh_start", "level_seconds", "checkpoints_level", "cells_new", "oob_frac", "exit_dist_min", "exit_ground_dist_min",
                                                  "firing_frac", "on_target_frac", "firing_on_target_frac",
                                                  "enemy_visible_frac", "enemy_angle_mean", "enemy_dist_mean",
                                                  "enemy_close_frac", "yaw_per_step_mean", "enemy_yaw_angle_mean", "enemy_pitch_err_mean", "pitch_abs_mean",

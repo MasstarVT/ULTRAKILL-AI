@@ -352,7 +352,10 @@ EXPECTED_LADDERS = {
     # ladder's own hops along it run 2,2,3,4,5,6,4,4,3,2,0, which is the collapse itself.
     "Level 0-3":   (0.944, "9/11", "4/4", 119.7, [
         "0,-10,300  1 - Main Room - Floor 1",
-        "0,10,331  2 - Side Hallway - Floor 1",
+        # Moved from the room centroid 0,10,331 by route_overrides.json, 2026-09-18: the centroid sat
+        # 1.5 m past the main room's far wall (z 329.5), so the reach cylinder covered the wall face
+        # and the rung was credited from the air on the main-room side. See the override's `why`.
+        "0,10,340  2 - Side Hallway - Floor 1",
         "0,10,362  3 - Side Arena - Floor 1",
         "0,10,403  4 - Side Stairway - Floor 1-2",
         "-26,5,413  5 - Path 1 - First Encounter",
@@ -542,6 +545,71 @@ def test_each_ladders_stored_diagnostics_are_the_measured_ones():
             "%s checkpoints_within_60m %s, expected %s" % (level, doc["checkpoints_within_60m"], cps)
         assert abs(doc["last_rung_to_exit_m"] - last) <= 0.05, \
             "%s last_rung_to_exit_m %.1f, expected %.1f" % (level, doc["last_rung_to_exit_m"], last)
+
+
+# ---------------------------------------------------------------- 12. the manual rung overrides
+
+OVERRIDES = ROUTES / "rung_overrides.json"
+
+
+def overrides() -> dict[str, list[dict]]:
+    if not OVERRIDES.exists():
+        return {}
+    with open(OVERRIDES, encoding="utf8") as f:
+        return {k: v for k, v in json.load(f).items() if not k.startswith("_")}
+
+
+def test_the_overrides_file_is_not_picked_up_as_a_route():
+    """It lives beside the routes, so it must not match the `route_*.json` glob every reader uses --
+    `files()` here, and `docs()`, which would try to parse it as a route document."""
+    assert "rung_overrides.json" not in files()
+    for name in files():
+        assert name.startswith("route_Level_"), name
+
+
+def test_every_override_is_present_in_the_file_that_ships():
+    """The override mechanism's whole purpose is that a REGENERATION keeps a measured fix. Nothing in
+    the emitted JSON records that a rung was overridden, so if `build_routes.py` ever stopped applying
+    them -- a refused `was` check after a game update, a renamed room, a lost call -- the files would
+    quietly go back to the centroid the fix exists to avoid, and every other test here would pass.
+
+    This is the detector: each entry's `pos` has to be the position that actually ships, and its `was`
+    must NOT be, or the override is doing nothing and should be deleted rather than left as decoration.
+    """
+    docs_by_level = shipped_docs()
+    for level_short, entries in overrides().items():
+        level = "Level %s" % level_short
+        assert level in docs_by_level, "%s has overrides but ships no route file" % level
+        rungs = {r["name"]: r for r in docs_by_level[level]["rungs"]}
+        for entry in entries:
+            name = entry["name"]
+            assert name in rungs, \
+                "%s override names %r, which is not a rung in the shipped file" % (level, name)
+            got = rungs[name]["pos"]
+            assert got == entry["pos"], \
+                "%s %r ships at %s, but the override asks for %s -- the regeneration did not apply " \
+                "it (check --validate for a REFUSED note)" % (level, name, got, entry["pos"])
+            assert entry["was"] != entry["pos"], \
+                "%s %r overrides a position to itself; delete the entry" % (level, name)
+            assert got == [round(float(v), 1) for v in entry["pos"]], \
+                "%s %r: route positions are stored to 0.1 m" % (level, name)
+            assert rungs[name]["key"] == ",".join(str(int(round(v))) for v in got), \
+                "%s %r: the key does not match its own position" % (level, name)
+
+
+def test_no_two_rungs_of_an_overridden_level_share_a_cylinder():
+    """I2 is run BEFORE the overrides in the pipeline, so an override is the one way a rung could be
+    moved inside a neighbour's 16 m reach cylinder after the guard has passed. `apply_overrides`
+    re-checks it and reverts; this is the same property asserted on what ships.
+    (`test_no_two_rungs_share_a_reach_cylinder` covers every level, including these -- this row exists
+    so the failure names the override as the suspect.)"""
+    for level_short in overrides():
+        doc = shipped_docs().get("Level %s" % level_short)
+        assert doc is not None
+        for a, b in itertools.combinations(doc["rungs"], 2):
+            assert dist3(a["pos"], b["pos"]) >= SEP, \
+                "Level %s: %r and %r are %.1f m apart after the overrides" \
+                % (level_short, a["name"], b["name"], dist3(a["pos"], b["pos"]))
 
 
 def test_files_stay_small():

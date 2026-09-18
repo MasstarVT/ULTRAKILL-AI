@@ -260,6 +260,15 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
       a ladder that was fine. The layer is therefore **latched per load** — once a load's ladder has come from
       the gates, a block-less frame returns `[]` rather than the trunk. The twelve trunk-only levels are
       untouched, because their source is "rooms" from their first frame.
+      **The ground rule, a sixth rule added 2026-09-18** (`_on_ground` / `_is_route_rung`): a **room-trunk**
+      rung is credited only when the player has ground under them — `player.grounded`, or the centre ground
+      ray within `route_ground_m` (8.0 m). A gate is never subject to it, by **object identity** against the
+      loaded document exactly as `_is_room_ladder` is, so all 18 gates levels and Cyber Grind are provably
+      untouched (`test_ladder_replay.py` and `test_a_gate_ladder_is_never_subject_to_the_ground_rule`). The
+      reading is held only for the duration of `update()`, which is why every **absorbing** call —
+      `mark_paid`, `new_level_load`, `retarget`, all outside it — stays permissive: refusing to absorb what a
+      respawn reveals would re-arm a rung, which is a farm. `ground=None` (every caller but the campaign env)
+      is the tracker exactly as it was. See the transform-vs-ground gotcha for the measurement.
   - `progress.py`: `ProgressCallback`. **Chart history keeps `timesteps` strictly increasing**: `_restore` carries
   the whole old history over, but resuming from an *older* checkpoint rewinds `num_timesteps`, so the restored tail
   would sit ahead of the points that follow it and the dashboard would draw a line doubling back on itself (seen
@@ -288,8 +297,21 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   `checkpoints_within_60m`, `legs_witnessed`, `last_rung_to_exit_m` and `trunk_collapsed`. **The recovery path
   for a bad rung is this data, never a knob:** set a level's `"rungs": []` and it falls to the exit vector with
   no code change and no retrain. `gated_by` is written but ignored by every consumer until stage S3.
+- `python/ultrakill_ai/routes/rung_overrides.json`: **hand-measured rung positions the generator applies
+  itself**, so a regeneration after a game update keeps a measured fix instead of silently undoing it (a plain
+  edit of the emitted JSON would not survive `build_routes.py`). Deliberately NOT named `route_*.json`, which
+  is the glob every reader of the route files uses. One entry today, 0-3's `2 - Side Hallway - Floor 1`; see
+  the transform-vs-ground gotcha for why. Three rules make it safe: it is applied **last**, after every guard
+  and **before** every diagnostic, so `tour_ratio` and the rest describe what ships; it only **moves** a rung,
+  never adds, removes or reorders one, so `hops` and the total order cannot break; and each entry carries
+  `was`, the position the generator itself produced when the override was measured — a drift of more than 1 m
+  means the rooms have moved and the override is **REFUSED** with a note that `--validate` turns into a
+  failure. Going last means the moved point skipped R4 and I2, so both are re-checked on the moved rungs alone
+  and either failing reverts that one override. `tests/test_route_files.py` fails if an entry is not in the
+  file that ships, which is the detector for an override that stopped being applied.
 - `python/scripts/build_routes.py`: the only thing that writes those files — regenerates them from the shipped
-  scene bundles with the spec's pipeline in order **I6 → T → R4 → I2 → R1 → I3 → R2**. One self-contained file
+  scene bundles with the spec's pipeline in order **I6 → T → R4 → I2 → R1 → I3 → R2**, then
+  `rung_overrides.json`. One self-contained file
   (it inlines the pure-Python UnityFS/SerializedFile readers, the MonoScript map, the room-trunk chain assembly
   and the voxel standability probe), so regenerating needs nothing but the repo and the game install; the game
   path comes from `mod/GamePaths.props`. Read-only with respect to the game, single-threaded, no port, ~2 min
@@ -482,7 +504,13 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   **second lap** in the same level load pays 0, the **live patience setting** (300 decisions) parks nothing and
   changes no target, and `GateProgress(route=None)` over the identical walk pays 0 and reports layer 3. The
   measured `gate_approach` reproduces the spec's section 6 table to within a few percent from the tracker
-  rather than from the polyline (no game needed).
+  rather than from the polyline (no game needed). **It also owns the ground rule** (2026-09-18): the same
+  walk **flown** at the wall-face reading (9.5 m) or over the void (30.0 m) pays nothing and advances the
+  ladder by nothing on all 14 trunks, while a grounded walk and a legal 7.9 m hop are **byte-identical** to
+  before the rule existed — instalments, approach metres and the whole target sequence. Plus the bound pinned
+  at exactly 8.0 (7.9 in, 8.1 out), `grounded` beating the ray, a mod reporting neither being permissive,
+  `route_ground_m: 0` switching it off, the **gate** ladder flown over the same trunks paying in full, and
+  a respawn still absorbing a rung from the air (the anti-farm half).
 - `python/tests/test_campaign_rewards.py`: campaign reward terms, finishing within the cap beating a timeout, the `level_complete` edge and the retired route terms (no game needed).
 - `python/tests/test_spaces.py`: layout sizes (448 / 479) and every index range of the campaign block, including the yaw-frame signs (no game needed).
 - `python/configs/`: `cybergrind.yaml`, `campaign_0-1.yaml` (campaign 0-1: Violent, all gear unlocked in memory, run `campaign_gates`; its header lists the run commands). `campaign_prelude.yaml` (the multi-level curriculum 0-1 / 0-3 / 0-4 under a new run name `campaign_prelude`, kept as the reference) and `campaign_1-1.yaml` (the first skull-carry level, run `campaign_1-1`, **`item_pickup` and `item_placed` pinned at 0.0** until the three in-game checks pass). `campaign_gates_prelude.yaml` carried the live run from 4.8M to 6.77M steps (curriculum 0-1 / 0-3 / 0-4, `num_envs` 8, `ent_coef` 0.004) and is kept as history and as the partial rollback. **`campaign_gates_main.yaml` is the live one** (integration pause #2, 2026-09-17): the same `run_name: campaign_gates`, so the 6.77M-step weights, `best.zip` and the exploration archives carry on, with the 11-level Tier A + Tier B ladder, `unlock_after_fresh_episodes: 600`, `max_steps` 12000, `item_pickup` 10.0 / `item_placed` 20.0, `num_envs` 12 and `ent_coef` still 0.004. **`campaign_gates_full.yaml` is the route-fallback config, staged and NOT yet live** (branch `route-fallback`): `campaign_gates_main.yaml` with **four** named changes and nothing else, each pinned by `test_the_full_config_is_the_main_config_with_more_levels` — the `levels` list 11 → 30, `gate_patience_mode: collapsed`, `prefer_route_when_collapsed: false` (both written out although they are the defaults, so flipping one is a deliberate act) and `ent_floor: 5.0` + `ent_coef_max: 0.02` (the adaptive entropy floor; `ent_coef` itself stays 0.004). Same `run_name: campaign_gates`, same weights, same policy — 18 of its levels are on layer 1, 12 on the offline room trunk, and 1-3 / 5-4 / 6-2 are left out because they have no route signal of any kind. Its header carries the three things to watch. Each config's header lists its own run commands, and **`tests/test_campaign_config.py` pins every setting and every reward weight that is NOT a named change equal to the config before it**, so nothing can drift while the same policy continues.
@@ -654,7 +682,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   saved next to the model (`explore_Level_0-1_47800.npz`, printed as a cell count; 0 cells means the policy sees
   an unexplored map) and never writes them. Add `--record-times` to write the fastest completion to `times.md`.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **parked/ep + exit-banished row** for the two ladder-patience mechanisms, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 14 trunks walked end to end). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**22 files; 548 named tests** as of 2026-09-17, of which `test_progress.py`'s 21 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run, and `tests/test_freeze_recovery.py` the bounds that keep a sick game from FREEZING it (the 17:52 incident). `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code. **`test_campaign.py`'s `test_save_best_run_serialises_two_racing_writers` is load-sensitive**: it races two real threads against a 5 s lock timeout, and on a box already running twelve games it failed once in eight suite runs on 2026-09-17 (then passed 6/6 when re-run on its own). A single failure of that one test under load is not a regression -- re-run the file before believing it -- but it is worth making the race deterministic rather than timed if it recurs.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 14 trunks walked end to end). All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**22 files; 576 named tests** as of 2026-09-18, of which `test_progress.py`'s 21 print no count; ~2 min). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run, and `tests/test_freeze_recovery.py` the bounds that keep a sick game from FREEZING it (the 17:52 incident). `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code. **`test_campaign.py`'s `test_save_best_run_serialises_two_racing_writers` is load-sensitive**: it races two real threads against a 5 s lock timeout, and on a box already running twelve games it failed once in eight suite runs on 2026-09-17 (then passed 6/6 when re-run on its own). A single failure of that one test under load is not a regression -- re-run the file before believing it -- but it is worth making the race deterministic rather than timed if it recurs.
   **In a worktree, set `PYTHONPATH` to that worktree's `python/`** or `import ultrakill_ai` resolves to the main tree and every test measures the wrong code: `$env:PYTHONPATH = "F:\Github\ULTRAKILL-AI-route\python"`.
 - Regenerate the route data (no game, no port, safe beside a live run): `python scripts/build_routes.py --validate` from `python/`. ~2 min for all 33 levels; it rewrites only `ultrakill_ai/routes/` and exits non-zero if any shipped level changes shape. Run it after every game update, then `python tests/test_route_files.py`.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
@@ -947,6 +975,41 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   25 m rather than 6 m so the hint does not drop out every time the agent is airborne, which in this game is
   most of the time.
 
+- **A TRANSFORM is not a place you can stand, and two live bugs came from treating one as a target
+  (measured on a private game 2026-09-18, fixed in mod 0.7.2 + Python).** Both are the same mistake in two
+  places: a position that identifies an object is not a position the agent can be told to go to. When adding
+  any new target, ask what the player would be standing on if they reached it.
+  1. **The exit target was the `FinalPit`'s own transform, which sits INSIDE the drop it triggers.** Measured
+     **61-75 m below standable ground on 0-2 and 70 m on 0-3**. Everything that drives the agent somewhere
+     reads `GateProgress._exit` — look mode 2, `gate_approach` and the target slots 448-455 — so once the
+     ladder handed over to the exit the agent was being aimed down a killing fall: **11 of one 0-2 episode's
+     18 respawns were falls taken at full health**, and `exit_dist_min` could never go below that offset.
+     Both of 0-2's real completions triggered at **(-197.5, -25, 276) / (-199, -27.5, 277)** while `exit.pos`
+     read **(-199, -86.1, 277)**. The fix was already half-built: `CampaignObserver.SampleExit` has snapped
+     the path hint's exit end onto the NavMesh since 2026-09-16, so mod 0.7.2 just keeps that point and
+     reports it as **`exit.ground_pos`**, and `_exit` prefers it. **Observation slots 0-4 still read
+     `exit.pos`** — that raw vector is a learned input column the policy has read since the run began.
+     `exit_dist_min` keeps its definition so its history stays comparable; **`exit_ground_dist_min`** is the
+     new one, and it is the column to read for "did the agent get near the exit".
+  2. **A room CENTROID is not inside its room, near a wall.** 0-3's trunk rung `2 - Side Hallway - Floor 1`
+     sat at z 331, **1.5 m past the main room's far wall (face z 329.5)**, while the hallway floor is y 10.4
+     spanning z 332-362. `_is_reached`'s 8 m x 6 m cylinder therefore covered the **wall face** down to y 4,
+     so the rung was credited with the player hanging against the wall in the room **before** it: **680 of
+     801 live credit steps airborne**, the first credit of every one of three fresh episodes at
+     `ground_ray_center` 9.5-10.5 m, and a **scripted hold-forward-and-jump run that never crossed the wall
+     (max z 329.5) credited it 31 times**. The ladder then advanced the target to the next rung **through the
+     wall**, and the agent dropped into the bowl — **26 of 66 fresh route episodes ended there**. Two
+     independent fixes, because **neither alone is enough**: the rung moved to **z 340** via
+     `rung_overrides.json` (every first credit then lands inside the hallway, z 332.9-333.9, and the scripted
+     non-crossing runs credit 0 times; `tour_ratio` 0.9439 → 0.9438, every other diagnostic unchanged), and
+     `GateProgress._on_ground` refuses to credit any **room-trunk** rung from the air with no ground within
+     `route_ground_m`. The bound is measured, not chosen: legitimate airborne credits on 0-3's six healthy
+     rungs max out at **5.8, 5.9, 6.0, 6.0, 6.0 and 7.9 m**; the wall-face first credits are **9.5, 10.5,
+     10.5**; the scripted ones **8.8 and 9.1**; and standing over the main room's void reads **30.0**, the
+     `ground_ray_length` sentinel. **8.0** is the only round number above every good reading and below every
+     bad one. Measuring it the other way round is what showed neither fix is redundant: the bound **alone**,
+     with the rung left at z 331, still credited from a ledge on the main-room side at 3-5 m.
+
 - **The baked NavMesh is an ENEMY-walking mesh, and `path` was retired because of it (2026-09-16).** 0-1's mesh
   is 412 polys in 47 islands with **nothing before z 378.5**, and no bridging rule connects the start area to the
   exit below a 17 m gap / 12 m climb limit — one that did would also bridge through walls. Over 32,022 logged
@@ -1083,7 +1146,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Aim shaping needs a gradient (1.9M steps):** a cone-only aim reward paid zero beyond the cone, and the agent was inside it 0.8% of the time, so raising the weight (0.06 → 0.15) changed nothing (on-target went 1.1% → 0.8%). `aim` is now a slope from facing away (0) to facing straight at the nearest visible enemy, with `aim_locked` extra inside the cone.
 - **Weight audit at 2.3M steps (why it never aims):** probing the policy offline and simulating its look dynamics from the weights alone reproduces the live stats (enemy angle 89°, on-target 0%, aim 0.040 per visible step, vs 88.8°, 0.9%, 0.041 in training). The pitch head has carried a constant +3°/step bias since ~300k steps, independent of weapon, health and enemy position, so within 5 game seconds the camera pins at the +90° clamp (the sky) and every enemy sits ~90° off the crosshair whatever the yaw does. Under random yaw the aim slope pays the same 0.5 level or pinned, so nothing ever corrected the drift. The yaw head only began tracking enemies in the last 300k steps (corr(rel.x, E[yaw]) 0 → 0.39, right sign) and the pin masks it: with pitch forced level the same weights are on target 12% of steps. The rest of the policy is fire always, dash often, lean backwards (entropy 11.7 → 5.9). Updates are noise-dominated: Adam gradient SNR sits at the noise floor and the checkpoint-to-checkpoint weight drift is a random walk (path/net ≈ 6–8 ≈ √40 over 40 checkpoints). Candidate fixes: clamp or auto-level pitch in Cyber Grind, penalise |pitch|, or split the aim reward into yaw and pitch terms.
 - **Pitch fix (2.30M–2.45M steps):** `pitch_limit_deg` clamps the camera to within a band of level on the Python side (the pitch command is trimmed against the last observed pitch, so no mod change and the camera snaps back into the band in one step), and the aim reward is split per look axis so each head gets its own gradient: `aim_yaw` 0.06 on the ground-plane heading error and `aim_pitch` 0.06 on the enemy elevation in camera space, with `aim` 0 and `aim_locked` unchanged. New per-episode diagnostics `pitch_abs_mean` and `enemy_yaw_angle_mean` flow into status.json and the dashboard Shooting panel. A first pass with a 40° band did not help by itself: after 150k steps the policy just leaned on the new edge (pitch 35°, on-target 1.6%), which still put eye-level enemies outside the aim cone and the hitbox. So the band is now 15° and the pitch head of `ckpt_2447005` was zeroed (output rows, bias and their Adam moments, giving uniform pitch actions) into `models/cybergrind_ppo/pitch_reset_2447005.zip`. That resume ran only minutes before the decision to start v2 fresh instead. Expected for v2: camera pitch under 15°, on-target climbing from ~1% (random heading alone gives ~8% inside 15°, and the same weights reached 12% with a level camera), then kills/min.
-- **Mod:** v0.6.0 (background play, training instances, teleport, soft death, rendering off; campaign block, `difficulty` and `unlock_all_gear` config, `kill` debug command, `player.slot_counts`, game-initiated restarts blocked while in control; **the `campaign.gates` route block with its room-graph BFS, the `ChooseExit` secret-pit and mission-successor fix frozen per level load, `ground_ray_center`, `player.slow_mode`/`heavy_fall`/`crouching`, and the `UnwedgePatch` postfix with its `unwedge` / `unwedge_frames` config keys**). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block, and every v0.6.0 addition (acceptance A1-A12 under Status). Protocol version is still **1**: obs gains fields, nothing is removed or changed. **Installed version is now v0.7.1** (see the 0.7.1 entry at the end of Status).
+- **Mod:** v0.6.0 (background play, training instances, teleport, soft death, rendering off; campaign block, `difficulty` and `unlock_all_gear` config, `kill` debug command, `player.slot_counts`, game-initiated restarts blocked while in control; **the `campaign.gates` route block with its room-graph BFS, the `ChooseExit` secret-pit and mission-successor fix frozen per level load, `ground_ray_center`, `player.slow_mode`/`heavy_fall`/`crouching`, and the `UnwedgePatch` postfix with its `unwedge` / `unwedge_frames` config keys**). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block, and every v0.6.0 addition (acceptance A1-A12 under Status). Protocol version is still **1**: obs gains fields, nothing is removed or changed. **Installed version is now v0.7.2** (see the 0.7.1 and 0.7.2 entries at the end of Status).
 - **Python:** env, training and eval verified against a mock and partly in game; campaign episodes verified against a fake level (`tests/test_campaign_env.py`).
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.
 - **Training:** first Cyber Grind PPO run (`cybergrind_ppo`) started 2026-09-15 and was abandoned at 2.45M steps after the weight audit: its updates had been noise-dominated and it carried locked-in reflexes (fire always, dash, walk backwards, look up), so a resume was not worth the carry-over.
@@ -2582,3 +2645,25 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   human reference, so combat is re-learned once, on the enemy set the records will be set on. Not before: the
   curriculum/route work is the bottleneck now and Brutal would only lower completion rates. `times.md` rows carry the
   difficulty, so Violent bests stay as their own rows.
+- **Mod v0.7.2 + the route-target fixes — released and installed 2026-09-18, during a planned pause.** Two
+  independent target bugs, both found by a live probe on a private game (port 47812) while the 12-game run kept
+  training. The measurements are under the transform-vs-ground gotcha; what follows is what shipped.
+  1. **`exit.ground_pos`** (mod, `CampaignObserver.UpdateExitGround`): the NavMesh-snapped standable point near
+     the pit, kept from the `SampleExit` call the path hint already made, reported on the same 4-obs cadence and
+     computed **before** the player-end snap so it is reported even where `path` reads `none` (0-1's own spawn).
+     `null` when NavMesh holds nothing within 95 m; absent on an older mod. Python's `GateProgress._exit`
+     prefers it and falls back to `exit.pos`, which moves look mode 2, `gate_approach` and the target slots
+     448-455 onto standable ground in one edit. **Observation slots 0-4 are deliberately unchanged.**
+     `ExitGuard` drops a rejected report's `ground_pos` with its `pos`, so a banished twin's sample can never
+     become the target. New per-episode `exit_ground_dist_min` through `CAMPAIGN_INFO_KEYS`, `status.json`,
+     `poll_status.py` and the dashboard's "closest to exit" row; `exit_dist_min` keeps its old definition.
+  2. **0-3's hallway rung moved, and a ground rule behind it.** `rung_overrides.json` (new) moves the rung to
+     z 340 in a way `build_routes.py` re-applies on every regeneration, and `GateProgress._on_ground` refuses
+     to credit any **room-trunk** rung from the air with no ground within `route_ground_m` (8.0 m). Gates are
+     exempt by object identity, so all 18 gates levels and Cyber Grind are provably untouched.
+  - **Judge the fixes on:** 0-3's bowl share (26 of 66 fresh route episodes ended there before), 0-2's
+    fall deaths at full health (11 of 18 respawns in one episode), and `exit_ground_dist_min` falling where
+    `exit_dist_min` had a floor it could never cross. `route_source` 2 and `gates_reached` on 0-3 are the
+    readout for the rung move: a fresh 0-3 load should now stop crediting rung 9 from the main room.
+  - **`metrics_log.csv` gained a column** (`exit_ground_dist_min`), and `poll_status.py` keeps an existing
+    header, so the old file was moved aside at the pause.

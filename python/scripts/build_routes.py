@@ -95,6 +95,34 @@ CP_NEAR = 60.0          # `checkpoints_within_60m`
 LEG_NEAR = 40.0         # `legs_witnessed`
 PIT_MAX_M = 70.0        # spec 7.1 test 9: a rung named `Pit` may only be hops 0, and near the pit
 
+# ---- the manual override file -------------------------------------------------------------------
+#
+# `rung_overrides.json`, beside the routes themselves (NOT `route_*.json`, which is the glob every
+# reader of the route files uses). A room's CENTROID is the right rung almost
+# everywhere, but it is not a promise that the whole 8 m x 6 m reach cylinder around it stays inside
+# that room: on `Level 0-3` the centroid of `2 - Side Hallway - Floor 1` sat 1.5 m past the main
+# room's far wall, so the cylinder covered the WALL FACE on the main-room side down to y 4 and the
+# rung was credited from the air against it, without the player ever entering the hallway (680 of 801
+# live credit steps airborne, and a scripted hold-forward-and-jump run that never crossed the wall
+# credited it 31 times). That is a property of the level's geometry, not of the pipeline, so there is
+# nothing in the generator to fix -- and a plain hand-edit of the emitted JSON would be silently
+# undone the next time spec risk 3 says to rerun this script after a game update.
+#
+# So the fix lives here, in data the generator applies itself. Three rules make it safe:
+#
+#   1. it is applied LAST, after every guard (I6 -> T -> R4 -> I2 -> R1 -> I3) and BEFORE the
+#      diagnostics (R2's tour ratio, `legs_witnessed`, `checkpoints_within_60m`,
+#      `last_rung_to_exit_m`), so what ships is measured on the positions that ship -- the property
+#      `test_tour_ratio_passes_and_is_reproduced_from_the_shipped_positions` exists to hold;
+#   2. it moves a rung, and never adds, removes or reorders one. `hops` is assigned after this from
+#      the row order, so a total order cannot be broken by an override;
+#   3. every entry carries `was`, the position the generator itself produced when the override was
+#      written. If the generator no longer produces that position the rooms have MOVED, the
+#      hand-picked point is no longer known to be inside the room, and the override is REFUSED with
+#      a loud note that `--validate` turns into a failure. A stale override is worse than none.
+OVERRIDES_NAME = "rung_overrides.json"  # NOT route_*.json: that glob is the route files themselves
+OVERRIDE_WAS_TOL_M = 1.0  # rule 3: how far the generator's own position may drift and still match `was`
+
 # Levels whose gate ladder layer 1 ACCEPTS but which the collapse detector calls collapsed at the
 # spawn, and whose trunk the S1 measurement showed reproduces a sensible walkable order. Their file
 # ships beside the ladder and is read only by a run with `prefer_route_when_collapsed: true` (the
@@ -2006,6 +2034,81 @@ def polyline(rows):
     return sum(dist3(rows[i]["pos"], rows[i + 1]["pos"]) for i in range(len(rows) - 1))
 
 
+def load_overrides(path=None):
+    """`rung_overrides.json` as `{level short form: [entry, ...]}`, or {} when there is none.
+
+    Missing is the normal case and is silent. A file that exists but cannot be read is NOT silent:
+    the whole point of the mechanism is that a regeneration keeps a measured fix, so losing it to a
+    typo has to be visible. See the OVERRIDES_NAME comment for the format and the three rules.
+    """
+    path = Path(path) if path else (ROOT / "ultrakill_ai" / "routes" / OVERRIDES_NAME)
+    if not path.exists():
+        return {}
+    doc = json.loads(path.read_text(encoding="utf8"))
+    return {k: v for k, v in doc.items() if not k.startswith("_")}
+
+
+def apply_overrides(lvl, rows, overrides, geom=None):
+    """Rule 1: move the named rungs, last, before anything is measured. Returns (rows, notes).
+
+    Matching is by the rung's room NAME, not by index, hops or position: names survive a
+    regeneration, and the other three do not. Every refusal is a note rather than an exception,
+    because one bad entry must not stop the other 13 levels from being rebuilt -- `--validate` is
+    what turns the notes into a non-zero exit.
+
+    `geom` re-runs R4 (standability) and I2 (16 m separation) on the moved rungs, since going last
+    means the new point did not pass either on the way through the pipeline. Either failing reverts
+    that one override and leaves the generated position in place. `geom=None` (a --no-probe run)
+    keeps the separation check, which needs no geometry, and skips only R4.
+    """
+    notes = []
+    by_name = {r["name"]: r for r in rows}
+    moved = []
+    for entry in overrides.get(lvl, ()):
+        name, want, was = entry.get("name"), entry.get("pos"), entry.get("was")
+        row = by_name.get(name)
+        if row is None:
+            notes.append("override REFUSED: %s has no rung named %r (it may have been dropped by a "
+                         "guard, or the room was renamed)" % (lvl, name))
+            continue
+        if not (isinstance(want, list) and len(want) == 3 and isinstance(was, list) and len(was) == 3):
+            notes.append("override REFUSED: %s %r needs a 3-element `pos` and `was`" % (lvl, name))
+            continue
+        drift = dist3(row["pos"], was)
+        if drift > OVERRIDE_WAS_TOL_M:
+            # Rule 3. The hand-picked point was chosen against geometry that has since moved, so it
+            # is no longer known to be inside the room it names.
+            notes.append("override REFUSED: %s %r now builds at %s, %.1f m from the recorded `was` "
+                         "%s -- re-measure the override against the new geometry"
+                         % (lvl, name, [round(v, 1) for v in row["pos"]], drift, was))
+            continue
+        moved.append((row, list(row["pos"]), [float(v) for v in want], entry.get("why", "")))
+        row["pos"] = [float(v) for v in want]
+
+    # I2 on the moved rungs against every other rung, and R4 on the moved rungs alone.
+    reach = {}
+    if geom is not None and moved:
+        reach = {r["name"]: ok for r, ok in
+                 zip([m[0] for m in moved],
+                     [x["reach"] for x in standability(geom, [m[0] for m in moved])])}
+    for row, before, want, why in moved:
+        clash = next((o for o in rows if o is not row and dist3(o["pos"], row["pos"]) < SEP), None)
+        bad = None
+        if clash is not None:
+            bad = "it lands %.1f m from %r, inside I2's %.0f m separation" \
+                  % (dist3(clash["pos"], row["pos"]), clash["name"], SEP)
+        elif reach.get(row["name"]) is False:
+            bad = "R4 finds no standable cell inside its reach cylinder there"
+        if bad:
+            row["pos"] = before
+            notes.append("override REFUSED: %s %r -> %s: %s" % (lvl, row["name"], want, bad))
+        else:
+            notes.append("override applied: %s %r %s -> %s (%s)"
+                         % (lvl, row["name"], [round(v, 1) for v in before], want,
+                            why or "no reason recorded"))
+    return rows, notes
+
+
 # ============================================================================ 7. one level
 
 ALTAR_NEAR = 25.0       # a lock is "on the trunk" when its door is this close to a leg
@@ -2023,7 +2126,7 @@ def load_scene(lvl):
     return Scene(nodes[main[0]], script_map()), nodes.get(main[0] + ".resS")
 
 
-def build_level(lvl, probe=True, analyse_gates=False):
+def build_level(lvl, probe=True, analyse_gates=False, overrides=None):
     """Run the whole pipeline on one level and return a report, with `doc` set when it ships.
 
     `analyse_gates` measures the trunk on a level layer 1 already routes. No file is ever written for
@@ -2072,6 +2175,16 @@ def build_level(lvl, probe=True, analyse_gates=False):
     rows, merges = guard_i2(rows)                                        # I2
     r1 = len(rows) >= MIN_RUNGS                                          # R1
     rows, drop_i3 = guard_i3(rows)                                       # I3
+    # Rule 1: the manual overrides go LAST, after every guard and before every measurement below, so
+    # the tour ratio, the two "a/b" counts and `last_rung_to_exit_m` all describe what ships -- and so
+    # that an override can never change WHICH rungs ship or their order, only where one of them sits.
+    # Going last does mean the moved point skipped R4 and I2 on the way past, so both are re-checked
+    # on the moved rungs alone and a failure REVERTS that one override: a rung the player cannot stand
+    # at, or one that has been moved inside a neighbour's reach cylinder, is worse than the bug.
+    rows, override_notes = apply_overrides(lvl, rows, overrides or {},
+                                           geom=LevelGeom(sc, ress) if probe else None)
+    rep["notes"] = list(rep["notes"]) + override_notes
+    rep["override_refused"] = [n for n in override_notes if "REFUSED" in n]
     tour = tour_ratio(rows)                                              # R2
     r2 = tour <= MAX_TOUR
 
@@ -2227,6 +2340,11 @@ def print_validate(reports, expect_shipped=True):
     """
     fails = []
     ship = [r for r in reports if r.get("ships")]
+    # A refused override means a measured fix was silently dropped, which is exactly the regeneration
+    # failure the file exists to prevent. It is a failure even on a level that still ships.
+    for r in reports:
+        for note in r.get("override_refused", ()):
+            fails.append(note)
     print("\n--- layer 1: the live gate ladder's own guard, reproduced offline ---")
     for r in reports:
         g = r.get("gate")
@@ -2394,6 +2512,10 @@ def main(argv=None):
                     help="also measure the room trunk on the levels layer 1 already routes. Never "
                          "writes a file for them; this is the measurement a 'would the trunk be "
                          "better here?' question needs (spec risk 5, 1-1)")
+    ap.add_argument("--overrides", default=None,
+                    help="the manual rung-position overrides file (default "
+                         "python/ultrakill_ai/routes/" + OVERRIDES_NAME + "). They are applied after "
+                         "every guard and before every measurement; see the OVERRIDES_NAME comment")
     ap.add_argument("--json", default=None, help="write the full per-level report to this file")
     args = ap.parse_args(argv)
 
@@ -2405,9 +2527,11 @@ def main(argv=None):
         # +-40 m and can never target its own pit. Refuse to overwrite the committed data with it off.
         ap.error("--no-probe cannot write the committed files; add --dry-run or --out <dir>")
 
+    overrides = load_overrides(args.overrides)
     reports = []
     for lvl in levels:
-        rep = build_level(lvl, probe=not args.no_probe, analyse_gates=args.analyse_gates_levels)
+        rep = build_level(lvl, probe=not args.no_probe, analyse_gates=args.analyse_gates_levels,
+                          overrides=overrides)
         state = ("rooms %d" % rep["rungs"]) if rep.get("ships") else rep.get("signal", "exit vector")
         print("%-5s %-13s %5.1fs  %s"
               % (lvl, state, rep.get("secs", 0.0), "; ".join(rep["why"]) or ""))
