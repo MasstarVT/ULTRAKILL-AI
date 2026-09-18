@@ -399,7 +399,11 @@ class StageSupervisor(supervise.Supervisor):
             # what keeps times.md current without an eval run and without a free bridge port. It commits
             # times.md ALONE, so a live trainer's checkpoints are never staged.
             ("scripts/post_times.py", ["--run", self.cfg.run, "--watch", "600", "--push"],
-             "%s_post_times.log" % self.cfg.run)]
+             "%s_post_times.log" % self.cfg.run),
+            # The live dashboard follows the stage's run, so it is started (and restarted) per stage like the
+            # other helpers instead of being left behind at a stage boundary (the user noticed it missing).
+            ("scripts/dashboard.py", ["--run", self.cfg.run, "--monitor", str(self.cfg.monitor)],
+             "%s_dashboard.log" % self.cfg.run)]
 
 
 @dataclass

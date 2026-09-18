@@ -377,7 +377,7 @@ def test_the_first_tick_of_a_stage_prepares_it_and_starts_the_trainer():
             "the stage resumes from its own seeded copy, so a crash inside the first 50k steps can too"
         assert "runs\\spec_0-1_train.log" in command
         started = sorted(Path(c.split(" -u ")[1].split()[0]).name for c in h.spawned)
-        assert started == ["keep_best.py", "poll_status.py", "post_times.py", "train.py"]
+        assert started == ["dashboard.py", "keep_best.py", "poll_status.py", "post_times.py", "train.py"]
         state = json.loads((h.tmp / "runs" / "specialists" / "driver_state.json").read_text(encoding="utf-8"))
         assert state["current"]["level"] == "Level 0-1" and state["current"]["start_steps"] == 10_000_000
 
@@ -521,7 +521,7 @@ def test_the_stage_supervisor_adds_post_times_to_the_helper_set():
         h = harness(tmp)
         sup = h.driver.supervisor_for(cd.Stage(level="Level 0-1", run="spec_0-1", index=0, init="x"))
         specs = sup.helper_specs()
-        assert [Path(script).name for script, _, _ in specs] == ["poll_status.py", "keep_best.py", "post_times.py"]
+        assert [Path(script).name for script, _, _ in specs] == ["poll_status.py", "keep_best.py", "post_times.py", "dashboard.py"]
         args = dict((Path(script).name, arguments) for script, arguments, _ in specs)
         assert args["keep_best.py"] == ["--run", "spec_0-1", "--metric", "campaign"], \
             "the campaign metric, or best.zip would be scored on kills"
