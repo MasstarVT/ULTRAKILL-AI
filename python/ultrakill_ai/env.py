@@ -62,9 +62,11 @@ CAMPAIGN_INFO_KEYS = ("kills", "style", "deaths", "completed", "fresh_start", "l
                       "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac",
                       "targets_parked", "exit_banished", "route_source", "ladder_collapsed",
                       # The speed stage (docs/superpowers/specs/2026-09-18-speed-stages.md): the level's target
-                      # time, and what the completion edge paid. `target_seconds` is how the driver learns the
-                      # target at all -- it travels env -> status.json -> driver_state.json -> the sidecar.
-                      "target_seconds", "completion_bonus")
+                      # time, the raw S-rank threshold it was scaled from, and what the completion edge paid.
+                      # `target_seconds` is how the driver learns the target at all -- it travels
+                      # env -> status.json -> driver_state.json -> the sidecar, and `s_rank_seconds` rides with
+                      # it so the sidecar can say what the game itself calls S.
+                      "target_seconds", "s_rank_seconds", "completion_bonus")
 
 YAW_CAP = max(abs(b) for b in YAW_BINS)  # 90 degrees per decision, the widest look bin
 PITCH_CAP = max(abs(b) for b in PITCH_BINS)  # 20 degrees per decision
@@ -150,6 +152,13 @@ class EnvConfig:
     # reports whichever it is as `info["target_seconds"]`, so the reward and the driver's rule agree by
     # construction. Never a hand-picked number chosen away from the level.
     speed_target_seconds: float = 0.0
+    # What the level's own S-rank threshold is MULTIPLIED by to get the target (§8). Measured 2026-09-18: the
+    # 0-2 specialist's 139.5 s is already inside 0-2's S window, so a bare S threshold would have promoted that
+    # stage with zero improvement -- an S-rank time is what a competent human run scores, not a fast one. The
+    # scale is applied HERE and nowhere else, so `info["target_seconds"]` is the single number the reward and
+    # the driver's promotion rule both read. An explicit `speed_target_seconds` is a decision already made and
+    # is NEVER scaled.
+    speed_target_scale: float = 0.75
     # Route gates (campaign.gates): the door-graph ladder GateProgress walks.
     gate_reach_m: float = 8.0  # horizontal radius at which a gate counts as reached (2x while it is open)
     gate_reach_v_m: float = 6.0  # vertical half-height of the same test, so a roof over a door is not "reached"
@@ -434,6 +443,9 @@ class UltrakillEnv(gym.Env):
         self._speed_target: float | None = (float(self.cfg.speed_target_seconds)
                                             if campaign and self.cfg.speed_bonus and self.cfg.speed_target_seconds > 0
                                             else None)
+        # The level's RAW S-rank threshold, before `speed_target_scale`. Reported and recorded beside the target
+        # so a sidecar says both what was demanded and what the game calls S; nothing is measured against it.
+        self._s_rank_seconds: float | None = None
 
         # Campaign state. The exploration archive counts, per game and per level, how many earlier episodes
         # entered each cell, so the novelty reward fades where this game has already been. A curriculum run keeps
@@ -1928,16 +1940,27 @@ class UltrakillEnv(gym.Env):
     def _note_speed_target(self, raw: dict[str, Any]) -> None:
         """Reads the level's own S-rank time off the first observation that carries one, once.
 
-        Only on a speed stage, only while there is no target yet -- an override from the config is already set
-        in `__init__` and is never overwritten -- so the number is a constant for the run and a first load whose
-        campaign block was missing still gets one at the next reset.
+        Only on a speed stage, and only while the raw threshold has not been read yet, so the numbers are
+        constants for the run and a first load whose campaign block was missing still gets them at the next
+        reset.
+
+        The TARGET is `s_rank_seconds * speed_target_scale` (§8): an S-rank time is a competent human run, not a
+        fast one, and the 0-2 specialist was already inside it before any speed stage existed. An override from
+        the config is a decision already made -- it is set in `__init__`, is never overwritten here, and is never
+        scaled -- but the raw threshold is still recorded beside it, because a sidecar that says "target 82 s"
+        without saying what S is cannot be read a month later.
         """
-        if not self.cfg.speed_bonus or self._speed_target is not None:
+        if not self.cfg.speed_bonus or self._s_rank_seconds is not None:
             return
-        target = s_rank_time(raw.get("campaign"))
-        if target is not None:
-            self._speed_target = target
-            self.envlog.event("speed_target", level=self.level, target_seconds=target)
+        s_rank = s_rank_time(raw.get("campaign"))
+        if s_rank is None:
+            return
+        self._s_rank_seconds = s_rank
+        if self._speed_target is None:
+            scaled = s_rank * float(self.cfg.speed_target_scale)
+            self._speed_target = scaled if scaled > 0.0 else None  # a zero or negative scale means "no target"
+        self.envlog.event("speed_target", level=self.level, s_rank_seconds=s_rank,
+                          scale=self.cfg.speed_target_scale, target_seconds=self._speed_target)
 
     def _level_result(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Official time, kills, style, restarts and rank as the game's results screen would count them."""
@@ -2057,6 +2080,7 @@ class UltrakillEnv(gym.Env):
             # override) and is None on every run that is not a speed stage; `completion_bonus` is overwritten in
             # step() with what the completion edge actually paid. Both numeric, so both survive `_num`.
             info["target_seconds"] = self._speed_target
+            info["s_rank_seconds"] = self._s_rank_seconds
             info["completion_bonus"] = 0.0
             # Route gates. `gates_reached` is numeric and always present so it can be charted; `gate_hops_best`
             # is None until a gate is reached, so it only ever reaches episodes.jsonl. Both are inherited by a

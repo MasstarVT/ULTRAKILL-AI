@@ -569,11 +569,13 @@ def speed_env(**overrides):
 
 
 def test_a_speed_stage_reads_the_levels_own_s_rank_time_as_its_target():
-    """Never a hand-picked number: the target is `campaign.ranks.time[-1]`, the time the game itself calls S."""
+    """Never a hand-picked number: the target is `campaign.ranks.time[-1]` scaled, the game's own idea of S."""
     env, fake = speed_env()
     _, info = env.reset(seed=0)
     assert RANKS["time"][-1] == 30
-    assert env._speed_target == 30.0 and info["target_seconds"] == 30.0
+    # The default scale is 0.75 (spec §8b): an S-rank time is a competent run, not a fast one.
+    assert env._speed_target == 22.5 and info["target_seconds"] == 22.5
+    assert env._s_rank_seconds == 30.0 and info["s_rank_seconds"] == 30.0, "the raw threshold travels too"
     assert info["completion_bonus"] == 0.0, "nothing has been completed yet"
     env.close()
 
@@ -581,13 +583,26 @@ def test_a_speed_stage_reads_the_levels_own_s_rank_time_as_its_target():
     plain, _ = make_env(rewards=RewardConfig(level_complete=100.0))
     _, info = plain.reset(seed=0)
     assert plain._speed_target is None and info["target_seconds"] is None
+    assert info["s_rank_seconds"] is None
     plain.close()
 
 
-def test_a_config_override_wins_over_the_live_threshold():
-    env, fake = speed_env(speed_target_seconds=8.0)
+def test_the_target_scale_multiplies_the_s_threshold_and_is_applied_only_here():
+    """§8b: one place, the env, so `info["target_seconds"]` is what the reward AND the driver both read."""
+    for scale, expected in ((1.0, 30.0), (0.75, 22.5), (0.5, 15.0)):
+        env, _ = speed_env(speed_target_scale=scale)
+        _, info = env.reset(seed=0)
+        assert info["target_seconds"] == expected and info["s_rank_seconds"] == 30.0
+        assert env.cfg.rewards.level_complete == 100.0, "the scale never touches a reward weight"
+        env.close()
+
+
+def test_a_config_override_wins_over_the_live_threshold_and_is_never_scaled():
+    """A per-level `speed.targets` entry is a decision already made: 8 s means 8 s, not 8 x 0.75 (§8b)."""
+    env, fake = speed_env(speed_target_seconds=8.0, speed_target_scale=0.5)
     _, info = env.reset(seed=0)
     assert env._speed_target == 8.0 and info["target_seconds"] == 8.0, "the plan's per-level override"
+    assert info["s_rank_seconds"] == 30.0, "the raw threshold is still recorded beside it"
     env.close()
 
 
@@ -597,6 +612,7 @@ def test_a_level_load_with_no_ranks_leaves_the_target_unread():
     fake.drop_campaign_steps = 1  # the reset observation has no campaign block at all
     _, info = env.reset(seed=0)
     assert env._speed_target is None and info["target_seconds"] is None
+    assert env._s_rank_seconds is None and info["s_rank_seconds"] is None
     info = run_forward_until_end(env)
     assert info["end_reason"] == "level_complete"
     assert info["completion_bonus"] == 100.0, "the plain weight: no target means today's rule exactly"
@@ -612,14 +628,14 @@ def run_forward_until_end(env: UltrakillEnv, limit: int = 200) -> dict:
 
 
 def test_a_fast_fresh_start_completion_pays_the_scaled_bonus():
-    """The fake corridor is finished in about four seconds against a 30 s target, so it hits the 2.0 ceiling."""
+    """The fake corridor is finished in about four seconds against a 22.5 s target, so it hits the 2.0 ceiling."""
     env, fake = speed_env()
     _, info = env.reset(seed=0)
     info = run_forward_until_end(env)
     assert info["end_reason"] == "level_complete" and info["fresh_start"] == 1
-    assert info["level_seconds"] == fake.seconds and fake.seconds < 30.0
+    assert info["level_seconds"] == fake.seconds and fake.seconds < 22.5
     assert info["completion_bonus"] == 200.0 == info["reward_parts"]["level_complete"]
-    assert info["target_seconds"] == 30.0
+    assert info["target_seconds"] == 22.5 and info["s_rank_seconds"] == 30.0
     env.close()
 
 
