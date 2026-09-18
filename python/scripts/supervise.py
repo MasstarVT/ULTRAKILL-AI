@@ -820,7 +820,12 @@ class Supervisor:
         """
         return [("scripts/poll_status.py", ["--run", self.cfg.run], "%s_poll.log" % self.cfg.run),
                 ("scripts/keep_best.py", ["--run", self.cfg.run, "--metric", "campaign"],
-                 "%s_keep_best.log" % self.cfg.run)]
+                 "%s_keep_best.log" % self.cfg.run),
+                # The games leak (1 GB at boot, ~6 GB after 5.5 h; twelve of them exhausted a 60 GB commit limit
+                # on 2026-09-18 and took the run, the driver and the desktop session down). mem_guard.py recycles
+                # one game at a time before that, through the env's own bridge recovery. One log for every run,
+                # because its subject is the machine, not the run.
+                ("scripts/mem_guard.py", ["--run", self.cfg.run], "mem_guard.log")]
 
     def ensure_helpers(self, procs: list[Proc]) -> list[str]:
         """Starts poll_status.py / keep_best.py when they are not running. Checked every poll: a

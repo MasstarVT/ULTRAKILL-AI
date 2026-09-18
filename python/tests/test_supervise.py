@@ -40,6 +40,7 @@ CMD_WORKER = ('"python.exe" "-c" "from multiprocessing.spawn import spawn_main; 
               'spawn_main(parent_pid=32324, pipe_handle=1536)" "--multiprocessing-fork"')
 CMD_POLL = "F:\\...\\python.exe -u scripts/poll_status.py --run campaign_gates"
 CMD_KEEP_BEST = "F:\\...\\python.exe -u scripts/keep_best.py --run campaign_gates --metric campaign"
+CMD_MEM_GUARD = "F:\...\python.exe -u scripts/mem_guard.py --run campaign_gates"
 # The supervisor itself, and the query it uses to list processes. Both MENTION the trainer; neither IS one.
 CMD_SELF = ('"C:\\WINDOWS\\system32\\cmd.exe" /c "F:\\...\\python.exe" -u scripts/supervise.py --run campaign_gates '
             "--config configs/campaign_gates_main.yaml --count 12 --monitor 1 >> runs\\campaign_gates_supervisor.log")
@@ -54,7 +55,7 @@ TRAINER_TREE = [
     Proc(30024, 32324, CMD_WORKER),
     Proc(5016, 32324, CMD_WORKER),
 ]
-HELPERS = [Proc(13504, 4728, CMD_POLL), Proc(21572, 20576, CMD_KEEP_BEST)]
+HELPERS = [Proc(13504, 4728, CMD_POLL), Proc(21572, 20576, CMD_KEEP_BEST), Proc(21800, 20580, CMD_MEM_GUARD)]
 BYSTANDERS = [
     Proc(SELF_PID, 111, CMD_SELF),
     Proc(1234, SELF_PID, CMD_QUERY),
@@ -313,7 +314,7 @@ def test_missing_helpers_are_started_and_running_ones_are_not_duplicated():
     h = harness(BYSTANDERS + TRAINER_TREE, Status(12.0, "running", 6_901_546))
     assert h.sup.tick() == "ok"
     assert sorted(Path(c.split(" -u ")[1].split()[0]).name for c in h.spawned) == \
-        ["keep_best.py", "poll_status.py"]
+        ["keep_best.py", "mem_guard.py", "poll_status.py"]
     h2 = harness(BYSTANDERS + TRAINER_TREE + HELPERS, Status(12.0, "running", 6_901_546))
     assert h2.sup.tick() == "ok" and h2.spawned == []
 
