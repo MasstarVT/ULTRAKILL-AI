@@ -832,7 +832,7 @@ def test_a_single_laggard_port_is_repaired_instead_of_failing_the_whole_launch()
     state = {"open": {47801, 47802}, "repairs": []}
     original = (games.listening_ports, games.running_pids, games.relaunch_one, games.kill_unlistening,
                 games.stop_all, games.start_instance, games.backup_display, games.tile, games.game_dir,
-                games.time.sleep, games.disk_logging_enabled)
+                games.time.sleep, games.disk_logging_enabled, games.record_instance_flags)
 
     def repair(port, *a, **kw):
         state["repairs"].append(port)
@@ -850,13 +850,18 @@ def test_a_single_laggard_port_is_repaired_instead_of_failing_the_whole_launch()
     games.game_dir = lambda: Path(__file__).resolve().parent
     games.disk_logging_enabled = lambda path: False
     games.time.sleep = lambda s: None
+    # This test drives the REAL `games.launch`, and `launch` records the per-port Steam flags to
+    # `python/runs/instance_flags.json` -- live state that the running 12-game run reads back during a
+    # recovery. A no-game test must not write there; caught when this test's three fake ports turned up in
+    # the file of a real one-game launch.
+    games.record_instance_flags = lambda ports, no_steam: None
     try:
         (games.game_dir() / "ULTRAKILL.exe").write_bytes(b"")
         games.launch(3, 47800, 368, 207, 0.0, 0.0, None, 3)
     finally:
         (games.listening_ports, games.running_pids, games.relaunch_one, games.kill_unlistening,
          games.stop_all, games.start_instance, games.backup_display, games.tile, games.game_dir,
-         games.time.sleep, games.disk_logging_enabled) = original
+         games.time.sleep, games.disk_logging_enabled, games.record_instance_flags) = original
         (Path(__file__).resolve().parent / "ULTRAKILL.exe").unlink(missing_ok=True)
     assert state["repairs"] == [47800], "only the port that did not come up was restarted"
 

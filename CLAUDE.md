@@ -18,8 +18,9 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - `Env/EpisodeController.cs`: lockstep, resets, time settings, and the `unwedge` / `unwedge_frames` config keys.
   - `Act/ActionInjector.cs`: virtual Input System keyboard and mouse; camera look via `CameraController.rotationX/Y`.
   - `Obs/ObservationBuilder.cs`: raw game-state snapshot. `ground_ray_center` (a single ray straight down from the player, outside the 8-ray ring and outside the array, so the packed size stays 479) and the raw movement flags `player.slow_mode` / `heavy_fall` / `crouching` (`crouching` is private, read with `AccessTools` and degrading to `false` with one warning).
-  - `Obs/CampaignObserver.cs`: the obs `campaign` block in the 35 main levels (exit, checkpoints, NavMesh path to the exit, locked doors, arena enemies, milestone keys, rank thresholds); room templates are skipped by `CheckPoint.defaultRooms` ancestry. Since v0.6.0 also the **route**: `campaign.gates`, the door graph built from `Door.activatedRooms` and BFS'd from the exit's room, plus `gates_ordered` / `gates_truncated` (see the gates gotcha), and a `ChooseExit` that drops secret-level pits and prefers the mission successor, frozen per level load. Since v0.7.0 (branch `next-levels`) also the **skull carry**: `campaign.altars[]`, `campaign.items[]` and `gates[].needs_item`, one shared door-key table so an altar's door key string-matches a gate key by construction, a phase-2 gate pass that appends altar-driven one-room doors as `altar_only` gates, and a `ChooseExit` that drops `Level P-` Prime Sanctum pits, counts an `Intermission*` target as leading onward and warns once per level load on a rank tie. Branch `skull-fixes` adds `altars[].aim_pos` (the zone's own collider centre, which is what a placement punch has to hit) and replaces the dead-twin filter with the relative `IsDeadTwin` rule. See the branch entries under Status.
+  - `Obs/CampaignObserver.cs`: the obs `campaign` block in the 35 main levels (exit, checkpoints, NavMesh path to the exit, locked doors, arena enemies, milestone keys, rank thresholds); room templates are skipped by `CheckPoint.defaultRooms` ancestry. Since v0.6.0 also the **route**: `campaign.gates`, the door graph built from `Door.activatedRooms` and BFS'd from the exit's room, plus `gates_ordered` / `gates_truncated` (see the gates gotcha), and a `ChooseExit` that drops secret-level pits and prefers the mission successor, frozen per level load. Since v0.7.0 (branch `next-levels`) also the **skull carry**: `campaign.altars[]`, `campaign.items[]` and `gates[].needs_item`, one shared door-key table so an altar's door key string-matches a gate key by construction, a phase-2 gate pass that appends altar-driven one-room doors as `altar_only` gates, and a `ChooseExit` that drops `Level P-` Prime Sanctum pits, counts an `Intermission*` target as leading onward and warns once per level load on a rank tie. Branch `skull-fixes` adds `altars[].aim_pos` (the zone's own collider centre, which is what a placement punch has to hit) and replaces the dead-twin filter with the relative `IsDeadTwin` rule. See the branch entries under Status. **Since v0.7.1 the chosen exit is RE-RESOLVED on every `Scan` (`ResolveExit`)** instead of the reference being cached: `CheckPoint.Start` clones the exit's room and banishes the original +10,000 on x, so a cached reference followed the banished twin. The choice *rule* (`ChooseExitByRule`) still runs once per level load — its rank reads `activeInHierarchy` and every gate's hops are measured from the chosen pit's room — but what it freezes is the pit's `targetLevelName` plus the position it was picked at, and each scan re-attaches that verdict to the live pit nearest that anchor (the clone is 0 m away, the banished twin 10,000 m). Python's `ExitGuard` stays as the older stopgap.
   - `Env/SafetyPatches.cs`: blocks leaderboard submissions.
+  - `Env/SteamPatches.cs` (v0.7.1): under `-aibridge-nosteam`, a Harmony prefix that skips Facepunch's `SteamClient.Init(uint, bool)`, so the instance never registers with Steam. Reported in the handshake as `steam_hidden` (whether the skip is in place, not merely asked for). One patch is enough because `Init` is the only thing that calls `SteamAPI.Init()` and every consumer gates itself on `SteamClient.IsValid`; the audit is in `docs/game-internals.md`. Applied inside its own try/catch in `Plugin.Awake`, so losing invisibility can never cost the bridge.
   - `Env/TimePatches.cs`: frame-based hitstop during lockstep.
   - `Env/BackgroundPatches.cs`: keeps the cursor free and audio muted while the AI has control.
   - `Env/TrainingSpeed.cs`: soft death (Harmony prefix on `NewMovement.GetHurt` heals instead of a lethal hit, counted in obs `player.soft_deaths`), camera disabling, and enemy Animators set to `AlwaysAnimate`. Since v0.7.0 `ForcePlayerAnimators` also forces `AlwaysAnimate` on every Animator under `FistControl` and `CameraController` while rendering is disabled, because `Punch.ActiveStart` / `ActiveEnd` are Unity **AnimationEvents** with no C# caller: a culled fist Animator means nothing can ever be picked up under `render: false`. Its cache is keyed on the two singleton instance ids **plus every direct child's**, and it re-walks when any forced Animator has become null, because `FistControl.ResetFists` replaces the arms mid-level (an arm pickup) without changing the child count. Also `UnwedgePatch`, a separate Harmony class (so a game update renaming the private method it binds cannot take soft death down with it): a postfix on the private `NewMovement.HandleSlideState` that breaks the absorbing airborne `slowMode` state. See the wedge gotcha.
@@ -511,6 +512,23 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   2. `python scripts/train.py --config configs/cybergrind.yaml --resume models/cybergrind_ppo_v2/best.zip` (`num_envs` 5 in config; `timesteps` is the run total, so resuming trains only the rest; drop `--resume` for a fresh run, and give it a new `run_name` so `status.json` does not inherit the old episodes)
   3. `python scripts/games.py stop`
   - `python scripts/games.py status` is safe during training (it reads netstat, it does not connect).
+- **Training is hidden from Steam** (user instruction, 2026-09-17; mod v0.7.1). `games.py launch` and
+  `relaunch`, and every game `supervise.py` starts, add `-aibridge-nosteam`, so a training copy never
+  registers with Steam: no playtime is credited and Steam does not list ULTRAKILL as running. `launch` prints
+  `Launching N instance(s) HIDDEN from Steam` and the handshake carries `steam_hidden`.
+  - **`--steam` is the opt-out**, on `games.py launch`, `games.py relaunch` and `supervise.py`. `--no-steam`
+    is accepted everywhere as a **no-op alias** (it was the opt-IN for about an hour on 2026-09-17), so an old
+    command line still means hidden rather than failing to parse.
+  - `launch` writes the per-port flags to `python/runs/instance_flags.json` and `relaunch_one` reads them back,
+    so **the env's own-game recovery rebuilds the same command line**: a recovery cannot silently change
+    whether Steam can see that game. It has to be a file — the recovery runs in an SB3 worker that never
+    called `launch`, in another process. A no-game test must never write that file: `test_freeze_recovery.py`
+    drives the real `games.launch` and now stubs `record_instance_flags` for exactly this reason.
+  - **To switch a running setup** (the config lives on the SUPERVISOR's command line, so this restarts it):
+    `New-Item runs\campaign_gates\SUPERVISOR_PAUSE` → stop `supervise.py` → kill the `train.py` /
+    multiprocessing / `poll_status.py` processes → `python scripts/games.py stop` →
+    `Remove-Item runs\campaign_gates\SUPERVISOR_PAUSE` → start the supervisor again, with or without
+    `--steam`. Nothing hides or unhides a game in place; only a relaunch does.
 - **Campaign training — the live run. `configs/campaign_gates_main.yaml`, run `campaign_gates`, TWELVE games**
   (since integration pause #2, 2026-09-17; it uses every game, so Cyber Grind stays paused). This is the same run
   that started on 0-1: same `run_name`, same `models/campaign_gates/`, same weights, now a **curriculum** over
@@ -853,6 +871,20 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
   - Launching the exe directly works (Facepunch `SteamClient.Init`; the launcher sets `SteamAppId`).
   - The game re-applies resolution from `LocalPrefs.json` in `InitGame` at startup, so Unity's registry `Screenmanager*` values barely matter.
   - BepInEx writes `LogOutput.log.1..3` for extra instances.
+- **Steam only credits playtime for instances it can SEE, and since 2026-09-17 training is not one of them.**
+  Registering with Steam happens in exactly one place — Facepunch's `SteamClient.Init` calling
+  `SteamAPI.Init()` — and mod v0.7.1's `-aibridge-nosteam` skips it, which `games.py`/`supervise.py` now pass
+  by default. So **no training hours are credited to ULTRAKILL on Steam**, and Steam does not show the game as
+  running while twelve copies train. **Your own sessions are unaffected**: nothing adds the flag to a game
+  started from Steam or from the launcher, and the patch is per-process, applied at `Plugin.Awake` from that
+  process's own command line. `--steam` puts a training launch back on the books.
+  - **How to check what Steam believes**, without reading the client UI: `HKCU\Software\Valve\Steam\Apps\1229490\Running`
+    (and `HKCU\Software\Valve\Steam\RunningAppID`). Measured 2026-09-17 with the Steam client up: 0 with no game,
+    **1 / 1229490** about 10 s after a `--steam` instance passes ~1 GB working set, and **0 for the whole two
+    minutes** a hidden instance sat fully booted at ~950 MB. The value lags the launch by a boot, so reading it
+    the instant a port opens proves nothing — wait for the working set.
+  - Not verified: the Steam client's own window and tray, which are GUI state this session could not read.
+    The registry pair above is what was measured, plus the mod's in-band `steam_hidden` in the handshake.
 - **The five-copy cap was BepInEx's disk log, not the game (measured and lifted 2026-09-17).** BepInEx's
   `DiskLogListener` opens `LogOutput.log` plus `.1`-`.4`, so a sixth copy could not open a log file and the
   plugin never loaded. Setting `[Logging.Disk] Enabled = false` in
@@ -1051,7 +1083,7 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
 - **Aim shaping needs a gradient (1.9M steps):** a cone-only aim reward paid zero beyond the cone, and the agent was inside it 0.8% of the time, so raising the weight (0.06 → 0.15) changed nothing (on-target went 1.1% → 0.8%). `aim` is now a slope from facing away (0) to facing straight at the nearest visible enemy, with `aim_locked` extra inside the cone.
 - **Weight audit at 2.3M steps (why it never aims):** probing the policy offline and simulating its look dynamics from the weights alone reproduces the live stats (enemy angle 89°, on-target 0%, aim 0.040 per visible step, vs 88.8°, 0.9%, 0.041 in training). The pitch head has carried a constant +3°/step bias since ~300k steps, independent of weapon, health and enemy position, so within 5 game seconds the camera pins at the +90° clamp (the sky) and every enemy sits ~90° off the crosshair whatever the yaw does. Under random yaw the aim slope pays the same 0.5 level or pinned, so nothing ever corrected the drift. The yaw head only began tracking enemies in the last 300k steps (corr(rel.x, E[yaw]) 0 → 0.39, right sign) and the pin masks it: with pitch forced level the same weights are on target 12% of steps. The rest of the policy is fire always, dash often, lean backwards (entropy 11.7 → 5.9). Updates are noise-dominated: Adam gradient SNR sits at the noise floor and the checkpoint-to-checkpoint weight drift is a random walk (path/net ≈ 6–8 ≈ √40 over 40 checkpoints). Candidate fixes: clamp or auto-level pitch in Cyber Grind, penalise |pitch|, or split the aim reward into yaw and pitch terms.
 - **Pitch fix (2.30M–2.45M steps):** `pitch_limit_deg` clamps the camera to within a band of level on the Python side (the pitch command is trimmed against the last observed pitch, so no mod change and the camera snaps back into the band in one step), and the aim reward is split per look axis so each head gets its own gradient: `aim_yaw` 0.06 on the ground-plane heading error and `aim_pitch` 0.06 on the enemy elevation in camera space, with `aim` 0 and `aim_locked` unchanged. New per-episode diagnostics `pitch_abs_mean` and `enemy_yaw_angle_mean` flow into status.json and the dashboard Shooting panel. A first pass with a 40° band did not help by itself: after 150k steps the policy just leaned on the new edge (pitch 35°, on-target 1.6%), which still put eye-level enemies outside the aim cone and the hitbox. So the band is now 15° and the pitch head of `ckpt_2447005` was zeroed (output rows, bias and their Adam moments, giving uniform pitch actions) into `models/cybergrind_ppo/pitch_reset_2447005.zip`. That resume ran only minutes before the decision to start v2 fresh instead. Expected for v2: camera pitch under 15°, on-target climbing from ~1% (random heading alone gives ~8% inside 15°, and the same weights reached 12% with a level camera), then kills/min.
-- **Mod:** v0.6.0 (background play, training instances, teleport, soft death, rendering off; campaign block, `difficulty` and `unlock_all_gear` config, `kill` debug command, `player.slot_counts`, game-initiated restarts blocked while in control; **the `campaign.gates` route block with its room-graph BFS, the `ChooseExit` secret-pit and mission-successor fix frozen per level load, `ground_ray_center`, `player.slow_mode`/`heavy_fall`/`crouching`, and the `UnwedgePatch` postfix with its `unwedge` / `unwedge_frames` config keys**). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block, and every v0.6.0 addition (acceptance A1-A12 under Status). Protocol version is still **1**: obs gains fields, nothing is removed or changed.
+- **Mod:** v0.6.0 (background play, training instances, teleport, soft death, rendering off; campaign block, `difficulty` and `unlock_all_gear` config, `kill` debug command, `player.slot_counts`, game-initiated restarts blocked while in control; **the `campaign.gates` route block with its room-graph BFS, the `ChooseExit` secret-pit and mission-successor fix frozen per level load, `ground_ray_center`, `player.slow_mode`/`heavy_fall`/`crouching`, and the `UnwedgePatch` postfix with its `unwedge` / `unwedge_frames` config keys**). Verified in game: plugin load, handshake, Cyber Grind reset, movement/look/jump/dash, observations (enemies, waves, damage, death), leaderboard block, and every v0.6.0 addition (acceptance A1-A12 under Status). Protocol version is still **1**: obs gains fields, nothing is removed or changed. **Installed version is now v0.7.1** (see the 0.7.1 entry at the end of Status).
 - **Python:** env, training and eval verified against a mock and partly in game; campaign episodes verified against a fake level (`tests/test_campaign_env.py`).
 - **In game:** `UltrakillEnv` auto-enters the Cyber Grind arena on reset (`auto_enter_arena`). The random-agent smoke test passes at about 70 steps/s.
 - **Training:** first Cyber Grind PPO run (`cybergrind_ppo`) started 2026-09-15 and was abandoned at 2.45M steps after the weight audit: its updates had been noise-dominated and it carried locked-in reflexes (fire always, dash, walk backwards, look up), so a resume was not worth the carry-over.
@@ -2502,4 +2534,45 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     7. **Confirm within ten minutes**: `runs/campaign_gates_train.log` is **growing** (it is the regression test
        for the detached-spawn fix and had been dead for seven hours), twelve `runs/campaign_gates/env_*.log`
        files exist and are each getting `reset_start`/`reset_end` pairs, and `status.json`'s `timesteps` is
-       climbing. Rollback is steps 1-2 and 4-6 with `git revert` of the merge.
+       climbing. Rollback is steps 1-2 and 4-6 with `git revert` of the merge.- **Mod v0.7.1 — released and installed 2026-09-17, during a 9-minute planned pause.** Two changes plus the
+  Python plumbing for the first. The 12-game `campaign_gates` run went down at 20:24:43 and was stepping again
+  by ~20:33, resuming from `ckpt_10153414_steps.zip` (the live run was at 10,163,902 when it was paused, so
+  ~10.5k steps were lost — well inside the documented 50k).
+  1. **`-aibridge-nosteam`: training is hidden from Steam, by default.** A Harmony prefix on Facepunch's
+     `SteamClient.Init(uint, bool)` skips the call, so `SteamAPI.Init()` never runs and a running Steam client
+     never learns the app is live. **Why one patch is the whole job** (audited against the shipped
+     `Facepunch.Steamworks.Win64.dll` and `decompiled/`, written up in `docs/game-internals.md`): `Init` is the
+     only thing that registers; `SteamClient.RestartAppIfNecessary` is **never called** anywhere in the game;
+     there is **no `steam_appid.txt`** (Facepunch's own `Init` sets the appid env var, which is why launching
+     the exe directly works at all); and every consumer — rich presence, user stats, UGC playtime tracking,
+     `Shutdown`, the leaderboards — gates itself on `SteamClient.IsValid`, which *is* the private `initialized`
+     flag `Init` sets. So skipping it switches all of them off by their own code. The two `SteamClient.SteamId`
+     reads that are not directly gated sit behind `LeaderboardsSupported` and behind `SafetyPatches`.
+     - **Verified in game.** Control, launched with `--steam`: `HKCU\...\Apps\1229490\Running` went 0 → **1**
+       and `RunningAppID` → **1229490**, about 10 s after the copy passed ~1 GB working set. Hidden, the new
+       default: the copy reached ~950 MB and `Running`/`RunningAppID` stayed **0 / 0 for the whole two minutes**
+       it was polled; all twelve training games then came up hidden and Steam still read 0. In band, the
+       handshake reported `mod 0.7.1 ... steam_hidden True`, and that instance loaded `Level 0-2`, teleported,
+       stepped and activated a checkpoint normally — so the game runs fine without Steam.
+     - **Not verified:** the Steam client's own window and tray. That is GUI state this session could not read;
+       the registry pair and `steam_hidden` are what was measured.
+  2. **The exit is re-resolved on every `Scan`** (`CampaignObserver.ResolveExit`) — the proper fix behind
+     Python's `ExitGuard` stopgap, which stays. **Verified on `Level 0-2` against the RAW bridge** (deliberately
+     not through `UltrakillEnv`, whose `ExitGuard` would have masked the regression): fresh load
+     `exit (-199.0, -86.1, 277.0)`, teleport onto checkpoint `-55,-11,277`, activated in 1 decision, 20 further
+     steps so a rescan lands — `exit (-199.0, -86.1, 277.0)`, **moved 0.0 m**. Before the fix that read
+     `(9801, -86.1, 277)`.
+  3. **0-1 regression, `campaign_check.py --level "Level 0-1"`:** 1 level load PASS | 2 arsenal SKIP |
+     3 checkpoint PASS | 4 death respawn PASS | 5 exit FAIL | **6 gates PASS — 11 gates, hops 0..9 (10
+     distinct), 0 unordered, unchanged across a respawn**. Check 5's FAIL is the long-standing teleport-onto-a-
+     collider-in-a-switched-off-room artifact (see its gotcha), not a regression.
+  - **A no-game test was writing live state, found by this change and fixed.**
+    `test_freeze_recovery.py::test_a_single_laggard_port_is_repaired_instead_of_failing_the_whole_launch`
+    drives the REAL `games.launch`, so once `launch` began recording `runs/instance_flags.json` that test's
+    three fake ports landed in the file a live twelve-game run reads back during a recovery. Caught because a
+    one-game launch produced a file listing 47800-47802. The test now stubs `record_instance_flags`. Worth
+    remembering as a class: a test that calls a real entry point inherits every side effect that entry point
+    later grows.
+  - Evidence: mod builds clean, and the full no-game suite green twice (before and after the install) —
+    **22 files, 554 named tests, 0 failures** (6 new: 5 in `test_games.py` for the flag, the flags file and the
+    retired alias, 1 in `test_supervise.py` for the supervisor's launches).
