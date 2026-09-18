@@ -348,21 +348,18 @@ def test_the_collapsed_levels_that_ship_are_the_two_the_lead_approved():
 #
 #   level -> (tour_ratio, legs_witnessed, checkpoints_within_60m, last_rung_to_exit_m, [rungs])
 EXPECTED_LADDERS = {
-    # The two collapsed-ladder levels. 0-3's trunk is the level's real walking order -- the gate
-    # ladder's own hops along it run 2,2,3,4,5,6,4,4,3,2,0, which is the collapse itself.
-    "Level 0-3":   (0.944, "9/11", "4/4", 119.7, [
+    # The two collapsed-ladder levels. 0-3 ships FOUR of the survey's eleven rooms: 'Double Down'
+    # forks into Path 1 (y 5 -> -15) and Path 2 (y 50), guard T cannot see a fork spelled mid-name,
+    # and the generator chained the two mutually exclusive branches in series. The seven rungs of that
+    # side wing were dropped on 2026-09-18 by the `drop` list in rung_overrides.json; the four here
+    # are the ones the level's only recorded completions credited (gates_reached 3 and 4, never more).
+    # `test_the_0_3_wing_stays_off_the_route` below names them individually.
+    "Level 0-3":   (1.000, "2/4", "1/4", 119.7, [
         "0,-10,300  1 - Main Room - Floor 1",
         # Moved from the room centroid 0,10,331 by route_overrides.json, 2026-09-18: the centroid sat
         # 1.5 m past the main room's far wall (z 329.5), so the reach cylinder covered the wall face
         # and the rung was credited from the air on the main-room side. See the override's `why`.
         "0,10,340  2 - Side Hallway - Floor 1",
-        "0,10,362  3 - Side Arena - Floor 1",
-        "0,10,403  4 - Side Stairway - Floor 1-2",
-        "-26,5,413  5 - Path 1 - First Encounter",
-        "-87,-15,413  6 - Path 1 - Boss Arena",
-        "11,50,413  7 - Path 2 - Menacing Room",
-        "116,50,449  8 - Path 2 - Menacing Hallway",
-        "76,50,397  9 - Windtunnel",
         "0,50,330  10 - Main Room - Floor 2",
         "-82,90,315  10B - Second Encounter + 11 - Boss Arena - Floor 2",
     ]),
@@ -497,7 +494,7 @@ EXPECTED_LADDERS = {
     ]),
 }
 
-TOTAL_RUNGS = 114  # 95 over the twelve unrouted levels, plus 0-3's 11 and 4-3's 8
+TOTAL_RUNGS = 107  # 95 over the twelve unrouted levels, plus 0-3's 4 and 4-3's 8
 
 
 def test_the_ladder_table_covers_exactly_the_shipped_levels():
@@ -583,6 +580,18 @@ def test_every_override_is_present_in_the_file_that_ships():
         rungs = {r["name"]: r for r in docs_by_level[level]["rungs"]}
         for entry in entries:
             name = entry["name"]
+            if entry.get("drop"):
+                # The other kind of entry, and the same detector the other way round: a drop that
+                # stopped being applied would put the rung back on the route in silence.
+                assert name not in rungs, \
+                    "%s override asks to drop %r, which is still a rung in the shipped file -- the " \
+                    "regeneration did not apply it (check --validate for a REFUSED note)" % (level, name)
+                assert "pos" not in entry and "was" not in entry, \
+                    "%s %r is a drop entry and must carry neither `pos` nor `was`" % (level, name)
+                assert name in (docs_by_level[level].get("trunk_dropped") or ()), \
+                    "%s drops %r but the shipped file does not record it in `trunk_dropped`" \
+                    % (level, name)
+                continue
             assert name in rungs, \
                 "%s override names %r, which is not a rung in the shipped file" % (level, name)
             got = rungs[name]["pos"]
@@ -595,6 +604,58 @@ def test_every_override_is_present_in_the_file_that_ships():
                 "%s %r: route positions are stored to 0.1 m" % (level, name)
             assert rungs[name]["key"] == ",".join(str(int(round(v))) for v in got), \
                 "%s %r: the key does not match its own position" % (level, name)
+
+
+WING_0_3 = ("3 - Side Arena - Floor 1", "4 - Side Stairway - Floor 1-2",
+            "5 - Path 1 - First Encounter", "6 - Path 1 - Boss Arena",
+            "7 - Path 2 - Menacing Room", "8 - Path 2 - Menacing Hallway", "9 - Windtunnel")
+
+
+def test_the_0_3_wing_stays_off_the_route():
+    """`test_only_the_trunk_ships` CANNOT catch 0-3, which is why this row exists beside it.
+
+    Guard T collapses a parallel branch only when the branch marker is a LEADING letter
+    (`RX_G_BR = ^([A-Z])(\\d{1,2})\\s*-\\s+`). 0-3 spells its fork in the middle of the room name --
+    `5 - Path 1 - First Encounter` against `7 - Path 2 - Menacing Room` -- so every one of its rooms
+    parses as a plain ordinal with an empty suffix, no rung is kind `branch`, and that test's
+    `len(prefixes) <= 1` is vacuous on exactly the level that needed it. The two mutually exclusive
+    branches therefore shipped chained in series until 2026-09-18.
+
+    Measured before the drop: 238 fresh `spec_0-3` episodes over 2.83M steps, zero fresh completions,
+    115 of them (48%) walking the wing to `7 - Path 2 - Menacing Room` for 7 x 15.0 = 105 reward --
+    more than the 100.0 `level_complete` pays -- and 200 of the 263 episodes that got there ending
+    back in the Path 1 bowl. All four recorded 0-3 completions credited 3 or 4 rungs and none of them
+    ever entered the wing. Restoring any of these seven re-creates that trade.
+    """
+    doc = shipped_docs()["Level 0-3"]
+    names = {r["name"] for r in doc["rungs"]}
+    for banned in WING_0_3:
+        assert banned not in names, "0-3 ships %r again; see rung_overrides.json" % banned
+    assert [r["name"] for r in doc["rungs"]] == [
+        "1 - Main Room - Floor 1", "2 - Side Hallway - Floor 1", "10 - Main Room - Floor 2",
+        "10B - Second Encounter + 11 - Boss Arena - Floor 2"], [r["name"] for r in doc["rungs"]]
+    assert sorted(doc["trunk_dropped"]) == sorted(WING_0_3), doc["trunk_dropped"]
+
+
+def test_a_drop_entry_names_a_room_that_was_really_there():
+    """The drop list is measured against a SHAPE, so a name that never appears in the survey's trunk
+    for that level is a typo the generator cannot tell from a room the guards took first: both look
+    like 'no rung named X'. `build_routes.py` REFUSES such an entry rather than ignoring it, and
+    `--validate` turns the refusal into a non-zero exit -- but that needs the scene bundles, so pin
+    the one thing that can be checked offline: every dropped name is recorded by the file that ships,
+    and no name is both dropped and kept."""
+    for level_short, entries in overrides().items():
+        doc = shipped_docs()["Level %s" % level_short]
+        dropped = [e["name"] for e in entries if e.get("drop")]
+        assert len(set(dropped)) == len(dropped), "Level %s drops a name twice: %r" % (level_short,
+                                                                                       dropped)
+        recorded = list(doc.get("trunk_dropped") or ())
+        assert sorted(recorded) == sorted(dropped), \
+            "Level %s drops %r but the file records %r" % (level_short, sorted(dropped),
+                                                           sorted(recorded))
+        kept = {r["name"] for r in doc["rungs"]}
+        assert not (set(dropped) & kept), \
+            "Level %s both drops and ships %r" % (level_short, sorted(set(dropped) & kept))
 
 
 def test_no_two_rungs_of_an_overridden_level_share_a_cylinder():

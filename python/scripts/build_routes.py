@@ -127,6 +127,22 @@ PIT_MAX_M = 70.0        # spec 7.1 test 9: a rung named `Pit` may only be hops 0
 #      written. If the generator no longer produces that position the rooms have MOVED, the
 #      hand-picked point is no longer known to be inside the room, and the override is REFUSED with
 #      a loud note that `--validate` turns into a failure. A stale override is worse than none.
+#
+# An entry of the second kind, `{"name": ..., "drop": true, "why": ...}`, REMOVES a rung instead of
+# moving one (`apply_drops`). It exists because guard T cannot see every parallel branch: RX_G_BR
+# matches a LEADING branch letter ("A1 - ..."), so a fork spelled in the MIDDLE of the room name --
+# `0-3`'s `5 - Path 1 - First Encounter` against `7 - Path 2 - Menacing Room` -- parses as a plain
+# ordinal and the two mutually exclusive branches ship chained in series, as one 688 m trunk the
+# agent is paid 15.0 a rung to walk end to end. Fixing the detector is a separate, campaign-wide
+# change; this is the level-local escape hatch, and it obeys three rules of its own:
+#
+#   4. it is applied between I2 and R1, not last, so R1 re-counts what actually ships and `hops` is
+#      still assigned from the surviving row order -- a drop cannot leave a gap in the ladder;
+#   5. it matches by room NAME like a move. A name that is no longer a rung is REFUSED rather than
+#      ignored, because the shape it was measured against has changed;
+#   6. if the drops would take a level under MIN_RUNGS the WHOLE list for that level is refused and
+#      the generated trunk ships unchanged. A short route is not a route, and silently falling to the
+#      gate ladder is not what a drop list asks for.
 OVERRIDES_NAME = "rung_overrides.json"  # NOT route_*.json: that glob is the route files themselves
 OVERRIDE_WAS_TOL_M = 1.0  # rule 3: how far the generator's own position may drift and still match `was`
 
@@ -171,7 +187,13 @@ EXPECTED_SHAPE = {
     # survey printed room by room: 11 rungs from `1 - Main Room - Floor 1` to the merged
     # `10B - Second Encounter + 11 - Boss Arena - Floor 2`, in the order the level is actually walked
     # (the gate ladder's own hops along it run 2,2,3,4,5,6,4,4,3,2,0 -- which is why it collapses).
-    "0-3": (11, 64.9, 117.6, 0.944, "9/11", "4/4", 119.7),
+    # 0-3 ships FOUR rungs, not the survey's eleven: the seven between them are the level's side wing,
+    # removed by the `drop` list in rung_overrides.json on 2026-09-18 after 238 fresh specialist
+    # episodes walked it for 105 reward apiece and completed the level zero times. Read that entry's
+    # `why` before touching this row. checkpoints_within_60m falls 4/4 -> 1/4 and legs_witnessed 9/11
+    # -> 2/4 because three of the level's four checkpoints are IN the wing; both are diagnostics, and
+    # what they now say is true -- the route no longer passes them.
+    "0-3": (4, 44.7, 92.5, 1.000, "2/4", "1/4", 119.7),
     "4-3": (8, 64.8, 249.8, 1.000, "6/8", "3/3", 218.5),
     "0-5": (5, 46.5, 137.2, 1.000, "3/5", "1/1", 211.1),
     "1-4": (4, 81.2, 117.0, 1.000, "2/4", "2/2", 149.5),
@@ -2072,6 +2094,8 @@ def apply_overrides(lvl, rows, overrides, geom=None):
     by_name = {r["name"]: r for r in rows}
     moved = []
     for entry in overrides.get(lvl, ()):
+        if entry.get("drop"):
+            continue  # `apply_drops` already handled it, between I2 and R1
         name, want, was = entry.get("name"), entry.get("pos"), entry.get("was")
         row = by_name.get(name)
         if row is None:
@@ -2114,6 +2138,45 @@ def apply_overrides(lvl, rows, overrides, geom=None):
                          % (lvl, row["name"], [round(v, 1) for v in before], want,
                             why or "no reason recorded"))
     return rows, notes
+
+
+def apply_drops(lvl, rows, overrides):
+    """Rules 4-6: remove the rungs an entry marks `"drop": true`. Returns (rows, notes, dropped).
+
+    Called between I2 and R1 so the count R1 guards is the count that ships, and so `hops` -- which
+    `build_level` assigns from the surviving row order -- stays a gapless 0..n-1 whatever is removed.
+    Matching is by room NAME, the only identity that survives a regeneration; a name that is not a
+    rung is a REFUSED note, which `--validate` turns into a non-zero exit.
+
+    The all-or-nothing floor is rule 6: a list that would take the level under MIN_RUNGS is dropped
+    entirely and the generated trunk ships untouched, because `_parse_route` reads a sub-minimum file
+    as NO file and the level would fall to its gate ladder -- a much larger change than a drop list
+    is allowed to make by accident.
+    """
+    wanted = [e for e in overrides.get(lvl, ()) if e.get("drop")]
+    if not wanted:
+        return rows, [], []
+    have = {r["name"] for r in rows}
+    notes, names = [], []
+    for entry in wanted:
+        name = entry.get("name")
+        if name not in have:
+            notes.append("drop REFUSED: %s has no rung named %r (a guard may have taken it already, "
+                         "or the room was renamed) -- re-measure the drop list" % (lvl, name))
+            continue
+        names.append(name)
+    if not names:
+        return rows, notes, []
+    kept = [r for r in rows if r["name"] not in set(names)]
+    if len(kept) < MIN_RUNGS:
+        notes.append("drop REFUSED: %s would keep %d rungs, under R1's %d -- the whole drop list for "
+                     "this level is ignored and the generated trunk ships" % (lvl, len(kept), MIN_RUNGS))
+        return rows, notes, []
+    for entry in wanted:
+        if entry.get("name") in names:
+            notes.append("drop applied: %s %r (%s)"
+                         % (lvl, entry["name"], entry.get("why") or "no reason recorded"))
+    return kept, notes, names
 
 
 # ============================================================================ 7. one level
@@ -2180,6 +2243,10 @@ def build_level(lvl, probe=True, analyse_gates=False, overrides=None):
     drop_r4 = [r["name"] for r in rows if r["name"] in bad]
     rows = [r for r in rows if r["name"] not in bad]
     rows, merges = guard_i2(rows)                                        # I2
+    # Rules 4-6: the manual drops go HERE, between I2 and R1, so R1 counts what ships and the `hops`
+    # assigned from the row order below stays gapless. See the OVERRIDES_NAME comment.
+    rows, drop_notes, drop_manual = apply_drops(lvl, rows, overrides or {})
+    rep["notes"] = list(rep["notes"]) + drop_notes
     r1 = len(rows) >= MIN_RUNGS                                          # R1
     rows, drop_i3 = guard_i3(rows)                                       # I3
     # Rule 1: the manual overrides go LAST, after every guard and before every measurement below, so
@@ -2191,7 +2258,7 @@ def build_level(lvl, probe=True, analyse_gates=False, overrides=None):
     rows, override_notes = apply_overrides(lvl, rows, overrides or {},
                                            geom=LevelGeom(sc, ress) if probe else None)
     rep["notes"] = list(rep["notes"]) + override_notes
-    rep["override_refused"] = [n for n in override_notes if "REFUSED" in n]
+    rep["override_refused"] = [n for n in (drop_notes + override_notes) if "REFUSED" in n]
     tour = tour_ratio(rows)                                              # R2
     r2 = tour <= MAX_TOUR
 
@@ -2222,6 +2289,7 @@ def build_level(lvl, probe=True, analyse_gates=False, overrides=None):
         "ships": bool(r1 and r2 and (not gate["pass"] or collapsed_ship)),
         "rungs": len(rows),
         "drop_i6": drop_i6, "drop_trunk": drop_t, "drop_r4": drop_r4, "drop_i3": drop_i3,
+        "drop_manual": drop_manual,
         "merges": merges,
         "tour": round(tour, 3),
         "med_gap": round(statistics.median(gaps), 1) if gaps else 0.0,
@@ -2246,6 +2314,9 @@ def build_level(lvl, probe=True, analyse_gates=False, overrides=None):
         "exit": {"pos": exit_pos, "target": trunk.exit["target"]},
         "start_room": rep["start_room"],
         "trunk_collapsed": [nm for _why, nm in drop_t],
+        # Emitted only when a drop list was applied, so the thirteen files with none are byte for byte
+        # what they were. A four-rung 0-3 next to an eleven-room survey has to say so in the file.
+        **({"trunk_dropped": list(drop_manual)} if drop_manual else {}),
         "tour_ratio": round(tour, 3),
         "checkpoints_within_60m": rep["checkpoints_within_60m"],
         "legs_witnessed": rep["legs_witnessed"],
