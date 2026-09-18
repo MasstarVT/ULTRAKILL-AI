@@ -1774,11 +1774,13 @@ current state.
     two FAIL lines ("the gates guard passes on 1 levels, not the measured 18" and the EXPECTED_SHAPE /
     EXPECTED_SHIPPED ordering) are **pre-existing on main for any single-level `--validate`** -- verified by
     running the identical command on the unmodified main tree, which prints the same two lines and exits 1.
-  - **What to watch, and the honest limit.** Baseline read minutes before the bounce: `spec_0-3` ts
-    **21,588,202**, `mean_100.exit_ground_dist_min` **129.44 m**, `mean_fresh_100.gates_reached` **4.86**,
-    `mean_100.length` **7017**, `mean_100.targets_parked` **2.53**, `end_reasons_100` stuck 64 / max_steps 12,
-    wing endings **68 of the last 100**, fresh episodes reaching `gate_hops_best <= 1` **12 of 238**,
-    `part_gate` **42.31**, `part_gate_approach` **28.71**, fresh completions **0 of 238**. Judge at +400k steps
+  - **What to watch, and the honest limit.** Baseline, read at the bounce (`spec_0-3` ts **21,697,762**;
+    the trainer was killed and the driver restarted it 2 minutes later from `ckpt_21701566_steps.zip`, so
+    **the clock for +400k steps starts at 21,701,566**): `mean_100.exit_ground_dist_min` **131.83 m**,
+    `mean_fresh_100.gates_reached` **5.00**, `mean_100.length` **6757**, `mean_100.targets_parked` **2.54**,
+    `end_reasons_100` stuck 77 / max_steps 12 / bridge_reset 5, wing endings **68 of the last 100**, fresh
+    episodes reaching `gate_hops_best <= 1` **12 of 238**, `part_gate` **43.26**, `part_gate_approach`
+    **28.75**, `mean_100.reward` **-45.21**, fresh completions **0 of 238**. Judge at +400k steps
     on: wing endings (`end_pos` x < -40 and z > 370; should fall well under 20/100), `exit_ground_dist_min`
     (should fall under ~100 m -- the Boss Arena Floor 2 rung is ~97 m from the exit ground point, so simply
     getting into the arena drives it there), `length`, `max_steps` endings, `targets_parked`, and the share of

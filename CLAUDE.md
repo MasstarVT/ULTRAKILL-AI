@@ -141,8 +141,8 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   real speed targets, are in `docs/il-records.md`.
 - 0-3's trunk shipped BOTH branches of the level's fork chained in series, and a 7-rung detour tour paid 105
   against a completion's 100. Trimmed to the 4 rungs every recorded completion used (2026-09-18, `route-0-3`);
-  `rung_overrides.json` now carries `drop` entries and the trainer was bounced onto it. Judge at +400k steps on
-  wing endings and `exit_ground_dist_min` (129.4 m at the bounce), never on `gates_reached` — see the log.
+  `rung_overrides.json` now carries `drop` entries; trainer bounced onto it at **21,701,566** steps. Judge at
+  +400k on wing endings and `exit_ground_dist_min` (131.8 m at the bounce), never on `gates_reached` — see the log.
 - In flight: branch **`speed-stages`** (currently level with `main`, nothing built yet) for the S-rank time
   targets and the time-scaled completion bonus; guard T's mid-name-fork blind spot still unfixed campaign-wide;
   and the memory work — another engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
