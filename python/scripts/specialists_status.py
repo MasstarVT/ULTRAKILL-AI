@@ -21,8 +21,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from campaign_driver import (  # noqa: E402
-    DRIVER_RUN, SPECIALIST_DIR, DriverState, load_plan, read_sample, specialist_path, stage_run_name,
-    stage_verdict)
+    COMPLETE, DRIVER_RUN, SPECIALIST_DIR, SPEED, DriverState, load_plan, read_sample, specialist_path,
+    stage_run_name, stage_verdict)
 from ultrakill_ai.times import format_time  # noqa: E402
 
 
@@ -34,18 +34,26 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
     """Everything the report prints, as plain data, so `--json` and the text share one source."""
     plan = load_plan(cwd / plan_path)
     state = DriverState.load(cwd / runs_dir / DRIVER_RUN / "driver_state.json")
-    out: dict = {"levels": len(plan.order), "rule": plan.rule.__dict__, "history": state.history, "current": None}
+    state.reconcile(plan)  # read-only: the same (level, kind) match the driver does on its own start
+    out: dict = {"levels": len(plan.order), "stages": len(plan.stages), "rule": plan.rule.__dict__,
+                 "speed_rule": plan.rule_for(SPEED).__dict__, "history": state.history, "current": None}
     stage = state.current
     if stage is not None:
-        sample = read_sample(cwd / runs_dir / stage_run_name(stage.level) / "status.json",
-                             cwd / models_dir / stage_run_name(stage.level) / "best.json")
-        verdict, reached = stage_verdict(sample, stage.start_steps, stage.target_reached_at, plan.rule)
+        rule = plan.rule_for(stage.kind)
+        sample = read_sample(cwd / runs_dir / stage_run_name(stage.level, stage.kind) / "status.json",
+                             cwd / models_dir / stage_run_name(stage.level, stage.kind) / "best.json")
+        # A speed stage's target: whatever the stage already holds, else whatever the live run has reported.
+        target = stage.target_seconds if stage.target_seconds else sample.target_seconds
+        verdict, reached = stage_verdict(sample, stage.start_steps, stage.target_reached_at, rule,
+                                         kind=stage.kind, target_seconds=target)
         out["current"] = {
-            "level": stage.level, "run": stage.run, "index": stage.index, "init": stage.init,
+            "level": stage.level, "kind": stage.kind, "run": stage.run, "index": stage.index, "init": stage.init,
             "start_steps": stage.start_steps, "timesteps": sample.timesteps,
             "stage_steps": (sample.timesteps - stage.start_steps) if sample.timesteps is not None else None,
             "fresh_completion_rate": sample.fresh_rate, "fresh_window": sample.fresh_window,
-            "best_time": sample.best_time, "best_at": sample.best_at,
+            "best_time": sample.best_time, "best_at": sample.best_at, "target_seconds": target,
+            "target_rate": rule.target_rate, "max_steps_per_stage": rule.max_steps_per_stage,
+            "settle_steps": rule.settle_steps, "min_fresh_window": rule.min_fresh_window,
             "target_reached_at": reached, "verdict": verdict,
         }
     promoted = []
@@ -57,8 +65,9 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
             except ValueError:
                 continue
     out["promoted"] = promoted
-    out["remaining"] = [level for level in plan.order
-                        if level not in {h.get("level") for h in state.history}]
+    done = state.finished_stages()
+    out["remaining"] = ["%s (%s)" % (s.level, s.kind) if s.kind != COMPLETE else s.level
+                        for s in plan.stages if s.key not in done]
     return out
 
 
@@ -67,28 +76,36 @@ def render(data: dict) -> str:
     rule = data["rule"]
     current = data["current"]
     if current is None:
-        lines.append("no stage running (%d of %d levels left in the plan)"
-                     % (len(data["remaining"]), data["levels"]))
+        lines.append("no stage running (%d of %d stages left in the plan)"
+                     % (len(data["remaining"]), data.get("stages", data["levels"])))
     else:
-        lines.append("STAGE %d/%d  %s  run %s  [%s]"
-                     % (current["index"] + 1, data["levels"], current["level"], current["run"], current["verdict"]))
+        lines.append("STAGE %d/%d  %s  [%s]  run %s  [%s]"
+                     % (current["index"] + 1, data.get("stages", data["levels"]), current["level"],
+                        current.get("kind", "complete"), current["run"], current["verdict"]))
         lines.append("  steps into the stage: %s of %s (total %s)"
                      % ("{:,.0f}".format(current["stage_steps"] or 0),
-                        "{:,}".format(rule["max_steps_per_stage"]),
+                        "{:,}".format(current.get("max_steps_per_stage", rule["max_steps_per_stage"])),
                         "{:,.0f}".format(current["timesteps"] or 0)))
         lines.append("  fresh completion rate: %s over %d fresh episodes (target %s, needs %d)"
                      % (fmt(current["fresh_completion_rate"], 3), current["fresh_window"],
-                        fmt(rule["target_rate"], 2), rule["min_fresh_window"]))
+                        fmt(current.get("target_rate", rule["target_rate"]), 2),
+                        current.get("min_fresh_window", rule["min_fresh_window"])))
         best = current["best_time"]
         lines.append("  best official time: %s   best.zip last moved at %s"
                      % (format_time(best) if best is not None else "-",
                         "{:,.0f}".format(current["best_at"]) if current["best_at"] is not None else "-"))
+        if current.get("kind") == SPEED:
+            target = current.get("target_seconds")
+            lines.append("  SPEED stage: it promotes only once the best time is at or under %s%s"
+                         % (format_time(target) if target else "the level's own S-rank time",
+                            "" if target else " (not read from the run yet)"))
+        settle = current.get("settle_steps", rule["settle_steps"])
         if current["target_reached_at"] is None:
-            lines.append("  target not reached yet: the stage ends on the rate, or at the %s-step cap"
-                         % "{:,}".format(rule["max_steps_per_stage"]))
+            lines.append("  target not reached yet: the stage ends on the rule above, or at the %s-step cap"
+                         % "{:,}".format(current.get("max_steps_per_stage", rule["max_steps_per_stage"])))
         else:
             hold_from = max(current["target_reached_at"], current["best_at"] or 0.0)
-            left = rule["settle_steps"] - ((current["timesteps"] or 0) - hold_from)
+            left = settle - ((current["timesteps"] or 0) - hold_from)
             lines.append("  target reached at %s steps; %s settle steps left (a new best restarts this)"
                          % ("{:,.0f}".format(current["target_reached_at"]), "{:,.0f}".format(max(0.0, left))))
         lines.append("  resumed from %s" % current["init"])
@@ -98,11 +115,12 @@ def render(data: dict) -> str:
     if not data["promoted"]:
         lines.append("  none yet")
     for row in data["promoted"]:
-        best = row.get("best_time")
-        lines.append("  %-12s %-10s rate %-6s best %-10s %s steps  <- %s"
-                     % (row.get("level"), row.get("status"),
+        best, target = row.get("best_time"), row.get("target_seconds")
+        lines.append("  %-12s %-9s %-10s rate %-6s best %-10s target %-10s %s steps  <- %s"
+                     % (row.get("level"), row.get("mode", COMPLETE), row.get("status"),
                         fmt(row.get("fresh_completion_rate"), 3),
                         format_time(best) if best is not None else "-",
+                        format_time(target) if target else "-",
                         "{:,.0f}".format(row.get("stage_steps") or 0),
                         row.get("source_checkpoint")))
     remaining = data["remaining"]

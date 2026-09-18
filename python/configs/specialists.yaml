@@ -27,18 +27,46 @@
 # and minus the per-stage keys (`run_name`, `timesteps`). `tests/test_specialists_config.py` pins EVERY other
 # setting, reward weight and hyperparameter equal to that config, so a specialist run cannot silently drift
 # away from the policy it is initialised from.
-order:  # the 30 levels of configs/campaign_gates_full.yaml, mission order. Read that file's header for why
-        # exactly these: every shipped level with a gate ladder or a route file, and 1-3 / 5-4 / 6-2 left out
-        # because they have no route signal of any kind.
-  ["Level 0-1", "Level 0-2", "Level 0-3", "Level 0-4", "Level 0-5",
-   "Level 1-1", "Level 1-2", "Level 1-4",
-   "Level 2-1", "Level 2-2", "Level 2-3", "Level 2-4",
-   "Level 3-1", "Level 3-2",
-   "Level 4-1", "Level 4-2", "Level 4-3", "Level 4-4",
-   "Level 5-1", "Level 5-2", "Level 5-3",
-   "Level 6-1",
-   "Level 7-1", "Level 7-2", "Level 7-3", "Level 7-4",
-   "Level 8-1", "Level 8-2", "Level 8-3", "Level 8-4"]
+# STAGE KINDS (2026-09-18, docs/superpowers/specs/2026-09-18-speed-stages.md). An entry is either a bare level
+# name -- a `complete` stage, the rule this file has always carried -- or `{level: ..., kind: speed}`, which
+# re-runs a level that is already being finished with `level_complete` scaled by the clock and will not promote
+# until the level is finished FAST. The lead's instruction on 2026-09-18: nothing promotes to 0-4 until 0-1,
+# 0-2 and 0-3 have better times, because they can be done much faster than they are being done.
+order:  # the 30 levels of configs/campaign_gates_full.yaml, mission order (read that file's header for why
+        # exactly these), with the three speed stages inserted after 0-3 and before any 0-4 stage.
+  - "Level 0-1"
+  - "Level 0-2"
+  - "Level 0-3"
+  - {level: "Level 0-1", kind: speed}
+  - {level: "Level 0-2", kind: speed}
+  - {level: "Level 0-3", kind: speed}
+  - "Level 0-4"
+  - "Level 0-5"
+  - "Level 1-1"
+  - "Level 1-2"
+  - "Level 1-4"
+  - "Level 2-1"
+  - "Level 2-2"
+  - "Level 2-3"
+  - "Level 2-4"
+  - "Level 3-1"
+  - "Level 3-2"
+  - "Level 4-1"
+  - "Level 4-2"
+  - "Level 4-3"
+  - "Level 4-4"
+  - "Level 5-1"
+  - "Level 5-2"
+  - "Level 5-3"
+  - "Level 6-1"
+  - "Level 7-1"
+  - "Level 7-2"
+  - "Level 7-3"
+  - "Level 7-4"
+  - "Level 8-1"
+  - "Level 8-2"
+  - "Level 8-3"
+  - "Level 8-4"
 stage:
   # THE STAGE RULE. A stage ends when BOTH of these hold:
   #   - the level's fresh completion rate over its last 50 fresh episodes is >= `target_rate`, over at least
@@ -59,6 +87,22 @@ stage:
   # directory, when they exist. Their floor counts carry the 1/sqrt(N) decay that makes the agent push outward
   # at all, and a stage that starts without them restarts exploration from nothing.
   seed_explore_from: campaign_gates
+speed:
+  # A SPEED STAGE's rule: everything not named here falls back to `stage:` above. It ends when the fresh
+  # completion rate reaches `target_rate` over `min_fresh_window` fresh episodes AND the best official time is
+  # at or under the level's own S-rank time -- both latched together, then the same settle. The rate bar is
+  # lower than a complete stage's because a fast policy that finishes four loads in ten is worth more to the
+  # ladder than a slow one that finishes six, and the step cap is higher because the clock is a harder target
+  # than the first completion was.
+  target_rate: 0.4
+  min_fresh_window: 30
+  settle_steps: 300000
+  max_steps_per_stage: 8000000
+  # THE TARGET TIME IS NEVER HAND-PICKED. It is the level's own S-rank time threshold
+  # (`campaign.ranks.time[-1]`), which the env reads live at the first observation of the stage and reports
+  # through status.json. A level may be overridden here -- `"Level 0-1": 95.0` -- and the env then reports THAT
+  # number down the same path, so the reward and the promotion rule always agree. Empty: read every level's own.
+  targets: {}
 env:
   mode: campaign
   level: "Level 0-1"   # the driver overwrites this per stage; `levels` is deliberately absent

@@ -141,6 +141,75 @@ def test_new_best_copies_checkpoint_and_records_penalty():
         assert keep_best.stored_penalty_name(model_dir / "best.json") == "best_time"
 
 
+# ---------------------------------------------------------------------------
+# --metric time: the speed stage (docs/superpowers/specs/2026-09-18-speed-stages.md §5)
+# ---------------------------------------------------------------------------
+
+
+def test_time_needs_a_minimum_completion_rate_behind_it():
+    """A 40-second time set by the one lucky load in a hundred is not a policy. The gate is the whole metric."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cold = campaign_rows([0.05] * 12, [42.0] * 12)
+        assert keep_best.scored(write_log(Path(tmp), cold), "time") == []
+        # ... and the window gate is still there: a rate over the bar on 19 fresh episodes does not count.
+        thin = campaign_rows([0.6] * 12, [42.0] * 12, fresh_window=19)
+        assert keep_best.scored(write_log(Path(tmp), thin), "time") == []
+        ready = campaign_rows([0.6] * 9, [42.0] * 9, fresh_window=20)
+        series = keep_best.scored(write_log(Path(tmp), ready), "time")
+        assert len(series) == 1
+        assert abs(series[0][0] + 42.0) < 1e-9, "the score is the NEGATED time, so higher is still better"
+        assert abs(series[0][1] + 0.6) < 1e-9, "and the tie-break is the negated rate, so higher wins"
+        assert keep_best.scored(write_log(Path(tmp), ready), "time", min_rate=0.9) == []
+
+
+def test_a_row_with_no_best_time_never_scores_on_time():
+    """Before the first completion there is no time to rank, whatever the rate says."""
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = campaign_rows([0.5] * 12, [None] * 12)
+        assert keep_best.scored(write_log(Path(tmp), rows), "time") == []
+
+
+def test_a_faster_time_wins_and_the_rate_breaks_the_tie():
+    assert keep_best.is_better((-118.0, -0.5), (-131.0, -0.5)), "118 s beats 131 s"
+    assert not keep_best.is_better((-140.0, -0.9), (-131.0, -0.5)), "a higher rate does not buy a slower time"
+    assert keep_best.is_better((-131.0, -0.7), (-131.0, -0.5)), "same time, the higher rate wins"
+    assert not keep_best.is_better((-131.0, -0.5), (-131.0, -0.5))  # strictly better only
+    series = [(-131.0, -0.5, 0.0, 1.0), (-118.0, -0.4, 0.0, 2.0), (-125.0, -0.9, 0.0, 3.0)]
+    assert keep_best.best_of(series)[3] == 2.0, "the fastest sample, not the most reliable one"
+
+
+def test_time_saves_the_checkpoint_and_guards_the_other_metrics_best_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        model_dir = Path(tmp)
+        (model_dir / "ckpt_100000_steps.zip").write_bytes(b"early")
+        (model_dir / "ckpt_200000_steps.zip").write_bytes(b"late")
+        series = [(-131.25, -0.42, 40.0, 150_000.0), (-118.50, -0.44, 60.0, 230_000.0)]
+        assert keep_best.save_if_better(series, model_dir, "time", None) == (-118.5, -0.44)
+        assert (model_dir / "best.zip").read_bytes() == b"late"
+        saved = json.loads((model_dir / "best.json").read_text(encoding="utf-8"))
+        assert saved["score"] == -118.5 and saved["penalty"] == -0.44
+        assert saved["penalty_name"] == "fresh_completion_rate"
+        assert saved["score_metric"] == "-best_time (lower is better), smoothed over 9 samples"
+        # The cross-metric guard: this file may not be read, or overwritten, by the campaign metric.
+        assert keep_best.stored_penalty_name(model_dir / "best.json") == "fresh_completion_rate"
+        assert keep_best.METRICS["campaign"].penalty == "best_time" != "fresh_completion_rate"
+        assert keep_best.METRICS["time"].penalty == "fresh_completion_rate"
+        # ... and a slower later run does not move best.zip.
+        assert keep_best.save_if_better([(-140.0, -0.9, 0.0, 240_000.0)], model_dir, "time",
+                                        (-118.5, -0.44)) == (-118.5, -0.44)
+
+
+def test_the_campaign_and_kills_metrics_are_untouched_by_the_signs():
+    """Both signs default to +1, so `scored` returns exactly what it always did for the other two metrics."""
+    for name in ("kills_per_min", "campaign"):
+        m = keep_best.METRICS[name]
+        assert (m.score_sign, m.penalty_sign) == (1.0, 1.0) and m.gate == ""
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = campaign_rows([0.5] * 9, [80.0] * 9)
+        series = keep_best.scored(write_log(Path(tmp), rows), "campaign")
+        assert len(series) == 1 and abs(series[0][0] - 0.5) < 1e-9 and abs(series[0][1] - 80.0) < 1e-9
+
+
 def test_restart_does_not_resave_the_same_best():
     with tempfile.TemporaryDirectory() as tmp:
         model_dir = Path(tmp)

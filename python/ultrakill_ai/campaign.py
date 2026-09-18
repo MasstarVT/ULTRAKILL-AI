@@ -101,6 +101,29 @@ def grade(thresholds: list[int], value: float, reverse: bool) -> int:
     return 4
 
 
+def s_rank_time(campaign: dict | None) -> float | None:
+    """The level's own S-rank time: the seconds a run must beat for the time category to score S, or None.
+
+    The mod's campaign block carries `ranks = {"time": [t0, t1, t2, t3], "kills": [...], "style": [...]}`, and
+    `grade(..., reverse=True)` counts a category up only while the value is at or under the NEXT threshold --
+    so 4 (S) needs `seconds <= ranks["time"][-1]`, the strictest and last of the four. That number is the
+    level's own idea of fast, set by the game rather than by hand, and it is what a speed stage's completion
+    bonus and promotion rule are both measured against (docs/.../2026-09-18-speed-stages.md §3).
+
+    Returns None for a block that carries no ranks at all, which is what a level load reports before the mod
+    has built one and what an older mod reports always.
+    """
+    ranks = (campaign or {}).get("ranks")
+    times = ranks.get("time") if isinstance(ranks, dict) else None
+    if not times:
+        return None
+    try:
+        target = float(times[-1])
+    except (TypeError, ValueError):
+        return None
+    return target if target > 0 else None
+
+
 def compute_rank(seconds: float, kills: int, style: int, restarts: int, ranks: dict) -> str:
     """The level rank StatsManager.GetFinalRank gives without cheats or major assists: "D".."S", or "P".
 

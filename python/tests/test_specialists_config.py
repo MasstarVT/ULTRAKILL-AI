@@ -102,6 +102,45 @@ def test_the_stage_rule_numbers_are_the_ones_the_driver_documents():
     assert rule.seed_explore_from == "campaign_gates", "the shared run's archives seed each stage"
 
 
+def test_the_three_speed_stages_sit_before_any_0_4_stage():
+    """The lead's 2026-09-18 instruction, pinned: nothing promotes to 0-4 until 0-1..0-3 have better times."""
+    p = plan()
+    keys = [s.key for s in p.stages]
+    assert keys[:6] == [("Level 0-1", "complete"), ("Level 0-2", "complete"), ("Level 0-3", "complete"),
+                        ("Level 0-1", "speed"), ("Level 0-2", "speed"), ("Level 0-3", "speed")]
+    speed_at = [i for i, key in enumerate(keys) if key[1] == "speed"]
+    later = [i for i, key in enumerate(keys) if key[0] not in ("Level 0-1", "Level 0-2", "Level 0-3")]
+    assert max(speed_at) < min(later), "every speed stage runs before the first level past 0-3"
+    assert len(keys) == 33 and len(set(keys)) == 33, "30 complete stages plus the three speed ones"
+
+
+def test_the_speed_rule_is_the_stage_rule_with_the_clock_added():
+    p = plan()
+    speed = p.rule_for(campaign_driver.SPEED)
+    assert (speed.target_rate, speed.max_steps_per_stage) == (0.4, 8_000_000)
+    assert (speed.min_fresh_window, speed.settle_steps) == (30, 300_000), "inherited from `stage:`"
+    assert (speed.count, speed.monitor, speed.seed_explore_from) == (12, 1, "campaign_gates")
+    assert p.targets == {}, "no hand-picked seconds: every level's target is its own S-rank time"
+    assert p.rule_for(campaign_driver.COMPLETE) == p.rule, "a complete stage's rule is untouched"
+
+
+def test_a_speed_stage_only_adds_the_bonus_switch_to_the_env():
+    """No observation, action or reward-weight change, so the level's own specialist loads into it unchanged."""
+    p = plan()
+    complete = campaign_driver.stage_config(p, "Level 0-2")["env"]
+    speed = campaign_driver.stage_config(p, "Level 0-2", kind=campaign_driver.SPEED)["env"]
+    assert set(speed) - set(complete) == {"speed_bonus"} and speed["speed_bonus"] is True
+    assert {k: v for k, v in speed.items() if k != "speed_bonus"} == complete
+    cfg = EnvConfig.from_dict(speed)
+    assert cfg.speed_bonus is True and cfg.speed_target_seconds == 0.0, "0 = read the level's own S-rank time"
+    assert cfg.rewards == EnvConfig.from_dict(complete).rewards, "every reward weight is the complete stage's"
+    env = UltrakillEnv(cfg)
+    try:
+        assert env.observation_space.shape == (479,), "the same policy shape: an existing checkpoint loads"
+    finally:
+        env.close()
+
+
 def test_a_generated_stage_config_builds_a_479_input_single_level_env():
     p = plan()
     generated = campaign_driver.stage_config(p, "Level 2-3", init_steps=12_000_000)
