@@ -2966,3 +2966,13 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     means 30 model directories** of checkpoints — `ckpt_*` files are gitignored, but the disk is not infinite,
     and a stage's numbered checkpoints are worth pruning once its specialist is promoted (keep the one
     `best.json` names).
+- **Specialist mode ACTIVE (2026-09-18 07:01).** The shared `campaign_gates` run was stopped at 17,002,318 steps (its
+  last 12 hours thrashed between levels: 0-1 0.65 -> 0.13 -> 0.36 as its fresh-start share moved, 0-3 7.3 -> 3.6
+  rungs once damped) and `scripts/campaign_driver.py` now trains one specialist per level in mission order, all 12
+  games on the current level: stage 1/30 `spec_0-1`, initialised from `models/campaign_gates/ckpt_17002318_steps.zip`
+  (the generalist that finishes 0-1, 0-2 and 0-3). Started through `runs/start_driver.cmd` (a bare
+  `Start-Process cmd /c "..."` mangles the quoted `"Level 0-1"`). Stage rule: fresh rate >= 0.5 over 50 (window >= 30),
+  latched, plus 300k settle steps after the last `best.zip` move, else the 6M cap. Do NOT run `supervise.py` while the
+  driver runs. Status: `python scripts/specialists_status.py`; pause: `runs/specialists/DRIVER_PAUSE`; full-game
+  chain: `python scripts/full_run.py`. The speed phase (Brutal + time-scaled completion bonus) will revisit each
+  specialist in turn.
