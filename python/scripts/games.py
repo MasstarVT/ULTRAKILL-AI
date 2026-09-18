@@ -45,6 +45,22 @@ REG_PATH = r"Software\Hakita\ULTRAKILL"
 EXE_NAME = "ULTRAKILL.exe"
 STEAM_APP_ID = "1229490"
 
+# Hiding training instances from Steam (mod v0.7.1). The flag makes the plugin skip Facepunch's
+# `SteamClient.Init`, so the copy never registers with a running Steam client: no playtime, and Steam does not
+# show ULTRAKILL as running. **Default ON for every training launch**, per the user's instruction of
+# 2026-09-17 -- training must always be hidden. `--steam` opts one launch back into visibility; your own
+# sessions, started from Steam or from the launcher, are untouched because nothing adds the flag for them.
+NO_STEAM_FLAG = "-aibridge-nosteam"
+NO_STEAM_DEFAULT = True
+
+# Per-port record of the flags an instance was started with, so `relaunch_one` can rebuild the SAME command
+# line. It has to be a file rather than a module global: the env's own-game relaunch runs inside an SB3
+# subprocess worker that never called `launch`, in a different process, and would otherwise silently fall back
+# to the default and flip a deliberately-visible instance to hidden (or, before the default flipped, the
+# reverse). Written whole by `launch` alone -- one writer, atomically -- and only ever read by `relaunch_one`,
+# so twelve workers recovering at once cannot race it.
+INSTANCE_FLAGS = REPO / "python" / "runs" / "instance_flags.json"
+
 
 def game_dir() -> Path:
     if os.environ.get("ULTRAKILL_DIR"):
@@ -320,11 +336,43 @@ def restore_display() -> None:
 # ---------------------------------------------------------------------------
 
 
-def start_instance(port: int, width: int, height: int, job_workers: int) -> int:
+def record_instance_flags(ports: list[int], no_steam: bool) -> None:
+    """Writes the per-port launch flags `relaunch_one` reads back. See `INSTANCE_FLAGS`."""
+    data = {str(port): {"no_steam": bool(no_steam)} for port in ports}
+    try:
+        INSTANCE_FLAGS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = INSTANCE_FLAGS.with_name(INSTANCE_FLAGS.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        tmp.replace(INSTANCE_FLAGS)
+    except OSError as exc:  # a launch must not fail over a bookkeeping file
+        print(f"games: could not record launch flags: {exc}")
+
+
+def instance_no_steam(port: int, default: bool = NO_STEAM_DEFAULT) -> bool:
+    """Whether the instance on `port` was started hidden from Steam, falling back to the default.
+
+    Any problem at all -- no file, unreadable, half-written, a port that was never recorded -- gives the
+    default, because guessing wrong costs visibility bookkeeping and raising costs a running game.
+    """
+    try:
+        data = json.loads(INSTANCE_FLAGS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+    entry = data.get(str(port)) if isinstance(data, dict) else None
+    if isinstance(entry, dict) and isinstance(entry.get("no_steam"), bool):
+        return entry["no_steam"]
+    return default
+
+
+def start_instance(port: int, width: int, height: int, job_workers: int,
+                   no_steam: bool = NO_STEAM_DEFAULT) -> int:
     """Starts one copy on `port` and returns the pid it was started with.
 
     That pid is only a launch handle: the game re-execs under a new one, so nothing may treat it as the
     instance's identity. Use `listening_pids()[port]` for that once the port is up.
+
+    `no_steam` adds `-aibridge-nosteam`, which the plugin turns into "skip SteamClient.Init". On by default:
+    training is hidden from Steam.
     """
     exe = game_dir() / EXE_NAME
     args = [
@@ -333,6 +381,8 @@ def start_instance(port: int, width: int, height: int, job_workers: int) -> int:
         # Fewer Unity worker threads per copy, so several games don't fight over the CPU.
         "-job-worker-count", str(job_workers),
     ]
+    if no_steam:
+        args.append(NO_STEAM_FLAG)
     # Below-normal priority keeps your PC responsive while the games train.
     flags = subprocess.DETACHED_PROCESS | subprocess.BELOW_NORMAL_PRIORITY_CLASS
     env = dict(os.environ, SteamAppId=STEAM_APP_ID, SteamGameId=STEAM_APP_ID)
@@ -364,8 +414,12 @@ def kill_unlistening() -> list[int]:
 
 
 def relaunch_one(port: int, width: int = 368, height: int = 207, job_workers: int = 3,
-                 timeout: float = 240.0) -> bool:
+                 timeout: float = 240.0, no_steam: bool | None = None) -> bool:
     """Restarts the single instance on `port`, leaving every other game running.
+
+    `no_steam` None -- the normal case, and what the env's own-game recovery passes -- means "whatever this
+    instance was started with", read back from `INSTANCE_FLAGS`. A replacement must carry the same flags as
+    the copy it replaces, or a recovery would quietly change whether Steam can see that game.
 
     `launch` cannot do this: it calls `stop_all()` first, which would take down eleven healthy games to fix one
     laggard and throw away the rollouts in flight. The instance is found by port (netstat gives the owning pid),
@@ -392,7 +446,8 @@ def relaunch_one(port: int, width: int = 368, height: int = 207, job_workers: in
         wedged = kill_unlistening()
         print(f"No process is listening on port {port}; reaped {len(wedged)} portless instance(s) "
               f"and starting one anyway")
-    start_instance(port, width, height, job_workers)
+    hidden = instance_no_steam(port) if no_steam is None else no_steam
+    start_instance(port, width, height, job_workers, no_steam=hidden)
     _invalidate_proc_cache()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -406,7 +461,7 @@ def relaunch_one(port: int, width: int = 368, height: int = 207, job_workers: in
 
 def launch(
     count: int, base_port: int, width: int, height: int, stagger: float, timeout: float, monitor: int | None,
-    job_workers: int, repair_rounds: int = 2
+    job_workers: int, repair_rounds: int = 2, no_steam: bool = NO_STEAM_DEFAULT
 ) -> None:
     exe = game_dir() / EXE_NAME
     if not exe.exists():
@@ -421,12 +476,17 @@ def launch(
     stop_all()
     backup_display()
 
+    ports = [base_port + i for i in range(count)]
+    # Before the first game starts, so a copy that crashes and is relaunched mid-launch still finds its flags.
+    record_instance_flags(ports, no_steam)
+    print(f"Launching {count} instance(s) {'HIDDEN from' if no_steam else 'VISIBLE to'} Steam")
+
     for i in range(count):
         port = base_port + i
-        print(f"Started instance {i} on port {port} (pid {start_instance(port, width, height, job_workers)})")
+        pid = start_instance(port, width, height, job_workers, no_steam=no_steam)
+        print(f"Started instance {i} on port {port} (pid {pid})")
         time.sleep(stagger)
 
-    ports = [base_port + i for i in range(count)]
     # One instance that never opens its port used to fail the WHOLE launch, and the supervisor's answer to a
     # failed launch is another full stop-and-launch on the next poll -- twelve games torn down to fix one, three
     # times, and then it gives up and exits. That is what turned the 2026-09-17 17:52 freeze into a 19-minute
@@ -476,6 +536,20 @@ def status(base_port: int) -> None:
         print(f"  bridge listening on {port} (pid {pid}, {note})")
 
 
+def add_steam_flags(parser: argparse.ArgumentParser, relaunch: bool = False) -> None:
+    """The `--steam` / `--no-steam` pair, shared with supervise.py so both spell it the same way.
+
+    Training is hidden from Steam by default (user instruction, 2026-09-17), so `--steam` is the opt-OUT and
+    `--no-steam` is kept only as a no-op alias: it was the opt-in for about an hour on 2026-09-17, and a
+    command line or a shortcut carrying it must keep meaning "hidden" rather than fail to parse.
+    """
+    kept = "kept" if relaunch else "started"
+    parser.add_argument("--steam", action="store_true",
+                        help=f"leave the instance(s) VISIBLE to Steam (playtime accrues). Default: {kept} hidden.")
+    parser.add_argument("--no-steam", action="store_true", dest="no_steam_alias",
+                        help=argparse.SUPPRESS)  # no-op: hiding is the default
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -489,6 +563,7 @@ def main() -> None:
     p_launch.add_argument("--timeout", type=float, default=180.0)
     p_launch.add_argument("--monitor", type=int, default=3, help="Windows display number to put the games on")
     p_launch.add_argument("--job-workers", type=int, default=3, help="Unity job worker threads per game")
+    add_steam_flags(p_launch)
     p_tile = sub.add_parser("tile")
     p_tile.add_argument("--monitor", type=int, default=3)
     p_tile.add_argument("--width", type=int, default=368)
@@ -500,15 +575,19 @@ def main() -> None:
     p_one.add_argument("--width", type=int, default=368)
     p_one.add_argument("--height", type=int, default=207)
     p_one.add_argument("--job-workers", type=int, default=3)
+    add_steam_flags(p_one, relaunch=True)
     sub.add_parser("stop")
     args = parser.parse_args()
 
     if args.cmd == "launch":
-        launch(args.count, args.base_port, args.width, args.height, args.stagger, args.timeout, args.monitor, args.job_workers)
+        launch(args.count, args.base_port, args.width, args.height, args.stagger, args.timeout, args.monitor,
+               args.job_workers, no_steam=not args.steam)
     elif args.cmd == "tile":
         tile(running_pids(), args.width, args.height, args.monitor)
     elif args.cmd == "relaunch":
-        sys.exit(0 if relaunch_one(args.port, args.width, args.height, args.job_workers) else 1)
+        # Default None: keep whatever the instance on this port was started with. --steam forces visible.
+        sys.exit(0 if relaunch_one(args.port, args.width, args.height, args.job_workers,
+                                   no_steam=False if args.steam else None) else 1)
     elif args.cmd == "status":
         status(args.base_port)
     else:

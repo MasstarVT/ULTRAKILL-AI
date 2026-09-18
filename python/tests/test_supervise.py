@@ -430,6 +430,23 @@ def test_the_command_line_matches_the_pattern_a_human_would_type():
                    '--config configs/campaign_gates_main.yaml >> runs\\campaign_gates_train.log 2>&1"')
 
 
+def test_the_supervisor_launches_its_games_hidden_from_steam_unless_steam_is_asked_for():
+    """The 12 games come up through `_default_launch_games`, which the other tests replace wholesale. This is
+    the only place the real one is exercised, and it is the whole of "training is hidden by default": the
+    supervisor is what relaunches the games after every restart."""
+    import games  # noqa: PLC0415 - the supervisor imports it the same way, inside the function
+
+    seen: list = []
+    original = games.launch
+    games.launch = lambda *a, **kw: seen.append(kw.get("no_steam"))
+    try:
+        Supervisor(Config(run=RUN, config=CONFIG))._default_launch_games(12, 1)
+        Supervisor(Config(run=RUN, config=CONFIG, no_steam=False))._default_launch_games(12, 1)
+    finally:
+        games.launch = original
+    assert seen == [True, False], seen
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     for name, fn in tests:

@@ -204,6 +204,9 @@ namespace UltrakillAIBridge.Env
                         ["mod_version"] = Plugin.Version,
                         ["port"] = Plugin.ListenPort,
                         ["training_instance"] = Plugin.IsTrainingInstance,
+                        // Whether the skip is actually in place, not merely asked for: -aibridge-nosteam with
+                        // Steam already initialised leaves this false, which is the only in-band way to tell.
+                        ["steam_hidden"] = SteamPatches.Hidden,
                         ["scene"] = SceneHelper.CurrentScene,
                     });
                     break;

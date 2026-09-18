@@ -2,6 +2,7 @@
 
 The mod listens on `127.0.0.1:47800` (configurable in `BepInEx/config/masstarvt.ultrakill.aibridge.cfg`).
 Launching the game with `-aibridge-port N` makes it a **training instance** on port N: it opens preferences read-only and never writes preferences or save data. A normally launched game moves to the next free port if 47800 is taken.
+Adding `-aibridge-nosteam` (mod v0.7.1) additionally hides the instance from Steam: the plugin skips Facepunch's `SteamClient.Init`, so the copy never registers with a running Steam client — no playtime is credited and Steam does not show the game as running. `scripts/games.py` adds it to every training launch by default; `--steam` there leaves an instance visible. The handshake reports whether the skip actually took effect, as `steam_hidden`.
 Messages are single-line JSON objects terminated by `\n`, in both directions. Every request gets exactly one reply.
 
 ## Control model
@@ -20,7 +21,7 @@ Because of the fixed frame time, how long Python takes to decide never changes w
 
 | type | fields | reply |
 |---|---|---|
-| `hello` | `protocol` | `{"type":"hello","protocol":1,"mod_version":..,"port":..,"training_instance":..,"scene":..}` |
+| `hello` | `protocol` | `{"type":"hello","protocol":1,"mod_version":..,"port":..,"training_instance":..,"steam_hidden":..,"scene":..}` |
 | `config` | any of the settings below | `{"type":"ok"}` |
 | `get_obs` | | an `obs` message (doesn't take control) |
 | `reset` | `scene` (e.g. `"Endless"`, `"Level 0-1"`; omit = current), `checkpoint` (bool) | an `obs` with `"event":"reset"` once the player is spawned and has been ready for `reset_settle_frames` frames |

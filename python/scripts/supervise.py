@@ -490,6 +490,10 @@ class Config:
     runs_dir: str = "runs"
     models_dir: str = "models"
     dry_run: bool = False
+    # Training is hidden from Steam by default (user instruction, 2026-09-17): every game the supervisor
+    # launches gets `-aibridge-nosteam`. `--steam` on its command line is the opt-out, and because the config
+    # lives on the SUPERVISOR's command line, changing it means restarting the supervisor, not just the trainer.
+    no_steam: bool = True
 
 
 class Supervisor:
@@ -582,7 +586,8 @@ class Supervisor:
         import games
 
         try:
-            games.launch(count, self.cfg.base_port, 368, 207, 4.0, 240.0, monitor, 3)
+            games.launch(count, self.cfg.base_port, 368, 207, 4.0, 240.0, monitor, 3,
+                         no_steam=self.cfg.no_steam)
             return True
         except SystemExit as exc:  # games.launch reports failure by exiting
             self.log("games.launch failed: %s" % exc)
@@ -877,6 +882,9 @@ def main() -> None:
     ap.add_argument("--runs-dir", default="runs")
     ap.add_argument("--models-dir", default="models")
     ap.add_argument("--dry-run", action="store_true", help="report the health decision and exit, changing nothing")
+    import games  # noqa: PLC0415 - late, like every other games import here
+
+    games.add_steam_flags(ap)
     a = ap.parse_args()
 
     cfg = Config(run=a.run, config=a.config, count=a.count, monitor=a.monitor,
@@ -885,7 +893,7 @@ def main() -> None:
                  base_port=a.base_port, python=a.python, cwd=Path.cwd(),
                  boot_min_mb=a.boot_min_mb, boot_polls=a.boot_polls, boot_poll_seconds=a.boot_poll_seconds,
                  boot_timeout_seconds=a.boot_timeout_seconds, boot_relaunch_rounds=a.boot_relaunch_rounds,
-                 runs_dir=a.runs_dir, models_dir=a.models_dir, dry_run=a.dry_run)
+                 runs_dir=a.runs_dir, models_dir=a.models_dir, dry_run=a.dry_run, no_steam=not a.steam)
     sys.exit(Supervisor(cfg).run())
 
 

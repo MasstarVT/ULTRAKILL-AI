@@ -247,6 +247,103 @@ def test_repeated_polls_share_one_snapshot():
         _restore(monkey)
 
 
+# ---------------------------------------------------------------------------
+# Hiding training instances from Steam (mod v0.7.1)
+# ---------------------------------------------------------------------------
+
+
+def _fake_popen(monkey):
+    """Replaces games.subprocess.Popen and returns the list of argv it was called with."""
+    calls: list[list[str]] = []
+
+    class Handle:
+        pid = 4242
+
+    def popen(argv, **kw):
+        calls.append(list(argv))
+        return Handle()
+
+    monkey.append((games.subprocess, "Popen", games.subprocess.Popen))
+    games.subprocess.Popen = popen
+    return calls
+
+
+def _flags_file(monkey, tmp: Path):
+    monkey.append((games, "INSTANCE_FLAGS", games.INSTANCE_FLAGS))
+    games.INSTANCE_FLAGS = tmp / "instance_flags.json"
+    return games.INSTANCE_FLAGS
+
+
+def test_a_training_launch_is_hidden_from_steam_by_default():
+    """The user's standing instruction (2026-09-17): training must always be hidden from Steam."""
+    monkey: list = []
+    calls = _fake_popen(monkey)
+    try:
+        games.start_instance(47800, 368, 207, 3)
+    finally:
+        _restore(monkey)
+    assert games.NO_STEAM_FLAG in calls[0], calls[0]
+
+
+def test_steam_opts_one_launch_back_into_visibility():
+    monkey: list = []
+    calls = _fake_popen(monkey)
+    try:
+        games.start_instance(47800, 368, 207, 3, no_steam=False)
+    finally:
+        _restore(monkey)
+    assert games.NO_STEAM_FLAG not in calls[0], calls[0]
+    assert "-aibridge-port" in calls[0], "the rest of the command line is unchanged"
+
+
+def test_a_relaunch_rebuilds_the_command_line_the_instance_was_started_with():
+    """The env's own-game recovery runs in an SB3 worker that never called `launch`, so the flags have to
+    come off disk. A recovery must not quietly flip whether Steam can see that game."""
+    for recorded in (True, False):
+        with tempfile.TemporaryDirectory() as tmp:
+            monkey: list = []
+            _flags_file(monkey, Path(tmp))
+            calls = _fake_popen(monkey)
+            _fake_subprocess(monkey, lambda argv, kw: type("R", (), {"stdout": ""})())
+            try:
+                games.record_instance_flags([47800, 47801], recorded)
+                games._invalidate_proc_cache()
+                games.relaunch_one(47801, timeout=0)  # timeout 0: start it, don't wait for the port
+            finally:
+                _restore(monkey)
+            started = [c for c in calls if "-aibridge-port" in c]
+            assert started, "the replacement was started"
+            assert (games.NO_STEAM_FLAG in started[-1]) is recorded, (recorded, started[-1])
+
+
+def test_an_unknown_port_or_unreadable_file_falls_back_to_hidden():
+    """Guessing wrong costs bookkeeping; raising inside the recovery ladder costs a running game."""
+    with tempfile.TemporaryDirectory() as tmp:
+        monkey: list = []
+        path = _flags_file(monkey, Path(tmp))
+        try:
+            assert games.instance_no_steam(47800) is True, "no file at all"
+            games.record_instance_flags([47800], False)
+            assert games.instance_no_steam(47800) is False
+            assert games.instance_no_steam(47999) is True, "a port nobody recorded"
+            path.write_text("{not json", encoding="utf-8")
+            assert games.instance_no_steam(47800) is True, "a half-written file"
+        finally:
+            _restore(monkey)
+
+
+def test_the_retired_no_steam_flag_still_parses_as_a_no_op():
+    """`--no-steam` was the opt-IN for about an hour on 2026-09-17. A shortcut carrying it must still mean
+    hidden, not fail to parse."""
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    games.add_steam_flags(ap)
+    assert not ap.parse_args([]).steam, "hidden by default"
+    assert not ap.parse_args(["--no-steam"]).steam, "the alias still means hidden"
+    assert ap.parse_args(["--steam"]).steam, "--steam is the only way back to visible"
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     for name, fn in tests:

@@ -15,7 +15,7 @@ namespace UltrakillAIBridge
     {
         public const string Guid = "masstarvt.ultrakill.aibridge";
         public const string Name = "ULTRAKILL AI Bridge";
-        public const string Version = "0.7.0";
+        public const string Version = "0.7.1";
         public const int ProtocolVersion = 1;
 
         internal static ManualLogSource Log;
@@ -61,6 +61,17 @@ namespace UltrakillAIBridge
             harmony.PatchAll(typeof(TrainingSpeed));
             try
             {
+                // Binds Facepunch's SteamClient.Init, and only when -aibridge-nosteam asks for it. Isolated
+                // because a game update that ships a different Steamworks build would throw here, and losing
+                // Steam invisibility must never cost us the bridge itself.
+                SteamPatches.Apply(harmony);
+            }
+            catch (System.Exception e)
+            {
+                Log.LogError($"Steam-hiding patch failed to apply, this instance IS visible to Steam: {e}");
+            }
+            try
+            {
                 // Binds the private NewMovement.HandleSlideState, so a game update renaming it would throw.
                 // Isolated so the un-wedge failing can't take soft death and the rest of TrainingSpeed down.
                 harmony.PatchAll(typeof(UnwedgePatch));
@@ -95,7 +106,8 @@ namespace UltrakillAIBridge
             DontDestroyOnLoad(host);
             host.AddComponent<BridgeRunner>();
 
-            Log.LogInfo($"{Name} {Version} loaded{(IsTrainingInstance ? " as a training instance" : "")}");
+            Log.LogInfo($"{Name} {Version} loaded{(IsTrainingInstance ? " as a training instance" : "")}"
+                        + (SteamPatches.Hidden ? ", hidden from Steam" : ""));
         }
     }
 

@@ -34,6 +34,8 @@
     <Reference Include="Unity.Addressables"><HintPath>$(ManagedDir)\Unity.Addressables.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.ResourceManager"><HintPath>$(ManagedDir)\Unity.ResourceManager.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Newtonsoft.Json"><HintPath>$(ManagedDir)\Newtonsoft.Json.dll</HintPath><Private>false</Private></Reference>
+    <!-- Facepunch.Steamworks: only SteamPatches uses it, to skip SteamClient.Init under -aibridge-nosteam. -->
+    <Reference Include="Facepunch.Steamworks.Win64"><HintPath>$(ManagedDir)\Facepunch.Steamworks.Win64.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Unity.InputSystem"><HintPath>$(ManagedDir)\Unity.InputSystem.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine"><HintPath>$(ManagedDir)\UnityEngine.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.CoreModule"><HintPath>$(ManagedDir)\UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>

@@ -122,10 +122,19 @@ namespace UltrakillAIBridge.Obs
         private readonly HashSet<Door> gateDoors = new HashSet<Door>();
         private readonly Dictionary<Door, int> gateIndexByDoor = new Dictionary<Door, int>();
 
-        // The FinalPit chosen for this level load. Rule 4 of the spec: the preference order is
-        // time-varying (a pit's room activates mid-run) and every hops value depends on which pit was
-        // chosen, so re-running it mid-load could silently renumber the route.
+        // The FinalPit chosen for this level load, RE-RESOLVED on every Scan (see ResolveExit). The
+        // decision is still made once -- rule 4 of the spec: the preference order is time-varying (a pit's
+        // room activates mid-run) and every hops value depends on which pit was chosen, so re-running the
+        // RULE mid-load could silently renumber the route -- but the reference it hands out is not frozen,
+        // because CheckPoint.Start replaces the exit's room with a live clone and banishes the original.
         private FinalPit chosenExit;
+
+        // The frozen decision: what the rule picked, as an identity that survives the room being replaced.
+        // Level-load scoped, like hopsByKey.
+        private bool exitChosen;
+        private string exitTarget;   // the chosen pit's targetLevelName
+        private Vector3 exitAnchor;  // where it was when the rule picked it, i.e. the true pit position
+        private bool exitReresolveLogged;
 
         private bool scanned;
         private int sceneHandle;
@@ -164,6 +173,9 @@ namespace UltrakillAIBridge.Obs
                 hopsByKey.Clear();
                 itemKeys.Clear();
                 chosenExit = null;
+                exitChosen = false;
+                exitTarget = null;
+                exitReresolveLogged = false;
                 duplicateDoorKeysWarned = false;
                 duplicateAltarKeysWarned = false;
                 exitTieWarned = false;
@@ -272,6 +284,8 @@ namespace UltrakillAIBridge.Obs
             {
                 if (door != null && !IsTemplate(door.transform)) doors.Add(door);
             }
+            // Before ScanGates, which asks ExitRoom() (and so ChooseExit()) which room the route starts from.
+            ResolveExit();
             ScanDoorKeys();
             ScanAltars(playerPos);
             ScanItems(playerPos);
@@ -1136,10 +1150,82 @@ namespace UltrakillAIBridge.Obs
         }
 
         /// <summary>
-        /// The real exit, chosen once per level load. Decoys, secret-level pits and Prime Sanctum pits are
-        /// already out of <see cref="pits"/> (see Scan), so this only has to prefer the pit that leads
-        /// onward, then an active pit over one whose room hasn't loaded yet. The choice is frozen because
-        /// "active" changes as the level plays and every gate's hop count depends on which pit was picked.
+        /// The exit for this step: the frozen decision, re-resolved onto whichever live <see cref="FinalPit"/>
+        /// now carries it. Cheap -- <see cref="ResolveExit"/> does the work once per <see cref="Scan"/>.
+        /// </summary>
+        private FinalPit ChooseExit()
+        {
+            if (!exitChosen) ResolveExit();
+            return chosenExit;
+        }
+
+        /// <summary>
+        /// Re-resolves <see cref="chosenExit"/> against the live scene, running the choice RULE only the
+        /// first time it succeeds in a level load.
+        ///
+        /// **Why a frozen reference was wrong.** <c>CheckPoint.Start</c> (decompiled/CheckPoint.cs:120-132)
+        /// clones every room the checkpoint owns, activates the clone at the room's own position, and moves
+        /// the ORIGINAL to <c>x + 10000</c>; <c>ResetRoom</c> (:621) does it again on every respawn. A
+        /// checkpoint's Start only runs once its own room is live, so on a level where the exit's room belongs
+        /// to a later checkpoint the first scan sees the original -- picks it, and used to keep that reference
+        /// for the whole load. The moment that checkpoint activated, the reported exit jumped 10,000 m along
+        /// x while the real trigger stayed put. Measured on <c>Level 0-2</c>: the exit read
+        /// (9801, -86.1, 277) once checkpoint <c>-55,-11,277</c> activated, against a true pit at
+        /// (-199, -86.1, 277). Python's <c>ExitGuard</c> is the stopgap that rejects the jump; this is the fix.
+        ///
+        /// **What stays frozen.** The rule's verdict, not the object: the pit's <c>targetLevelName</c> and the
+        /// position it held when the rule picked it. Re-running the rule itself would be unsafe, because its
+        /// rank includes <c>activeInHierarchy</c>, which changes as rooms stream in, and every gate's hop
+        /// count is measured from the chosen pit's room.
+        ///
+        /// **How the live twin is told from the banished one.** By distance to the anchor. The clone is
+        /// instantiated at the original's exact position, so it sits 0 m away; the banished original sits
+        /// 10,000 m away, a gap no legitimate move approaches. (It is usually gone from <see cref="pits"/>
+        /// anyway once its room is in some checkpoint's <c>defaultRooms</c> and <see cref="IsTemplate"/>
+        /// catches it -- but that is a consequence of the same Start, so it must not be the only defence.)
+        /// A scan that finds no match at all keeps the last resolved pit rather than reporting no exit: a
+        /// respawn re-instantiates the room, and a scan landing inside that window is a blink, not a change.
+        /// </summary>
+        private void ResolveExit()
+        {
+            if (!exitChosen)
+            {
+                var picked = ChooseExitByRule();
+                if (picked == null) return;  // nothing to freeze yet; try again on the next scan
+                exitChosen = true;
+                exitTarget = picked.targetLevelName;
+                exitAnchor = picked.transform.position;
+                chosenExit = picked;
+                return;
+            }
+
+            FinalPit best = null;
+            float bestDist = float.MaxValue;
+            foreach (var pit in pits)
+            {
+                if (pit == null) continue;
+                if (!string.Equals(pit.targetLevelName, exitTarget, StringComparison.Ordinal)) continue;
+                var dist = (pit.transform.position - exitAnchor).sqrMagnitude;
+                if (dist >= bestDist) continue;  // ties keep FindObjectsOfType order, as the rule does
+                best = pit;
+                bestDist = dist;
+            }
+            if (best == null) return;  // mid-respawn blink: keep the pit we already have
+            if (!ReferenceEquals(best, chosenExit) && !exitReresolveLogged)
+            {
+                exitReresolveLogged = true;
+                var was = chosenExit != null ? CampaignPatches.Key(chosenExit.transform.position) : "none";
+                Plugin.Log.LogInfo(
+                    $"Exit re-resolved in {SceneHelper.CurrentScene}: {was} -> "
+                    + $"{CampaignPatches.Key(best.transform.position)} (target '{exitTarget}')");
+            }
+            chosenExit = best;
+        }
+
+        /// <summary>
+        /// The choice rule, run once per level load by <see cref="ResolveExit"/>. Decoys, secret-level pits
+        /// and Prime Sanctum pits are already out of <see cref="pits"/> (see Scan), so this only has to
+        /// prefer the pit that leads onward, then an active pit over one whose room hasn't loaded yet.
         ///
         /// An "Intermission*" target counts as leading onward: an act finale's real exit drops into an
         /// intermission, not into the next mission, and MissionNumber cannot parse it, so IsSuccessor has
@@ -1152,10 +1238,8 @@ namespace UltrakillAIBridge.Obs
         /// uniqueness rather than by the successor test -- exactly the shape of level where a future
         /// duplicate would go unnoticed.
         /// </summary>
-        private FinalPit ChooseExit()
+        private FinalPit ChooseExitByRule()
         {
-            if (chosenExit != null) return chosenExit;
-
             var current = MissionNumber(SceneHelper.CurrentScene);
             FinalPit best = null;
             int bestRank = int.MaxValue;
@@ -1184,8 +1268,7 @@ namespace UltrakillAIBridge.Obs
                     $"{tied + 1} FinalPit candidates tie at rank {bestRank} in {SceneHelper.CurrentScene}; "
                     + $"keeping the one to '{best.targetLevelName}' at {CampaignPatches.Key(best.transform.position)}");
             }
-            chosenExit = best;
-            return chosenExit;
+            return best;
         }
 
         /// <summary>"Level 3-2" to (3, 2); null for anything that doesn't parse (a secret, the menu, ...).</summary>
