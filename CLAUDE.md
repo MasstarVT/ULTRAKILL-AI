@@ -2782,3 +2782,34 @@ Reinforcement-learning agent for ULTRAKILL (Cyber Grind + campaign). Repo: githu
     45.1. Same prefab, same offset, which is why the "61-75 m" estimate was in the right band, and it is a
     cheap sanity check on any future reading: a `ground_pos` that is not ~62 m above its pit is suspect.
     0-2's is 1.1 m in y from where the level's two real completions triggered (y -25).
+  - **The offline rescan of all 114 shipped rungs (2026-09-18), and the measure that actually works.** Four
+    obvious measures do NOT separate the known-bad rung from its neighbours, and one of them was tried first
+    and discarded: **raw "share of the reach cylinder over foreign floor"** scores the known-bad `0,10,331` at
+    **29.0%** while four rungs on the same level that live play proves are fine score **higher** (44.6, 49.0,
+    33.5, 31.9). R4's standable-cell view, floor-height-per-column, room-ownership share and geodesic
+    separation all fail too. The measure that works has two extra ingredients: (1) count only foreign-floor
+    air **within `route_ground_m` of drop**, i.e. what is still creditable after the ground rule — that alone
+    takes the known-bad rung to 7.3% and its neighbours to ~0, because their foreign floor is 14-50 m down;
+    and (2) **attribute** the remaining air to the room it belongs to, because the signature of the bug is
+    that the foreign floor is the room the route comes FROM. On `0,10,331` 100% of it is `1 - Main Room -
+    Floor 1`, the previous rung's room. The fixed `0,10,340` scores 0.0%, and an independent search for the
+    nearest clean point on the hallway floor proposes z 339.2 against the 340 that was applied by hand.
+    It needs a probe box reaching **46 m down**; the generator's own +/-14 m box cannot see the floor below.
+  - **Four more rungs are flagged and NOT yet shipped**, because the analysis itself asks for a live probe
+    first and each move re-aims a level. Ready to apply as `rung_overrides.json` entries at the next pause:
+
+    | level | rung (`was`) | creditable foreign air | attributed to | proposed |
+    |---|---|---|---|---|
+    | 0-3 | `-87,-15,413` `6 - Path 1 - Boss Arena` | 31.6% | **100% `5 - Path 1 - First Encounter`, the previous rung's room** | `[-95.2,-15.0,413.2]` `-95,-15,413` (0.0%) |
+    | 0-3 | `76,50,397` `9 - Windtunnel` | 25.1% | 42.7% `7 - Path 2 - Menacing Room`, two rungs earlier | `[64.8,50.0,377.2]` `65,50,377` (0.2%) |
+    | 8-3 | `201,155,928` `15 - Space Mass` | 41.0% | unattributed | `[202.2,157.8,916.8]` `202,158,917` (0.1%) |
+    | 8-3 | `513,254.2,941` `13 - Space Streets` | 30.0% | unattributed | `[512.8,256.8,930.8]` `513,257,931` (0.0%) |
+
+    Left alone with a reason: **7-1 `217,1,467`** (43.8%, but the foreign room is the NEXT rung's, so the
+    error is credit-early-by-one, not stranding, and the best point still scores 5.7%); **7-2 `0,28,340`**
+    (contaminated by `1 - Empty Hall` with nothing better than 8.8% within 26 m — it needs a different
+    mechanism, not a move); and the **5-2 / 7-3 / 7-4 rungs with a real lower deck inside the cylinder**,
+    whose floors are parented outside any room `RoomTrunk` parses, so a benign second standing place cannot
+    be told from a cross-room leak offline. 88 of 114 rungs are clean, and a further 12 are clean only
+    **because of** the ground rule (8.3-66.6% raw air, 0.0-3.6% after it) — those would all have been
+    suspects a day ago.
