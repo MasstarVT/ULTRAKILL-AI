@@ -27,6 +27,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ultrakill_ai.procmem import cap_blas_threads, refuse_if_commit_high  # noqa: E402
+
+cap_blas_threads()
+# It reads a whole run's episodes.jsonl and replays it; safe beside a live run, but not on a box that is
+# already out of room. Offline analysis has twice taken this machine down while a run was live.
+refuse_if_commit_high("replay_curriculum.py")
+
 from ultrakill_ai.campaign import (  # noqa: E402
     CURRICULUM_BLOCKED_FRESH_EPISODES,
     CURRICULUM_WEIGHT_CAP,

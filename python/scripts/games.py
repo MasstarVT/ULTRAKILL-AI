@@ -37,6 +37,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
+
+cap_blas_threads()
+
 from ultrakill_ai.windows import monitor_work_area  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]

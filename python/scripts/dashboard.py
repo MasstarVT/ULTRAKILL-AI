@@ -20,6 +20,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
+
+cap_blas_threads()  # a JSON viewer must not reserve 785 MB of commit for numpy's BLAS threads
+
 RUNS_DIR = Path(__file__).resolve().parents[1] / "runs"
 REFRESH_MS = 2000
 STALE_AFTER_S = 60

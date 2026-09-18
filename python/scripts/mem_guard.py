@@ -17,8 +17,6 @@ Never opens a bridge port. Honours the supervisor's and the driver's pause files
 from __future__ import annotations
 
 import argparse
-import ctypes
-import ctypes.wintypes as wt
 import sys
 import time
 from pathlib import Path
@@ -27,48 +25,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
-GB = 1024 ** 3
+from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
 
+cap_blas_threads()  # a guard that reserves 785 MB for numpy's BLAS threads is part of the problem
 
-class _MemCounters(ctypes.Structure):
-    _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD), ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t), ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t), ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t), ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t), ("PrivateUsage", ctypes.c_size_t)]
+from ultrakill_ai.procmem import (  # noqa: E402,F401
+    GB, MAX_LIMIT_GB, MIN_FRESH_GB, commit_fraction, derive_game_limit, private_bytes)
 
-
-class _MemStatus(ctypes.Structure):
-    _fields_ = [("dwLength", wt.DWORD), ("dwMemoryLoad", wt.DWORD), ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong), ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong), ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong), ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-
-
-def private_bytes(pid: int) -> int | None:
-    """Committed private memory of `pid`, or None when the process cannot be opened (gone, or protected)."""
-    kernel32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
-    kernel32.OpenProcess.restype = wt.HANDLE
-    handle = kernel32.OpenProcess(0x1000 | 0x0010, False, pid)  # QUERY_LIMITED_INFORMATION | VM_READ
-    if not handle:
-        return None
-    try:
-        counters = _MemCounters()
-        counters.cb = ctypes.sizeof(counters)
-        if not psapi.GetProcessMemoryInfo(wt.HANDLE(handle), ctypes.byref(counters), counters.cb):
-            return None
-        return int(counters.PrivateUsage)
-    finally:
-        kernel32.CloseHandle(wt.HANDLE(handle))
-
-
-def commit_fraction() -> float:
-    """System commit charge as a share of the commit limit (RAM + page file). This is what actually runs out."""
-    status = _MemStatus()
-    status.dwLength = ctypes.sizeof(status)
-    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-    total = float(status.ullTotalPageFile) or 1.0
-    return 1.0 - float(status.ullAvailPageFile) / total
+# How much a game may grow above the FRESHEST copy running before it is recycled; see `derive_game_limit`,
+# which this guard shares with the env's own episode-boundary recycle so the two cannot disagree.
+DEFAULT_GROWTH_GB = 1.0
 
 
 def choose_victim(private_by_port: dict[int, int], commit_frac: float, game_limit: int,
@@ -106,7 +72,10 @@ def paused(run: str) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--run", default="", help="run whose SUPERVISOR_PAUSE file is honoured (the driver's always is)")
-    parser.add_argument("--game-limit-gb", type=float, default=2.5, help="recycle a game above this much commit")
+    parser.add_argument("--game-limit-gb", type=float, default=0.0,
+                        help="fixed per-game limit in GB; 0 (the default) derives it from the live fleet")
+    parser.add_argument("--growth-gb", type=float, default=DEFAULT_GROWTH_GB,
+                        help="how far above the FRESHEST running copy a game may grow before it is recycled")
     parser.add_argument("--commit-limit-frac", type=float, default=0.93, help="recycle the fattest game above this system commit share")
     parser.add_argument("--base-port", type=int, default=47800)
     parser.add_argument("--ports", type=int, default=32, help="size of the bridge port range that is ours to touch")
@@ -126,20 +95,29 @@ def main() -> None:
             frac = commit_fraction()
             now = time.monotonic()
             stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            limit = (int(args.game_limit_gb * GB) if args.game_limit_gb > 0
+                     else derive_game_limit(sizes, int(args.growth_gb * GB)))
             if args.dry_run or now - last_heartbeat > 1800:
                 total = sum(sizes.values()) / GB
                 top = max(sizes.values(), default=0) / GB
-                print("%s mem: %d games, %.1f GB total, fattest %.1f GB, system commit %.0f%%"
-                      % (stamp, len(sizes), total, top, frac * 100), flush=True)
+                print("%s mem: %d games, %.1f GB total, fattest %.1f GB, limit %.1f GB, system commit %.0f%%"
+                      % (stamp, len(sizes), total, top, limit / GB, frac * 100), flush=True)
                 last_heartbeat = now
-            victim = choose_victim(sizes, frac, int(args.game_limit_gb * GB), args.commit_limit_frac)
+            victim = choose_victim(sizes, frac, limit, args.commit_limit_frac)
             if victim and args.dry_run:
                 print("%s would recycle port %d: %s" % (stamp, victim[0], victim[1]), flush=True)
             elif victim and not paused(args.run) and now - last_recycle >= args.cooldown_seconds:
-                print("%s recycling port %d: %s" % (stamp, victim[0], victim[1]), flush=True)
-                ok = games.relaunch_one(victim[0])
-                print("%s port %d %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), victim[0],
-                                         "is listening again" if ok else "did NOT come back"), flush=True)
+                port, reason = victim
+                before = sizes.get(port, 0)
+                print("%s recycling port %d: %s" % (stamp, port, reason), flush=True)
+                ok = games.relaunch_one(port)
+                after = private_bytes(games.listening_pids().get(port) or 0) or 0
+                # One line per recycle, with both sizes: this is the only record of what the leak costs, and
+                # `after` is also the freshest baseline measurement the derived limit will ever see.
+                print("%s port %d %s: %.2f GB -> %.2f GB (freed %.2f GB), system commit %.0f%%"
+                      % (time.strftime("%Y-%m-%d %H:%M:%S"), port,
+                         "is listening again" if ok else "did NOT come back",
+                         before / GB, after / GB, (before - after) / GB, commit_fraction() * 100), flush=True)
                 last_recycle = time.monotonic()
         except Exception as error:  # the guard must outlive a netstat hiccup
             print("%s error: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), error), flush=True)

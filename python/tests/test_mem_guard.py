@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import mem_guard  # noqa: E402
 from mem_guard import GB, choose_victim  # noqa: E402
+from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
+from ultrakill_ai.procmem import derive_game_limit  # noqa: E402
 
 LIMIT = 3 * GB
 
@@ -54,6 +56,131 @@ def test_the_readings_work_on_this_process():
     assert (mem_guard.private_bytes(os.getpid()) or 0) > 1024 * 1024
     assert 0.0 < mem_guard.commit_fraction() < 1.0
     assert mem_guard.private_bytes(0x7FFFFFF0) is None  # a pid that cannot exist
+
+
+# --------------------------------------------------------------- the limit is measured, not a constant
+
+
+def test_the_limit_is_the_freshest_game_plus_the_allowed_growth():
+    """A constant cannot track a build whose fresh size moved 1.0 -> 1.4 GB; the freshest copy running can."""
+    fleet = {47800: int(1.4 * GB), 47801: int(1.9 * GB), 47802: int(2.2 * GB)}
+    assert derive_game_limit(fleet, GB) == int(1.4 * GB) + GB
+
+
+def test_a_half_booted_copy_is_never_taken_for_the_fresh_baseline():
+    """The 2026-09-17 laggard sat at 56 MB. Believing that would put the limit under the boot size."""
+    fleet = {47800: int(0.06 * GB), 47801: int(1.5 * GB), 47802: int(2.4 * GB)}
+    assert derive_game_limit(fleet, GB) == int(1.5 * GB) + GB
+
+
+def test_a_fleet_that_has_all_grown_together_is_still_capped():
+    """The shape that killed the box: three copies at 5.8-6.1 GB and nothing fresh left to compare against."""
+    fleet = {47800: int(5.8 * GB), 47801: int(6.1 * GB)}
+    assert derive_game_limit(fleet, GB) == int(mem_guard.MAX_LIMIT_GB * GB)
+
+
+def test_an_empty_fleet_gives_a_usable_limit_rather_than_nonsense():
+    assert derive_game_limit({}, GB) == int(mem_guard.MIN_FRESH_GB * GB) + GB
+
+
+def test_the_guard_and_the_env_derive_the_same_limit():
+    """They recycle the same games for the same reason, so they must not drift apart."""
+    fleet = {47800: int(1.35 * GB), 47801: int(3.0 * GB)}
+    assert derive_game_limit(fleet, GB) == mem_guard.derive_game_limit(fleet, GB)
+
+
+# --------------------------------------------------------------- the env recycles its own game at a boundary
+
+
+class _Recorder(UltrakillEnv):
+    """An env that never touches a game: the fleet reading, the relaunch and the reconnect are all stubbed."""
+
+    def __init__(self, cfg, fleet, boots_to=None, relaunch_ok=True):
+        super().__init__(cfg)
+        self._fleet, self._boots_to, self._relaunch_ok = fleet, boots_to, relaunch_ok
+        self.relaunched, self.reconnected = 0, 0
+
+    def _fleet_memory_hook(self):
+        return self._fleet
+
+    def _relaunch_own_game(self, deadline):
+        self.relaunched += 1
+        if self._relaunch_ok and self._boots_to is not None:
+            self._fleet = {**self._fleet, self.cfg.port: self._boots_to}
+        return self._relaunch_ok
+
+    def _reconnect(self):
+        self.reconnected += 1
+
+
+def _env(fleet, growth=1.0, relaunch=True, **kwargs):
+    cfg = EnvConfig(port=47800, game_memory_growth_gb=growth, bridge_relaunch=relaunch)
+    return _Recorder(cfg, fleet, **kwargs)
+
+
+def test_a_fat_game_is_replaced_between_episodes():
+    env = _env({47800: int(3.0 * GB), 47801: int(1.4 * GB)}, boots_to=int(1.4 * GB))
+    env._recycle_own_game_if_fat(deadline=1e9)
+    assert env.relaunched == 1 and env.reconnected == 1 and env._mem_recycles == 1
+
+
+def test_a_healthy_game_is_left_alone():
+    env = _env({47800: int(1.9 * GB), 47801: int(1.4 * GB)})
+    env._recycle_own_game_if_fat(deadline=1e9)
+    assert env.relaunched == 0 and env._mem_recycles == 0
+
+
+def test_only_this_envs_own_port_is_ever_judged():
+    """Another worker's game being fat is that worker's business; this one must not touch it."""
+    env = _env({47800: int(1.4 * GB), 47801: int(5.9 * GB)})
+    env._recycle_own_game_if_fat(deadline=1e9)
+    assert env.relaunched == 0
+
+
+def test_the_recycle_is_off_unless_the_run_turned_relaunching_on():
+    """`bridge_relaunch` is train.py's alone, so an eval can no more recycle a game than relaunch one."""
+    env = _env({47800: int(5.9 * GB)}, relaunch=False, boots_to=int(1.4 * GB))
+    env._recycle_own_game_if_fat(deadline=1e9)
+    assert env.relaunched == 0
+
+
+def test_growth_zero_is_off():
+    env = _env({47800: int(5.9 * GB)}, growth=0.0, boots_to=int(1.4 * GB))
+    env._recycle_own_game_if_fat(deadline=1e9)
+    assert env.relaunched == 0
+
+
+def test_a_fresh_game_still_over_the_limit_latches_the_mechanism_off():
+    """Otherwise a limit set below the boot size relaunches forever and the run never trains again."""
+    env = _env({47800: int(3.0 * GB), 47801: int(1.4 * GB)}, boots_to=int(3.0 * GB))
+    env._recycle_own_game_if_fat(deadline=1e9)
+    assert env.relaunched == 1 and env._mem_recycle_off is True
+    env._recycle_own_game_if_fat(deadline=1e9)
+    assert env.relaunched == 1, "a latched-off env must not try again"
+
+
+def test_a_failed_relaunch_does_not_count_as_a_recycle_or_drop_the_connection():
+    env = _env({47800: int(3.0 * GB), 47801: int(1.4 * GB)}, relaunch=True, boots_to=None)
+
+    def refuse(deadline):
+        env.relaunched += 1
+        return False
+
+    env._relaunch_own_game = refuse
+    env._recycle_own_game_if_fat(deadline=1e9)
+    assert env.relaunched == 1 and env.reconnected == 0 and env._mem_recycles == 0
+
+
+def test_a_broken_memory_reading_never_breaks_a_reset():
+    """A memory optimisation may not become a new way for an episode to die."""
+    env = _env({47800: int(3.0 * GB), 47801: int(1.4 * GB)}, boots_to=int(1.4 * GB))
+
+    def explode():
+        raise OSError("netstat said no")
+
+    env._fleet_memory_hook = explode
+    env._recycle_own_game_if_fat(deadline=1e9)  # must not raise
+    assert env.relaunched == 0 and env._mem_recycle_off is True
 
 
 if __name__ == "__main__":

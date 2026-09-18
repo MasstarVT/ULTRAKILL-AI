@@ -24,6 +24,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
+
+cap_blas_threads()  # before ultrakill_ai.times, which reaches numpy through ultrakill_ai.campaign
+
 from ultrakill_ai.times import (  # noqa: E402
     LEADERBOARD_HEADING, TimeEntry, _data_rows, _ms, _table, format_time, parse_time, record_file, short_level)
 

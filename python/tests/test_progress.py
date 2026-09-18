@@ -11,6 +11,7 @@ import importlib.util
 import json
 import statistics
 import subprocess
+import os
 import sys
 import tempfile
 import time
@@ -696,10 +697,14 @@ def test_replay_curriculum_scores_both_rules_from_an_episode_log():
         log.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
         before = log.read_bytes()
 
+        # The script refuses to start when system commit is over 85%, because offline analysis has twice taken
+        # this machine down beside a live run. A 60-row fixture is not that hazard, so the test overrides it
+        # the same documented way an operator would.
+        env = dict(os.environ, ULTRAKILL_AI_IGNORE_COMMIT="1")
         result = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "replay_curriculum.py"), "--episodes", str(log),
              "--hours", "0.5", "--drift"],
-            capture_output=True, text=True, timeout=120, cwd=str(ROOT),
+            capture_output=True, text=True, timeout=120, cwd=str(ROOT), env=env,
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert log.read_bytes() == before, "the replay must never write to the log it reads"
