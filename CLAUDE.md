@@ -48,7 +48,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - `python/scripts/` — `train.py`, `eval.py`, `games.py`, `campaign_driver.py` (the specialist driver),
   `supervise.py`, `mem_guard.py`, `full_run.py`, `specialists_status.py`, `poll_status.py`, `keep_best.py`,
   `post_times.py`, `dashboard.py`, `build_routes.py`, `campaign_check.py`, `skull_check.py`, `bridge_test.py`.
-- `python/tests/` — 25 no-game test files, ~612 named tests, about 2 minutes for the lot.
+- `python/tests/` — 29 no-game test files, ~670 named tests, about 2 minutes for the lot.
 - `python/configs/` — `specialists.yaml` (the specialist plan; **not** a training config),
   `campaign_gates_full.yaml` (the shared-run config it is pinned against), `campaign_0-1.yaml`,
   `cybergrind.yaml`, `il_records.yaml`, and the earlier campaign configs kept as rollbacks.
@@ -139,9 +139,13 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - `times.md` leaderboard, all Violent, all set by `campaign_gates`: **0-1 03:03.628 (A)**, **0-2 02:07.927
   (S)**, **0-3 04:23.904 (B)**. The human reference playthrough of 0-1 is **146.58 s**; human IL records, the
   real speed targets, are in `docs/il-records.md`.
+- 0-3's trunk shipped BOTH branches of the level's fork chained in series, and a 7-rung detour tour paid 105
+  against a completion's 100. Trimmed to the 4 rungs every recorded completion used (2026-09-18, `route-0-3`);
+  `rung_overrides.json` now carries `drop` entries and the trainer was bounced onto it. Judge at +400k steps on
+  wing endings and `exit_ground_dist_min` (129.4 m at the bounce), never on `gates_reached` — see the log.
 - In flight: branch **`speed-stages`** (currently level with `main`, nothing built yet) for the S-rank time
-  targets and the time-scaled completion bonus; a **0-3 mid-level wall probe** still to run; and the memory
-  work above — another engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
+  targets and the time-scaled completion bonus; guard T's mid-name-fork blind spot still unfixed campaign-wide;
+  and the memory work — another engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
   (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2** installed; **33 of 35**
   levels ship; Violent, with all weapons unlocked in memory for AI runs only.

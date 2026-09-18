@@ -1719,3 +1719,80 @@ current state.
   driver runs. Status: `python scripts/specialists_status.py`; pause: `runs/specialists/DRIVER_PAUSE`; full-game
   chain: `python scripts/full_run.py`. The speed phase (Brutal + time-scaled completion bonus) will revisit each
   specialist in turn.
+- **0-3's route trunk chained both branches of the fork, and the ladder paid more for the detour than for
+  finishing (2026-09-18, branch `route-0-3`).** `Level 0-3` ("Double Down") forks into Path 1, the lower branch
+  (y 5 -> -15), and Path 2, the upper one (y 50) -- you take one. `scripts/build_routes.py` shipped **both,
+  chained in series**, as an 11-rung / 688 m trunk.
+  - **Mechanism.** Guard T collapses a parallel branch only when the branch marker is a LEADING letter
+    (`RX_G_BR = ^([A-Z])(\d{1,2})\s*-\s+`, e.g. `A1 - ...`). 0-3 spells its fork in the MIDDLE of the room name
+    -- `5 - Path 1 - First Encounter` against `7 - Path 2 - Menacing Room` -- so `name_kind()` returns
+    `('ord', N, '')` for all twelve rooms, no rung is kind `branch`, and guard T's `len(prefixes) <= 1` test is
+    vacuous on exactly the level that needed it (`drop_trunk: []`, `drop_i6: []`).
+    `tests/test_route_files.py::test_only_the_trunk_ships` passed on a route shipping both branches for the
+    same reason, which is why `test_the_0_3_wing_stays_off_the_route` now sits beside it.
+  - **Evidence (offline only; nothing was probed in game).** `gates_reached` is the count of DISTINCT rungs the
+    player physically stood on -- `_is_reached` is a grounded 8 m x 6 m cylinder and `_note_reached` pays once
+    per new lower `hops` -- so it reads back the route an episode took. In `runs/campaign_gates/episodes.jsonl`
+    (895 0-3 episodes, 606 fresh) the level's **only four completions credited 3 or 4 rungs and never more**:
+    gr 3 / 3 / **4** / 3, the gr=4 one being the 263.903 s row in `times.md`. Its stored trace
+    (`best_runs/Level_0-3.json`, 4064 points) reaches exactly `1 - Main Room - Floor 1`, `2 - Side Hallway`,
+    `10 - Main Room - Floor 2`, `11 - Boss Arena - Floor 2` and enters **none** of the seven wing rooms (closest
+    approach 20.3 m to the Side Arena, 157.9 m to the Menacing Hallway); its climb to Floor 2 is 39.4 m in 3.0 s
+    inside the main-room footprint (x -14..+5, z 303..330), not via the Side Stairway. In `runs/spec_0-3` (238
+    fresh episodes, 2.83M steps, **0 fresh completions**) the specialist had learned the detour instead: 115 of
+    238 fresh episodes (48%) walk the wing to `7 - Path 2 - Menacing Room`, wing endings rose 47% -> 68% over
+    the stage, mean episode length 6185 -> 7419, and only 16 of 238 ever got past it. The arithmetic is the
+    whole story: at `gate: 15.0` a 7-rung wing tour pays **105**, and `level_complete` pays **100**. The trunk
+    was paying more for the dead end than for the exit, with certainty instead of at 1%.
+  - **What the data did NOT say.** The 12 fresh episodes that credit exactly 2 rungs -- Main Room Floor 1 then
+    Main Room Floor 2, skipping the wing -- are spread over the whole stage (ts 19.38M-21.13M) and are the only
+    ones that get near the exit. That proves the main-room ascent is **available from level start and reachable
+    by the current policy**, which is what the trim depends on; the ascent's MECHANISM (0-3 has 7 moving
+    platforms) is still unidentified, and no in-game probe was run.
+  - **The fix, data plus one generator hook.** `rung_overrides.json` gained a second kind of entry,
+    `{"name": ..., "drop": true, "why": ...}`, honoured by `build_routes.apply_drops()` between I2 and R1 --
+    so R1 counts what ships and `hops` stays gapless -- with three rules of its own: matched by room NAME, an
+    unknown name REFUSED rather than ignored, and the whole list for a level refused if it would go under
+    `MIN_RUNGS` (a sub-minimum file reads as NO file and would drop the level to its gate ladder in silence).
+    A plain hand-edit could not be used: the next `build_routes.py` run would have restored the detour, and the
+    override README forbids a move entry from removing a rung. `route_Level_0-3.json` was then REGENERATED, not
+    hand-written: **4 rungs, hops 3..0** (`1 - Main Room - Floor 1`, `2 - Side Hallway - Floor 1`,
+    `10 - Main Room - Floor 2`, `10B - Second Encounter + 11 - Boss Arena - Floor 2`), tour_ratio 0.944 ->
+    **1.000**, polyline 688 -> **178.4 m**, max gap 117.6 -> **92.5 m**, last rung to pit 119.7 m unchanged, and
+    the shipped file now records the seven dropped rooms in `trunk_dropped`. `checkpoints_within_60m` falls
+    4/4 -> **1/4** and `legs_witnessed` 9/11 -> **2/4** because three of the level's four checkpoints are IN the
+    wing -- both are diagnostics, and what they now say is true. The 2026-09-18 Side Hallway position override
+    still applies cleanly (`override_refused` empty). **No config, reward weight, observation or mod change**;
+    `prefer_route_when_collapsed: true` is untouched, so 0-3 still prefers its trunk and 4-3's is unaffected.
+  - **Tests.** New `tests/test_route_drops.py` (10 tests) lifts `apply_drops`/`apply_overrides` out of
+    `build_routes.py` by AST -- importing it would run `refuse_if_commit_high()` and fail whenever the box is
+    busy -- and pins the three rules plus what actually ships. `test_route_files.py` 23 -> 25 tests
+    (`test_the_0_3_wing_stays_off_the_route`, `test_a_drop_entry_names_a_room_that_was_really_there`;
+    `EXPECTED_LADDERS`, `TOTAL_RUNGS` 114 -> 107 and `build_routes.EXPECTED_SHAPE` moved with the data, which is
+    the pin working). Full no-game suite green, one file at a time, in the worktree: **29 files, 0 failures**.
+    `build_routes.py --levels 0-3 --dry-run --validate` reports `0-3 unchanged` against the new shape row; its
+    two FAIL lines ("the gates guard passes on 1 levels, not the measured 18" and the EXPECTED_SHAPE /
+    EXPECTED_SHIPPED ordering) are **pre-existing on main for any single-level `--validate`** -- verified by
+    running the identical command on the unmodified main tree, which prints the same two lines and exits 1.
+  - **What to watch, and the honest limit.** Baseline read minutes before the bounce: `spec_0-3` ts
+    **21,588,202**, `mean_100.exit_ground_dist_min` **129.44 m**, `mean_fresh_100.gates_reached` **4.86**,
+    `mean_100.length` **7017**, `mean_100.targets_parked` **2.53**, `end_reasons_100` stuck 64 / max_steps 12,
+    wing endings **68 of the last 100**, fresh episodes reaching `gate_hops_best <= 1` **12 of 238**,
+    `part_gate` **42.31**, `part_gate_approach` **28.71**, fresh completions **0 of 238**. Judge at +400k steps
+    on: wing endings (`end_pos` x < -40 and z > 370; should fall well under 20/100), `exit_ground_dist_min`
+    (should fall under ~100 m -- the Boss Arena Floor 2 rung is ~97 m from the exit ground point, so simply
+    getting into the arena drives it there), `length`, `max_steps` endings, `targets_parked`, and the share of
+    fresh episodes reaching `gate_hops_best <= 1`, which is the real bottleneck rate. Do NOT judge on
+    `gates_reached` or `part_gate`: both are capped by the rung count and fall by arithmetic (4 rungs instead of
+    11) whatever the policy does. Do NOT judge on the completion rate before ~1.5M steps -- the stage produces
+    ~84 fresh episodes per 1M steps, so 400k is ~34 of them and the best rate ever observed on 0-3 is 1.8%.
+    **REVERT TRIGGER:** if wing endings fall but `exit_ground_dist_min` is not under ~120 m by 400k steps, the
+    wing was at least carrying the agent upward and the trim was not the binding constraint -- revert and probe
+    the Floor 1 -> Floor 2 transition in game.
+  - **Not claimed.** That the trunk was the ONLY cause. The stall reproduces across layers: 0 completions in 292
+    fresh episodes before any route file existed, 2 in 113 under the gate ladder, 2 in 201 under the trunk in
+    the shared run, 0 in 238 under the trunk in the specialist -- and 2/113 vs 2/201 is not a significant
+    difference. What is removed here is a measured, arithmetically certain perverse incentive (105 > 100) and a
+    ladder that pointed at rooms no completion has ever entered; that is not the same as a fix for 0-3. The
+    generator's blind spot itself (`RX_G_BR` sees only a LEADING branch letter) is NOT fixed -- it is a
+    campaign-wide correctness change and is documented in the `OVERRIDES_NAME` comment for whoever takes it.

@@ -3,7 +3,11 @@
     "Manual rung-position overrides for scripts/build_routes.py, applied AFTER every guard and",
     "BEFORE every measurement, so a regeneration after a game update keeps a measured fix instead of",
     "silently undoing it. Read the OVERRIDES_NAME comment in build_routes.py for the three rules.",
-    "An entry moves one rung and never adds, removes or reorders one.",
+    "An entry moves one rung and never adds or reorders one.",
+    "An entry with `drop: true` instead of `pos`/`was` REMOVES that rung: guard T only sees a",
+    "LEADING branch letter, so a fork spelled mid-name ('5 - Path 1 - ...' vs '7 - Path 2 - ...')",
+    "ships both branches chained in series. Drops are applied between I2 and R1, by name, and the",
+    "whole list for a level is refused if it would take that level under MIN_RUNGS.",
     "Keys are the short level form ('0-3'). `name` is the rung's room name, which survives a",
     "regeneration where an index or a position does not. `was` is the position the generator itself",
     "produced when the override was measured: if it no longer produces that position the rooms have",
@@ -17,6 +21,41 @@
       "was": [0.0, 10.0, 331.0],
       "pos": [0.0, 10.0, 340.0],
       "why": "The room centroid sits 1.5 m past the main room's far wall (wall face z 329.5; the Side Hallway floor is y 10.4, spanning z 332-362), so the 8 m x 6 m reach cylinder covers the wall face on the MAIN ROOM side down to y 4. Measured live 2026-09-18 over three fresh episodes: 801 credit steps, 680 of them airborne against the wall, and the first credit of every episode was airborne at ground_ray_center 9.5-10.5 m on the main-room side -- the ladder then advanced the target to rung 8 through the wall and the agent dropped into the bowl (26 of 66 fresh route episodes). A scripted hold-forward-and-jump run that never crossed the wall (max z 329.5) credited it 31 times. z 340 is 10.5 m past the wall, so the whole cylinder is inside the hallway: every first credit then lands inside it (z 332.9-333.9), and the two scripted non-crossing runs credit it 0 times. tour_ratio 0.9439 -> 0.9438."
+    },
+    {
+      "name": "3 - Side Arena - Floor 1",
+      "drop": true,
+      "why": "THE 0-3 SIDE WING, DROPPED AS ONE (this entry and the six below). 'Double Down' forks: Path 1 is the lower branch (y 5 -> -15), Path 2 the upper (y 50), and the generator chained them in series because guard T cannot see a mid-name fork. Measured 2026-09-18 on runs/spec_0-3/episodes.jsonl (238 fresh episodes, 2.83M steps, ZERO fresh completions) and runs/campaign_gates/episodes.jsonl (606 fresh, 4 completions). gates_reached is the count of DISTINCT rungs physically stood on, so it reads the route the episode took: all four completions credited 3 or 4 rungs and NONE credited more, i.e. no completed run has ever entered this wing. The fastest (263.9 s, the times.md row) credited exactly the four rungs that remain. Meanwhile 115 of 238 fresh specialist episodes (48%) walk the wing to rung 4 for 7 x 15.0 = 105 reward -- MORE than the 100.0 a completion pays -- and 200 of 263 such episodes end back down in the Path 1 bowl. The wing share rose 47% -> 68% of episodes over the stage while completions stayed at zero. The four rungs kept are the ones the policy already uses when it does well: 12 of 238 fresh episodes credit 2 rungs (Main Room Floor 1, then Main Room Floor 2) and skip the wing entirely, which also proves the main-room ascent to Floor 2 is available from level start."
+    },
+    {
+      "name": "4 - Side Stairway - Floor 1-2",
+      "drop": true,
+      "why": "The wing, see '3 - Side Arena - Floor 1'."
+    },
+    {
+      "name": "5 - Path 1 - First Encounter",
+      "drop": true,
+      "why": "The wing, see '3 - Side Arena - Floor 1'. Path 1 is the branch NOT taken when Path 2 is."
+    },
+    {
+      "name": "6 - Path 1 - Boss Arena",
+      "drop": true,
+      "why": "The wing, see '3 - Side Arena - Floor 1'. The sink: 200 of the 263 episodes that reached rung 4 END nearest this bowl, 62 of the last 100 episodes overall, and the 117.6 m / +65 m leg out of it was the trunk's largest gap."
+    },
+    {
+      "name": "7 - Path 2 - Menacing Room",
+      "drop": true,
+      "why": "The wing, see '3 - Side Arena - Floor 1'. Reached in 115 of 238 fresh episodes and never once on the way to an exit."
+    },
+    {
+      "name": "8 - Path 2 - Menacing Hallway",
+      "drop": true,
+      "why": "The wing, see '3 - Side Arena - Floor 1'. The eastward dead end: 16 of 238 fresh episodes get this far, and the 111 m out and 65.6 m back burn the 12000-step budget (16 of the last 100 episodes ended on max_steps)."
+    },
+    {
+      "name": "9 - Windtunnel",
+      "drop": true,
+      "why": "The wing, see '3 - Side Arena - Floor 1'. The return half of the Path 2 dead end."
     }
   ]
 }
