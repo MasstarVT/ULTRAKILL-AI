@@ -135,6 +135,118 @@ def test_a_launch_that_never_opens_its_ports_times_out():
     assert games.startup_verdict([47800], set(), game_count=3, elapsed=181.0, timeout=180.0) == "timeout"
 
 
+# ---------------------------------------------------------------------------
+# Every process query is bounded and cached (the 2026-09-17 freeze; see CLAUDE.md)
+# ---------------------------------------------------------------------------
+
+
+def _fake_subprocess(monkey, behaviour):
+    """Replaces games.subprocess.run and returns the list of argv it was called with."""
+    calls: list[list[str]] = []
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return behaviour(argv, kw)
+
+    monkey.append((games.subprocess, "run", games.subprocess.run))
+    games.subprocess.run = run
+    return calls
+
+
+def _restore(monkey):
+    for obj, name, original in monkey:
+        setattr(obj, name, original)
+    games._invalidate_proc_cache()
+
+
+def test_every_process_query_is_bounded():
+    """`netstat` and `tasklist` block under WMI/Tcpip contention, which is normal on a box running twelve
+    games plus a recovery storm -- and these are now called from inside a worker's recovery ladder and from
+    the supervisor. An unbounded one there is a hang indistinguishable from the one being fixed."""
+    monkey: list = []
+    seen: list[dict] = []
+
+    def behaviour(argv, kw):
+        seen.append(kw)
+        class R:  # noqa: E306
+            stdout = ""
+        return R()
+
+    _fake_subprocess(monkey, behaviour)
+    try:
+        games._invalidate_proc_cache()
+        games.listening_pids()
+        games._invalidate_proc_cache()
+        games.working_sets()
+        games._invalidate_proc_cache()
+        games.running_pids()
+    finally:
+        _restore(monkey)
+    assert seen, "the queries ran"
+    for kw in seen:
+        assert kw.get("timeout"), "every process query must carry a timeout"
+
+
+def test_a_process_query_that_times_out_returns_no_data_instead_of_raising():
+    """Empty maps make the caller fall through to its next rung; an exception out of a diagnostic does not."""
+    monkey: list = []
+
+    def behaviour(argv, kw):
+        raise games.subprocess.TimeoutExpired(argv[0], kw.get("timeout", 1))
+
+    _fake_subprocess(monkey, behaviour)
+    try:
+        games._invalidate_proc_cache()
+        assert games.listening_pids() == {}
+        games._invalidate_proc_cache()
+        assert games.working_sets() == {}
+        games._invalidate_proc_cache()
+        assert games.running_pids() == []
+        games._invalidate_proc_cache()
+        assert games.port_open(47800) is False
+    finally:
+        _restore(monkey)
+
+
+def test_a_taskkill_that_hangs_does_not_hang_the_caller():
+    monkey: list = []
+
+    def behaviour(argv, kw):
+        if argv[0] == "taskkill":
+            raise games.subprocess.TimeoutExpired(argv[0], kw.get("timeout", 1))
+        class R:  # noqa: E306
+            stdout = ""
+        return R()
+
+    _fake_subprocess(monkey, behaviour)
+    try:
+        games._invalidate_proc_cache()
+        assert games.kill_unlistening() == []  # nothing is running, so nothing to kill, and no exception
+        assert games._run_bounded(["taskkill", "/F", "/PID", "1"]) is False
+    finally:
+        _restore(monkey)
+
+
+def test_repeated_polls_share_one_snapshot():
+    """Twelve workers polling once a second each is ~18 process spawns a second on a thrashing machine."""
+    monkey: list = []
+
+    def behaviour(argv, kw):
+        class R:  # noqa: E306
+            stdout = "  TCP    127.0.0.1:47800    0.0.0.0:0    LISTENING    4242\n"
+        return R()
+
+    calls = _fake_subprocess(monkey, behaviour)
+    try:
+        games._invalidate_proc_cache()
+        for _ in range(10):
+            assert games.port_open(47800)
+        netstats = [c for c in calls if c[0] == "netstat"]
+        assert len(netstats) == 1, "ten polls in one TTL window must cost one netstat, not ten"
+    finally:
+        _restore(monkey)
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     for name, fn in tests:

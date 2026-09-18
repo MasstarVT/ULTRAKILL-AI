@@ -222,7 +222,10 @@ class FakeLevel:
         self.dead = True
         return self._obs("kill")
 
-    def reset(self, scene: str | None = None, checkpoint: bool = False) -> dict:
+    def reset(self, scene: str | None = None, checkpoint: bool = False,
+              timeout: float | None = None) -> dict:
+        # `timeout` is accepted and ignored: the real client clamps a reset to what is left of the recovery
+        # budget, and a fake that rejected the argument would pass while production raised TypeError.
         if self.fail_resets:
             raise self.fail_resets.pop(0)
         self.resets.append(checkpoint)

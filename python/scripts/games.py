@@ -86,10 +86,69 @@ def disk_logging_enabled(cfg_path: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# Every process query here is BOUNDED and CACHED, because these are now called from inside a training
+# worker's recovery ladder (`UltrakillEnv._relaunch_hook`) and from the supervisor, not only from a human's
+# command line.
+#
+#   Bounded: `netstat -ano -p tcp` and `tasklist` block under WMI/Tcpip provider contention, which is normal on
+#   a box running twelve games plus a recovery storm -- exactly the state these are called in. An unbounded
+#   `subprocess.run` there is a worker hung forever inside the machinery whose whole promise is that it cannot
+#   hang, with no exception and no log line.
+#
+#   Cached: twelve workers polling `relaunch_one`'s `port_open` once a second and the boot gate's
+#   `listening_pids` + `working_sets` every two seconds is ~18 process spawns a second on a machine that is
+#   already thrashing. One snapshot per TTL serves all of them.
+PROC_QUERY_TIMEOUT_S = 30.0
+PROC_CACHE_TTL_S = 2.0
+_proc_cache: dict[str, tuple[float, str]] = {}
+
+
+def _query(key: str, argv: list[str], ttl: float = PROC_CACHE_TTL_S) -> str:
+    """One bounded, briefly-cached process query. Returns "" when it times out or cannot run.
+
+    "" makes every parser above return an empty map, so a caller sees "nothing is listening" / "no working set
+    known" and falls through to its next rung, rather than inheriting an exception from a diagnostic.
+    """
+    now = time.monotonic()
+    hit = _proc_cache.get(key)
+    if hit is not None and now - hit[0] < ttl:
+        return hit[1]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=PROC_QUERY_TIMEOUT_S).stdout
+    except subprocess.TimeoutExpired:
+        print(f"games: '{argv[0]}' did not answer within {PROC_QUERY_TIMEOUT_S:.0f}s; treating it as no data")
+        return ""
+    except OSError as exc:
+        print(f"games: could not run '{argv[0]}': {exc}")
+        return ""
+    _proc_cache[key] = (now, out)
+    return out
+
+
+def _run_bounded(argv: list[str]) -> bool:
+    """A fire-and-forget command (taskkill) with a bound. True when it ran, False when it timed out."""
+    try:
+        subprocess.run(argv, capture_output=True, timeout=PROC_QUERY_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        print(f"games: '{' '.join(argv[:2])}' did not finish within {PROC_QUERY_TIMEOUT_S:.0f}s")
+        return False
+    except OSError as exc:
+        print(f"games: could not run '{argv[0]}': {exc}")
+        return False
+    return True
+
+
+def _invalidate_proc_cache() -> None:
+    """After a kill or a start, the cached snapshot describes a machine that no longer exists."""
+    _proc_cache.clear()
+
+
+def _tasklist() -> str:
+    return _query("tasklist", ["tasklist", "/FI", f"IMAGENAME eq {EXE_NAME}", "/FO", "CSV", "/NH"])
+
+
 def running_pids() -> list[int]:
-    out = subprocess.run(
-        ["tasklist", "/FI", f"IMAGENAME eq {EXE_NAME}", "/FO", "CSV", "/NH"], capture_output=True, text=True
-    ).stdout
+    out = _tasklist()
     return [int(line.split(",")[1].strip('"')) for line in out.splitlines() if line.startswith(f'"{EXE_NAME}"')]
 
 
@@ -98,12 +157,14 @@ def stop_all(timeout: float = 30.0) -> None:
     if not pids:
         return
     print(f"Closing {len(pids)} running game(s)...")
-    subprocess.run(["taskkill", "/IM", EXE_NAME], capture_output=True)  # polite close, lets the game save state
+    _run_bounded(["taskkill", "/IM", EXE_NAME])  # polite close, lets the game save state
+    _invalidate_proc_cache()
     deadline = time.monotonic() + timeout
     while running_pids() and time.monotonic() < deadline:
         time.sleep(1)
     if running_pids():
-        subprocess.run(["taskkill", "/F", "/IM", EXE_NAME], capture_output=True)
+        _run_bounded(["taskkill", "/F", "/IM", EXE_NAME])
+        _invalidate_proc_cache()
         time.sleep(2)
 
 
@@ -129,7 +190,7 @@ def listening_pids() -> dict[int, int]:
     """Port -> pid for everything listening. Never probe the bridge by connecting: it is a single-client server
     that drops its current client when a new one connects, so a probe connection kicks a running trainer off the
     game (this killed a training run once)."""
-    return parse_listening(subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True).stdout)
+    return parse_listening(_query("netstat", ["netstat", "-ano", "-p", "tcp"]))
 
 
 def listening_ports() -> set[int]:
@@ -164,10 +225,7 @@ def parse_working_sets(tasklist_output: str) -> dict[int, int]:
 
 def working_sets() -> dict[int, int]:
     """Working set in bytes for every running copy of the game: the boot-progress signal the health gate uses."""
-    out = subprocess.run(
-        ["tasklist", "/FI", f"IMAGENAME eq {EXE_NAME}", "/FO", "CSV", "/NH"], capture_output=True, text=True
-    ).stdout
-    return parse_working_sets(out)
+    return parse_working_sets(_tasklist())
 
 
 def startup_verdict(wanted: list[int], open_ports: set[int], game_count: int, elapsed: float,
@@ -281,6 +339,30 @@ def start_instance(port: int, width: int, height: int, job_workers: int) -> int:
     return subprocess.Popen(args, cwd=exe.parent, env=env, creationflags=flags).pid
 
 
+def unlistening_pids(pids: list[int] | None = None, owners: dict[int, int] | None = None) -> list[int]:
+    """Game processes that own no LISTENING port at all: an instance wedged before its bridge came up.
+
+    Not "not one of OUR ports": a copy someone started by hand on another port is listening and is left alone.
+    The plugin opens the bridge server long before Addressables finish, so after a launch timeout a game with
+    no port is stuck, not slow -- the 2026-09-17 one sat at 242 MB burning a core for six minutes.
+    """
+    pids = running_pids() if pids is None else pids
+    listening = set((listening_pids() if owners is None else owners).values())
+    return [pid for pid in pids if pid not in listening]
+
+
+def kill_unlistening() -> list[int]:
+    """Kills the wedged instances `unlistening_pids` found, so a repair does not leave them burning a core."""
+    dead = unlistening_pids()
+    for pid in dead:
+        print(f"Killing a wedged instance with no bridge port (pid {pid})")
+        _run_bounded(["taskkill", "/F", "/PID", str(pid)])
+    if dead:
+        _invalidate_proc_cache()
+        time.sleep(2)
+    return dead
+
+
 def relaunch_one(port: int, width: int = 368, height: int = 207, job_workers: int = 3,
                  timeout: float = 240.0) -> bool:
     """Restarts the single instance on `port`, leaving every other game running.
@@ -297,13 +379,21 @@ def relaunch_one(port: int, width: int = 368, height: int = 207, job_workers: in
     pid = listening_pids().get(port)
     if pid is not None:
         print(f"Killing the instance on port {port} (pid {pid})")
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+        _run_bounded(["taskkill", "/F", "/PID", str(pid)])
+        _invalidate_proc_cache()
         deadline = time.monotonic() + 30.0
         while port_open(port) and time.monotonic() < deadline:
             time.sleep(1)
     else:
-        print(f"No process is listening on port {port}; starting one anyway")
+        # No pid owns the port, so the instance that should be here wedged before its bridge came up. Starting
+        # a replacement without reaping it leaves the wedged copy burning a core for the rest of the run --
+        # `launch` calls `kill_unlistening` for exactly this, and this path used not to. It is safe here for the
+        # same reason it is safe there: a copy someone started by hand IS listening, so it is never in the list.
+        wedged = kill_unlistening()
+        print(f"No process is listening on port {port}; reaped {len(wedged)} portless instance(s) "
+              f"and starting one anyway")
     start_instance(port, width, height, job_workers)
+    _invalidate_proc_cache()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if port_open(port):
@@ -315,7 +405,8 @@ def relaunch_one(port: int, width: int = 368, height: int = 207, job_workers: in
 
 
 def launch(
-    count: int, base_port: int, width: int, height: int, stagger: float, timeout: float, monitor: int | None, job_workers: int
+    count: int, base_port: int, width: int, height: int, stagger: float, timeout: float, monitor: int | None,
+    job_workers: int, repair_rounds: int = 2
 ) -> None:
     exe = game_dir() / EXE_NAME
     if not exe.exists():
@@ -336,18 +427,34 @@ def launch(
         time.sleep(stagger)
 
     ports = [base_port + i for i in range(count)]
-    started = time.monotonic()
-    while True:
-        elapsed = time.monotonic() - started
-        verdict = startup_verdict(ports, listening_ports(), len(running_pids()), elapsed, timeout)
-        if verdict == "ready":
+    # One instance that never opens its port used to fail the WHOLE launch, and the supervisor's answer to a
+    # failed launch is another full stop-and-launch on the next poll -- twelve games torn down to fix one, three
+    # times, and then it gives up and exits. That is what turned the 2026-09-17 17:52 freeze into a 19-minute
+    # outage: eleven games were up and healthy at 18:08 and the run still did not start, because 47800 alone was
+    # stuck at 242 MB. A laggard is now restarted on its own port instead.
+    for repair in range(1 + max(0, repair_rounds)):
+        started = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - started
+            verdict = startup_verdict(ports, listening_ports(), len(running_pids()), elapsed, timeout)
+            if verdict == "ready":
+                break
+            if verdict == "no_processes":
+                sys.exit(f"No {EXE_NAME} process is running {elapsed:.0f}s after launching {count}. "
+                         "Check BepInEx/LogOutput.log.")
+            if verdict == "timeout":
+                break
+            time.sleep(1)
+        missing = sorted(set(ports) - listening_ports())
+        if not missing:
             break
-        if verdict == "no_processes":
-            sys.exit(f"No {EXE_NAME} process is running {elapsed:.0f}s after launching {count}. "
-                     "Check BepInEx/LogOutput.log.")
-        if verdict == "timeout":
-            sys.exit(f"Timed out waiting for ports {sorted(set(ports) - listening_ports())}")
-        time.sleep(1)
+        if repair >= repair_rounds:
+            sys.exit(f"Timed out waiting for ports {missing}")
+        print(f"Ports {missing} did not come up; restarting just those instances "
+              f"(repair round {repair + 1}/{repair_rounds})")
+        kill_unlistening()
+        for port in missing:
+            relaunch_one(port, width, height, job_workers, timeout=timeout)
 
     tile(running_pids(), width, height, monitor)
     print(f"All {count} instances ready on ports {ports[0]}-{ports[-1]}")

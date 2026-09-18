@@ -18,16 +18,33 @@ the pause file:
 While that file exists the supervisor does nothing at all: it does not restart the trainer, does not
 touch the games and does not start the helpers. It logs the pause once, and logs once when it lifts.
 
-**Health** is all three of:
+**Health** is all four of:
   - a `train.py` process for THIS run exists (matched on the command line: `train.py` plus the config
     file name or the run name),
   - `runs/<run>/status.json` was modified within `--stale-seconds`,
+  - its `timesteps` has MOVED within `--stale-seconds`,
   - and its `state` is `"running"`.
 
-A trainer that exists while `status.json` stays stale for the whole window is HUNG: it is killed by PID
+**On the step-count test, honestly.** In the 2026-09-17 freeze it would NOT have fired first: `ProgressCallback`
+writes status.json only from SB3's own callbacks, so a worker blocked inside `env.step()` stops the writes too
+and the mtime went stale on its own. It is here for two reasons that do not depend on that. First, mtime is a
+proxy for liveness while `timesteps` is the thing actually being asked about -- whether the run is progressing.
+Second, the file is ALREADY written off the step loop in places (`_on_rollout_start` refreshes it after a
+step-free PPO update, `mark_stopped` on the way out), and the obvious next improvement -- a heartbeat thread, so
+a trainer that is recovering can be told from one that is dead -- would make the mtime test blind entirely. The
+check costs one comparison and cannot be silently defeated later.
+
+A trainer that exists while the run stops progressing for the whole window is HUNG: it is killed by PID
 (with its multiprocessing workers) before the restart. A trainer that is gone is DEAD: restart straight
 away. A trainer that exists with a fresh `status.json` whose state is `stopped`/`finished` is draining
-(a Ctrl+C in progress) and is left alone until it either exits or goes stale.
+(a Ctrl+C in progress) and is left alone until it either exits or goes stale -- the step test is not
+applied there, because a draining trainer is *supposed* to have stopped stepping.
+
+**Before any restart** the supervisor writes an attribution block: one line per bridge port with its pid,
+working set, number of ESTABLISHED connections and CPU cores used over a 5 s window (all read from netstat
+and CIM -- never by connecting to a bridge port, which would drop that game's trainer), then the tail of
+each worker's `runs/<run>/env_<port>.log`. That block is what makes the next incident diagnosable from the
+log alone; the 2026-09-17 one was not.
 
 **Matching, and the trap in it.** A command line that *mentions* the trainer is not the trainer. A
 previous report script counted the PowerShell query listing the processes -- its own command line
@@ -78,9 +95,15 @@ from typing import Callable, Iterable, NamedTuple
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from ultrakill_ai.envlog import tail as envlog_tail  # noqa: E402
+
 HOUR = 3600.0
 MB = 1024 * 1024
-DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+ENV_LOG_TAIL = 4  # lines of each worker's runs/<run>/env_<port>.log quoted into a restart report
+# NOT DETACHED_PROCESS (0x8): it silently discards the child's stdout through a shell redirect -- see
+# `spawn_detached`. CREATE_NEW_PROCESS_GROUP is what keeps the child clear of this supervisor's Ctrl+C;
+# CREATE_NO_WINDOW keeps a console from flashing up without touching the standard handles.
+DETACHED = 0x00000200 | 0x08000000  # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 TAIL_LINES = 30
 STOP_WAIT_S = 5.0  # between closing the games and relaunching them
 
@@ -322,8 +345,99 @@ def kill_tree(pid: int) -> None:
 
 
 def spawn_detached(command: str, cwd: Path) -> int:
+    """Starts a child that outlives this supervisor, WITHOUT `DETACHED_PROCESS`.
+
+    `DETACHED_PROCESS` (0x8) silently throws the child's output away. A detached `cmd /s /c "... >> log 2>&1"`
+    creates the log file, runs the program -- and nothing it prints ever lands, because the grandchild starts
+    with no console and no inherited standard handles, so its `sys.stdout` is None and every `print` is a
+    no-op. Measured on 2026-09-17: with 0x8 the log stayed 0 bytes; with 0x200 alone, or 0x08000000, or no
+    flag at all, the same command wrote every line. `campaign_gates_train.log` had not been written to in
+    SEVEN HOURS when the 17:52 freeze was investigated, and the supervisor had been printing its stale tail
+    on every restart as if it were evidence.
+
+    `CREATE_NEW_PROCESS_GROUP` is what actually detaches this from the supervisor's Ctrl+C, and it is kept.
+    `CREATE_NO_WINDOW` keeps the console from flashing up. Neither one touches the handles.
+    """
     proc = subprocess.Popen(command, cwd=str(cwd), creationflags=DETACHED, close_fds=True)
     return proc.pid
+
+
+def parse_established(netstat_output: str, ports: Iterable[int]) -> dict[int, int]:
+    """Port -> number of ESTABLISHED TCP connections on it, for the ports asked about.
+
+    The one readable signal for "does this game still have a trainer attached", and it costs no connection:
+    probing a bridge port by connecting DROPS the current client, which has killed a run before. During the
+    2026-09-17 freeze exactly one of twelve ports had an established connection and the other eleven had none
+    -- the mod drops a client that sends nothing for 300 s (`EpisodeController.commandTimeoutMs`), so that map
+    is a direct readout of which workers were still talking and which had gone silent.
+    """
+    wanted = set(ports)
+    found = dict.fromkeys(wanted, 0)
+    for line in netstat_output.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[0] != "TCP" or parts[3] != "ESTABLISHED":
+            continue
+        for endpoint in (parts[1], parts[2]):
+            try:
+                port = int(endpoint.rsplit(":", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if port in wanted:
+                found[port] += 1
+    return found
+
+
+def established_map(ports: Iterable[int]) -> dict[int, int]:
+    try:
+        out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return parse_established(out, ports)
+
+
+def cpu_seconds() -> dict[int, float]:
+    """pid -> total CPU seconds, through CIM. Two samples a few seconds apart give a per-process CPU delta,
+    which is how a game blocked in the mod's lockstep (0.00 cores) is told from one running free (~1 core)."""
+    query = ("$ErrorActionPreference='SilentlyContinue';"
+             "@(Get-CimInstance Win32_Process -Filter \"Name='ULTRAKILL.exe'\" |"
+             " Select-Object ProcessId,KernelModeTime,UserModeTime) | ConvertTo-Json -Compress -Depth 2")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", query],
+                             capture_output=True, text=True, timeout=120).stdout
+        data = json.loads(out) if out.strip() else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+    if isinstance(data, dict):
+        data = [data]
+    times: dict[int, float] = {}
+    for row in data:
+        try:  # the two columns are in 100-nanosecond units
+            times[int(row["ProcessId"])] = (int(row["KernelModeTime"]) + int(row["UserModeTime"])) / 1e7
+        except (TypeError, ValueError, KeyError):
+            continue
+    return times
+
+
+def sick_report(ports: list[int], owners: dict[int, int], sets: dict[int, int],
+                established: dict[int, int], cpu_before: dict[int, float], cpu_after: dict[int, float],
+                window: float) -> list[str]:
+    """One line per port: pid, working set, established connections and CPU cores used over `window`.
+
+    This is the line the next incident will be attributed from, so it says everything that was knowable
+    without connecting to anything. A port with `conns=0` has no worker talking to it; `cores=0.00` with a
+    connection is a game sitting in lockstep waiting for a command that is not coming.
+    """
+    lines = []
+    for port in ports:
+        pid = owners.get(port)
+        if pid is None:
+            lines.append("port %d: NOT LISTENING" % port)
+            continue
+        delta = cpu_after.get(pid, 0.0) - cpu_before.get(pid, 0.0)
+        lines.append("port %d: pid %d ws %d MB conns %d cores %.2f"
+                     % (port, pid, sets.get(pid, 0) // MB, established.get(port, 0),
+                        delta / window if window > 0 else 0.0))
+    return lines
 
 
 @dataclass
@@ -332,7 +446,35 @@ class Config:
     config: str = "configs/campaign_gates_main.yaml"
     count: int = 12
     monitor: int = 1
-    stale_seconds: float = 600.0
+    # **The arithmetic.** This must comfortably exceed the worst case of a worker's own bounded recovery, or the
+    # supervisor kills a trainer that was about to fix itself locally -- and a local fix costs one game where a
+    # restart costs twelve plus four minutes of relaunch.
+    #
+    # The worst case a worker can be silent for, now that every call inside the budget is CLAMPED to what is
+    # left of it (`UltrakillEnv._clamp`):
+    #
+    #     step that faults   120 s  (`step_timeout_s` -- paid before the budget opens)
+    #   + recovery budget    540 s  (`bridge_recovery_budget_s` -- reconnects, backoffs, resets, the relaunch)
+    #   + one poll interval   60 s  (this may notice a whole poll late)
+    #   ------------------------------
+    #                        720 s, against a 900 s window: three minutes of margin.
+    #
+    # `test_the_measured_ladder_fits_inside_the_supervisors_patience` does not take that sum on trust: it runs
+    # the real ladder on a fake clock with every blocking call charged its real bound, for each fault shape,
+    # and asserts the MEASURED elapsed fits. The sum is what CLAUDE.md quotes; the test is what holds.
+    #
+    # The earlier derivation here (540 + 180 + 60 = 780) was wrong in both directions at once. It added a
+    # reset timeout on top of the budget that a clamped ladder never pays, and it under-counted the real
+    # overshoot: before the clamp, an attempt admitted with a moment of budget left ran its own full bound
+    # anyway, and `reset()`'s tail handler opened a SECOND full budget on a cleared deadline. Measured on a
+    # fake clock with the shipped defaults: 555.6 s for the simplest shape, two budgets (1000->1540 and
+    # 1183->1723) for the tail shape. Before that it was 600 s, SHORTER than a single old 600 s reset
+    # timeout, so every recovery the env attempted was killed mid-flight.
+    #
+    # The cost of a longer window is only paid by a genuinely hung trainer, and that case is answered from the
+    # other side: `train.py`'s teardown is bounded now, so a dead worker exits the trainer within a minute and
+    # is caught by "no train.py process for this run", not by this timer.
+    stale_seconds: float = 900.0
     poll_seconds: float = 60.0
     max_restarts_per_hour: int = 3
     start_grace_seconds: float = 900.0
@@ -367,6 +509,8 @@ class Supervisor:
                  working_sets: Callable[[], dict[int, int]] | None = None,
                  port_pids: Callable[[], dict[int, int]] | None = None,
                  relaunch_one: Callable[[int], bool] | None = None,
+                 established: Callable[[Iterable[int]], dict[int, int]] | None = None,
+                 cpu: Callable[[], dict[int, float]] | None = None,
                  pid: int | None = None):
         self.cfg = cfg
         self.processes, self.now, self.sleep = processes, now, sleep
@@ -376,6 +520,8 @@ class Supervisor:
         self._working_sets = working_sets or self._default_working_sets
         self._port_pids = port_pids or self._default_port_pids
         self._relaunch_one = relaunch_one or self._default_relaunch_one
+        self._established = established or established_map
+        self._cpu = cpu or cpu_seconds
         self.pid = os.getpid() if pid is None else pid
 
         run_dir = cfg.cwd / cfg.runs_dir / cfg.run
@@ -385,10 +531,15 @@ class Supervisor:
         self.train_log = cfg.cwd / cfg.runs_dir / f"{cfg.run}_train.log"
         self.log_path = cfg.cwd / cfg.runs_dir / f"{cfg.run}_supervisor.log"
 
+        self.run_dir = run_dir
         self.restarts: list[float] = []
         self.grace_until = 0.0
         self.last_heartbeat = 0.0
         self._last_state: str | None = None
+        # The step watermark: the last `timesteps` seen and when it changed. Health is judged on this AS WELL AS
+        # on the file's mtime -- see the module docstring for what it does and does not add today.
+        self.steps_seen: float | None = None
+        self.steps_since = 0.0
 
     # -- logging ---------------------------------------------------------------------------------
 
@@ -506,9 +657,10 @@ class Supervisor:
         trainers = [p for p in procs
                     if p.pid not in mine and matches_script(p.cmdline, "train.py", self.cfg.run, self.cfg.config)]
         status = self.probe(self.status_path, now)
+        advancing = self.note_steps(status, now)
         fresh = status.age is not None and status.age <= self.cfg.stale_seconds
 
-        if trainers and fresh and status.state == "running":
+        if trainers and fresh and advancing and status.state == "running":
             self.ensure_helpers(procs)
             self.log_once("ok", "healthy: trainer pid %s, %s steps, status %.0fs old"
                           % (trainers[0].pid, self._steps(status), status.age))
@@ -531,11 +683,58 @@ class Supervisor:
                           % (self.grace_until - now))
             return "grace"
 
-        reason = ("no train.py process for this run" if not trainers else
-                  "trainer pid %s is up but status.json is %s" % (
-                      trainers[0].pid,
-                      "missing" if status.age is None else "%.0fs stale (state=%s)" % (status.age, status.state)))
+        if not trainers:
+            reason = "no train.py process for this run"
+        elif fresh and not advancing:
+            # The failure the mtime test cannot see: the file keeps being rewritten and the run is frozen.
+            reason = ("trainer pid %s keeps writing status.json but %s steps have not moved for %.0fs"
+                      % (trainers[0].pid, self._steps(status), now - self.steps_since))
+        else:
+            reason = "trainer pid %s is up but status.json is %s" % (
+                trainers[0].pid,
+                "missing" if status.age is None else "%.0fs stale (state=%s)" % (status.age, status.state))
         return self.restart(now, procs, trainers, reason)
+
+    def report_sick(self, window: float = 5.0) -> list[str]:
+        """Logs, per port, what could be known WITHOUT connecting to anything, then the env logs' tails.
+
+        Written before the kill, because after the kill none of it exists any more. The 2026-09-17 post-mortem
+        had to be assembled by hand from a console while the freeze was still on; from now on the supervisor
+        log carries it: which port had a worker attached, which games were burning a core with nobody driving
+        them, and what each worker last said about its own bridge.
+        """
+        ports = [self.cfg.base_port + i for i in range(self.cfg.count)]
+        lines: list[str] = []
+        try:
+            owners = self._port_pids()
+            sets = self._working_sets()
+            established = self._established(ports)
+            before = self._cpu()
+            self.sleep(window)
+            after = self._cpu()
+            lines = sick_report(ports, owners, sets, established, before, after, window)
+        except Exception as exc:  # noqa: BLE001 - a diagnostic may never be the thing that fails a restart
+            self.log("sick report failed (%s: %s)" % (type(exc).__name__, exc))
+        for line in lines:
+            self.log("  ~ %s" % line)
+        for path in sorted(self.run_dir.glob("env_*.log")):
+            for line in envlog_tail(path, ENV_LOG_TAIL):
+                self.log("  > %s" % line)
+        return lines
+
+    def note_steps(self, status: Status, now: float) -> bool:
+        """True while the trainer's step count is still moving; False once it has stood still too long.
+
+        Any change counts, up or down: a restart resumes from a checkpoint and the count goes BACKWARDS, which
+        is progress, not a stall. A run with no `timesteps` in its status file is not judged here at all.
+        """
+        if status.timesteps is None:
+            self.steps_seen, self.steps_since = None, now
+            return True
+        if self.steps_seen is None or status.timesteps != self.steps_seen:
+            self.steps_seen, self.steps_since = status.timesteps, now
+            return True
+        return now - self.steps_since <= self.cfg.stale_seconds
 
     def _steps(self, status: Status) -> str:
         return "unknown" if status.timesteps is None else "{:,.0f}".format(status.timesteps)
@@ -556,6 +755,7 @@ class Supervisor:
     def restart(self, now: float, procs: list[Proc], trainers: list[Proc], reason: str) -> str:
         self._last_state = "restart"
         self.log("UNHEALTHY: %s" % reason)
+        self.report_sick()
         for line in tail_lines(self.train_log):
             self.log("  | %s" % line)
 
@@ -657,8 +857,9 @@ def main() -> None:
     ap.add_argument("--config", default="configs/campaign_gates_main.yaml")
     ap.add_argument("--count", type=int, default=12, help="game instances to relaunch")
     ap.add_argument("--monitor", type=int, default=1, help="Windows display number for the games")
-    ap.add_argument("--stale-seconds", type=float, default=600.0,
-                    help="status.json older than this means the trainer is not stepping")
+    ap.add_argument("--stale-seconds", type=float, default=900.0,
+                    help="status.json older than this -- or a step count that has not moved for this long -- "
+                         "means the trainer is not stepping (see Config.stale_seconds for the arithmetic)")
     ap.add_argument("--poll-seconds", type=float, default=60.0)
     ap.add_argument("--max-restarts-per-hour", type=int, default=3,
                     help="after this many restarts in an hour the supervisor gives up and exits non-zero")

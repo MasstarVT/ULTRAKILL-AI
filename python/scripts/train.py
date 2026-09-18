@@ -23,6 +23,7 @@ os.environ.setdefault("KMP_BLOCKTIME", "1")
 import argparse  # noqa: E402
 import math  # noqa: E402
 import sys  # noqa: E402
+import time  # noqa: E402
 from collections import defaultdict  # noqa: E402
 from dataclasses import replace  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -192,11 +193,65 @@ def make_env(cfg: EnvConfig, info_keywords: tuple[str, ...]):
     return _init
 
 
+def close_vec_env(venv, timeout: float = 90.0) -> str:
+    """Shuts the vectorized env down in bounded time, however wedged a worker is.
+
+    `SubprocVecEnv.close()` cannot be trusted here and this is not a style preference. It does
+    `if self.waiting: remote.recv()` on every pipe and then `process.join()` with no timeout, so ONE worker
+    stuck in a bridge call keeps the trainer alive forever -- which is exactly how the 2026-09-17 freezes
+    presented: the supervisor found a HUNG trainer at the ten-minute mark instead of a DEAD one at the
+    one-minute mark, and paid a full twelve-game restart for it. A crash must reach the supervisor as an exit
+    code, promptly. SB3 marks the workers daemonic, so terminating them is safe and the parent may exit.
+
+    Returns what happened, for the log: "clean", "terminated" or "none".
+    """
+    processes = list(getattr(venv, "processes", []) or [])
+    if not processes:  # DummyVecEnv, or an env that never started workers
+        try:
+            venv.close()
+        except Exception:  # noqa: BLE001 - teardown may not raise over a run that is already ending
+            pass
+        return "none"
+
+    venv.waiting = False  # never block reading a reply from a worker that may be wedged
+    for remote in getattr(venv, "remotes", []):
+        try:
+            remote.send(("close", None))
+        except (EOFError, BrokenPipeError, ConnectionError, OSError):
+            pass  # a worker that already died needs no goodbye
+    deadline = time.monotonic() + timeout
+    for process in processes:
+        process.join(max(0.0, deadline - time.monotonic()))
+    stragglers = [p for p in processes if p.is_alive()]
+    for process in stragglers:
+        process.terminate()
+    for process in stragglers:
+        process.join(5.0)
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+    venv.closed = True
+    return "terminated" if stragglers else "clean"
+
+
 def load_config(path: str | None) -> tuple[dict, dict]:
     if not path:
         return {}, {}
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     return data.get("env", {}), data.get("train", {})
+
+
+def fill_run_dirs(cfg: EnvConfig, run_dir: Path) -> EnvConfig:
+    """Settings only a training run may have, in either mode.
+
+    `env_log_dir` is the per-worker attribution log (`runs/<run>/env_<port>.log`) and `bridge_relaunch` lets a
+    worker restart its OWN game as the last rung of its recovery ladder. Both are filled here and nowhere else,
+    on purpose: eval.py, bridge_test.py, campaign_check.py and every test build an `EnvConfig` of their own and
+    must stay incapable of restarting a game process or of writing into a live run's log directory.
+    """
+    return replace(cfg,
+                   env_log_dir=cfg.env_log_dir or run_dir.as_posix(),
+                   bridge_relaunch=True)
 
 
 def fill_campaign_dirs(cfg: EnvConfig, model_dir: Path, run_dir: Path) -> EnvConfig:
@@ -237,6 +292,8 @@ def main() -> None:
     model_dir = Path("models") / run_name
     model_dir.mkdir(parents=True, exist_ok=True)
     env_cfg = fill_campaign_dirs(env_cfg, model_dir, Path("runs") / run_name)
+    env_cfg = fill_run_dirs(env_cfg, Path("runs") / run_name)
+    Path(env_cfg.env_log_dir).mkdir(parents=True, exist_ok=True)
     if env_cfg.best_runs_dir:
         Path(env_cfg.best_runs_dir).mkdir(parents=True, exist_ok=True)
     (model_dir / "env_config.yaml").write_text(yaml.safe_dump(env_cfg.to_dict()), encoding="utf-8")
@@ -314,12 +371,12 @@ def main() -> None:
         print("Interrupted, saving.")
     finally:
         progress.mark_stopped()  # no-op if training finished normally
-        model.save(model_dir / "latest")
-        print(f"Saved {model_dir / 'latest.zip'}")
         try:
-            venv.close()
-        except (EOFError, BrokenPipeError, ConnectionError):
-            pass  # A worker already died with its game.
+            model.save(model_dir / "latest")
+            print(f"Saved {model_dir / 'latest.zip'}")
+        except Exception as exc:  # noqa: BLE001 - a failed save may not block the teardown below
+            print(f"Could not save latest.zip: {type(exc).__name__}: {exc}", flush=True)
+        print(f"vec env teardown: {close_vec_env(venv)}", flush=True)
 
 
 if __name__ == "__main__":

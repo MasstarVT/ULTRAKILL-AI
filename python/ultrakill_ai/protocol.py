@@ -1,4 +1,26 @@
-"""Socket client for the UltrakillAIBridge mod (newline-delimited JSON, see docs/protocol.md)."""
+"""Socket client for the UltrakillAIBridge mod (newline-delimited JSON, see docs/protocol.md).
+
+**Every blocking call here is bounded, in every state.** That is not a nicety: a worker blocked on this socket
+blocks all twelve games (vectorized envs step in lockstep), and a stall longer than the supervisor's patience
+costs a full twelve-game relaunch instead of a local recovery. The 2026-09-17 17:52 freeze is the worked
+example -- see the freeze gotcha in CLAUDE.md.
+
+Three bounds used to be wrong, and all three are now pinned by tests:
+
+  - `close()` set `settimeout(5.0)` and then called `recv()`, which set the timeout straight back to
+    `self.timeout`. Against a frozen game it blocked 120 s, not 5 s, *per env* -- measured live on the private
+    game on 2026-09-17. Twelve of those is a 24-minute teardown.
+  - The `hello` handshake was bounded by `self.timeout` (120 s), not by anything handshake-shaped. `connect()`'s
+    own 5 s only ever covered the TCP connect.
+  - A socket timeout is STICKY. `reset()` asked for its 600 s and left it on the socket, so the next `send()`
+    inherited 600 s. Every request now sets its own bound for both the send and the read.
+
+A bound also has to be CLAMPABLE, not just finite. `reset(timeout=...)` lets the caller ask for less than
+`reset_timeout`, which is what makes the env's recovery budget a total rather than a suggestion: the call in
+flight when the budget expires ends with the budget instead of adding a full reset on top of it. And a connect
+that never succeeds raises `BridgeClosed` (which is RECOVERABLE), not a bare `BridgeError`: a port that is not
+listening yet is the ordinary state of a booting game, not a fatal error.
+"""
 
 from __future__ import annotations
 
@@ -16,8 +38,18 @@ DEFAULT_PORT = 47800
 # started its own, so the client always gave up first and the graceful path was dead code. See the timeout
 # gotcha in CLAUDE.md.
 DEFAULT_STEP_TIMEOUT = 120.0  # deliberately the old shared value: no step has ever timed out, so nothing moves
-DEFAULT_RESET_TIMEOUT = 600.0  # a scene load with a dozen games loading at once, GC and a window losing the GPU
+# The mod gives up on a reset at `EpisodeController.resetTimeoutSeconds` (120 s) and answers with an error, so
+# the client only has to outlast that, not out-wait a hypothetical scene load. 180 s does, and unlike the old
+# 600 s it leaves room for a whole recovery ladder inside the supervisor's stale window (see env.py's
+# `bridge_recovery_budget_s`). 600 s was on its own longer than the supervisor's entire patience, so a single
+# unanswered reset always presented as a hung trainer.
+DEFAULT_RESET_TIMEOUT = 180.0
+DEFAULT_CONNECT_TIMEOUT = 10.0  # one TCP connect attempt, retried until `connect(retry_seconds=...)` runs out
+DEFAULT_HANDSHAKE_TIMEOUT = 20.0  # hello and config: the mod answers these without touching the scene
+DEFAULT_CLOSE_TIMEOUT = 5.0  # the release handshake on the way out; a teardown may never wait on a sick game
 UNKNOWN_SCENE = "unknown scene"
+
+_READ_CHUNK = 65536
 
 
 class BridgeError(RuntimeError):
@@ -46,61 +78,114 @@ class BridgeSceneUnknown(BridgeError):
 RECOVERABLE = (BridgeTimeout, BridgeClosed, BridgeSceneUnknown)
 
 
+class _LineReader:
+    """Newline-delimited reads off a socket with a WALL-CLOCK bound, not a per-syscall one.
+
+    `socket.makefile().readline()` restarts the socket timeout on every underlying `recv`, so a peer that
+    dribbles one byte just inside the timeout keeps a "bounded" read alive indefinitely. This keeps its own
+    deadline and re-arms the socket with whatever is left of it, so `readline(20)` cannot take 21 seconds.
+    """
+
+    def __init__(self, sock: socket.socket):
+        self._sock = sock
+        self._buf = b""
+
+    def readline(self, bound: float) -> str:
+        deadline = time.monotonic() + max(0.0, bound)
+        while True:
+            newline = self._buf.find(b"\n")
+            if newline >= 0:
+                line, self._buf = self._buf[:newline + 1], self._buf[newline + 1:]
+                return line.decode("utf-8")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out")
+            self._sock.settimeout(remaining)
+            chunk = self._sock.recv(_READ_CHUNK)
+            if not chunk:
+                self._buf = b""  # a half line before a hang-up is still a hang-up, never a message
+                return ""
+            self._buf += chunk
+
+    def close(self) -> None:
+        self._buf = b""
+
+
 class BridgeClient:
     """One TCP connection to one game's bridge.
 
-    `timeout` covers ordinary requests (step, get_obs, config); `reset_timeout` covers `reset`, which blocks
-    while the game loads a scene. A request that times out or drops marks the client broken and every later
-    request raises until `connect()` is called again: a late reply to the timed-out request is still sitting in
-    the socket, and reusing the stream would hand it back as the answer to the NEXT request, leaving every
-    observation from then on one request stale.
+    `timeout` covers ordinary requests (step, get_obs); `reset_timeout` covers `reset`, which blocks while the
+    game loads a scene; `handshake_timeout` covers hello and config; `close_timeout` covers the release on the
+    way out. A request that times out or drops marks the client broken and every later request raises until
+    `connect()` is called again: a late reply to the timed-out request is still sitting in the socket, and
+    reusing the stream would hand it back as the answer to the NEXT request, leaving every observation from
+    then on one request stale.
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT,
-                 timeout: float = DEFAULT_STEP_TIMEOUT, reset_timeout: float = DEFAULT_RESET_TIMEOUT):
+                 timeout: float = DEFAULT_STEP_TIMEOUT, reset_timeout: float = DEFAULT_RESET_TIMEOUT,
+                 handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+                 close_timeout: float = DEFAULT_CLOSE_TIMEOUT,
+                 connect_timeout: float = DEFAULT_CONNECT_TIMEOUT):
         self.host = host
         self.port = port
         self.timeout = timeout
         self.reset_timeout = reset_timeout
+        self.handshake_timeout = handshake_timeout
+        self.close_timeout = close_timeout
+        self.connect_timeout = connect_timeout
         self.broken = False
         self._sock: socket.socket | None = None
         self._reader = None
 
     def connect(self, retry_seconds: float = 60.0) -> dict[str, Any]:
-        """Connects (retrying while the game starts up) and performs the hello handshake."""
+        """Connects (retrying while the game starts up) and performs the hello handshake.
+
+        Bounded by `retry_seconds` for the TCP connect plus `handshake_timeout` for the hello. Nothing here
+        may wait on `self.timeout`: a game that accepts the socket and then answers nothing is exactly the
+        state a recovery is trying to escape.
+        """
         deadline = time.monotonic() + retry_seconds
         while True:
             try:
-                sock = socket.create_connection((self.host, self.port), timeout=5.0)
+                sock = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
                 break
             except OSError:
                 if time.monotonic() > deadline:
-                    raise BridgeError(
+                    # BridgeClosed, not a bare BridgeError: a port that is not listening yet is the ordinary
+                    # state of a game that is still booting, and it is exactly what the recovery ladder exists
+                    # to wait out. A bare BridgeError is not in RECOVERABLE, so `reset()` did not catch it and
+                    # the worker died -- the 18:08 pathology, where the boot gate gives up on a cold instance
+                    # and starts the trainer anyway. See the freeze gotcha in CLAUDE.md.
+                    raise BridgeClosed(
                         f"Could not connect to the mod on {self.host}:{self.port}. "
                         "Is ULTRAKILL running with BepInEx and UltrakillAIBridge installed?"
                     )
                 time.sleep(1.0)
 
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.settimeout(self.timeout)
         self._sock = sock
-        self._reader = sock.makefile("r", encoding="utf-8", newline="\n")
+        self._reader = _LineReader(sock)
         self.broken = False  # a reconnect is the one thing that clears it
 
-        hello = self.request({"type": "hello", "protocol": PROTOCOL_VERSION})
+        hello = self.request({"type": "hello", "protocol": PROTOCOL_VERSION}, timeout=self.handshake_timeout)
         if hello.get("protocol") != PROTOCOL_VERSION:
             raise BridgeError(f"Protocol mismatch: mod speaks {hello.get('protocol')}, client speaks {PROTOCOL_VERSION}")
         return hello
 
     def close(self) -> None:
+        """Releases control and drops the socket, in at most `close_timeout`.
+
+        The release reply is worth a short wait -- it hands control back so the game stops being driven -- but
+        never more than that. A teardown that waits on a sick game is how a crashed trainer becomes a hung one.
+        """
         if self._sock is None:
             return
         if not self.broken:
             try:
-                # Wait for the reply so control is released before the socket closes. Skipped on a broken
-                # client: `request` would raise straight away, and there is nothing to hand control back to.
-                self._sock.settimeout(5.0)
-                self.request({"type": "release"})
+                # Skipped on a broken client: `request` would raise straight away, and there is nothing to hand
+                # control back to.
+                self.request({"type": "release"}, timeout=self.close_timeout)
             except (OSError, BridgeError, ValueError):
                 pass
         self._drop()
@@ -127,12 +212,23 @@ class BridgeClient:
         self.broken = True
         return exc
 
-    def send(self, msg: dict[str, Any]) -> None:
+    def _arm(self, bound: float) -> None:
+        """Puts `bound` on the socket for the call about to be made.
+
+        Every send and every read arms its own bound. A socket timeout is sticky, so without this a `reset`'s
+        long bound stayed on the socket and the next `send` inherited it.
+        """
+        if self._sock is not None:
+            self._sock.settimeout(bound)
+
+    def send(self, msg: dict[str, Any], timeout: float | None = None) -> None:
         if self._sock is None:
             raise BridgeClosed("Not connected")
         if self.broken:
             raise BridgeClosed("Bridge connection is broken; reconnect before using it again")
+        bound = self.timeout if timeout is None else timeout
         try:
+            self._arm(bound)
             self._sock.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8"))
         except TimeoutError as exc:
             raise self._fail(BridgeTimeout(f"timed out sending to {self.host}:{self.port}")) from exc
@@ -144,14 +240,14 @@ class BridgeClient:
             raise BridgeClosed("Not connected")
         if self.broken:
             raise BridgeClosed("Bridge connection is broken; reconnect before using it again")
+        bound = self.timeout if timeout is None else timeout
         try:
-            self._sock.settimeout(self.timeout if timeout is None else timeout)
-            line = self._reader.readline()
+            self._arm(bound)
+            line = self._readline(bound)
         except TimeoutError as exc:
             # socket.timeout is TimeoutError from 3.10 on, so this catches both spellings.
             raise self._fail(BridgeTimeout(
-                f"no reply from {self.host}:{self.port} within "
-                f"{self.timeout if timeout is None else timeout:.0f}s")) from exc
+                f"no reply from {self.host}:{self.port} within {bound:.0f}s")) from exc
         except OSError as exc:
             raise self._fail(BridgeClosed(f"read from {self.host}:{self.port} failed: {exc}")) from exc
         if not line:
@@ -165,25 +261,39 @@ class BridgeClient:
             raise BridgeError(message)
         return msg
 
+    def _readline(self, bound: float) -> str:
+        """`_LineReader` gets the wall-clock bound; any other file-like reader (the tests' fake) does not."""
+        reader = self._reader
+        if isinstance(reader, _LineReader):
+            return reader.readline(bound)
+        return reader.readline()
+
     def request(self, msg: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
-        self.send(msg)
+        """One round trip. `timeout` bounds the send AND the read, so a request can never outlive twice it."""
+        self.send(msg, timeout=timeout)
         return self.recv(timeout)
 
     # Convenience wrappers -------------------------------------------------
 
     def configure(self, **settings: Any) -> None:
-        self.request({"type": "config", **settings})
+        self.request({"type": "config", **settings}, timeout=self.handshake_timeout)
 
     def get_obs(self) -> dict[str, Any]:
         return self.request({"type": "get_obs"})
 
-    def reset(self, scene: str | None = None, checkpoint: bool = False) -> dict[str, Any]:
+    def reset(self, scene: str | None = None, checkpoint: bool = False,
+              timeout: float | None = None) -> dict[str, Any]:
         """Loads a scene (or respawns at the checkpoint). Waits `reset_timeout`, not the step timeout: this
-        blocks on a Unity scene load, which with a dozen games loading at once is minutes, not frames."""
+        blocks on a Unity scene load, which with a dozen games loading at once is minutes, not frames.
+
+        `timeout` lets a caller ask for LESS than `reset_timeout`. A recovery ladder clamps each call to what
+        is left of its wall-clock budget, so the call in flight when the budget expires ends with it instead of
+        overshooting it by a whole reset -- the difference between a bounded recovery and a hung trainer.
+        """
         msg: dict[str, Any] = {"type": "reset", "checkpoint": checkpoint}
         if scene:
             msg["scene"] = scene
-        return self.request(msg, timeout=self.reset_timeout)
+        return self.request(msg, timeout=self.reset_timeout if timeout is None else timeout)
 
     def step(self, action: dict[str, Any]) -> dict[str, Any]:
         return self.request({"type": "step", "action": action})
@@ -196,7 +306,7 @@ class BridgeClient:
         return self.request({"type": "kill"})
 
     def release(self) -> None:
-        self.request({"type": "release"})
+        self.request({"type": "release"}, timeout=self.close_timeout)
 
     def __enter__(self) -> "BridgeClient":
         return self

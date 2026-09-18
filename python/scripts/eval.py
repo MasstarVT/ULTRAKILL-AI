@@ -96,6 +96,11 @@ def main() -> None:
         cfg.windowed = False
         cfg.render = True
     cfg.soft_death = False  # evaluate with real deaths
+    # Belt and braces with `EnvConfig.RUN_ONLY_FIELDS`, which keeps these out of the file in the first place:
+    # an eval must never be able to kill a game process, and it must never write into a live run's
+    # attribution log, whatever an `env_config.yaml` written by an older train.py happens to contain.
+    cfg.bridge_relaunch = False
+    cfg.env_log_dir = ""
     if cfg.mode == "campaign":
         # Every episode is a fresh level load, so each one is a whole run with an official time. The exploration
         # archive and best-run files belong to the training games, so eval never saves either of them.

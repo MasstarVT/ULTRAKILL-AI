@@ -84,6 +84,11 @@ class Harness:
         self.sets = {pid: 1000 * supervise.MB for pid in self.ports.values()}
         self.relaunched: list[int] = []
         self.polls = 0
+        # The restart report (established connections per port, CPU delta per pid). Injected like everything
+        # else: without it a test would shell out to netstat and CIM on the machine running the suite, and
+        # read the LIVE training run's ports.
+        self.established = dict.fromkeys(self.ports, 0)
+        self.cpu = dict.fromkeys(self.ports.values(), 0.0)
 
         (tmp / "runs" / RUN).mkdir(parents=True, exist_ok=True)
         model_dir = tmp / "models" / RUN
@@ -110,6 +115,8 @@ class Harness:
             working_sets=self._working_sets,
             port_pids=lambda: dict(self.ports),
             relaunch_one=self._relaunch_one,
+            established=lambda ports: {p: self.established.get(p, 0) for p in ports},
+            cpu=lambda: dict(self.cpu),
             pid=SELF_PID,
         )
 

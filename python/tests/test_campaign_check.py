@@ -77,7 +77,7 @@ class FakeGame:
     def close(self):
         pass
 
-    def reset(self, scene=None, checkpoint=False):
+    def reset(self, scene=None, checkpoint=False, timeout=None):  # timeout: the ladder's budget clamp
         self.resets.append(checkpoint)
         if checkpoint and self.current is not None:
             x, y, z = CHECKPOINTS[self.current]

@@ -47,7 +47,7 @@ class CheckpointLevel(corridor.FakeLevel):
         self.y, self.z = pos[1], pos[2]
         return self._obs("teleport")
 
-    def reset(self, scene=None, checkpoint=False):
+    def reset(self, scene=None, checkpoint=False, timeout=None):  # timeout: the ladder's budget clamp
         super().reset(scene, checkpoint)
         # `_load` clears `self.checkpoint`, so it still reading True means the respawn branch ran.
         self.item_active = bool(checkpoint and self.checkpoint)
