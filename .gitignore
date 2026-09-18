@@ -39,6 +39,12 @@ python/models/campaign_ppo_ground/ckpt_*.zip
 # The route-gates run. look_init.zip (the look-mode-widened weights, the only path an older campaign
 # checkpoint can take into this action space) is committed, as are its explore_*.npz archives.
 python/models/campaign_gates/ckpt_*.zip
+# The per-level specialist stages (scripts/campaign_driver.py). Each stage is its own run directory, so the
+# same rule applies to each of them: the numbered checkpoints stay local and best.zip + best.json, latest.zip,
+# env_config.yaml and the explore_*.npz archives are committed. `models/specialists/` -- the ONE promoted
+# policy per level plus its JSON sidecar -- is tracked on purpose: it is the deliverable, and it is what
+# scripts/full_run.py chains.
+python/models/spec_*/ckpt_*.zip
 # Throwaway in-game smoke runs
 python/models/campaign_smoke*/
 
