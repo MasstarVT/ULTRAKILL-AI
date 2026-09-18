@@ -1,0 +1,616 @@
+# Human individual-level (IL) speedrun records for ULTRAKILL, in seconds of in-game time.
+#
+# RESEARCH ARTIFACT FOR TARGET-SETTING ONLY. Nothing in the training pipeline reads this file: it is not an
+# EnvConfig, it is not loaded by train.py or eval.py, and no reward term references it. It exists so a human
+# comparing times.md against what people actually achieve has the numbers in one machine-readable place.
+#
+# Source:   speedrun.com REST API, https://www.speedrun.com/api/v1, game id 369p3p81
+# Fetched:  2026-09-18
+# Timing:   in-game time (IGT) on every entry. IL runs carry no real-time value on these boards.
+# Prose:    docs/il-records.md (runners, dates, run links, and the out-of-bounds analysis)
+#
+# DIFFICULTY IS NOT RECORDED BY THE BOARDS. No ULTRAKILL leaderboard has a difficulty variable, and the rules
+# allow any difficulty, so every difficulty: unrestricted below means exactly that: unknown, runner's choice.
+# Our pilot runs Violent, which is strictly harder in combat, so these are a floor and not a fair target.
+#
+# Two times per level:
+#   any_percent  - fastest known route of any kind. On 23 of 33 levels this leaves the intended path.
+#   inbounds     - the board's Inbounds subcategory: the route stays inside the level. Use this one.
+# Both are filtered to the Post-Revamp split, and to the Main Exit on levels that have more than one.
+#
+# Level 9-1 and Level 9-2 are absent: no scene bundle in this build, no leaderboard.
+
+source: https://www.speedrun.com/api/v1
+game_id: 369p3p81
+fetched: 2026-09-18
+timing: ingame
+revamp_split: Post-Revamp
+
+full_game:
+  any_percent:
+    seconds: 666.259
+    category: Fraud Full Game - Any%
+    difficulty: unrestricted
+    runner: dentess
+    date: '2026-05-22'
+    realtime_seconds: 1068.099
+    link: https://www.speedrun.com/ultrakill/runs/z1063qwm
+  inbounds:
+    seconds: 1400.439
+    category: Fraud Full Game - Inbounds
+    difficulty: unrestricted
+    runner: dentess
+    date: '2026-04-25'
+    link: https://www.speedrun.com/ultrakill/runs/y6w253qz
+  p_rank:
+    seconds: 2542.213
+    category: Fraud Full Game - P Rank
+    difficulty: unrestricted
+    runner: Dabonzack
+    date: '2026-07-06'
+    link: https://www.speedrun.com/ultrakill/runs/yjv43r3y
+
+# Scene name (as EnvConfig.levels and CAMPAIGN_LEVELS spell it) -> records.
+levels:
+  Level 0-1:
+    title: Into The Fire
+    any_percent:
+      seconds: 4.915
+      category: IL Any%
+      difficulty: unrestricted
+      runner: D31taa
+      date: '2026-07-23'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/z5433ngm
+    inbounds:
+      seconds: 19.798
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: geshem8
+      date: '2026-05-07'
+      link: https://www.speedrun.com/ultrakill/runs/zqn8rdrz
+  Level 0-2:
+    title: The Meatgrinder
+    any_percent:
+      seconds: 5.28
+      category: IL Any%
+      difficulty: unrestricted
+      runner: zaalk
+      date: '2026-05-22'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/y9gprvrm
+    inbounds:
+      seconds: 15.863
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: OskariTheHeimfanker
+      date: '2026-07-06'
+      link: https://www.speedrun.com/ultrakill/runs/mrp883dz
+  Level 0-3:
+    title: Double Down
+    any_percent:
+      seconds: 6.624
+      category: IL Any%
+      difficulty: unrestricted
+      runner: Sowsher
+      date: '2026-09-18'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/mrpvlx2z
+    inbounds:
+      seconds: 6.624
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Sowsher
+      date: '2026-09-18'
+      link: https://www.speedrun.com/ultrakill/runs/mrpvlx2z
+  Level 0-4:
+    title: A One-Machine Army
+    any_percent:
+      seconds: 5.802
+      category: IL Any%
+      difficulty: unrestricted
+      runner: Darknn
+      date: '2026-05-26'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/ywo2xxpm
+    inbounds:
+      seconds: 5.802
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Darknn
+      date: '2026-05-26'
+      link: https://www.speedrun.com/ultrakill/runs/ywo2xxpm
+  Level 0-5:
+    title: Cerberus
+    any_percent:
+      seconds: 12.595
+      category: IL Any%
+      difficulty: unrestricted
+      runner: Spirtek
+      date: '2026-04-19'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/me5625qm
+    inbounds:
+      seconds: 16.279
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: bowsette_
+      date: '2026-06-27'
+      link: https://www.speedrun.com/ultrakill/runs/yvk40vom
+  Level 1-1:
+    title: Heart Of The Sunrise
+    any_percent:
+      seconds: 9.837
+      category: IL Any%
+      difficulty: unrestricted
+      runner: xotiic_
+      date: '2026-06-29'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/y8434enz
+    inbounds:
+      seconds: 26.424
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: OskariTheHeimfanker
+      date: '2026-07-20'
+      link: https://www.speedrun.com/ultrakill/runs/y9q0kq2z
+  Level 1-2:
+    title: The Burning World
+    any_percent:
+      seconds: 9.797
+      category: IL Any%
+      difficulty: unrestricted
+      runner: DevilHunter
+      date: '2026-08-27'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/me51ql0m
+    inbounds:
+      seconds: 14.085
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: OskariTheHeimfanker
+      date: '2026-07-20'
+      link: https://www.speedrun.com/ultrakill/runs/z54jk4dm
+  Level 1-3:
+    title: Halls Of Sacred Remains
+    any_percent:
+      seconds: 10.841
+      category: IL Any%
+      difficulty: unrestricted
+      runner: Sowsher
+      date: '2026-07-25'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/yjv6ov7y
+    inbounds:
+      seconds: 13.21
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: F1restorm
+      date: '2026-05-30'
+      link: https://www.speedrun.com/ultrakill/runs/z02k994m
+  Level 1-4:
+    title: Clair De Lune
+    any_percent:
+      seconds: 8.377
+      category: IL Any%
+      difficulty: unrestricted
+      runner: CATPERFECT
+      date: '2026-07-10'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/yjv3j7gy
+    inbounds:
+      seconds: 8.377
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: CATPERFECT
+      date: '2026-07-10'
+      link: https://www.speedrun.com/ultrakill/runs/yjv3j7gy
+  Level 2-1:
+    title: Bridgeburner
+    any_percent:
+      seconds: 7.623
+      category: IL Any%
+      difficulty: unrestricted
+      runner: nirichy
+      date: '2026-08-16'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/yw7j9l2z
+    inbounds:
+      seconds: 7.623
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: nirichy
+      date: '2026-08-16'
+      link: https://www.speedrun.com/ultrakill/runs/yw7j9l2z
+  Level 2-2:
+    title: Death At 20,000 Volts
+    any_percent:
+      seconds: 10.153
+      category: IL Any%
+      difficulty: unrestricted
+      runner: vivyaann
+      date: '2026-04-26'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/yvepqkom
+    inbounds:
+      seconds: 13.032
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: vivyaann
+      date: '2025-04-29'
+      link: https://www.speedrun.com/ultrakill/runs/zpoq6gxm
+  Level 2-3:
+    title: Sheer Heart Attack
+    any_percent:
+      seconds: 9.13
+      category: IL Any%
+      difficulty: unrestricted
+      runner: vivyaann
+      date: '2025-10-27'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/yw5dqe3y
+    inbounds:
+      seconds: 23.725
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Darknn
+      date: '2026-06-08'
+      link: https://www.speedrun.com/ultrakill/runs/ydppk7wy
+  Level 2-4:
+    title: Court Of The Corpse King
+    any_percent:
+      seconds: 21.439
+      category: IL Any%
+      difficulty: unrestricted
+      runner: vivyaann
+      date: '2026-08-30'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/yjv8od7y
+    inbounds:
+      seconds: 35.604
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: sinrotoGT
+      date: '2026-08-29'
+      link: https://www.speedrun.com/ultrakill/runs/z14qxe7z
+  Level 3-1:
+    title: Belly Of The Beast
+    any_percent:
+      seconds: 12.977
+      category: IL Any%
+      difficulty: unrestricted
+      runner: DevilHunter
+      date: '2026-04-20'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/y4vgr1qy
+    inbounds:
+      seconds: 32.8
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Melifaro
+      date: '2025-12-25'
+      link: https://www.speedrun.com/ultrakill/runs/zp5p198y
+  Level 3-2:
+    title: In The Flesh
+    any_percent:
+      seconds: 7.71
+      category: IL Any%
+      difficulty: unrestricted
+      runner: I_am_Awkward
+      date: '2026-08-07'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/y84eq3xz
+    inbounds:
+      seconds: 8.959
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: I_am_Awkward
+      date: '2026-08-01'
+      link: https://www.speedrun.com/ultrakill/runs/zxrg4dgz
+  Level 4-1:
+    title: Slaves To Power
+    any_percent:
+      seconds: 5.337
+      category: IL Any%
+      difficulty: unrestricted
+      runner: _Goots_
+      date: '2026-06-01'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/zg19jpnz
+    inbounds:
+      seconds: 5.337
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: _Goots_
+      date: '2026-06-01'
+      link: https://www.speedrun.com/ultrakill/runs/zg19jpnz
+  Level 4-2:
+    title: God Damn The Sun
+    any_percent:
+      seconds: 21.187
+      category: IL Any%
+      difficulty: unrestricted
+      runner: geshem8
+      date: '2026-01-21'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/y400373z
+    inbounds:
+      seconds: 21.187
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: geshem8
+      date: '2026-01-21'
+      link: https://www.speedrun.com/ultrakill/runs/y400373z
+  Level 4-3:
+    title: A Shot In The Dark
+    any_percent:
+      seconds: 19.27
+      category: IL Any%
+      difficulty: unrestricted
+      runner: geshem8
+      date: '2026-05-06'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/med0rl2y
+    inbounds:
+      seconds: 45.165
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: dentess
+      date: '2026-01-08'
+      link: https://www.speedrun.com/ultrakill/runs/y2rw2xjm
+  Level 4-4:
+    title: Clair De Soleil
+    any_percent:
+      seconds: 28.597
+      category: IL Any%
+      difficulty: unrestricted
+      runner: FishyBandit
+      date: '2026-02-19'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/y8l3xxdm
+    inbounds:
+      seconds: 29.967
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Kolta
+      date: '2026-02-04'
+      link: https://www.speedrun.com/ultrakill/runs/y684qg6z
+  Level 5-1:
+    title: In The Wake Of Poseidon
+    any_percent:
+      seconds: 17.495
+      category: IL Any%
+      difficulty: unrestricted
+      runner: themeowingdragon
+      date: '2026-08-24'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/y44x8rqy
+    inbounds:
+      seconds: 110.608
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: MichalAndru
+      date: '2025-11-07'
+      link: https://www.speedrun.com/ultrakill/runs/z0kr3r8m
+  Level 5-2:
+    title: Waves Of The Starless Sea
+    any_percent:
+      seconds: 30.194
+      category: IL Any%
+      difficulty: unrestricted
+      runner: geshem8
+      date: '2026-09-12'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/z04xq6oy
+    inbounds:
+      seconds: 34.673
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: MichalAndru
+      date: '2026-09-10'
+      link: https://www.speedrun.com/ultrakill/runs/z04xov9y
+  Level 5-3:
+    title: Ship Of Fools
+    any_percent:
+      seconds: 9.617
+      category: IL Any%
+      difficulty: unrestricted
+      runner: Spirtek
+      date: '2026-06-22'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/z04904jy
+    inbounds:
+      seconds: 72.28
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: dentess
+      date: '2026-01-09'
+      link: https://www.speedrun.com/ultrakill/runs/y40lvdnz
+  Level 5-4:
+    title: Leviathan
+    any_percent:
+      seconds: 11.237
+      category: IL Any%
+      difficulty: unrestricted
+      runner: wexter
+      date: '2026-06-21'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/zpv72pvz
+    inbounds:
+      seconds: 11.237
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: wexter
+      date: '2026-06-21'
+      link: https://www.speedrun.com/ultrakill/runs/zpv72pvz
+  Level 6-1:
+    title: Cry For The Weeper
+    any_percent:
+      seconds: 18.617
+      category: IL Any%
+      difficulty: unrestricted
+      runner: themeowingdragon
+      date: '2026-06-05'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/m388rnwy
+    inbounds:
+      seconds: 42.698
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: F1restorm
+      date: '2026-02-07'
+      link: https://www.speedrun.com/ultrakill/runs/y40dw3dz
+  Level 6-2:
+    title: Aesthetics Of Hate
+    any_percent:
+      seconds: 23.252
+      category: IL Any%
+      difficulty: unrestricted
+      runner: Darknn
+      date: '2026-07-02'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/y445q62y
+    inbounds:
+      seconds: 23.252
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Darknn
+      date: '2026-07-02'
+      link: https://www.speedrun.com/ultrakill/runs/y445q62y
+  Level 7-1:
+    title: Garden Of Forking Paths
+    any_percent:
+      seconds: 25.524
+      category: IL Any%
+      difficulty: unrestricted
+      runner: tootaroni
+      date: '2026-04-09'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/m7j6830m
+    inbounds:
+      seconds: 63.763
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Kolta
+      date: '2025-12-31'
+      link: https://www.speedrun.com/ultrakill/runs/ydon530z
+  Level 7-2:
+    title: Light Up The Night
+    any_percent:
+      seconds: 6.822
+      category: IL Any%
+      difficulty: unrestricted
+      runner: dentess
+      date: '2026-08-16'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/me538e9m
+    inbounds:
+      seconds: 55.329
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Kolta
+      date: '2025-05-30'
+      link: https://www.speedrun.com/ultrakill/runs/yv729rey
+  Level 7-3:
+    title: No Sound, No Memory
+    any_percent:
+      seconds: 24.762
+      category: IL Any%
+      difficulty: unrestricted
+      runner: vivyaann
+      date: '2026-06-02'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/yve5k54m
+    inbounds:
+      seconds: 145.246
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Erig189
+      date: '2026-01-05'
+      link: https://www.speedrun.com/ultrakill/runs/z0kq5kom
+  Level 7-4:
+    title: ...Like Antennas To Heaven
+    any_percent:
+      seconds: 20.443
+      category: IL Any%
+      difficulty: unrestricted
+      runner: themeowingdragon
+      date: '2026-04-18'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/mrwrpndy
+    inbounds:
+      seconds: 30.576
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: vivyaann
+      date: '2026-04-05'
+      link: https://www.speedrun.com/ultrakill/runs/mrw6r3dy
+  Level 8-1:
+    title: Hurtbreak Wonderland
+    any_percent:
+      seconds: 4.042
+      category: IL Any%
+      difficulty: unrestricted
+      runner: vivyaann
+      date: '2026-07-02'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/yw78wonz
+    inbounds:
+      seconds: 4.042
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: vivyaann
+      date: '2026-07-02'
+      link: https://www.speedrun.com/ultrakill/runs/yw78wonz
+  Level 8-2:
+    title: Through The Mirror
+    any_percent:
+      seconds: 10.824
+      category: IL Any%
+      difficulty: unrestricted
+      runner: vivyaann
+      date: '2026-03-20'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/med6r19y
+    inbounds:
+      seconds: 28.799
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: Kolta
+      date: '2026-03-22'
+      link: https://www.speedrun.com/ultrakill/runs/m38nkj6y
+  Level 8-3:
+    title: Disintegration Loop
+    any_percent:
+      seconds: 21.66
+      category: IL Any%
+      difficulty: unrestricted
+      runner: zaalk
+      date: '2026-09-11'
+      inbounds_tagged: false
+      link: https://www.speedrun.com/ultrakill/runs/zpepw9ny
+    inbounds:
+      seconds: 170.419
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: dentess
+      date: '2026-03-20'
+      link: https://www.speedrun.com/ultrakill/runs/z5n070dz
+  Level 8-4:
+    title: Final Flight
+    any_percent:
+      seconds: 30.32
+      category: IL Any%
+      difficulty: unrestricted
+      runner: winterrr
+      date: '2026-09-14'
+      inbounds_tagged: true
+      link: https://www.speedrun.com/ultrakill/runs/y4465l2y
+    inbounds:
+      seconds: 30.32
+      category: IL Any% + Inbounds
+      difficulty: unrestricted
+      runner: winterrr
+      date: '2026-09-14'
+      link: https://www.speedrun.com/ultrakill/runs/y4465l2y
+
