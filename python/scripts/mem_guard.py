@@ -11,7 +11,7 @@ leaves the other copies running. The env that owns the port sees its socket drop
 recovery budget and truncates that one episode as `bridge_reset` (measured: 47.7 s for a killed game).
 Never opens a bridge port. Honours the supervisor's and the driver's pause files.
 
-    python scripts/mem_guard.py --run spec_0-3 --game-limit-gb 3.0 --commit-limit-frac 0.80
+    python scripts/mem_guard.py --run spec_0-3 --game-limit-gb 2.5 --commit-limit-frac 0.93
 """
 
 from __future__ import annotations
@@ -106,8 +106,8 @@ def paused(run: str) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--run", default="", help="run whose SUPERVISOR_PAUSE file is honoured (the driver's always is)")
-    parser.add_argument("--game-limit-gb", type=float, default=3.0, help="recycle a game above this much commit")
-    parser.add_argument("--commit-limit-frac", type=float, default=0.80, help="recycle the fattest game above this system commit share")
+    parser.add_argument("--game-limit-gb", type=float, default=2.5, help="recycle a game above this much commit")
+    parser.add_argument("--commit-limit-frac", type=float, default=0.93, help="recycle the fattest game above this system commit share")
     parser.add_argument("--base-port", type=int, default=47800)
     parser.add_argument("--ports", type=int, default=32, help="size of the bridge port range that is ours to touch")
     parser.add_argument("--poll-seconds", type=float, default=60.0)
