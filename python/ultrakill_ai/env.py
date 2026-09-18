@@ -235,8 +235,8 @@ class EnvConfig:
     bridge_relaunch_stagger_s: float = 4.0  # per-port stagger, the same one `games.launch` uses for cold starts
     env_log_dir: str = ""  # runs/<run>/, where env_<port>.log is written ("" = no attribution log)
     # Recycle THIS env's own game at an EPISODE BOUNDARY once it has grown this many GB above the freshest
-    # copy running (0 = off). ULTRAKILL leaks under training -- measured 2026-09-18 at ~0.5-0.8 GB per game
-    # per hour, which is what took a 60 GB commit limit down twice -- and `scripts/mem_guard.py` already
+    # copy running (0 = off). ULTRAKILL leaks under training -- measured 2026-09-18 at 1.2-1.4 GB per game
+    # per hour from a 1.2 GB boot, which took a 60 GB commit limit down -- and `scripts/mem_guard.py` already
     # recycles a fat game from outside. The difference is WHEN: the guard kills the game at an arbitrary
     # moment and the env truncates that episode as `bridge_reset`, while this fires inside `reset()`, where
     # the episode has already ended and the level is about to be loaded anyway. Same boot cost, no episode
