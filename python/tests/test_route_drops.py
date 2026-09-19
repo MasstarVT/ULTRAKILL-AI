@@ -159,16 +159,24 @@ def test_apply_overrides_steps_over_a_drop_entry():
 
 def test_the_shipped_0_3_file_is_what_its_drop_list_asks_for():
     """End to end on the committed data, without regenerating it: the seven names the override file
-    drops are absent from the route, the four that remain are in trunk order with gapless hops, and
-    the file records the drop. (`tests/test_route_files.py` pins the positions and the diagnostics.)"""
+    drops are absent from the route, what remains is in trunk order with gapless hops, and the file
+    records the drop. (`tests/test_route_files.py` pins the positions and the diagnostics.)
+
+    Six rungs, not the four the drop list leaves: `apply_inserts` splices two waypoints onto the
+    main-room climb (2026-09-18, `tests/test_route_inserts.py`). Counting the ROOMS is what this
+    test is for, so the waypoints are excluded from that count rather than folded into it -- a drop
+    that stopped being applied must still show up here even while the insert list grows.
+    """
     doc = json.loads((ROUTES / "route_Level_0-3.json").read_text(encoding="utf-8"))
     entries = json.loads((ROUTES / "rung_overrides.json").read_text(encoding="utf-8"))["0-3"]
     dropped = [e["name"] for e in entries if e.get("drop")]
     assert len(dropped) == 7, dropped
     shipped = [r["name"] for r in doc["rungs"]]
     assert not set(dropped) & set(shipped), sorted(set(dropped) & set(shipped))
-    assert len(shipped) == 4, shipped
-    assert [r["hops"] for r in doc["rungs"]] == [3, 2, 1, 0]
+    rooms = [r["name"] for r in doc["rungs"] if not r.get("waypoint")]
+    assert len(rooms) == 4, rooms
+    assert len(shipped) == 6, shipped
+    assert [r["hops"] for r in doc["rungs"]] == [5, 4, 3, 2, 1, 0]
     assert sorted(doc["trunk_dropped"]) == sorted(dropped)
 
 

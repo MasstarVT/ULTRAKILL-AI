@@ -206,16 +206,32 @@ def test_the_approach_paid_is_the_distance_walked_and_no_more():
     top of it. This is the anti-farm bound: the ladder cannot pay more than the trunk is long.
 
     The walked path is slightly longer than the sum of the legs, because the target switches when the player
-    ENTERS a rung's 8 m cylinder while the path carries on through the rung's own position; the approach
-    banked for the next leg is measured from that switch point. So the two agree to a few metres per rung
-    rather than exactly, and the assertion is a bound plus a 10% band.
+    ENTERS a rung's 8 m x 6 m cylinder while the path carries on through the rung's own position; the
+    approach banked for the next leg is measured from that switch point, so the metres between the two are
+    walked and never paid.
+
+    That shortfall is therefore PER RUNG, not per metre, and its ceiling is derived rather than tuned: the
+    path aims at the rung's centre, so it enters the cylinder at most `hypot(reach_h, reach_v)` = 10.0 m from
+    it. Measured over the fourteen shipped trunks the worst is 9.72 m a rung (8-3). The bound used to be a
+    flat 10% of the distance walked, which says the same thing only while a route's legs are long compared
+    with 8 m: 0-3's six rungs over 314 m walked lose 45.5 m, 14.5%, and the flat band failed it on a route
+    whose every rung is exactly where it should be. 0.15 reward a metre makes that shortfall 6.8 over a
+    whole level, against `level_complete` 100.
     """
+    reach_diag = math.hypot(8.0, 6.0)  # GateProgress reach_m x reach_v_m, the cylinder's half-diagonal
     for scene, route in shipped():
         result = full_walk(route)
         assert result["approach"] > 0.0, f"{scene}: a walk of the whole trunk paid no approach at all"
+        # The anti-farm bound, and the one that matters: the ladder cannot pay more than the trunk is long.
         assert result["approach"] <= result["walked"] + 1.0, \
             f"{scene}: paid {result['approach']:.1f} m of approach over {result['walked']:.1f} m walked"
-        assert result["approach"] >= 0.90 * result["walked"], \
+        slack = reach_diag * len(route["rungs"])
+        assert result["approach"] >= result["walked"] - slack, \
+            f"{scene}: only {result['approach']:.1f} m of {result['walked']:.1f} m walked was ever paid -- " \
+            f"{result['walked'] - result['approach']:.1f} m unpaid against a ceiling of {slack:.1f} m " \
+            f"({len(route['rungs'])} rungs x {reach_diag:.1f} m). More than one cylinder's worth a rung " \
+            f"means a leg is doubling back, not that the route is dense"
+        assert result["approach"] >= 0.50 * result["walked"], \
             f"{scene}: only {result['approach']:.1f} m of {result['walked']:.1f} m walked was ever paid"
 
 

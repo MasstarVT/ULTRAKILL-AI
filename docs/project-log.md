@@ -1934,3 +1934,115 @@ one place, the env).
   reported 12 games, 20.8 GB total, fattest 1.9 GB, system commit **67%**. **Nothing here is validated in
   game** — no speed stage has been trained, so whether an S-rank median is reachable on any level is still
   unknown, and the first speed stage cannot start until 0-3's complete stage is `"done"`.
+
+## 2026-09-18 — The 0-3 main-room ascent: route waypoints, and a third override kind
+
+**Mechanism.** `Level 0-3`'s trunk had four rungs, and the leg between rungs 2 and 3 —
+`2 - Side Hallway - Floor 1` (0,10,340) to `10 - Main Room - Floor 2` (0,50,330) — was **10.0 m of
+horizontal against 40.0 m of vertical, 76.0 degrees**. The target vector the policy reads in
+`campaign_block` slots 448-455 therefore said "up" and carried no usable heading, and the only physical
+way up (a spiral ramp round the main room) *starts* by moving **18.7 m away** from that target, which
+`gate_approach` pays nothing for. A room trunk can only aim at rooms, and on this level one room's
+centroid to the next is not a direction the agent can walk.
+
+**Evidence, measured on `runs/spec_0-3/episodes.jsonl`, 264 fresh episodes since timesteps 21,701,566
+(4.3M stage steps).** Zero completions. `gate_hops_best` 2 — the hallway rung — in **219** of them, 3
+in 32, 1 in only 13. `end_reason` stuck in 237, `bridge_reset` 20, `max_steps` 7. Median end height
+**y 17.8**; share of episodes ending above y 20 **0.398**, above y 40 **0.057**, above y 48 **0.027**.
+The four densest 10 m end cells are (10,20,340) 19, (0,20,340) 15, (10,20,330) 11, (10,20,350) 11 —
+the policy climbs something by the hallway and wedges at y ≈ 20. Median episode 6,106 steps of a
+12,000 cap, median reward −76.6.
+
+**How the ascent is actually done**, from `runs/campaign_gates/best_runs/Level_0-3.json` — the AI's
+**own** 263.904 s completion (4064 positions at 15.4 Hz, rank B, difficulty 3), not a human demo. Trace
+indices 1000-1042 are **one continuous supported run** up a spiral ramp: per-sample vertical speed holds
++1.0 to +1.7 m with no gravity signature (free fall on this level measures −0.175 m per sample, over five
+clean onsets at indices 58, 1774, 1790, 1791, 1813). It is not a jump chain and it has no airborne gap —
+an earlier analysis called indices 1028-1035 airborne from a failed standability probe; the velocities
+say otherwise, and `standability()` reports 276-714 standable cells at the points now shipped.
+
+**Fix — a third `rung_overrides.json` entry kind, `insert_after` (`build_routes.apply_inserts`).** It
+ADDS a rung behind the one it names; hand-editing a route file is still forbidden and the generator is
+still the only writer. It runs immediately **after** the moves, so `anchor_was` is the anchor's *shipped*
+position and every check runs on final geometry, and before `hops` is assigned from the row order, so the
+ladder stays a gapless n−1..0. Rules 7-17 of the `OVERRIDES_NAME` comment, one test each in the new
+`tests/test_route_inserts.py` (36 tests): reserved `WP<n> - ` namespace, duplicate, unknown/dropped
+anchor, anchor drift > 1.0 m, I2 separation, **co-credit**, R4 standability, seed margin, budget cap, and
+**all-or-nothing per level**.
+
+**Co-credit is the rule this incident buys.** Two `_is_reached` cylinders share a point whenever their
+horizontal gap is ≤ 2·`REACH_H` (16 m) **and** their vertical gap is ≤ 2·`REACH_V` (12 m). I2's sphere
+cannot express that: a reviewed candidate pair sat 13.5 m apart horizontally and 10.8 m vertically —
+**17.3 m in a straight line, so I2's 16 m passed it** — while (−4.0, 27.0, 328.3) lies inside both, and
+one arrival there would pay two ladder instalments for one place. Applied to inserted rungs only; the
+other 13 shipped files have **not** been measured against it.
+
+**The 0-3 ladder now ships six rungs, hops 5..0:**
+
+| hops | pos | rung |
+|---|---|---|
+| 5 | 0,−10,300 | `1 - Main Room - Floor 1` (absorbed by `_seed_start`, pays nothing) |
+| 4 | 0,10,340 | `2 - Side Hallway - Floor 1` |
+| 3 | −10.7,21.6,327.2 | `WP1 - Main Room Stack Foot` — insert, trace #1014 |
+| 2 | 5.3,36.7,328.9 | `WP2 - Main Room Stack Top` — insert, trace #1024 |
+| 1 | −7.1,48.5,315.2 | `10 - Main Room - Floor 2` — **moved** from the centroid 0,50,330 |
+| 0 | −82,90,315 | `10B - Second Encounter + 11 - Boss Arena - Floor 2` |
+
+Leg angles 26.6, 34.8, 43.2, 32.6, 29.0 degrees — **steepest 43.2, down from 76.0**. tour_ratio 0.972
+(cap 1.35), med gap 22.1, max gap 85.6, legs_witnessed 2/6, checkpoints_within_60m 1/4,
+last_rung_to_exit_m 119.7 unchanged. Minimum pairwise distance 20.3 m and no pair co-credits.
+
+**The pay ceiling is unchanged.** The spawn (0, 0.5, 253) is 48.2 m from rung 1 and 77.9 m from the
+nearest waypoint, so `_seed_start` still absorbs rung 1 and the ladder is still **five hops deep**: a
+level load can earn `gate` 15.0 x 5 = **75.0** by walking the whole ladder without finishing, exactly as
+the four-rung file could, against `level_complete` 100.0. The arithmetic that condemned the side wing
+(7 x 15 = 105 > 100) is **not** re-created. The margin also survives play: it is 29.7 m at the spawn and
+still 23.0 m 2.6 s in, where a candidate rejected in review went negative by trace index 54.
+
+**Credit order is monotone on the one run that finished.** Walking all 4064 trace positions through
+`_is_reached`'s own 8 m x 6 m cylinder, first credit per rung is **34, 651, 688, 1021, 1034, 1241** —
+strictly increasing. A candidate rejected in review was first credited at index **130**, 8.4 s in and 521
+samples *before* the hallway it was anchored behind, which would have paid 30 points for walking over a
+low staircase and taken the hallway rung out of `_choose_target` for the rest of the load. The shipped
+waypoints credit nothing from index 130, nothing from any of the five live stall cells, and nothing from
+directly below (main floor, y −10) or directly above (Floor 2, y 48.5) themselves.
+
+**Also fixed, pre-existing:** `build_routes.py --validate` compared `tuple(EXPECTED_SHAPE)` against
+`EXPECTED_SHIPPED` by ORDER. `EXPECTED_SHAPE` is grouped by its own commentary (the two `COLLAPSED_SHIP`
+rows lead it) while `EXPECTED_SHIPPED` is sorted, so `--validate` had been printing **FAIL** on every run
+since that grouping was written — a permanently red gate is the same as no gate. It now compares the
+level sets, which have always agreed.
+
+**Live signal to judge this on, within 400k steps of the restart, on fresh episodes.** Baseline taken at
+**timesteps 23,683,450** (the bounce point), over the 264 fresh episodes above:
+
+1. **Primary, ladder-independent — read this one, not `gates_reached`:** share of fresh episodes with
+   `end_pos` y > 40 rises from **0.057** to >= 0.12, and y > 48 from **0.027** to >= 0.06.
+2. Share with y > 20 rises from **0.398** to >= 0.45, and the (0..10, 20, 330..350) end cells lose mass.
+3. `gate_hops_best` in the NEW numbering: the hallway is hops 4, so success is the mode moving from 4 to
+   <= 2. **Confound:** `gates_reached` rises mechanically because there are more rungs — on its own it is
+   not evidence.
+4. Ultimate: a first fresh completion (0 in 4.3M stage steps).
+
+**Revert triggers.** At two consecutive checks >= 200k steps apart, the y > 40 share is not above 0.057;
+or the y > 20 share has fallen below 0.30 (the waypoints have pulled the policy into the main room and
+parked it); or `targets_parked` rises well above its baseline of **42 of 264 episodes** with >= 1. Revert
+= delete the three `0-3` entries (the Floor-2 move and the two inserts) and regenerate; the file returns
+to its four rungs, because the generator is the only writer. **Note that a revert does not restore the
+diagnostics:** `progress.py` ratchets `gates_total = max(gates_total, gates_reached + gate_hops_best)`
+and persists it, so 0-3's denominator moves 4 -> 6 at the first post-bounce episode and `progress_score`
+for the same physical progress reads 2/6 instead of 2/4 for the rest of the run unless `gates_total` is
+cleared by hand in `runs/spec_0-3/status.json` and `curriculum.json`. Nothing in `keep_best.py` or
+`campaign_driver.py` reads it; it is a dashboard column.
+
+**Not verified.** (1) Whether the Side Hallway's `ActivateNextWave` "Wave 1"/"Wave 2" must fire to open
+the Floor-2 `Door (Large)` at (0,53,330.5) — the wiring was not traced. The hallway rung was **kept** for
+that reason, though the live data argues it is not required: **5 of the 264 fresh episodes reached Floor 2
+with `gates_reached` 2 and `gate_hops_best` 1**, i.e. `hops_reached` = {3,1}, skipping the hallway
+entirely. (2) The second climb, Floor 2 y 48 -> y 72, gets **no waypoint in this pass** — its target
+vector is already usable (the boss rung lies 74.9 m west and 41.5 m up, 29.0 degrees) and the live data
+says the blocker is climb 1. The measured candidate if it becomes the wall is trace #1159,
+(−13.5, 66.0, 313.6). One change at a time. (3) Whether the co-credit rule holds on the other 13 shipped
+files. (4) Nothing was run in game: no socket, no `games.py launch/stop`, no `supervise.py`, no mod build.
+(5) `route_Level_0-3.json`'s `start_room` still reads `3 - Side Arena - Floor 1`, a room the drop list
+removes — a diagnostic field nothing in `campaign.py` reads, but it is wrong.

@@ -354,13 +354,24 @@ EXPECTED_LADDERS = {
     # side wing were dropped on 2026-09-18 by the `drop` list in rung_overrides.json; the four here
     # are the ones the level's only recorded completions credited (gates_reached 3 and 4, never more).
     # `test_the_0_3_wing_stays_off_the_route` below names them individually.
-    "Level 0-3":   (1.000, "2/4", "1/4", 119.7, [
+    # The four became SIX on 2026-09-18: the leg from the Side Hallway to Floor 2 was 76.0 degrees
+    # (10 m horizontal against 40 m vertical), so the target vector carried no heading and 219 of 264
+    # fresh episodes stalled on the hallway rung with zero completions in 4.3M steps. Two waypoints
+    # from the AI's own completing run were spliced onto the spiral ramp by `apply_inserts`, and
+    # Floor 2 moved off its centroid onto the floor the run actually walks. Steepest leg now 43.2
+    # degrees; the ladder is still five hops deep, so the gate income a load can earn without
+    # finishing is unchanged. `tests/test_route_inserts.py` holds the evidence and walks the trace.
+    "Level 0-3":   (0.972, "2/6", "1/4", 119.7, [
         "0,-10,300  1 - Main Room - Floor 1",
         # Moved from the room centroid 0,10,331 by route_overrides.json, 2026-09-18: the centroid sat
         # 1.5 m past the main room's far wall (z 329.5), so the reach cylinder covered the wall face
         # and the rung was credited from the air on the main-room side. See the override's `why`.
         "0,10,340  2 - Side Hallway - Floor 1",
-        "0,50,330  10 - Main Room - Floor 2",
+        "-11,22,327  WP1 - Main Room Stack Foot",
+        "5,37,329  WP2 - Main Room Stack Top",
+        # Moved from the room centroid 0,50,330: the centroid is at the EDGE of the second floor and
+        # the AI's own completion enters its cylinder once, on the way out.
+        "-7,48,315  10 - Main Room - Floor 2",
         "-82,90,315  10B - Second Encounter + 11 - Boss Arena - Floor 2",
     ]),
     "Level 0-5":   (1.000, "3/5",  "1/1",    211.1, [
@@ -494,7 +505,7 @@ EXPECTED_LADDERS = {
     ]),
 }
 
-TOTAL_RUNGS = 107  # 95 over the twelve unrouted levels, plus 0-3's 4 and 4-3's 8
+TOTAL_RUNGS = 109  # 95 over the twelve unrouted levels, plus 0-3's 6 (4 rooms + 2 waypoints) and 4-3's 8
 
 
 def test_the_ladder_table_covers_exactly_the_shipped_levels():
@@ -592,6 +603,25 @@ def test_every_override_is_present_in_the_file_that_ships():
                     "%s drops %r but the shipped file does not record it in `trunk_dropped`" \
                     % (level, name)
                 continue
+            if entry.get("insert_after"):
+                # The third kind. It has no `was` -- there is no generated position for a rung the
+                # generator did not produce -- so it must not fall into the move branch below.
+                # `tests/test_route_inserts.py` pins the anchor order and the flags; what matters
+                # here is the same detector as the other two: the entry reached the file that ships.
+                assert name in rungs, \
+                    "%s inserts %r, which is not a rung in the shipped file -- the regeneration " \
+                    "did not apply it (check --validate for a REFUSED note)" % (level, name)
+                assert "was" not in entry and "drop" not in entry, \
+                    "%s %r is an insert entry and must carry neither `was` nor `drop`" % (level, name)
+                assert rungs[name]["pos"] == [round(float(v), 1) for v in entry["pos"]], \
+                    "%s %r ships at %s, not the %s the insert asks for" \
+                    % (level, name, rungs[name]["pos"], entry["pos"])
+                assert rungs[name].get("waypoint") is True, \
+                    "%s %r ships without `waypoint: true`" % (level, name)
+                assert name in [i["name"] for i in (docs_by_level[level].get("trunk_inserted") or ())], \
+                    "%s inserts %r but the shipped file does not record it in `trunk_inserted`" \
+                    % (level, name)
+                continue
             assert name in rungs, \
                 "%s override names %r, which is not a rung in the shipped file" % (level, name)
             got = rungs[name]["pos"]
@@ -632,7 +662,12 @@ def test_the_0_3_wing_stays_off_the_route():
     for banned in WING_0_3:
         assert banned not in names, "0-3 ships %r again; see rung_overrides.json" % banned
     assert [r["name"] for r in doc["rungs"]] == [
-        "1 - Main Room - Floor 1", "2 - Side Hallway - Floor 1", "10 - Main Room - Floor 2",
+        "1 - Main Room - Floor 1", "2 - Side Hallway - Floor 1",
+        # The two waypoints `apply_inserts` splices onto the main-room spiral ramp. They are the
+        # only rungs on this level the room survey did not produce, and the only reason the list
+        # above is longer than the four rooms the drop list left.
+        "WP1 - Main Room Stack Foot", "WP2 - Main Room Stack Top",
+        "10 - Main Room - Floor 2",
         "10B - Second Encounter + 11 - Boss Arena - Floor 2"], [r["name"] for r in doc["rungs"]]
     assert sorted(doc["trunk_dropped"]) == sorted(WING_0_3), doc["trunk_dropped"]
 

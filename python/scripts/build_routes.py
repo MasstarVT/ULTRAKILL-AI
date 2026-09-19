@@ -143,8 +143,61 @@ PIT_MAX_M = 70.0        # spec 7.1 test 9: a rung named `Pit` may only be hops 0
 #   6. if the drops would take a level under MIN_RUNGS the WHOLE list for that level is refused and
 #      the generated trunk ships unchanged. A short route is not a route, and silently falling to the
 #      gate ladder is not what a drop list asks for.
+#
+# An entry of the THIRD kind, `{"name": "WP1 - ...", "insert_after": ..., "pos": ..., "why": ...}`,
+# ADDS a rung (`apply_inserts`). It exists because a room trunk can only aim at rooms, and one room's
+# centroid to the next is not always a direction the agent can walk. On `0-3` the leg from
+# `2 - Side Hallway - Floor 1` (0,10,340) to `10 - Main Room - Floor 2` (0,50,330) is 10 m of
+# horizontal against 40 m of vertical -- 76 degrees -- so the target vector in observation slots
+# 448-455 says "up" and carries no usable heading, and the only physical way up (a spiral ramp round
+# the main room) starts by moving 18.7 m AWAY from that target, which `gate_approach` punishes.
+# Measured 2026-09-18 on 264 fresh `spec_0-3` episodes over 4.3M steps: zero completions, 219 of them
+# stalled with `gate_hops_best` 2 (the hallway rung) and a median end height of y 17.8. A waypoint is
+# a rung at a place on the real climb, so every leg keeps a heading. Its rules:
+#
+#   7. it is applied immediately AFTER the moves, so an anchor's `anchor_was` is the position that
+#      SHIPS for that anchor (a rung that is itself moved is matched against its moved position, not
+#      the generator's) and every check below -- separation, co-credit, standability -- runs against
+#      final positions. `hops` is still assigned from the row order afterwards, so it stays a gapless
+#      n-1..0 with no special casing. I3's budget cap has already run, so rule 16 re-checks it;
+#   8. `insert_after` names the rung the new one is spliced in behind, by NAME, and may name an
+#      earlier ACCEPTED insert. That, not a tie-break, is what orders several waypoints on one climb;
+#   9. names live in a reserved namespace, `WP<digit> - `, so an inserted rung can never be confused
+#      with a room the survey produced (and if the survey ever produces one, the whole list refuses);
+#  10. `anchor_was` is the anchor's shipped position when the waypoint was measured, checked to
+#      OVERRIDE_WAS_TOL_M exactly as a move's `was` is: the waypoint was measured in geometry the
+#      anchor sat in, so if the anchor moved, the rooms moved. An insert anchored on another insert
+#      carries none -- an authored position cannot drift;
+#  11. I2's separation (>= SEP from every other rung) and, beyond it, CO-CREDIT: two `_is_reached`
+#      cylinders share a point whenever their horizontal gap is <= 2 * REACH_H AND their vertical gap
+#      is <= 2 * REACH_V, and one step inside both pays two ladder instalments for one arrival. I2's
+#      sphere cannot express that; rule 11 can. Inserted rungs only -- the other 13 shipped files
+#      have not been measured against it, so making it campaign-wide is a separate, measured change;
+#  12. R4 standability, as `apply_overrides` runs it on a moved rung. Skipped with a note on
+#      `--no-probe`, the same concession moves already make;
+#  13. the SEED margin. `GateProgress._seed_start` absorbs the rung nearest the spawn and forgoes
+#      every instalment above it, so a waypoint that lands nearer the spawn than the trunk's own
+#      first rung silently deletes the ladder above it. With `start_pos` on the entry, an insert must
+#      be farther from it than the nearest GENERATED rung by at least SEED_MARGIN_M or
+#      SEED_MARGIN_FRAC, whichever is larger. Without `start_pos` the check is skipped with a note:
+#      the offline parse has no real per-level spawn (spec 2.8 / risk 7);
+#  14. duplicate names are refused, against both the surviving rows and the earlier inserts;
+#  15. an anchor that no longer exists -- taken by a guard, renamed, or removed by a `drop` entry --
+#      is REFUSED rather than appended somewhere plausible;
+#  16. `len(rows) + inserts > MAX_RUNGS` refuses the list rather than letting I3's cheapest-detour
+#      trimming silently drop a trunk room to make space;
+#  17. ALL-OR-NOTHING per level: if any insert entry for a level is refused, NONE is applied and the
+#      level ships its generated + dropped + moved trunk. Half a waypoint chain is worse than none --
+#      it leaves exactly the 76-degree leg the chain exists to remove, one rung further up.
+#
+# An inserted rung carries `"waypoint": true` in the file it ships in, and the doc records the whole
+# set in `trunk_inserted`, beside `trunk_dropped`. Both are emitted only when something was applied,
+# so a level with no inserts is byte for byte what it was.
 OVERRIDES_NAME = "rung_overrides.json"  # NOT route_*.json: that glob is the route files themselves
 OVERRIDE_WAS_TOL_M = 1.0  # rule 3: how far the generator's own position may drift and still match `was`
+WAYPOINT_PREFIX = re.compile(r"^WP\d+ - \S")  # rule 9: the reserved namespace for an inserted rung
+SEED_MARGIN_M = 4.0        # rule 13: absolute floor on "farther from the spawn than the first rung"
+SEED_MARGIN_FRAC = 0.10    # rule 13: ... or this share of that rung's own distance, whichever is more
 
 # Levels whose gate ladder layer 1 ACCEPTS but which the collapse detector calls collapsed at the
 # spawn, and whose trunk the S1 measurement showed reproduces a sensible walkable order. Their file
@@ -193,7 +246,14 @@ EXPECTED_SHAPE = {
     # `why` before touching this row. checkpoints_within_60m falls 4/4 -> 1/4 and legs_witnessed 9/11
     # -> 2/4 because three of the level's four checkpoints are IN the wing; both are diagnostics, and
     # what they now say is true -- the route no longer passes them.
-    "0-3": (4, 44.7, 92.5, 1.000, "2/4", "1/4", 119.7),
+    # 2026-09-18, second change: the four rungs became SIX. `10 - Main Room - Floor 2` moved off its
+    # centroid to where the AI's own completing run actually stands on that floor, and two waypoints
+    # (`apply_inserts`) were spliced onto the spiral ramp between the hallway and it, because the
+    # 76-degree leg between them gave the policy no heading to learn -- 264 fresh episodes, zero
+    # completions, 219 stalled at the hallway rung. Read the insert entries' `why` before touching
+    # this row. The steepest leg is now 43.2 degrees and the ladder is still five hops deep, so the
+    # gate income a load can earn without finishing is unchanged at 5 x 15.
+    "0-3": (6, 22.1, 85.6, 0.972, "2/6", "1/4", 119.7),
     "4-3": (8, 64.8, 249.8, 1.000, "6/8", "3/3", 218.5),
     "0-5": (5, 46.5, 137.2, 1.000, "3/5", "1/1", 211.1),
     "1-4": (4, 81.2, 117.0, 1.000, "2/4", "2/2", 149.5),
@@ -2096,6 +2156,8 @@ def apply_overrides(lvl, rows, overrides, geom=None):
     for entry in overrides.get(lvl, ()):
         if entry.get("drop"):
             continue  # `apply_drops` already handled it, between I2 and R1
+        if entry.get("insert_after"):
+            continue  # `apply_inserts` handles it, immediately after this pass (rule 7)
         name, want, was = entry.get("name"), entry.get("pos"), entry.get("was")
         row = by_name.get(name)
         if row is None:
@@ -2179,6 +2241,174 @@ def apply_drops(lvl, rows, overrides):
     return kept, notes, names
 
 
+def _vec3(v):
+    """`v` as a list of three finite floats, or None. Every position a rule reads goes through it."""
+    if not isinstance(v, (list, tuple)) or len(v) != 3:
+        return None
+    try:
+        out = [float(x) for x in v]
+    except (TypeError, ValueError):
+        return None
+    return out if all(math.isfinite(x) for x in out) else None
+
+
+def co_credit(a, b):
+    """Do two rungs' `_is_reached` cylinders share a point? Rule 11.
+
+    A cylinder is REACH_H horizontally and REACH_V vertically about its rung, so a common point
+    exists exactly when the horizontal gap is within two radii AND the vertical gap within two
+    half-heights. Anything closer can be credited from one arrival, which pays two ladder
+    instalments for one place -- the free-hop skip I2's sphere was meant to stop and cannot see:
+    0-3's measured pair sat 13.5 m apart horizontally and 10.8 m vertically, 17.3 m in a straight
+    line, so I2's 16 m passed it while the point (-4.0, 27.0, 328.3) lay inside both.
+    """
+    return (math.hypot(a[0] - b[0], a[2] - b[2]) <= 2 * REACH_H
+            and abs(a[1] - b[1]) <= 2 * REACH_V)
+
+
+def apply_inserts(lvl, rows, overrides, geom=None):
+    """Rules 7-17: splice in the `insert_after` waypoints. Returns (rows, notes, inserted).
+
+    All-or-nothing (rule 17): the returned rows are either `rows` with every entry applied, or
+    `rows` untouched. `inserted` is the record `build_level` writes to `trunk_inserted`.
+
+    See the OVERRIDES_NAME comment for what each rule is for. Every refusal is a note rather than an
+    exception, exactly as `apply_overrides` and `apply_drops` do it, because one bad entry must not
+    stop the other 13 levels from being rebuilt -- `--validate` is what turns a note into a non-zero
+    exit.
+    """
+    wanted = [e for e in overrides.get(lvl, ()) if e.get("insert_after")]
+    if not wanted:
+        return rows, [], []
+    notes, refused = [], []
+
+    def refuse(msg):
+        refused.append(msg)
+        notes.append("insert REFUSED: %s %s" % (lvl, msg))
+
+    # Rule 9, the half that cannot be judged per entry: if the survey itself ever starts producing a
+    # name in the reserved namespace, an inserted rung is no longer distinguishable from a room and
+    # every duplicate/anchor rule below is unsound. Refuse the whole list rather than guess.
+    clash = [r["name"] for r in rows if WAYPOINT_PREFIX.match(r["name"])]
+    if clash:
+        refuse("the generated trunk already carries %r, which is inside the reserved `WP<n> - ` "
+               "waypoint namespace -- rename the waypoints or the namespace" % clash[0])
+        return rows, notes, []
+
+    if len(rows) + len(wanted) > MAX_RUNGS:
+        refuse("%d rungs plus %d waypoints is over I3's cap of %d; I3 has already run, so the "
+               "waypoints would push a trunk room off the route instead"
+               % (len(rows), len(wanted), MAX_RUNGS))
+        return rows, notes, []
+
+    out = [dict(r) for r in rows]
+    generated = {r["name"] for r in out}
+    # Rule 13's baseline: the nearest GENERATED rung to the spawn is the one `_seed_start` absorbs
+    # today, and the one an insert must stay clear of.
+    inserted = []
+    for entry in wanted:
+        name, anchor = entry.get("name"), entry.get("insert_after")
+        pos = _vec3(entry.get("pos"))
+        if not (isinstance(name, str) and name and isinstance(anchor, str) and anchor and pos):
+            refuse("%r needs a non-empty `name`, a non-empty `insert_after` and a 3-element finite "
+                   "`pos`" % (name,))
+            continue
+        if not WAYPOINT_PREFIX.match(name):                                          # rule 9
+            refuse("%r is not in the reserved `WP<n> - ` namespace, which is what keeps an inserted "
+                   "rung apart from a room the survey produced" % name)
+            continue
+        if any(r["name"] == name for r in out):                                      # rule 14
+            refuse("%r is already a rung on this level" % name)
+            continue
+        at = next((i for i, r in enumerate(out) if r["name"] == anchor), None)       # rule 15
+        if at is None:
+            refuse("%r asks to follow %r, which is not a rung here (a guard or a `drop` entry may "
+                   "have taken it, or the room was renamed)" % (name, anchor))
+            continue
+        anchor_row = out[at]
+        was = entry.get("anchor_was")
+        if anchor_row.get("waypoint"):
+            if was is not None:                                                      # rule 10
+                refuse("%r follows the inserted rung %r, whose position is authored and cannot "
+                       "drift -- drop its `anchor_was`" % (name, anchor))
+                continue
+        else:
+            was = _vec3(was)
+            if was is None:
+                refuse("%r needs a 3-element finite `anchor_was`, the shipped position of %r when "
+                       "the waypoint was measured" % (name, anchor))
+                continue
+            drift = dist3(anchor_row["pos"], was)
+            if drift > OVERRIDE_WAS_TOL_M:                                           # rule 10
+                refuse("%r follows %r, which now ships at %s, %.1f m from the recorded `anchor_was` "
+                       "%s -- the waypoint was measured against geometry that has moved, so "
+                       "re-measure it" % (name, anchor, [round(v, 1) for v in anchor_row["pos"]],
+                                          drift, was))
+                continue
+        bad = None
+        for other in out:                                                            # rules 11, 12
+            d = dist3(other["pos"], pos)
+            if d < SEP:
+                bad = ("it lands %.1f m from %r, inside I2's %.0f m separation"
+                       % (d, other["name"], SEP))
+                break
+            if co_credit(other["pos"], pos):
+                bad = ("its reach cylinder overlaps %r's (%.1f m apart horizontally, %.1f m "
+                       "vertically, against %.0f m and %.0f m) -- one arrival there would pay two "
+                       "ladder instalments"
+                       % (other["name"], math.hypot(other["pos"][0] - pos[0],
+                                                    other["pos"][2] - pos[2]),
+                          abs(other["pos"][1] - pos[1]), 2 * REACH_H, 2 * REACH_V))
+                break
+        if bad:
+            refuse("%r -> %s: %s" % (name, pos, bad))
+            continue
+        start = _vec3(entry.get("start_pos"))                                        # rule 13
+        if start is None:
+            notes.append("insert note: %s %r ships with no `start_pos`, so the seed-margin check "
+                         "was skipped -- `_seed_start` absorbs the rung nearest the spawn"
+                         % (lvl, name))
+        else:
+            near = min((dist3(start, r["pos"]) for r in out if not r.get("waypoint")), default=None)
+            if near is not None:
+                need = near + max(SEED_MARGIN_M, SEED_MARGIN_FRAC * near)
+                here = dist3(start, pos)
+                if here < need:
+                    refuse("%r sits %.1f m from the start %s, against the nearest generated rung's "
+                           "%.1f m -- under the %.1f m `_seed_start` needs to absorb that rung and "
+                           "not this waypoint" % (name, here, [round(v, 1) for v in start], near,
+                                                  need))
+                    continue
+        row = {"name": name, "pos": [round(float(v), 1) for v in pos], "waypoint": True}
+        out.insert(at + 1, row)
+        inserted.append({"name": name, "after": anchor, "pos": row["pos"],
+                         "source": str(entry.get("source") or "")})
+        notes.append("insert applied: %s %r after %r at %s (%s)"
+                     % (lvl, name, anchor, row["pos"], entry.get("why") or "no reason recorded"))
+
+    if refused:                                                                      # rule 17
+        return rows, [n for n in notes if "REFUSED" in n] + [
+            "insert REFUSED: %s all %d waypoints withheld -- a half-applied chain leaves exactly the "
+            "leg it exists to remove, one rung further up" % (lvl, len(wanted))], []
+
+    if geom is not None and inserted:                                                # rule 12
+        added = [r for r in out if r.get("waypoint")]
+        reach = {r["name"]: x["reach"] for r, x in zip(added, standability(geom, added))}
+        unstandable = [n for n, ok in reach.items() if not ok]
+        if unstandable:
+            for n in unstandable:
+                notes.append("insert REFUSED: %s %r: R4 finds no standable cell inside its reach "
+                             "cylinder there" % (lvl, n))
+            notes.append("insert REFUSED: %s all %d waypoints withheld -- a half-applied chain "
+                         "leaves exactly the leg it exists to remove, one rung further up"
+                         % (lvl, len(wanted)))
+            return rows, [n for n in notes if "REFUSED" in n], []
+    elif inserted:
+        notes.append("insert note: %s %d waypoints shipped UNPROBED (--no-probe): R4 was not run on "
+                     "them" % (lvl, len(inserted)))
+    return out, notes, inserted
+
+
 # ============================================================================ 7. one level
 
 ALTAR_NEAR = 25.0       # a lock is "on the trunk" when its door is this close to a leg
@@ -2257,8 +2487,15 @@ def build_level(lvl, probe=True, analyse_gates=False, overrides=None):
     # at, or one that has been moved inside a neighbour's reach cylinder, is worse than the bug.
     rows, override_notes = apply_overrides(lvl, rows, overrides or {},
                                            geom=LevelGeom(sc, ress) if probe else None)
-    rep["notes"] = list(rep["notes"]) + override_notes
-    rep["override_refused"] = [n for n in (drop_notes + override_notes) if "REFUSED" in n]
+    # Rules 7-17: the waypoints go in immediately after the moves, so `anchor_was` is the anchor's
+    # SHIPPED position and the separation, co-credit and R4 checks all run against final geometry.
+    # `hops` is assigned from the row order further down, so an insert keeps it gapless n-1..0.
+    rows, insert_notes, inserted = apply_inserts(lvl, rows, overrides or {},
+                                                 geom=LevelGeom(sc, ress) if probe else None)
+    rep["notes"] = list(rep["notes"]) + override_notes + insert_notes
+    rep["override_refused"] = [n for n in (drop_notes + override_notes + insert_notes)
+                               if "REFUSED" in n]
+    rep["inserted"] = inserted
     tour = tour_ratio(rows)                                              # R2
     r2 = tour <= MAX_TOUR
 
@@ -2317,6 +2554,10 @@ def build_level(lvl, probe=True, analyse_gates=False, overrides=None):
         # Emitted only when a drop list was applied, so the thirteen files with none are byte for byte
         # what they were. A four-rung 0-3 next to an eleven-room survey has to say so in the file.
         **({"trunk_dropped": list(drop_manual)} if drop_manual else {}),
+        # Same conditional emit, and for the same reason: a route carrying rungs the room survey
+        # never produced has to say so in the file, and the thirteen files with no waypoints stay
+        # byte for byte what they were.
+        **({"trunk_inserted": [dict(i) for i in inserted]} if inserted else {}),
         "tour_ratio": round(tour, 3),
         "checkpoints_within_60m": rep["checkpoints_within_60m"],
         "legs_witnessed": rep["legs_witnessed"],
@@ -2326,7 +2567,11 @@ def build_level(lvl, probe=True, analyse_gates=False, overrides=None):
                    "hops": n - 1 - k,
                    "name": r["name"],
                    "gated_by": [],
-                   "open": False, "locked": False, "active": True}
+                   "open": False, "locked": False, "active": True,
+                   # `_parse_route` does `dict(entry)` and then forces open/locked/active, so an
+                   # extra field rides through untouched and `_is_route_rung` stays object-identity
+                   # based. Room rungs carry no such key and are unchanged.
+                   **({"waypoint": True} if r.get("waypoint") else {})}
                   for k, r in enumerate(rows)],
     }
     return rep
@@ -2550,9 +2795,15 @@ def print_validate(reports, expect_shipped=True):
                          "check the new trunk by hand, then edit EXPECTED_SHAPE and "
                          "tests/test_route_files.py's EXPECTED_LADDERS with the reason"
                          % (r["lvl"], "; ".join(moved)))
-    if tuple(EXPECTED_SHAPE) != EXPECTED_SHIPPED:
-        fails.append("EXPECTED_SHAPE and EXPECTED_SHIPPED disagree: %s vs %s"
-                     % (" ".join(EXPECTED_SHAPE), " ".join(EXPECTED_SHIPPED)))
+    # The two tables must cover the same LEVELS. Not the same order: EXPECTED_SHAPE is grouped by its
+    # own commentary (the two COLLAPSED_SHIP rows lead it, so the paragraph above them can explain
+    # both at once) while EXPECTED_SHIPPED is sorted, and comparing the orders made `--validate`
+    # report FAIL on every run from the day that grouping was written -- a permanently red gate,
+    # which is the same as no gate. Found 2026-09-18 while adding `apply_inserts`; the sets have
+    # always agreed.
+    if sorted(EXPECTED_SHAPE) != sorted(EXPECTED_SHIPPED):
+        fails.append("EXPECTED_SHAPE and EXPECTED_SHIPPED cover different levels: %s vs %s"
+                     % (" ".join(sorted(EXPECTED_SHAPE)), " ".join(sorted(EXPECTED_SHIPPED))))
 
     got = tuple(r["lvl"] for r in ship)
     if expect_shipped and got != EXPECTED_SHIPPED:
