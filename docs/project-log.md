@@ -2064,3 +2064,81 @@ y 21.6. The tenth reached hops 1, Floor 2, and the ten end heights run to a maxi
 episodes is not evidence of improvement and is not offered as any; it is proof the file is live. Watch
 `targets_parked`, which is 5 of those 10 at >= 1 against a baseline of 42 of 264 — far too small a sample
 to read, and the first thing to re-measure at the +400k check.
+
+## 2026-09-18 — Level 0-3's main room, looked at in game for the first time
+
+**Three offline fixes had shipped on this level in two days and nobody had opened the game.** This pass is a
+live rollout of the current 0-3 policy on ONE private instance (port 47812, hand-started with
+`games.start_instance` + `-aibridge-nosteam`, never `games.py launch`, killed by its own pid; 47800-47811 were
+verified listening before and after, and `instance_flags.json` was not touched). New tool:
+`python/scripts/probe_rollout.py`, one JSON line per decision. Evidence, all under `python/runs/probe_0-3/`
+(gitignored, still on disk): `rollout_0..9.jsonl` (10 stochastic), `det_0..2.jsonl` (3 deterministic),
+`rollout_scripted_0..1.jsonl` (a scripted driver), `geometry_dropscan*.jsonl` (teleport-and-fall probes).
+Weights: a COPY of `models/spec_0-3/ckpt_24181522_steps.zip` (24.18M), CPU, config
+`configs/generated/spec_0-3.yaml` unchanged.
+
+**Mechanism: `WP1` and `WP2` are points in open air, so the rung they mark can only be credited from
+somewhere that is not on the climb.**
+
+- Drop probes (teleport to y 40/44, no input, let the player fall) at **WP1's own (x,z) = (-10.7, 327.2)**
+  fall past **y -35 still at -80 m/s**: there is nothing under WP1 for at least 80 m. Under **WP2's (5.3,
+  328.9)** the nearest surface is at y ≈ -0.6, **~37 m below it**.
+- The policy agrees. Across 13 policy episodes the closest approach to WP1 was **0.73 m**, at
+  (-10.3, 21.1, 327.6) with `ground_ray_center` **24.1**; to WP2 **2.72 m**, at (4.8, 35.7, 326.4) with
+  **25.7**. Every single closest approach to either waypoint was airborne over 21-30 m of nothing.
+- `route_ground_m` (8 m, the rule added the same day for the Side Hallway overhang) therefore refuses the
+  credit. **WP2's 8 m x 6 m cylinder was occupied for 540 decisions across the 13 episodes and passed
+  `_on_ground` on 11 of them (2%)**; in the ten stochastic episodes, 311 cylinder-steps, 6 on ground, and
+  the one credit came at (1.53, 30.81, 329.34) — a block top 5.9 m BELOW WP2, not WP2.
+- **WP1 is credited in 13 of 13 episodes and not once at WP1.** The first credit per episode sits at
+  x -2.99..-8.62 (WP1's x is -10.7), y 15.7..21.6 (WP1's y is 21.6; nine of ten are 2-6 m below it),
+  z 326.2..334.2 — three of them past the main room's north wall face (z 329.5), in the Side Hallway mouth,
+  with 2-4 m of ground below. That is the *same* wrong-side credit the hallway rung was moved to stop, one
+  rung later. Crediting WP1 advances the ladder to WP2, and the target vector then reads +15 m up with no
+  usable heading.
+
+**What the climb actually is.** The 1 m drop scan finds a staircase of narrow block tops against the north
+wall — measured rest points: **(-4.30, 10.76, 327.27)**, **(0.93, 11.17, 328.70)**, **(4, 21.5, 330)**,
+**(-11.92, 30.83, 326.99)**, **(-3.68, 31.64, 331.66)** and a broad y≈31.6 platform over z 331-334,
+**(5.00, 39.98, 328.87)** and **(7.25, 39.84, 329.49)**, then Floor 2 at y 47-49. It is **not walkable**: the
+scripted face-the-target-walk-and-jump driver (`rollout_scripted_*.jsonl`, 5,000 decisions) never rose above
+**y 6.0** in the main room and entered no rung cylinder at all. The policy's own ascent is a jump/dash/slide
+chain — in the 900 decisions after WP1 is credited it is grounded on **7%** of steps and presses jump on
+**697** of 900 — and it does reach the height: per-episode peaks inside the main-room box are y 36.1-49.0.
+**Three of thirteen episodes entered Floor 2's cylinder (217 steps, 96% grounded)** and `rollout_6` credited
+WP2 and then Floor 2 at decisions 463 and 502, about 35 s in.
+
+**Second, independent failure: a parked rung sends the agent backwards.** `_pick`'s fallback is "the nearest
+active gate that is neither reached nor parked", with no hop constraint, so a rung the episode skipped stays
+a magnet for the rest of the load. In `rollout_6` the boss rung was parked at decision **867** while the
+player stood on Floor 2 at (-6.8, 48.9, 303.1); the target became **WP1, 34 m away and 27 m BELOW**
+(observation slot 449 read -0.5463, i.e. -27.3 m), the policy went back down, and the level reloaded at
+decision 1149 — which is why that episode's `gate_hops_best` reports 3 and not 1. Parks fired in 8 of the 13
+episodes; in `rollout_5`, `rollout_7` and `rollout_9` they walked WP2 -> Floor 2 -> Boss and ended with the
+**exit** as the target, 187 m away through walls. Parking is on here because `patience_mode: collapsed`
+reads the verdict off the GATE ladder (`_layer_gates`), while `prefer_route_when_collapsed: true` means the
+level is actually walking its ROOM TRUNK — which `GateProgress`'s own docstring calls a total order on which
+parking is "nearly INERT" and a park "can only mislead".
+
+**The exploration archives agree over the whole stage.** All twelve `models/spec_0-3/explore_Level_0-3_*.npz`
+together hold 2,516 cells and 521,185 episode-entries. In the main-room column (x -24..16, z 296..336) the
+band **y 32..48 is completely empty — 0 cells, 0 entries** — and y 20..32 holds 283. **WP2's own 4 m cell
+(1,9,82) has 0 entries and so does its entire 3x3x3 block**; WP1's own cell has 0 and its block 229. The
+archive is keyed on the ground point, so this says the player has never had ground under it at the height of
+either waypoint, in 5.4M stage steps.
+
+**Live numbers at the time of the probe** (`runs/spec_0-3/episodes.jsonl`, fresh rows since 23,731,594,
+n=68): `gate_hops_best` 3 in 62, **2 in ZERO**, 1 in 4; 0 completions; end y median 19.4, share above 40
+0.059. `check_run.py` at 24,723,490 steps reads the last 100 fresh as hops {1: 6, 3: 91, 4: 1, 5: 2} — still
+**no episode credits WP2**. The stage reaches its 6M cap at ~24.75M.
+
+**Nothing was changed.** No route file, no config, no code beyond adding `probe_rollout.py` and these notes;
+the live run was not touched. The proposed fix and what would falsify it are in the handover, not here.
+
+**Not verified.** (1) Why `grounded` reads true through parts of the ascent while `ground_ray_center` reads
+the 30 m sentinel — documented for Floor 2's walkway, unexplained on the blocks. (2) Whether the block tops
+listed above are wide enough to land on reliably; the 1 m scan settled on only 24 of 161 probes and the
+player was soft-dead and sliding for most of it. (3) Whether the 0-3 completion trace's "supported spiral
+ramp" reading is right — this pass found no ramp, but it did not re-derive that trace. (4) The probe wedged
+the private game once (a `reset` after a death timed out at 300 s, `Responding` false, ~1 s of CPU in 20 s);
+it was killed by pid and restarted, and no training game was involved.

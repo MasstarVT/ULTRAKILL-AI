@@ -426,6 +426,16 @@ and check `docs/project-log.md` for anything later.
   Rolls to `<name>.1` at 2 MB and never raises — a log that failed would turn a recoverable fault into a dead
   worker. `supervise.py` quotes each file's tail into its restart report.
 - `python/scripts/post_times.py`: posts a training run's best official level times to `times.md` from files the run already writes (no game, idempotent). `python/tests/test_post_times.py` covers first post, repeat post, only-faster and a missing `episodes.jsonl` (no game needed).
+- `python/scripts/probe_rollout.py`: **the per-DECISION recorder** — builds the env a stage builds, from that
+  stage's own generated config, and writes one JSON line per step (position, velocity, grounded/ground-ray,
+  the route target and the eight observation slots it occupies, every rung credited, the whole
+  patience/parking state, the decoded 12-dimension action, the reward parts) to `runs/<out>/<tag>_<n>.jsonl`.
+  It forces the read-only settings an off-run probe must have (`probe_config`: private port, one level, fresh
+  loads only, no bridge relaunch, no archive/best-run/curriculum/env-log writes) and **refuses a port in
+  47800-47811**, because the bridge is single-client. `--scripted` swaps the policy for a hand-written
+  face-the-target-and-jump driver, which is a probe of geometry and never training data. Written for the
+  2026-09-18 0-3 main-room investigation; it takes the model path as a COPY so the trainer's file is never
+  held open.
 - `python/scripts/replay_curriculum.py` (branch `curriculum-progress`): replays a run's `episodes.jsonl` through
   **both** curriculum weighting rules and prints, per hour, the mean share of the fresh draws each unlocked level
   would have had under each — the evidence a weighting change has to produce before it is switched on. The
