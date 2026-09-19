@@ -35,15 +35,23 @@ from ultrakill_ai.procmem import (  # noqa: E402,F401
 # How much a game may grow above the FRESHEST copy running before it is recycled; see `derive_game_limit`,
 # which this guard shares with the env's own episode-boundary recycle so the two cannot disagree.
 DEFAULT_GROWTH_GB = 1.0
+# The budget for ALL the games together. The per-game limit is derived from the freshest copy, so a fleet that
+# was launched together ages together and the limit degenerates to its 3 GB ceiling: twelve games reached 32 GB
+# and 89% commit on 2026-09-19 01:28 before the first recycle. Over this budget the fattest goes whatever its
+# size, which starts the recycling early (at ~2 GB each) and staggers the fleet's ages; a staggered fleet of
+# twelve under a 3 GB limit averages ~20 GB, so the budget never binds once the ages are spread.
+DEFAULT_TOTAL_LIMIT_GB = 24.0
 
 
 def choose_victim(private_by_port: dict[int, int], commit_frac: float, game_limit: int,
-                  commit_limit_frac: float) -> tuple[int, str] | None:
+                  commit_limit_frac: float, total_limit: int = 0) -> tuple[int, str] | None:
     """The one port to recycle now, with the reason, or None. Pure, so it is tested without a process.
 
     A game over its own limit goes first (the fattest of them). Otherwise, when the SYSTEM is short, the fattest
     game goes whatever its size: something else may be eating the memory (an analysis script has twice taken
-    50-70 GB), and the games are the only thing this guard can safely give back.
+    50-70 GB), and the games are the only thing this guard can safely give back. The same goes when the games
+    TOGETHER are over `total_limit` (0 = no budget): a fleet launched together grows together, and waiting for
+    each copy's own limit lets all twelve arrive at it at once.
     """
     if not private_by_port:
         return None
@@ -53,6 +61,10 @@ def choose_victim(private_by_port: dict[int, int], commit_frac: float, game_limi
     if commit_frac > commit_limit_frac:
         return port, "system commit at %.0f%% (limit %.0f%%); fattest game is %.1f GB" % (
             commit_frac * 100, commit_limit_frac * 100, size / GB)
+    total = sum(private_by_port.values())
+    if total_limit > 0 and total > total_limit:
+        return port, "games total %.1f GB, over the %.1f GB budget; fattest game is %.1f GB" % (
+            total / GB, total_limit / GB, size / GB)
     return None
 
 
@@ -76,6 +88,8 @@ def main() -> None:
                         help="fixed per-game limit in GB; 0 (the default) derives it from the live fleet")
     parser.add_argument("--growth-gb", type=float, default=DEFAULT_GROWTH_GB,
                         help="how far above the FRESHEST running copy a game may grow before it is recycled")
+    parser.add_argument("--total-limit-gb", type=float, default=DEFAULT_TOTAL_LIMIT_GB,
+                        help="recycle the fattest game while ALL the games together are over this; 0 = off")
     parser.add_argument("--commit-limit-frac", type=float, default=0.93, help="recycle the fattest game above this system commit share")
     parser.add_argument("--base-port", type=int, default=47800)
     parser.add_argument("--ports", type=int, default=32, help="size of the bridge port range that is ours to touch")
@@ -103,7 +117,7 @@ def main() -> None:
                 print("%s mem: %d games, %.1f GB total, fattest %.1f GB, limit %.1f GB, system commit %.0f%%"
                       % (stamp, len(sizes), total, top, limit / GB, frac * 100), flush=True)
                 last_heartbeat = now
-            victim = choose_victim(sizes, frac, limit, args.commit_limit_frac)
+            victim = choose_victim(sizes, frac, limit, args.commit_limit_frac, int(args.total_limit_gb * GB))
             if victim and args.dry_run:
                 print("%s would recycle port %d: %s" % (stamp, victim[0], victim[1]), flush=True)
             elif victim and not paused(args.run) and now - last_recycle >= args.cooldown_seconds:

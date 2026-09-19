@@ -44,6 +44,19 @@ def test_no_games_means_no_victim_however_short_the_system_is():
     assert choose_victim({}, 0.99, LIMIT, 0.80) is None
 
 
+def test_a_fleet_that_ages_together_is_thinned_before_every_copy_reaches_its_limit():
+    """2026-09-19 01:28: twelve copies launched together reached 32 GB and 89% commit with none over its limit."""
+    sizes = {47800 + i: int((2.1 + 0.01 * i) * GB) for i in range(12)}  # 25.9 GB, every copy under 3 GB
+    assert choose_victim(sizes, 0.80, LIMIT, 0.93) is None, "no budget given: the old behaviour"
+    port, reason = choose_victim(sizes, 0.80, LIMIT, 0.93, total_limit=24 * GB)
+    assert port == 47811 and "budget" in reason
+
+
+def test_a_staggered_fleet_under_the_budget_is_left_alone():
+    sizes = {47800 + i: int((0.4 + 0.2 * i) * GB) for i in range(12)}  # 18 GB, fattest 2.6 GB
+    assert choose_victim(sizes, 0.70, LIMIT, 0.93, total_limit=24 * GB) is None
+
+
 def test_only_bridge_ports_owned_by_a_game_are_ever_candidates():
     """The first dry run counted 19 "games" with none running: every listening port on the machine."""
     listening = {135: 1000, 445: 4, 47800: 5001, 47801: 5002, 47812: 5003, 50000: 5004, 47802: 9999}
