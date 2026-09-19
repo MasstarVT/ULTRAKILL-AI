@@ -4,9 +4,10 @@
     python scripts/specialists_status.py --json        # the same thing, machine readable
 
 Prints the current stage (level, run, steps into it, how far off the stage rule it is), the live fresh
-completion rate and window, the best official time so far, and the table of specialists already promoted to
-`models/specialists/`. Safe to run beside the driver and beside a trainer: it reads `driver_state.json`,
-`status.json`, `best.json` and the promoted sidecars, and touches nothing else.
+completion rate and window, the MEDIAN official time over the last 50 fresh episodes (what a speed stage
+promotes on) beside the best one ever recorded (reported only), the hold line and what it is waiting on, and
+the table of specialists already promoted to `models/specialists/`. Safe to run beside the driver and beside a
+trainer: it reads `driver_state.json`, `status.json`, `best.json` and the promoted sidecars, and nothing else.
 """
 
 from __future__ import annotations
@@ -43,7 +44,8 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
     hold = plan.hold_index()
     out["hold_before"] = plan.hold_before
     out["held_by"] = ([{"level": s.level, "kind": s.kind, "rounds": state.rounds(s.key),
-                        "status": state.stage_status(s.key)}
+                        "status": state.stage_status(s.key),
+                        "max_rounds": plan.rule_for(s.kind).max_rounds}
                        for s in plan.stages[:hold]
                        if state.stage_status(s.key) not in ("done", "skipped")] if hold is not None else [])
     out["target_scale"] = plan.target_scale
@@ -61,7 +63,10 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
             "start_steps": stage.start_steps, "timesteps": sample.timesteps,
             "stage_steps": (sample.timesteps - stage.start_steps) if sample.timesteps is not None else None,
             "fresh_completion_rate": sample.fresh_rate, "fresh_window": sample.fresh_window,
-            "best_time": sample.best_time, "best_at": sample.best_at, "target_seconds": target,
+            # `median_time` is what the speed rule promotes on; `best_time` is the run's lifetime minimum and
+            # is reported only. Printing both is the point: on the live runs they differ by about 2x.
+            "best_time": sample.best_time, "median_time": sample.median_time,
+            "best_at": sample.best_at, "target_seconds": target,
             "s_rank_seconds": stage.s_rank_seconds or sample.s_rank_seconds, "round": stage.round,
             "target_rate": rule.target_rate, "max_steps_per_stage": rule.max_steps_per_stage,
             "settle_steps": rule.settle_steps, "min_fresh_window": rule.min_fresh_window,
@@ -102,17 +107,20 @@ def render(data: dict) -> str:
                      % (fmt(current["fresh_completion_rate"], 3), current["fresh_window"],
                         fmt(current.get("target_rate", rule["target_rate"]), 2),
                         current.get("min_fresh_window", rule["min_fresh_window"])))
-        best = current["best_time"]
-        lines.append("  best official time: %s   best.zip last moved at %s"
-                     % (format_time(best) if best is not None else "-",
+        best, median = current["best_time"], current.get("median_time")
+        lines.append("  median official time: %s   best ever: %s   best.zip last moved at %s"
+                     % (format_time(median) if median is not None else "-",
+                        format_time(best) if best is not None else "-",
                         "{:,.0f}".format(current["best_at"]) if current["best_at"] is not None else "-"))
         if current.get("kind") == SPEED:
             target, s_rank = current.get("target_seconds"), current.get("s_rank_seconds")
-            lines.append("  SPEED stage: it promotes only once the best time is at or under %s%s"
+            lines.append("  SPEED stage: it promotes only once the MEDIAN time is at or under %s%s"
                          % (format_time(target) if target else
                             "%.2f x the level's own S-rank time" % data.get("target_scale", 0.75),
                             (" (S is %s)" % format_time(s_rank)) if s_rank else
                             ("" if target else " (not read from the run yet)")))
+            lines.append("    (the median, not the best: the best is a run-lifetime minimum one lucky load "
+                         "sets for good)")
         settle = current.get("settle_steps", rule["settle_steps"])
         if current["target_reached_at"] is None:
             lines.append("  target not reached yet: the stage ends on the rule above, or at the %s-step cap"
@@ -135,6 +143,13 @@ def render(data: dict) -> str:
                                       for h in held)))
             lines.append("  no stage at or after %s starts until every one of those is done; they are trained "
                          "in round robin, fewest rounds first" % data["hold_before"])
+            caps = [h for h in held if h.get("max_rounds", 0) > 0 and h["rounds"] >= h["max_rounds"]]
+            if caps:
+                lines.append("  OUT OF ROUNDS (the driver stops rather than looping): %s -- retune "
+                             "speed.target_scale or speed.targets in the plan"
+                             % ", ".join("%s (%s), %d of %d"
+                                         % (h["level"], h["kind"], h["rounds"], h["max_rounds"])
+                                         for h in caps))
         else:
             lines.append("hold line before %s is OPEN: every stage in front of it is done"
                          % data["hold_before"])
@@ -144,11 +159,11 @@ def render(data: dict) -> str:
     if not data["promoted"]:
         lines.append("  none yet")
     for row in data["promoted"]:
-        best, target = row.get("best_time"), row.get("target_seconds")
-        lines.append("  %-12s %-9s r%-2d %-10s rate %-6s best %-10s target %-10s %s steps  <- %s"
+        median, target = row.get("median_time"), row.get("target_seconds")
+        lines.append("  %-12s %-9s r%-2d %-10s rate %-6s median %-10s target %-10s %s steps  <- %s"
                      % (row.get("level"), row.get("mode", COMPLETE), row.get("round", 1), row.get("status"),
                         fmt(row.get("fresh_completion_rate"), 3),
-                        format_time(best) if best is not None else "-",
+                        format_time(median) if median is not None else "-",
                         format_time(target) if target else "-",
                         "{:,.0f}".format(row.get("stage_steps") or 0),
                         row.get("source_checkpoint")))

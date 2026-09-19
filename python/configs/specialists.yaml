@@ -81,6 +81,9 @@ stage:
   min_fresh_window: 30
   settle_steps: 300000
   max_steps_per_stage: 6000000
+  # Only ever reached while the HOLD LINE is up: the ladder itself runs each stage exactly once and walks past
+  # an "unfinished" one. See the same key under `speed:` below.
+  max_rounds: 3
   count: 12        # game instances; hidden from Steam unless --steam
   monitor: 1       # the one-display PC
   # Each stage starts with the shared run's exploration archives for ITS level copied into the stage's model
@@ -98,6 +101,13 @@ speed:
   min_fresh_window: 30
   settle_steps: 300000
   max_steps_per_stage: 8000000
+  # HOW MANY ROUNDS the hold line may spend on one stage before the driver stops and asks for a human
+  # (2026-09-18 review). The round robin below has no other exit: a target the policy cannot reach would make
+  # it an unbounded loop, burning 8M steps per round with nobody told, and 0.75 x S on Level 0-1 is 90 s
+  # against a 183.6 s leaderboard best -- so "cannot reach it yet" is the expected case, not a remote one.
+  # Three rounds is 24M steps per level. When the driver stops with HELD, retune `target_scale` or set a
+  # per-level `targets:` override above; the rounds' weights are all still in models/spec_<level>_speed/.
+  max_rounds: 3
   # THE TARGET TIME IS NEVER HAND-PICKED. It is the level's own S-rank time threshold
   # (`campaign.ranks.time[-1]`), which the env reads live at the first observation of the stage and reports
   # through status.json. A level may be overridden here -- `"Level 0-1": 95.0` -- and the env then reports THAT

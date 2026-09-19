@@ -142,9 +142,18 @@ def test_a_speed_stage_only_adds_the_bonus_switch_to_the_env():
     speed = campaign_driver.stage_config(p, "Level 0-2", kind=campaign_driver.SPEED)["env"]
     added = {"speed_bonus", "speed_target_scale"}
     assert set(speed) - set(complete) == added and speed["speed_bonus"] is True
-    assert {k: v for k, v in speed.items() if k not in added} == complete
+    # ... plus exactly ONE changed value: every episode is a fresh level load (2026-09-18 review). The bonus is
+    # scaled only on a fresh-start completion, and the stage is scored only on fresh-start episodes, so at the
+    # complete stage's 0.2 a checkpoint respawn would pay the full unscaled weight for the outcome the stage
+    # does not measure -- an unobservable 4x split in the terminal reward.
+    changed = {k for k in set(speed) & set(complete) if speed[k] != complete[k]}
+    assert changed == {"fresh_start_prob"}
+    assert speed["fresh_start_prob"] == 1.0 and complete["fresh_start_prob"] == 0.2
+    assert {k: v for k, v in speed.items() if k not in added | changed} == \
+        {k: v for k, v in complete.items() if k not in changed}
     cfg = EnvConfig.from_dict(speed)
     assert cfg.speed_bonus is True and cfg.speed_target_seconds == 0.0, "0 = read the level's own S-rank time"
+    assert cfg.fresh_start_prob == 1.0
     assert cfg.speed_target_scale == 0.75, "the plan's target_scale (§8b), applied in the env and nowhere else"
     assert cfg.rewards == EnvConfig.from_dict(complete).rewards, "every reward weight is the complete stage's"
     env = UltrakillEnv(cfg)

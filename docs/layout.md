@@ -498,6 +498,22 @@ and check `docs/project-log.md` for anything later.
     keeps training. Without the "later of", a best saved long before the target would satisfy the settle the
     instant the target was reached. OR the stage has consumed `max_steps_per_stage` 6M, at which point it moves
     on **regardless** and is recorded `"unfinished"` so it can be revisited: one blocked level may not block 29.
+  - **A SPEED stage** (`{level: ..., kind: speed}` in the plan) is the same rule with the clock added and with
+    `level_complete` scaled by it. Its promotion clause is `median_time_50 <= target_seconds` — the median over
+    the completions in the last 50 fresh episodes, **never** `campaign.best_time`, which is the run's lifetime
+    minimum and is satisfied for good by one lucky load (2026-09-18 review; on the live runs the best is about
+    half the median). `target_seconds` is `speed.target_scale` 0.75 times the level's own S-rank threshold,
+    computed once in `UltrakillEnv._note_speed_target` and carried env → `status.json` → `driver_state.json` →
+    the sidecar so the reward and the rule always read one number. Rate bar 0.4, cap 8M, `max_rounds` 3, its
+    own run (`spec_0-1_speed`) with `keep_best --metric time`, and `fresh_start_prob: 1.0` because the bonus
+    and every statistic the stage is judged on are fresh-start only. `refuse_promotion` stops a speed stage
+    that ended `"unfinished"` overwriting a specialist it never beat; the round's weights stay in its own model
+    directory, which is where `round_init` resumes from.
+  - **The hold line** (`hold_before`, `Plan.hold_index`, `Driver.held_by`, `Driver.choose_stage`): no stage at
+    or after that level starts while any stage in front of it is not `"done"`, and those stages are trained in
+    round robin, fewest rounds first. `start_at_objection` applies the same line to `--start-at`, which bypasses
+    `choose_stage` (`--ignore-hold` / `--rerun-stage` override it, loudly). `Stage.stale_below` keeps a new
+    round from latching on the previous round's `status.json` tail.
   - **Per stage**: run `spec_<short level>` (`spec_0-1`), `models/spec_0-1/`, `runs/spec_0-1/`, the generated
     config at `configs/generated/spec_0-1.yaml` (written from the plan, with `timesteps` budgeted **from where
     the stage starts** — `timesteps` is the run total in `train.py` and every stage resumes from the last one).

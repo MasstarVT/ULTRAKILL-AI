@@ -44,10 +44,18 @@ def grind_rows(kills_per_min: list[float], window: int = 100) -> list[dict]:
             for i, k in enumerate(kills_per_min)]
 
 
-def campaign_rows(rates: list[float], best_times: list[float | None], fresh_window: int = 50) -> list[dict]:
+def campaign_rows(rates: list[float], best_times: list[float | None], fresh_window: int = 50,
+                  median_times: list[float | None] | None = None) -> list[dict]:
+    """`median_time_50` defaults to `best_time`, which is what a run that never varies would write.
+
+    The two are separate columns because they are separate statistics: `best_time` is the run's lifetime
+    minimum and `median_time_50` is the median over the completions in the last 50 fresh episodes. Every test
+    that cares about the difference passes both.
+    """
+    medians = list(median_times) if median_times is not None else list(best_times)
     return [{"timesteps": 10_000 * (i + 1), "window": 100, "reward": 10.0 * i, "fresh_window": fresh_window,
-             "fresh_completion_rate": rate, "best_time": best_time}
-            for i, (rate, best_time) in enumerate(zip(rates, best_times))]
+             "fresh_completion_rate": rate, "best_time": best_time, "median_time_50": median}
+            for i, (rate, best_time, median) in enumerate(zip(rates, best_times, medians))]
 
 
 def test_kills_per_min_needs_a_full_window():
@@ -169,6 +177,32 @@ def test_a_row_with_no_best_time_never_scores_on_time():
         assert keep_best.scored(write_log(Path(tmp), rows), "time") == []
 
 
+def test_time_ranks_the_policys_median_and_not_the_runs_lifetime_best():
+    """The 2026-09-18 review: `best_time` only ever falls, so scoring it makes `--metric time` inert.
+
+    After one lucky load sets the record every later sample ties at the same score, `rank_key` falls through
+    to the tie-break -- the completion rate -- and `best.zip` tracks the most RELIABLE checkpoint while the
+    policy gets slower. `median_time_50` is a real per-sample statistic and moves in both directions.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # One 88 s load early on, then a policy that is reliable and slow, then one that is slightly less
+        # reliable and much faster. `best_time` is 88 for every row after the record, exactly as the live
+        # ProgressCallback writes it.
+        rates = [0.31] * 9 + [0.52] * 9 + [0.45] * 9
+        best = [250.0] * 4 + [88.0] * 23
+        medians = [150.0] * 9 + [240.0] * 9 + [120.0] * 9
+        path = write_log(Path(tmp), campaign_rows(rates, best, median_times=medians))
+        series = keep_best.scored(path, "time")
+        scores = sorted({round(s[0], 4) for s in series})
+        assert len(scores) > 1, "a lifetime minimum would make every post-record sample score the same"
+        fastest = keep_best.best_of(series)
+        assert abs(fastest[0] + 120.0) < 1e-6, "the 120 s median wins, not the 240 s one behind the same best"
+        # ... and the degradation warning is reachable again: a later, slower sample IS worse than the stored
+        # best, which can never happen while the score column is a running minimum.
+        assert keep_best.is_better((-120.0, -0.45), (-240.0, -0.52))
+        assert not keep_best.is_better((-240.0, -0.52), (-120.0, -0.45))
+
+
 def test_a_faster_time_wins_and_the_rate_breaks_the_tie():
     assert keep_best.is_better((-118.0, -0.5), (-131.0, -0.5)), "118 s beats 131 s"
     assert not keep_best.is_better((-140.0, -0.9), (-131.0, -0.5)), "a higher rate does not buy a slower time"
@@ -189,7 +223,7 @@ def test_time_saves_the_checkpoint_and_guards_the_other_metrics_best_json():
         saved = json.loads((model_dir / "best.json").read_text(encoding="utf-8"))
         assert saved["score"] == -118.5 and saved["penalty"] == -0.44
         assert saved["penalty_name"] == "fresh_completion_rate"
-        assert saved["score_metric"] == "-best_time (lower is better), smoothed over 9 samples"
+        assert saved["score_metric"] == "-median_time_50 (lower is better), smoothed over 9 samples"
         # The cross-metric guard: this file may not be read, or overwritten, by the campaign metric.
         assert keep_best.stored_penalty_name(model_dir / "best.json") == "fresh_completion_rate"
         assert keep_best.METRICS["campaign"].penalty == "best_time" != "fresh_completion_rate"

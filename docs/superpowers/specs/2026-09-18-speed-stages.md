@@ -194,3 +194,111 @@ Tests: `tests/test_campaign_env.py` (the scale at 1.0/0.75/0.5, the raw threshol
 scaled), `tests/test_progress.py` (`s_rank_seconds` through the numeric pipeline into the campaign block),
 `tests/test_campaign_driver.py` (the generated config carries the scale; the sidecar carries both numbers),
 `tests/test_specialists_config.py` (the plan's own 0.75 and its hold line).
+
+## 9. What the 2026-09-18 adversarial review changed
+
+Two reviewers (an RL-exploit lens and a driver-logic lens) read the branch before it was merged. Both returned
+**the same blocker**, and it is worth writing down because it was a mistake of statistics, not of wiring: the
+mechanism was correct end to end and still could not have worked.
+
+### 9a. The clock clause reads the MEDIAN, not `best_time` (blocker)
+
+`status.json`'s `campaign.best_time` is the run's **lifetime minimum** over every fresh completion by any of
+the twelve envs. `ProgressCallback` only ever lowers it, and `_restore` carries it across every trainer
+restart and into every later round. It is not a property of any checkpoint and it never decays, so one lucky
+load satisfied `best_time <= target_seconds` for the rest of the run -- and the hold line, whose entire job is
+to refuse the ladder a slow policy, would have opened on one.
+
+The gap is measured, not hypothetical. Read from the live runs on 2026-09-18:
+
+| run | `best_time` | `median_time_50` |
+|---|---|---|
+| `spec_0-1` | 243.4 s | 490.9 s |
+| `spec_0-2` | 139.5 s | 236.5 s |
+
+The run's single best is about **half** its typical completion in both cases. `stage_verdict`'s speed clause
+is now `sample.median_time <= target_seconds`, reading `campaign.median_time_50`, which `ProgressCallback`
+already computed and `poll_status.py` already carried into `metrics_log.csv`. `best_time` stays in the sample,
+the log line and the sidecar as a headline and is never compared against anything.
+
+`keep_best --metric time` had the same defect with a second consequence: because `-best_time` is monotone
+non-decreasing, every sample after the last record tied at the top score and `rank_key` fell through to the
+tie-break, so `--metric time` silently ranked the completion RATE -- and the "current is well below best"
+warning could never fire, since `raw_new > raw_best` cannot hold for a running minimum. Its score column is
+now `median_time_50` too.
+
+### 9b. The floor is approached, never reached (major)
+
+`max(target/official, 0.25)` is flat wherever the policy is more than 4x its target, which is where every
+policy starts. Over the 68 fresh 0-1 completions in the live log (median 481.9 s, target 90 s) 58 of them --
+**85%** -- sat exactly on the clip: a flat 75% pay cut with `d(bonus)/d(time) == 0`, paying less for the
+behaviour the policy already had and saying nothing about how to improve it. Above the target the ratio is now
+mapped into `(MIN, 1]` rather than clipped into `[MIN, 1]`:
+
+    scale = SPEED_BONUS_MIN + (1 - SPEED_BONUS_MIN) * target/official        (official > target)
+    scale = min(target/official, SPEED_BONUS_MAX)                            (official <= target)
+
+1.0 at exactly the target (unchanged), strictly decreasing at every slower time, and strictly above the floor
+at any finite time -- so the floor's safety property is stronger than the clip's, not weaker. At
+`level_complete: 100` and a 90 s target: 482 s pays 39.0, 243 s pays 52.8, 150 s pays 70.0, 90 s pays 100.0.
+**Not validated in game**: no speed stage has been trained with this, and the slope is still small next to the
+per-step `time` term (a 482 s -> 243 s improvement is +13.8 here against +71.7 there).
+
+### 9c. Every episode of a speed stage is a fresh level load (major)
+
+The bonus is scaled only on a fresh-start completion, and the stage is scored only on fresh-start episodes
+(`fresh_completion_rate`, `median_time_50` and `best_time` are all fresh-only). At the plan's
+`fresh_start_prob: 0.2` a checkpoint-respawn completion therefore paid the full unscaled 100 while the
+completions the stage actually measures paid 39-100 -- and 37% of the live `spec_0-1` completions were
+respawns. `fresh_start` is not in the observation, so at the same packed state near the exit the terminal
+reward depended on a hidden variable and PPO would have fitted one baseline across both, handing every
+fresh-start completion a systematically negative advantage. `stage_config` now sets `fresh_start_prob: 1.0`
+for a speed stage. Deaths still respawn at checkpoints INSIDE an episode; only the episode's own start moves.
+
+### 9d. A speed round never overwrites a specialist it did not beat (major)
+
+`promote()` wrote `models/specialists/<level>.zip` unconditionally, including for a stage recorded
+`"unfinished"` at its cap, with no comparison against the file already there. Before speed stages each level
+was promoted at most once so nothing could regress; now `refuse_promotion` declines when a SPEED stage did not
+end `"done"` and the level already has a specialist. The round's weights are not lost -- they stay in
+`models/spec_<level>_speed/`, which is exactly where `round_init` resumes the next round from -- and the
+history entry records `promoted: false` with the reason.
+
+### 9e. The round robin has an exit (minor, and the hold line needs one)
+
+`speed.max_rounds` (3, and `stage.max_rounds` for a stage in front of the line) caps how many rounds one stage
+may have before `choose_stage` returns nothing and the driver stops with a loud `HELD`. The line has no other
+exit, and `0.75 x S` on Level 0-1 is **90 s against a 183.6 s leaderboard best**, so "the policy cannot reach
+this target" is the expected case rather than a remote one. When the driver stops, retune `speed.target_scale`
+or add a per-level `speed.targets` override.
+
+### 9f. A new round ignores the previous round's `status.json` (major)
+
+A round resets `target_reached_at` but REUSES the run directory, so the first tick of round N read round N-1's
+final numbers -- the same rate, the same window, the same cumulative best -- and could re-latch immediately,
+recording `"done"` a settle later on exactly the data the cap had just rejected. `Stage.stale_below` is
+stamped at `begin_stage` from whatever the run's `status.json` says at that moment, and samples at or below it
+are discarded until the new trainer passes them.
+
+### 9g. `--start-at` is inside the hold line (major)
+
+The line was enforced only in `choose_stage`, and `--start-at` bypasses it. `start_at_objection` (pure,
+tested) now refuses a stage at or after `hold_before` while anything in front is not done (`--ignore-hold`
+overrides it, loudly), and refuses a stage that has already run (`--rerun-stage` overrides it). The second
+guard matters because `current` is null after a `"held"` exit as well as on a first launch, and
+`runs/start_driver.cmd` carries `--start-at "Level 0-1" --init <a 17.0M checkpoint>` permanently: an operator
+reading exit code 1 as a crash would otherwise have begun a second round of the finished 0-1 stage.
+`begin_stage` also takes `start_steps` from what `ensure_trainer` will actually resume (`choose_resume` on the
+stage's own model directory) rather than from `--init`, so the stage's cap and the generated `timesteps` total
+can no longer be measured from an origin the trainer never visits.
+
+### 9h. Rejected
+
+- *"The value function is shocked by the ~75% terminal-reward change on resume."* Real in mechanism and
+  partly mitigated by 9b (the median 0-1 completion now pays 39, not 25), but the proposed anneal of
+  `speed_target_scale` from 1.0 to 0.75 does **not** address it: at scale 1.0 the target is still 120 s
+  against a 482 s median, the same ratio regime. A real anneal would have to blend the plain weight with the
+  scaled one over the first rollouts, which is new machinery on a mechanism nothing has trained against yet.
+  The unbounded-loop half of the same finding is fixed by 9e.
+- *"Clear `campaign.best_time` per round."* Not needed once the gate is the median (9a); `best_time` is a
+  reported headline and a cumulative record of the run, which is what `times.md` wants it to be.

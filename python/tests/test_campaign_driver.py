@@ -40,8 +40,13 @@ SPEED_ORDER = ["Level 0-1", "Level 0-3",
 
 
 def sample(timesteps=None, rate=None, window=0, best_time=None, best_at=None,
-           target_seconds=None, s_rank_seconds=None) -> cd.StageSample:
-    return cd.StageSample(timesteps, rate, window, best_time, best_at, target_seconds, s_rank_seconds)
+           target_seconds=None, s_rank_seconds=None, median_time=None) -> cd.StageSample:
+    """`median_time` defaults to `best_time`: a run whose every completion took the same time.
+
+    The speed rule gates on the MEDIAN, so the tests that are about the difference between the two pass both.
+    """
+    return cd.StageSample(timesteps, rate, window, best_time, best_at, target_seconds, s_rank_seconds,
+                          best_time if median_time is None else median_time)
 
 
 # ---------------------------------------------------------------------------
@@ -338,10 +343,12 @@ class Harness:
 
     def write_status(self, run: str, timesteps: float, rate: float | None, window: int,
                      best_time: float | None = None, target_seconds: float | None = None,
-                     s_rank_seconds: float | None = None) -> None:
+                     s_rank_seconds: float | None = None, median_time: float | None = None) -> None:
+        """`median_time` defaults to `best_time`: the speed rule gates on the median, the sidecar reports both."""
         path = self.tmp / "runs" / run / "status.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         campaign = {"fresh_completion_rate": rate, "fresh_window": window, "best_time": best_time,
+                    "median_time_50": best_time if median_time is None else median_time,
                     "target_seconds": target_seconds, "s_rank_seconds": s_rank_seconds}
         path.write_text(json.dumps({"timesteps": timesteps, "campaign": campaign}), encoding="utf-8")
         self.status = Status(12.0, "running", timesteps)
@@ -632,14 +639,46 @@ def test_a_speed_stage_config_turns_the_bonus_on_and_carries_an_override():
         assert speed["env"]["speed_target_scale"] == 0.75, "the default scale is written out explicitly (§8b)"
         assert speed["train"]["run_name"] == "spec_0-1_speed"
         assert speed["train"]["timesteps"] == 10_000_000 + 8_000_000 + cd.TIMESTEPS_SLACK, "the speed cap"
-        # Every reward weight and env setting is the complete stage's: the same policy continues into it.
+        # Every episode is a fresh level load: the bonus is only scaled on a fresh-start completion, and the
+        # stage is only SCORED on fresh-start episodes, so a checkpoint respawn would pay the full unscaled
+        # weight for the outcome the stage does not measure (2026-09-18 review).
+        assert speed["env"]["fresh_start_prob"] == 1.0
+        # Every reward weight and other env setting is the complete stage's: the same policy continues into it.
         assert {k: v for k, v in speed["env"].items()
-                if k not in ("speed_bonus", "speed_target_scale")} == complete["env"]
+                if k not in ("speed_bonus", "speed_target_scale", "fresh_start_prob")} == \
+            {k: v for k, v in complete["env"].items() if k != "fresh_start_prob"}
         overridden = cd.stage_config(plan, "Level 0-3", kind=cd.SPEED)
         assert overridden["env"]["speed_target_seconds"] == 95.0
         path = cd.write_stage_config(plan, "Level 0-1", root, kind=cd.SPEED)
         assert path.name == "spec_0-1_speed.yaml"
         assert yaml.safe_load(path.read_text(encoding="utf-8"))["env"]["speed_bonus"] is True
+
+
+def test_a_speed_stage_promotes_on_the_median_and_never_on_one_lucky_load():
+    """THE 2026-09-18 REVIEW'S BLOCKER. `campaign.best_time` is the run's LIFETIME MINIMUM.
+
+    `ProgressCallback` only ever lowers it and `_restore` carries it across every trainer restart and into
+    every later round, so a single lucky fresh load satisfies `best_time <= target` for the rest of the run --
+    and the hold line would then open on a policy whose typical completion is twice the target. On the live
+    runs the gap is about 2x in both directions that have ever completed a level: spec_0-1 best 243.4 s with a
+    median of 490.9 s, spec_0-2 best 139.5 s with a median of 236.5 s.
+    """
+    target = 120.0
+    # One 88 s load in the record, a policy whose median is 480 s, a rate comfortably over the speed bar.
+    lucky = sample(11_000_000, 0.45, 50, best_time=88.0, median_time=480.0)
+    assert cd.stage_verdict(lucky, 10_000_000, None, SPEED_RULE, kind=cd.SPEED,
+                            target_seconds=target) == ("running", None), \
+        "one lucky load is not a fast policy, however long it stays in best_time"
+    # It still cannot latch 400k steps later, which is where the old rule recorded the stage \"done\".
+    assert cd.stage_verdict(sample(11_400_000, 0.45, 50, best_time=88.0, median_time=480.0),
+                            10_000_000, None, SPEED_RULE, kind=cd.SPEED, target_seconds=target)[0] == "running"
+    # ... and the same run, once the MEDIAN is actually inside the target, latches at once.
+    verdict, reached = cd.stage_verdict(sample(11_400_000, 0.45, 50, best_time=88.0, median_time=110.0),
+                                        10_000_000, None, SPEED_RULE, kind=cd.SPEED, target_seconds=target)
+    assert (verdict, reached) == ("running", 11_400_000)
+    # A stage that has never completed the level has no median at all and can never latch.
+    assert cd.stage_verdict(sample(11_000_000, 0.9, 50, best_time=None, median_time=None), 10_000_000, None,
+                            SPEED_RULE, kind=cd.SPEED, target_seconds=target) == ("running", None)
 
 
 def test_a_speed_stage_will_not_promote_on_the_rate_alone():
@@ -684,6 +723,13 @@ def test_read_sample_carries_the_target_the_env_measured():
                          "target_seconds": 120.0}}), encoding="utf-8")
         got = cd.read_sample(root / "status.json", root / "none.json")
         assert got.target_seconds == 120.0
+        # ... and the median the rule actually gates on, beside the lifetime best it only reports.
+        (root / "both.json").write_text(json.dumps({
+            "timesteps": 11_000_000,
+            "campaign": {"fresh_completion_rate": 0.52, "fresh_window": 41, "best_time": 118.5,
+                         "median_time_50": 243.0, "target_seconds": 120.0}}), encoding="utf-8")
+        both = cd.read_sample(root / "both.json", root / "none.json")
+        assert (both.best_time, both.median_time) == (118.5, 243.0)
         # A status.json written before the speed stages simply has no target, and reads as None.
         (root / "old.json").write_text(json.dumps({
             "timesteps": 11_000_000,
@@ -870,10 +916,10 @@ def test_nothing_at_or_after_the_hold_line_starts_while_a_stage_before_it_is_unf
         assert blocked == "" and pick.key == ("Level 0-3", "speed"), \
             "round robin: 0-3's speed stage has had no round at all, 0-1's has had one"
         assert [s.key for s in waiting] == [("Level 0-1", "speed"), ("Level 0-3", "speed")]
-        # ... and 0-4 is never the answer while anything is waiting, however many rounds have run.
+        # ... and 0-4 is never the answer while anything is waiting, for every round the cap allows.
         h.driver.state.history.append({"level": "Level 0-3", "kind": "speed", "status": "unfinished",
                                        "round": 1})
-        for _ in range(6):
+        for _ in range(4):
             pick, waiting, _ = h.driver.choose_stage()
             assert pick.level != "Level 0-4" and waiting, "the line holds for as long as it takes"
             h.driver.state.history.append({"level": pick.level, "kind": pick.kind, "status": "unfinished",
@@ -897,6 +943,36 @@ def test_the_round_robin_takes_the_fewest_rounds_first_and_ties_in_plan_order():
                                            "round": h.driver.state.rounds(pick.key) + 1})
         assert picks == [("Level 0-1", 1), ("Level 0-3", 1), ("Level 0-1", 2), ("Level 0-3", 2),
                          ("Level 0-1", 3), ("Level 0-3", 3)], "strict alternation, ties in plan order"
+
+
+def test_the_round_robin_stops_after_max_rounds_instead_of_looping_forever():
+    """The 2026-09-18 review: the hold line's round robin had NO exit.
+
+    A speed target the policy cannot reach -- and 0.75 x S on Level 0-1 is 90 s against a 183.6 s leaderboard
+    best -- would otherwise make the driver burn `max_steps_per_stage` on the same stages for ever, with
+    nobody told. After `max_rounds` the driver stops with a loud "held" so a human can retune the target.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = held_harness(tmp)
+        assert h.driver.plan.rule_for(cd.SPEED).max_rounds == 3
+        for _ in range(6):
+            pick, _, _ = h.driver.choose_stage()
+            assert pick is not None
+            h.driver.state.history.append({"level": pick.level, "kind": pick.kind, "status": "unfinished",
+                                           "round": h.driver.state.rounds(pick.key) + 1})
+        pick, waiting, blocked = h.driver.choose_stage()
+        assert pick is None, "three rounds each, and neither is done: nothing may start"
+        assert [s.key for s in waiting] == [("Level 0-1", "speed"), ("Level 0-3", "speed")]
+        assert "had its 3 rounds" in blocked and "Level 0-1" in blocked and "Level 0-3" in blocked
+        assert "Level 0-4" not in blocked, "the line still holds; the driver stops rather than walking past it"
+        # The driver reports it and stops, rather than spinning or advancing.
+        h.driver.state.current = None
+        assert h.driver.tick() == "held"
+        assert h.driver.run(max_ticks=1) == 1, "a nonzero exit: a human has to look at the target"
+        # Lifting the cap makes it runnable again without touching anything else.
+        h.driver.plan.speed["max_rounds"] = 0
+        pick, _, blocked = h.driver.choose_stage()
+        assert blocked == "" and pick.key == ("Level 0-1", "speed")
 
 
 def test_a_speed_stage_is_not_eligible_until_its_own_level_is_done_and_has_a_specialist():
@@ -971,12 +1047,140 @@ def test_a_finished_round_is_one_history_entry_and_the_next_round_follows_it():
         assert (entry["level"], entry["kind"], entry["status"], entry["round"]) == \
             ("Level 0-1", "speed", "unfinished", 1)
         assert entry["target_seconds"] == 90.0 and entry["s_rank_seconds"] == 120.0
-        sidecar = json.loads(
-            (h.tmp / "models" / "specialists" / "Level_0-1.json").read_text(encoding="utf-8"))
-        assert sidecar["round"] == 1 and sidecar["s_rank_seconds"] == 120.0
-        assert sidecar["target_seconds"] == 90.0
+        # It ended at its cap without ever beating the clock, so it did NOT replace the level's specialist.
+        assert entry["promoted"] is False and entry["specialist"] is None
+        assert cd.specialist_path(h.tmp / "models", "Level 0-1").read_bytes() == b"complete-Level 0-1"
+        assert not (h.tmp / "models" / "specialists" / "Level_0-1.json").exists()
         # The ladder did NOT walk to 0-4: it went to the other stage in front of the line.
         assert h.driver.state.current.key == ("Level 0-3", "speed")
+
+
+def test_an_unfinished_speed_round_never_overwrites_the_levels_specialist():
+    """THE 2026-09-18 REVIEW. `models/specialists/` is the only copy of a specialist that is committed.
+
+    Before speed stages each level was promoted exactly once, so `promote()` could not regress anything. A
+    speed stage runs on a level that already HAS a specialist and writes to the same path, and `keep_best
+    --metric time` only has to clear `--min-rate 0.3` -- so a round that burns its 8M-step cap without ever
+    beating the clock would replace a 0.48-rate policy with whatever it happened to hold. Nothing anywhere
+    compares the two. The round's weights are not lost: they stay in the stage's own model directory, which is
+    exactly where `round_init` resumes the next round from.
+    """
+    models = Path("models")
+    # A complete stage promotes whatever it produced, as it always has, whatever the verdict.
+    assert cd.refuse_promotion(models, "Level 0-1", kind=cd.COMPLETE, status="unfinished") == ""
+    with tempfile.TemporaryDirectory() as tmp:
+        h = held_harness(tmp)
+        good = cd.specialist_path(h.tmp / "models", "Level 0-1")
+        assert cd.refuse_promotion(h.tmp / "models", "Level 0-1", kind=cd.SPEED, status="done") == "", \
+            "a speed stage that MET its target is the whole point: it promotes"
+        why = cd.refuse_promotion(h.tmp / "models", "Level 0-1", kind=cd.SPEED, status="unfinished")
+        assert "unfinished" in why and "Level_0-1.zip" in why
+        # ... and with no specialist there at all, any weights beat none.
+        good.unlink()
+        assert cd.refuse_promotion(h.tmp / "models", "Level 0-1", kind=cd.SPEED, status="unfinished") == ""
+
+        # End to end: the round's own best.zip stays put and the promoted file is untouched.
+        good.write_bytes(b"complete-Level 0-1")
+        h.driver.begin_stage("Level 0-1", good, cd.SPEED)
+        h.trainer_up("spec_0-1_speed")
+        h.write_status("spec_0-1_speed", 21_000_000, 0.42, 50, best_time=85.0, median_time=400.0,
+                       target_seconds=90.0)
+        h.write_best("spec_0-1_speed", 20_000_000)
+        assert h.driver.tick() == "advanced"
+        assert good.read_bytes() == b"complete-Level 0-1", "the committed specialist is still the good one"
+        assert (h.tmp / "models" / "spec_0-1_speed" / "best.zip").exists(), "the round's weights are kept"
+
+
+def test_a_new_round_cannot_latch_on_the_previous_rounds_status_file():
+    """The 2026-09-18 review: a round resets the latch but REUSES the run directory.
+
+    `runs/<run>/status.json` still holds the previous round's final numbers -- the same rate, the same window,
+    the same cumulative best -- until the new trainer overwrites it. Reading them on the first tick re-latches
+    immediately, and the stage is recorded "done" a settle later on exactly the data its cap had just
+    rejected, which makes the cap meaningless.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = held_harness(tmp)
+        # Round 1 ended at its 8M cap with a rate over the bar and a median inside the target.
+        h.driver.state.history.append({"level": "Level 0-1", "kind": "speed", "status": "unfinished",
+                                       "round": 1})
+        h.write_status("spec_0-1_speed", 21_000_000, 0.9, 50, best_time=85.0, median_time=85.0,
+                       target_seconds=90.0)
+        model_dir = h.tmp / "models" / "spec_0-1_speed"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        ckpt = model_dir / "ckpt_20950000_steps.zip"
+        ckpt.write_bytes(b"round one's newest")
+        h.zip_steps[ckpt.as_posix()] = 20_950_000
+
+        stage = h.driver.begin_stage("Level 0-1", ckpt, cd.SPEED)
+        assert stage.round == 2 and stage.stale_below == 21_000_000, \
+            "everything already in that status.json belongs to round 1"
+        h.trainer_up("spec_0-1_speed")
+        assert h.driver.tick() == "ok"
+        assert h.driver.state.current.target_reached_at is None, \
+            "round 2 may not latch on round 1's tail, which round 1's own cap had just rejected"
+        # ... and once the new trainer's own numbers pass it, the rule reads them normally.
+        h.write_status("spec_0-1_speed", 21_100_000, 0.9, 50, best_time=85.0, median_time=85.0,
+                       target_seconds=90.0)
+        assert h.driver.tick() == "ok"
+        assert h.driver.state.current.target_reached_at == 21_100_000
+        # A stage that has never run has nothing stale to ignore.
+        assert h.driver.begin_stage("Level 0-3", ckpt, cd.SPEED).stale_below is None
+
+
+def test_a_stage_budget_is_measured_from_what_the_trainer_will_actually_resume():
+    """The 2026-09-18 review: `--init` and `choose_resume` disagree, and the budget followed the wrong one.
+
+    `ensure_trainer` resumes from the highest-step checkpoint in the stage's OWN model directory, not from the
+    `--init` it was handed. When the directory is already ahead of that file, `start_steps` taken from `--init`
+    makes the stage's cap and the generated `timesteps` total both start from an origin the trainer never
+    visits: the "6M-step" round is really 6M minus the gap, and `learn()` stops that much early.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = harness(tmp)
+        model_dir = h.tmp / "models" / "spec_0-1"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        newest = model_dir / "ckpt_18362686_steps.zip"
+        newest.write_bytes(b"where the trainer will really start")
+        h.zip_steps[newest.as_posix()] = 18_362_686
+
+        stage = h.driver.begin_stage("Level 0-1", h.init, cd.COMPLETE)  # h.init reads 10,000,000 steps
+        assert stage.start_steps == 18_362_686, "the resume file's count, not the init's"
+        generated = yaml.safe_load(
+            (h.tmp / "configs" / "generated" / "spec_0-1.yaml").read_text(encoding="utf-8"))
+        assert generated["train"]["timesteps"] == 18_362_686 + 6_000_000 + cd.TIMESTEPS_SLACK
+        assert (model_dir / "latest.zip").exists() is False, "nothing to seed: it already has a resume file"
+    # With an empty directory the init IS what the trainer resumes from, exactly as before.
+    with tempfile.TemporaryDirectory() as tmp:
+        h = harness(tmp)
+        assert h.driver.begin_stage("Level 0-1", h.init, cd.COMPLETE).start_steps == 10_000_000
+        assert (h.tmp / "models" / "spec_0-1" / "latest.zip").exists(), "and the init is seeded as before"
+
+
+def test_start_at_respects_the_hold_line_and_refuses_a_stage_that_already_ran():
+    """The two holes `--start-at` left in the hold line (2026-09-18 review). It bypasses `choose_stage`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h = held_harness(tmp)
+        h.driver.state.history.append({"level": "Level 0-1", "kind": "speed", "status": "unfinished",
+                                       "round": 1})
+        plan, driver = h.driver.plan, h.driver
+        # 0-4 sits at the line, and two stages in front of it are not done.
+        why = cd.start_at_objection(plan, driver, "Level 0-4", cd.COMPLETE, plan_path="configs/x.yaml")
+        assert "hold line before Level 0-4" in why and "Level 0-1 (speed)" in why
+        assert "--ignore-hold" in why and "configs/x.yaml" in why
+        assert cd.start_at_objection(plan, driver, "Level 0-4", cd.COMPLETE, ignore_hold=True) == "", \
+            "an operator may lift it on purpose; the driver logs that it did"
+        # A stage in FRONT of the line is fine, as long as it has not already run.
+        assert cd.start_at_objection(plan, driver, "Level 0-3", cd.SPEED) == ""
+        # The finished-stage guard: this is what `runs/start_driver.cmd` would do after a "held" exit.
+        again = cd.start_at_objection(plan, driver, "Level 0-1", cd.COMPLETE)
+        assert "already run" in again and "'done'" in again and "--rerun-stage" in again
+        assert cd.start_at_objection(plan, driver, "Level 0-1", cd.COMPLETE, rerun_stage=True) == ""
+        # An unfinished stage has run too: a second round is a decision, not a restart's side effect.
+        assert "already run" in cd.start_at_objection(plan, driver, "Level 0-1", cd.SPEED)
+        # With no line in the plan at all, only the finished-stage guard is left.
+        open_plan = cd.load_plan(write_plan(Path(tmp), order=SPEED_ORDER))
+        assert cd.start_at_objection(open_plan, driver, "Level 0-4", cd.COMPLETE) == ""
 
 
 def test_specialists_status_reports_the_hold_line_and_the_round():

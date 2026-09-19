@@ -14,9 +14,10 @@ Scoring, smoothed over several consecutive samples in every mode:
   full 100-episode window. Ties break on lower deaths.
 - `--metric campaign`: the completion rate over the last 50 fresh-start episodes, only from samples
   backed by at least 20 of them. Ties break on the lower best official time.
-- `--metric time` (a SPEED STAGE, 2026-09-18): the lowest best official time, but only from samples whose
-  completion rate is at least `--min-rate` (0.3) -- a fast time set by one lucky load in a hundred is not a
-  policy. Ties break on the higher completion rate.
+- `--metric time` (a SPEED STAGE, 2026-09-18): the lowest MEDIAN official time over the last 50 fresh episodes,
+  but only from samples whose completion rate is at least `--min-rate` (0.3) -- a fast time set by one lucky
+  load in a hundred is not a policy, and neither is the run's all-time best, which never moves back up. Ties
+  break on the higher completion rate.
 
 A run's `best.json` records which tie-break chose it (`penalty_name`), and this refuses to start against a
 file written by another metric: the three scores are not comparable, and overwriting one would throw away a
@@ -71,7 +72,15 @@ METRICS = {
     # equal times the more reliable policy does. `gate` is what stops a single lucky load setting the record:
     # a sample whose completion rate is under `min_gate` is not scored at all. `missing` is 0.0 because a
     # window with no rate at all cannot pass the gate in the first place.
-    "time": Metric("fresh_window", MIN_FRESH_WINDOW, "best_time", "fresh_completion_rate", 0.0, "s (official time)",
+    # SCORED ON THE MEDIAN, NOT ON `best_time` (2026-09-18 review). `best_time` is the run's LIFETIME MINIMUM:
+    # it only ever falls, so `-best_time` is monotone non-decreasing, every sample after the last record ties
+    # at the maximum, and `rank_key` is then decided entirely by the tie-break -- `--metric time` would quietly
+    # behave as `--metric campaign` with a gate, and the "current is well below best" warning below could never
+    # fire, because `raw_new > raw_best` cannot hold for a running minimum. `median_time_50` is a real
+    # per-sample statistic of the policy that produced the window, it moves in both directions, and it is
+    # already a column of metrics_log.csv (poll_status.CAMPAIGN_FIELDS).
+    "time": Metric("fresh_window", MIN_FRESH_WINDOW, "median_time_50", "fresh_completion_rate", 0.0,
+                   "s (median official time)",
                    score_sign=-1.0, penalty_sign=-1.0, gate="fresh_completion_rate", min_gate=MIN_RATE),
 }
 

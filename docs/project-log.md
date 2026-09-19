@@ -1835,3 +1835,58 @@ current state.
   2,724,960 steps into the stage, rate 0.000 over 38 fresh`, printed the hold line as waiting on 0-3 complete
   plus the three speed stages, and exited 0 having spawned and killed nothing. Whole no-game suite green, one
   file at a time, 28 files.
+- **Speed stages reviewed, fixed and MERGED (2026-09-18).** Two adversarial reviewers (an RL-exploit lens and
+  a driver-logic lens) read `speed-stages` before it landed and independently returned **the same blocker**.
+  Full write-up: `docs/superpowers/specs/2026-09-18-speed-stages.md` §9. The short version, because the
+  mistake generalises: *the mechanism was wired correctly end to end and still could not have worked, because
+  two of its three decision points read the wrong statistic.*
+  - **The blocker.** The speed promotion clause and `keep_best --metric time` both keyed on `status.json`'s
+    `campaign.best_time`, which is the run's **lifetime minimum** over every fresh completion by any of the
+    twelve envs — `ProgressCallback` only ever lowers it and `_restore` carries it through every trainer
+    restart and into every later round. One lucky load would have satisfied `best_time <= target` for the rest
+    of the run, and the hold line — whose entire job is to refuse the ladder a slow policy — would have opened
+    on it. Measured on the live runs the same day: `spec_0-1` best **243.4 s** against a median of **490.9 s**;
+    `spec_0-2` best **139.5 s** against **236.5 s**. The run's single best is about half its typical
+    completion in both. Both clauses now read `campaign.median_time_50`, which `ProgressCallback` already
+    computed and `poll_status.py` already wrote into `metrics_log.csv`; `best_time` is reported everywhere it
+    was and gated on nowhere. A second consequence of the same defect: because `-best_time` is monotone
+    non-decreasing, every `--metric time` sample after the last record tied at the top score and the ranking
+    fell through to the tie-break, so it silently ranked the completion RATE and its degradation warning was
+    unreachable.
+  - **The reward had no gradient where the policy is.** `max(target/official, 0.25)` is flat past 4x the
+    target. Over the 68 fresh 0-1 completions in the live log (median 481.9 s, target 90 s), **58 of 68 (85%)**
+    sat exactly on the clip: a flat 75% pay cut carrying no information about the clock. The floor is now an
+    asymptote, `scale = 0.25 + 0.75 * target/official` above the target, so a slower completion always pays
+    strictly less than a faster one and a completion still can never pay under 25. 482 s pays 39.0, 243 s
+    52.8, 150 s 70.0, 90 s 100.0. Untrained: nothing has run against it.
+  - **The stage paid 4x more for what it does not measure.** The bonus is scaled only on a fresh-start
+    completion and the stage is scored only on fresh-start episodes, so at `fresh_start_prob: 0.2` a
+    checkpoint respawn paid the full 100 — and 37% of live `spec_0-1` completions were respawns. `fresh_start`
+    is not in the observation, so PPO would have fitted one baseline across both and given every fresh-start
+    completion a negative advantage. A speed stage's generated config now carries `fresh_start_prob: 1.0`.
+  - **A speed round can no longer regress a committed specialist.** `promote()` overwrote
+    `models/specialists/<level>.zip` unconditionally, cap-ended rounds included, with no comparison against
+    the file there; `models/specialists/` is the only copy in git. `refuse_promotion` now declines when a
+    SPEED stage did not end `"done"` and the level already has a specialist. The round's weights stay in
+    `models/spec_<level>_speed/`, which is where `round_init` resumes from anyway.
+  - **Three smaller holes.** (1) A new round reset the latch but reused the run directory, so its first tick
+    could re-latch on the previous round's `status.json` tail and record `"done"` a settle later on data the
+    cap had just rejected — `Stage.stale_below` now discards samples at or below what the run had written when
+    the round began. (2) `--start-at` bypassed the hold line entirely and would silently re-run a finished
+    stage after a `"held"` exit left `current: null` (which `runs/start_driver.cmd`, carrying
+    `--start-at "Level 0-1" --init <17.0M ckpt>`, would have done); `start_at_objection` refuses both, behind
+    `--ignore-hold` / `--rerun-stage`. (3) `begin_stage` takes `start_steps` from what `ensure_trainer` will
+    actually resume rather than from `--init`, so a stage's cap and its generated `timesteps` cannot be
+    measured from an origin the trainer never visits. `speed.max_rounds: 3` gives the round robin an exit:
+    `0.75 x S` on 0-1 is **90 s against a 183.6 s leaderboard best**, so "cannot reach the target" is the
+    expected case, and the driver now stops with a loud `HELD` instead of looping.
+  - **Rejected:** annealing `speed_target_scale` 1.0 -> 0.75 as a cure for the value-function shock (at 1.0
+    the target is still 120 s against a 482 s median — the same ratio regime; the loop half of that finding is
+    fixed by `max_rounds`), and clearing `campaign.best_time` per round (unnecessary once the gate is the
+    median, and `times.md` wants the cumulative record).
+  - **Verification.** Whole no-game suite green one file at a time with `PYTHONPATH` set to the worktree, 28
+    files. New tests fail before each fix and pass after. The live driver state file was read and never
+    written; a `--dry-run` from an isolated scratch cwd holding only copies reported `Level 0-3 (complete):
+    ok` with the hold line waiting on 0-3 complete plus the three speed stages, exit 0, nothing spawned,
+    killed or launched. **No in-game validation of any of it**: no speed stage has ever been trained, and
+    whether `0.75 x S` is reachable on any level is unknown.
