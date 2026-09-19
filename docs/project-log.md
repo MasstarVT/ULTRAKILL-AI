@@ -1890,3 +1890,47 @@ current state.
     ok` with the hold line waiting on 0-3 complete plus the three speed stages, exit 0, nothing spawned,
     killed or launched. **No in-game validation of any of it**: no speed stage has ever been trained, and
     whether `0.75 x S` is reachable on any level is unknown.
+
+### 2026-09-18 — Never idle the machine: `max_rounds: 0` under both kinds, and `target_scale: 1.0`
+
+The lead's two decisions on the plan file, hours after the speed-stage merge (e80651d) and before any speed
+stage has run. Both are `configs/specialists.yaml` only: no code changed, and the driver already supported
+each value (`Driver.stage_blocked` treats `max_rounds <= 0` as "no cap"; `target_scale` is applied in exactly
+one place, the env).
+
+- **`stage.max_rounds` and `speed.max_rounds` are both 0 — unbounded rounds.** `max_rounds: 3` came out of
+  the adversarial review as an exit for a round robin that had none, and it works: after three rounds each the
+  driver logs `HELD` and exits 1. But the driver exiting is the failure, not the cure. **Nobody watches this
+  run** — no LLM monitors, by the user's standing instruction, and the token-free watchers (`post_times.py
+  --watch`, `mem_guard.py`) do not restart a driver. A `HELD` exit is therefore hours or days of twelve idle
+  ULTRAKILL instances and an idle trainer, against the alternative of continuing to train exactly the stages
+  the hold line is waiting on. Training them is strictly better even when the target is out of reach: the
+  weights keep improving, `keep_best` keeps the peak, and `times.md` keeps getting rows. The round robin now
+  runs until the targets are met or a human lifts `hold_before`. A `HELD` exit is still possible and still
+  means what it should — nothing is eligible for a reason training cannot fix, e.g. a speed stage whose
+  complete stage is not `"done"` — and `test_with_no_round_cap_rounds_alone_never_hold_the_ladder` pins both
+  halves.
+- **`speed.target_scale` 0.75 -> 1.0 — the level's own S-rank time, unscaled.** 0.75 was chosen while the
+  promotion gate was the run's LIFETIME BEST, which one lucky load sets for good: `spec_0-2`'s 139.5 s best
+  already beat 0-2's S threshold, so a bare S target would have promoted that stage on its first observation
+  with zero improvement. The same review replaced that gate with `median_time_50`, the median official time
+  over the completions in the last 50 fresh episodes — and against a median, S is already a demanding,
+  objective bar: `spec_0-1`'s median is **482 s against an S of 120 s**, `spec_0-2`'s is **236 s**. At scale
+  1.0 the rule reads "the TYPICAL run S-ranks the clock", which is the same sentence the game uses. Pressure
+  does not stop at the gate either: `completion_bonus` keeps scaling up to **2x** (`SPEED_BONUS_MAX`) for a
+  completion at half the target, and the settle rule keeps a stage training while `keep_best` is still moving
+  `best.zip`. Note 0.75 x 120 = 90 s was *harder* than the new 120 s target, so this loosens the gate — which
+  is the point: it is now reachable in principle from a 482 s median, and it is the level's own number rather
+  than a hand-picked fraction.
+- **`runs/start_driver.cmd` lost its two flags.** It still carried `--start-at "Level 0-1" --init
+  models\campaign_gates\ckpt_17002318_steps.zip`, and `start_at_objection` (same review) now refuses
+  `--start-at` for a stage that has already run — so that file would have hard-failed (argparse exit 2) at any
+  restart made while `current` was null, which is exactly the state a stage boundary or a `HELD` exit leaves.
+  Flagless it resumes `current` (`main()` only reads the flags when `current is None`), and with `current`
+  null it picks the next stage through `choose_stage` and resumes it from `round_init`. `runs/` is gitignored,
+  so the file's exact content is recorded in `docs/commands.md`.
+- **Verification.** `tests/test_campaign_driver.py` 53 tests and `tests/test_specialists_config.py` 11 tests
+  green, then the whole no-game suite one file at a time. Memory before starting: `mem_guard.py --dry-run`
+  reported 12 games, 20.8 GB total, fattest 1.9 GB, system commit **67%**. **Nothing here is validated in
+  game** — no speed stage has been trained, so whether an S-rank median is reachable on any level is still
+  unknown, and the first speed stage cannot start until 0-3's complete stage is `"done"`.

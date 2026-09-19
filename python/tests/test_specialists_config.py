@@ -99,6 +99,7 @@ def test_the_stage_rule_numbers_are_the_ones_the_driver_documents():
     assert (rule.target_rate, rule.min_fresh_window) == (0.5, 30)
     assert (rule.settle_steps, rule.max_steps_per_stage) == (300_000, 6_000_000)
     assert (rule.count, rule.monitor) == (12, 1)
+    assert rule.max_rounds == 0, "no round cap: a HELD exit idles twelve games with nobody watching"
     assert rule.seed_explore_from == "campaign_gates", "the shared run's archives seed each stage"
 
 
@@ -121,7 +122,13 @@ def test_the_speed_rule_is_the_stage_rule_with_the_clock_added():
     assert (speed.min_fresh_window, speed.settle_steps) == (30, 300_000), "inherited from `stage:`"
     assert (speed.count, speed.monitor, speed.seed_explore_from) == (12, 1, "campaign_gates")
     assert p.targets == {}, "no hand-picked seconds: every level's target is its own S-rank time"
-    assert p.target_scale == 0.75, "... times 0.75 (§8b): an S-rank time is a competent run, not a fast one"
+    # 2026-09-18, the lead: the gate is the MEDIAN of the last 50 fresh completions, not the run's lifetime
+    # best, and against a median the level's own S-rank time is already demanding (spec_0-1's median is 482 s
+    # against an S of 120 s). Scale 1.0 is "the typical run S-ranks the clock".
+    assert p.target_scale == 1.0, "the level's own S-rank time, unscaled (§8b)"
+    # And NO round cap, under either kind: the driver's only alternative is a "HELD" exit, and nobody watches
+    # this run, so that exit leaves twelve games idle for hours. Training the held stages beats idling.
+    assert (speed.max_rounds, p.rule.max_rounds) == (0, 0), "unbounded rounds: never idle the machine"
     assert p.rule_for(campaign_driver.COMPLETE) == p.rule, "a complete stage's rule is untouched"
 
 
@@ -154,7 +161,7 @@ def test_a_speed_stage_only_adds_the_bonus_switch_to_the_env():
     cfg = EnvConfig.from_dict(speed)
     assert cfg.speed_bonus is True and cfg.speed_target_seconds == 0.0, "0 = read the level's own S-rank time"
     assert cfg.fresh_start_prob == 1.0
-    assert cfg.speed_target_scale == 0.75, "the plan's target_scale (§8b), applied in the env and nowhere else"
+    assert cfg.speed_target_scale == 1.0, "the plan's target_scale (§8b), applied in the env and nowhere else"
     assert cfg.rewards == EnvConfig.from_dict(complete).rewards, "every reward weight is the complete stage's"
     env = UltrakillEnv(cfg)
     try:

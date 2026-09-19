@@ -951,6 +951,10 @@ def test_the_round_robin_stops_after_max_rounds_instead_of_looping_forever():
     A speed target the policy cannot reach -- and 0.75 x S on Level 0-1 is 90 s against a 183.6 s leaderboard
     best -- would otherwise make the driver burn `max_steps_per_stage` on the same stages for ever, with
     nobody told. After `max_rounds` the driver stops with a loud "held" so a human can retune the target.
+
+    This pins the MECHANISM, on a plan that carries a cap (3, `StageRule`'s default). The SHIPPED plan sets
+    `max_rounds: 0` under both kinds -- see the test below, and `test_specialists_config.py` -- because a
+    "held" exit idles twelve games that nobody is watching.
     """
     with tempfile.TemporaryDirectory() as tmp:
         h = held_harness(tmp)
@@ -973,6 +977,51 @@ def test_the_round_robin_stops_after_max_rounds_instead_of_looping_forever():
         h.driver.plan.speed["max_rounds"] = 0
         pick, _, blocked = h.driver.choose_stage()
         assert blocked == "" and pick.key == ("Level 0-1", "speed")
+
+
+def test_with_no_round_cap_rounds_alone_never_hold_the_ladder():
+    """`max_rounds: 0` (the shipped plan, 2026-09-18): NEVER IDLE THE MACHINE.
+
+    A "held" exit is code 1 and the driver STOPS. Nobody watches this run -- there are no LLM monitors, by the
+    user's own instruction -- so a stage that cannot reach its target would leave twelve games idle for hours
+    or days, which is strictly worse than carrying on training the stages in front of the line. With no cap the
+    round robin keeps handing out fresh budgets until the targets are met or a human lifts `hold_before`.
+
+    It must still hold when nothing is eligible for a REASON the driver cannot train its way out of -- a speed
+    stage whose own level has no finished complete stage has nothing to resume from -- because spinning on that
+    would be worse than stopping.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = held_harness(tmp)
+        h.driver.plan.rule.max_rounds = 0          # `stage:` in the plan file
+        h.driver.plan.speed["max_rounds"] = 0      # ... and `speed:`
+        assert h.driver.plan.rule_for(cd.SPEED).max_rounds == 0
+        assert h.driver.plan.rule_for(cd.COMPLETE).max_rounds == 0
+        # Far more rounds than any cap would have allowed, and every one of them keeps training.
+        for n in range(20):
+            pick, waiting, blocked = h.driver.choose_stage()
+            assert pick is not None and blocked == "", "round %d: rounds alone may never hold the ladder" % n
+            assert h.driver.stage_blocked(pick) == ""
+            assert waiting and pick.level != "Level 0-4", "the hold line itself still holds"
+            h.driver.state.history.append({"level": pick.level, "kind": pick.kind, "status": "unfinished",
+                                           "round": h.driver.state.rounds(pick.key) + 1})
+        assert h.driver.state.rounds(("Level 0-1", cd.SPEED)) == 10, "ten rounds each and still going"
+        assert h.driver.state.rounds(("Level 0-3", cd.SPEED)) == 10
+        # ... and the driver does not stop: the next tick starts round 11 instead of exiting 1.
+        h.driver.state.current = None
+        assert h.driver.tick() == "started"
+        assert h.driver.state.current is not None and h.driver.state.current.round == 11
+
+        # BUT a stage blocked for a reason still holds, with no cap and no rounds at all: `--start-at` marked
+        # both complete stages "skipped", which satisfies the line, and a speed stage will not start without a
+        # "done" complete stage to resume from. No amount of training resolves that, so the driver stops.
+        h.driver.state.current = None
+        h.driver.state.history = [{"level": "Level 0-1", "kind": "complete", "status": "skipped", "round": 1},
+                                  {"level": "Level 0-3", "kind": "complete", "status": "skipped", "round": 1}]
+        pick, waiting, blocked = h.driver.choose_stage()
+        assert pick is None and [s.key for s in waiting] == [("Level 0-1", "speed"), ("Level 0-3", "speed")]
+        assert "complete stage is not done yet" in blocked and "rounds" not in blocked
+        assert h.driver.tick() == "held" and h.driver.run(max_ticks=1) == 1
 
 
 def test_a_speed_stage_is_not_eligible_until_its_own_level_is_done_and_has_a_specialist():

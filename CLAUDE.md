@@ -64,8 +64,8 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - All no-game tests, from `python/`: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python
   $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }`.
 - **The live trainer is the specialist driver** (`scripts/campaign_driver.py`): start it detached through
-  `runs/start_driver.cmd` (a bare `Start-Process` mangles the quoted `"Level 0-1"`); `--dry-run` decides and
-  exits without changing anything. Pause: `New-Item runs\specialists\DRIVER_PAUSE`.
+  `runs/start_driver.cmd`, which carries **no flags** — `driver_state.json` decides the stage, and `--start-at`
+  is refused once a stage has run. `--dry-run` decides and exits. Pause: `New-Item runs\specialists\DRIVER_PAUSE`.
 - Watch it: `python scripts/specialists_status.py` (read-only), and per stage
   `python scripts/dashboard.py --run spec_0-3 --monitor 1`.
 - Memory guard, required beside the driver:
@@ -101,10 +101,13 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   is NOT written: resume from the newest `ckpt_*_steps.zip`, at most 50k steps old. The driver and supervisor
   pick the file with the most steps by themselves.
 - **The mod DLL is locked while games run** — use `-p:InstallPlugin=false` to compile without installing.
-- **Memory is the binding constraint.** Twelve games plus the trainer sit at ~**80% of a 60 GB commit limit**,
-  and the games leak: ~1 GB at boot, ~6 GB each after 5.5 h (measured 2026-09-18, which killed the run, the
-  driver and the desktop session). `mem_guard.py` must be running, and any offline analysis script must
+- **Memory is the binding constraint.** Twelve games plus the trainer sit at ~**66-75% of a 60 GB commit
+  limit** (all Python ~4 GB since today's fix, was 15 GB), and the games leak ~**790 MB per game-hour** from
+  ~1 GB at boot. `mem_guard.py` recycles a game at 2.5 GB and must be running; any offline analysis script must
   **stream** and stay under ~4 GB. See `docs/notes/2026-09-18-memory.md`.
+- **The twelve games are CHILD processes of the driver's tree** — never `taskkill /T` the driver or its
+  `start_driver.cmd` wrapper, or they die with it. Enumerate by command line (`Get-CimInstance Win32_Process`)
+  and `Stop-Process -Id` each python pid individually; no `ULTRAKILL.exe` should ever be killed.
 - **A replay proves a mechanism only for the policy that was recorded.** An offline replay "proved" target
   patience inert on 0-1; live, on the current policy, it halved 0-1's completion rate.
 - **A transform is not a place you can stand.** A `FinalPit`'s transform sits 62.2 m below its own room's
@@ -132,11 +135,11 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   cap, recorded `"unfinished"`. It then promotes `best.zip` to `models/specialists/<level>.zip` with a JSON
   sidecar, and the next stage resumes from that file. Games are not relaunched between stages.
 - A **speed stage** (`{level, kind: speed}`) adds the clock: its `median_time_50` — never `best_time`, a
-  lifetime minimum one lucky load sets for good — must also be under `0.75 x` the level's own S-rank time, at
-  rate 0.4, cap 8M, at most 3 rounds. It does NOT overwrite the level's specialist unless it ends `"done"`.
-  The **hold line** `hold_before: "Level 0-4"` stops the ladder there and round-robins 0-1..0-3 until every
-  stage in front is done; when they run out of rounds the driver exits `HELD` (code 1) for a human to retune
-  `speed.target_scale`. Spec and the review that shaped it: `docs/superpowers/specs/2026-09-18-speed-stages.md`.
+  lifetime minimum one lucky load sets for good — must also reach the level's own S-rank time (`target_scale:
+  1.0`, since the gate is a median), at rate 0.4, cap 8M. It does NOT overwrite the level's specialist unless
+  it ends `"done"`. The **hold line** `hold_before: "Level 0-4"` stops the ladder there and round-robins
+  0-1..0-3 for as long as it takes (`max_rounds: 0`): a `HELD` exit would idle twelve games nobody watches.
+  Spec and the review that shaped it: `docs/superpowers/specs/2026-09-18-speed-stages.md`.
 - **Live: stage 3, `Level 0-3`, run `spec_0-3`**, initialised from `Level_0-2.zip`, started at 18.75M
   cumulative steps, 12 games on ports 47800-47811, `mem_guard.py` alongside.
 - Promoted so far: **0-1** (fresh rate 0.48 over 50, best 4:03.4) and **0-2** (0.72, best 2:19.5). Both are

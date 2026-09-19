@@ -502,9 +502,10 @@ and check `docs/project-log.md` for anything later.
     `level_complete` scaled by it. Its promotion clause is `median_time_50 <= target_seconds` — the median over
     the completions in the last 50 fresh episodes, **never** `campaign.best_time`, which is the run's lifetime
     minimum and is satisfied for good by one lucky load (2026-09-18 review; on the live runs the best is about
-    half the median). `target_seconds` is `speed.target_scale` 0.75 times the level's own S-rank threshold,
-    computed once in `UltrakillEnv._note_speed_target` and carried env → `status.json` → `driver_state.json` →
-    the sidecar so the reward and the rule always read one number. Rate bar 0.4, cap 8M, `max_rounds` 3, its
+    half the median). `target_seconds` is `speed.target_scale` (1.0 since 2026-09-18: against a MEDIAN the
+    level's own S-rank time is already demanding) times the level's own S-rank threshold, computed once in
+    `UltrakillEnv._note_speed_target` and carried env → `status.json` → `driver_state.json` →
+    the sidecar so the reward and the rule always read one number. Rate bar 0.4, cap 8M, `max_rounds` 0, its
     own run (`spec_0-1_speed`) with `keep_best --metric time`, and `fresh_start_prob: 1.0` because the bonus
     and every statistic the stage is judged on are fresh-start only. `refuse_promotion` stops a speed stage
     that ended `"unfinished"` overwriting a specialist it never beat; the round's weights stay in its own model

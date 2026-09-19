@@ -118,13 +118,25 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
   code, and it starts `poll_status.py`, `keep_best.py --metric campaign` and `post_times.py --watch --push` for
   the stage's run.
   ```powershell
-  # from python/, the same detached shape as the supervisor
+  # FIRST launch only -- the one time --start-at/--init mean anything
   Start-Process -FilePath cmd.exe -WorkingDirectory F:\Github\ULTRAKILL-AI\python -WindowStyle Minimized `
     -ArgumentList '/c', '"F:\Github\ULTRAKILL-AI\python\.venv\Scripts\python.exe" -u scripts/campaign_driver.py --start-at "Level 0-1" --init models\campaign_gates\best.zip --monitor 1 >> runs\specialists_driver.log 2>&1'
+  # EVERY restart after that: the launcher script, which carries no flags at all
+  Start-Process -FilePath "F:\Github\ULTRAKILL-AI\python\runs\start_driver.cmd" -WindowStyle Hidden
   ```
   `--start-at` and `--init` are read on the FIRST launch only; after that `runs/specialists/driver_state.json`
   decides, so a restart of the driver resumes the stage it was on rather than the top of the ladder. Run it once
   with `--dry-run` first: it reports the decision and exits, changing nothing.
+  - **`runs\start_driver.cmd` is gitignored, so its exact content is recorded here.** The two flags it used to
+    carry (`--start-at "Level 0-1" --init models\campaign_gates\ckpt_17002318_steps.zip`) were REMOVED on
+    2026-09-18: the driver refuses `--start-at` for a stage that has already run, so the file as it stood would
+    have failed any restart made after the 0-1 stage finished. Flagless, it resumes `current` and otherwise
+    picks the next stage itself. Keep it a `.cmd` file: a bare `Start-Process` mangles a quoted `"Level 0-1"`.
+    ```bat
+    @echo off
+    cd /d F:\Github\ULTRAKILL-AI\python
+    "F:\Github\ULTRAKILL-AI\python\.venv\Scripts\python.exe" -u scripts\campaign_driver.py >> runs\specialists_driver.log 2>&1
+    ```
   - **`--start-at` is refused in two cases** (2026-09-18 review), because it bypasses `choose_stage`, which is
     where every other rule lives. It will not start a stage at or after the plan's `hold_before` while a stage
     in front of the line is not `"done"` — pass `--ignore-hold` to lift the line for that one start, which the
@@ -132,10 +144,14 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
     `runs/start_driver.cmd` after a `"held"` exit would otherwise do (`current` is null then, exactly as on a
     first launch); pass `--rerun-stage` to give a finished stage another round on purpose. The message names
     the flag in both cases.
-  - **A `"held"` exit (code 1) is not a crash.** It means every stage in front of the hold line is blocked —
-    normally because each has had its `speed.max_rounds` (3) and none reached its target. Do not restart the
-    driver into it: retune `speed.target_scale` or add a per-level `speed.targets` override in
-    `configs/specialists.yaml` first. Every round's weights are still in `models/spec_<level>_speed/`.
+  - **A `"held"` exit (code 1) is not a crash**, and since 2026-09-18 it is also not expected: both
+    `max_rounds` are **0** (no cap), because a HELD exit stops the driver and leaves twelve games idle with
+    nobody watching, which is strictly worse than going on training the held stages. The round robin now runs
+    until the targets are met or a human lifts `hold_before`. A HELD exit therefore means something the driver
+    cannot train its way out of — a speed stage whose complete stage is not `"done"`, or no specialist file —
+    and the log line names the stage and the reason. Do not restart the driver into it; fix the reason, or
+    retune `speed.target_scale` / add a per-level `speed.targets` override in `configs/specialists.yaml`.
+    Every round's weights are still in `models/spec_<level>_speed/`.
   - **Pause it before any planned pause**, exactly as with the supervisor and for the same reason (a deliberate
     stop looks like a crash to it):
     ```powershell
