@@ -1196,9 +1196,12 @@ def test_specialists_status_reports_the_hold_line_and_the_round():
         assert data["hold_before"] == "Level 0-4"
         assert [(x["level"], x["kind"], x["rounds"], x["status"]) for x in data["held_by"]] == [
             ("Level 0-1", "speed", 1, "unfinished"), ("Level 0-3", "speed", 0, None)]
+        # `rounds` counts ENDED rounds, so the stage that is running right now would otherwise read
+        # "round 0, not started" in the same report that prints it as the live stage two lines above.
+        assert [x["current"] for x in data["held_by"]] == [False, True]
         text = specialists_status.render(data)
         assert "holding before Level 0-4: waiting on Level 0-1 (speed, round 1, unfinished)" in text
-        assert "Level 0-3 (speed, round 0, not started)" in text
+        assert "Level 0-3 (speed, round 0, RUNNING NOW)" in text
         assert "round 1]" in text, "the running stage says which round it is"
 
 

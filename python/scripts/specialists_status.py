@@ -43,8 +43,12 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
     # disagree with the driver about whether the line is up.
     hold = plan.hold_index()
     out["hold_before"] = plan.hold_before
+    # `rounds` counts ENDED rounds, so the stage that is running right now reads 0/"not started" unless it is
+    # named: `current` says which of the waiting stages is the one on screen above.
+    running = state.current.key if state.current is not None else None
     out["held_by"] = ([{"level": s.level, "kind": s.kind, "rounds": state.rounds(s.key),
                         "status": state.stage_status(s.key),
+                        "current": s.key == running,
                         "max_rounds": plan.rule_for(s.kind).max_rounds}
                        for s in plan.stages[:hold]
                        if state.stage_status(s.key) not in ("done", "skipped")] if hold is not None else [])
@@ -139,7 +143,9 @@ def render(data: dict) -> str:
             lines.append("holding before %s: waiting on %s"
                          % (data["hold_before"],
                             ", ".join("%s (%s, round %d, %s)"
-                                      % (h["level"], h["kind"], h["rounds"], h["status"] or "not started")
+                                      % (h["level"], h["kind"], h["rounds"],
+                                         "RUNNING NOW" if h.get("current") else
+                                         (h["status"] or "not started"))
                                       for h in held)))
             lines.append("  no stage at or after %s starts until every one of those is done; they are trained "
                          "in round robin, fewest rounds first" % data["hold_before"])
