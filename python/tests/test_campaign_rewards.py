@@ -9,7 +9,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ultrakill_ai.rewards import CampaignStep, RewardConfig, compute_reward  # noqa: E402
+from ultrakill_ai.rewards import (  # noqa: E402
+    SPEED_BONUS_MAX, SPEED_BONUS_MIN, CampaignStep, RewardConfig, completion_bonus, compute_reward)
 
 CAMPAIGN_WEIGHTS = {"time": 0.01, "checkpoint": 10.0, "arena_clear": 10.0, "door_unlock": 3.0, "novelty": 0.5, "path": 0.1}
 CAMPAIGN_PARTS = ("time", "checkpoint", "arena_clear", "door_unlock", "novelty", "path", "gate", "gate_approach")
@@ -192,7 +193,9 @@ def test_route_terms_are_retired():
     assert not {"route_point", "stuck"} & names
     assert not hasattr(RewardConfig(), "route_point") and not hasattr(RewardConfig(), "stuck")
     assert list(inspect.signature(compute_reward).parameters) == [
-        "cfg", "prev", "cur", "enemy_max_health", "died", "campaign", "buttons"]
+        "cfg", "prev", "cur", "enemy_max_health", "died", "campaign", "buttons",
+        # The speed stage's two numbers, both keyword-only and both None outside one.
+        "target_seconds", "official_seconds"]
 
 
 def test_punch_is_charged_per_press_and_only_when_pressed():
@@ -214,6 +217,78 @@ def test_level_complete_pays_even_when_the_frame_has_no_player():
     cur = dict(snapshot(level_complete=True))
     cur.pop("player")  # no player at all
     assert compute_reward(cfg, snapshot(), cur, {}).parts["level_complete"] == 100.0
+
+
+# ---------------------------------------------------------------------------
+# The speed stage's time-scaled completion bonus
+# (docs/superpowers/specs/2026-09-18-speed-stages.md §2)
+# ---------------------------------------------------------------------------
+
+
+def test_the_plain_bonus_is_byte_identical_when_no_target_is_set():
+    """Every run that is not a speed stage must be unchanged, so the default path may not even round."""
+    cfg = RewardConfig(level_complete=100.0)
+    assert completion_bonus(cfg) == cfg.level_complete
+    assert completion_bonus(cfg, None, 131.25) == cfg.level_complete
+    assert completion_bonus(cfg, 95.0, None) == cfg.level_complete, "a target with no official time pays plain"
+    assert completion_bonus(cfg, 0.0, 131.25) == cfg.level_complete
+    assert completion_bonus(cfg, 95.0, 0.0) == cfg.level_complete, "a completion frame with no clock pays plain"
+    assert compute_reward(cfg, snapshot(), snapshot(level_complete=True), {}).parts["level_complete"] == 100.0
+
+
+def test_the_bonus_scales_with_the_target_over_the_official_time():
+    cfg = RewardConfig(level_complete=100.0)
+    assert completion_bonus(cfg, 95.0, 95.0) == 100.0, "exactly the S-rank time pays the plain weight"
+    assert completion_bonus(cfg, 95.0, 47.5) == 200.0, "half the target is the 2.0 ceiling"
+    assert abs(completion_bonus(cfg, 95.0, 76.0) - 125.0) < 1e-9
+    # Above the target the ratio is mapped into (MIN, 1] rather than used raw, so the floor is an asymptote:
+    # 0.25 + 0.75 * 0.5 = 0.625.
+    assert abs(completion_bonus(cfg, 95.0, 190.0) - 62.5) < 1e-9, "twice the target pays well under the plain weight"
+
+
+def test_the_bonus_is_bounded_so_finishing_always_beats_not_finishing():
+    """The floor is the whole safety property: the void-farming post-mortem says a completion must never be
+    worth less than staying in the level, whatever the clock says."""
+    cfg = RewardConfig(level_complete=100.0)
+    assert completion_bonus(cfg, 95.0, 95.0 * 40) > 25.0, "a crawl bottoms out ABOVE 0.25, never at or below"
+    assert completion_bonus(cfg, 95.0, 95.0 * 1e6) > 25.0, "however slow, the floor is never actually reached"
+    assert completion_bonus(cfg, 95.0, 1e-3) == 200.0, "and a bogus near-zero time cannot pay unbounded"
+    assert (SPEED_BONUS_MIN, SPEED_BONUS_MAX) == (0.25, 2.0)
+
+
+def test_a_slower_completion_always_pays_strictly_less_than_a_faster_one():
+    """The 2026-09-18 review's finding: a hard `max(ratio, 0.25)` clip is FLAT wherever the policy actually is.
+
+    Measured on the live spec_0-1 log: 68 fresh Level 0-1 completions, median 481.9 s, against a 90 s target
+    (0.75 x an S-rank 120 s). Under the clip 58 of those 68 paid exactly 25.0 with d(bonus)/d(time) == 0 -- a
+    flat 75% pay cut carrying no information about the clock at all. Every one of them must now be separated.
+    """
+    cfg = RewardConfig(level_complete=100.0)
+    target = 90.0
+    times = [900.0, 600.0, 481.9, 400.0, 300.0, 243.4, 180.0, 120.0, 90.0, 60.0]
+    paid = [completion_bonus(cfg, target, t) for t in times]
+    assert all(a < b for a, b in zip(paid, paid[1:])), "strictly decreasing in the clock over the whole range"
+    assert len({round(p, 6) for p in paid}) == len(times), "no two of them may pay the same"
+    # The two numbers the live run sits between, and the plain weight at exactly the target.
+    assert abs(completion_bonus(cfg, target, 481.9) - 39.01) < 0.01
+    assert abs(completion_bonus(cfg, target, 243.4) - 52.74) < 0.01
+    assert completion_bonus(cfg, target, target) == 100.0
+
+
+def test_compute_reward_pays_the_scaled_bonus_on_the_completion_edge():
+    cfg = RewardConfig(**GATES_WEIGHTS)
+    parts = compute_reward(cfg, snapshot(), snapshot(level_complete=True), {},
+                           campaign=CampaignStep(), target_seconds=95.0, official_seconds=47.5).parts
+    assert parts["level_complete"] == 200.0
+    # Not on a step that is not the rising edge, and not on a step that never completed.
+    both = compute_reward(cfg, snapshot(level_complete=True), snapshot(level_complete=True), {},
+                          target_seconds=95.0, official_seconds=47.5).parts
+    assert "level_complete" not in both
+    # ... and still paid on a player-less completion frame, which is when a real one usually arrives.
+    cur = dict(snapshot(level_complete=True))
+    cur.pop("player")
+    assert compute_reward(cfg, snapshot(), cur, {}, target_seconds=95.0,
+                          official_seconds=190.0).parts["level_complete"] == 62.5
 
 
 if __name__ == "__main__":

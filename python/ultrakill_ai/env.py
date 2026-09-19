@@ -33,6 +33,7 @@ from ultrakill_ai.campaign import (
     exit_ground_point,
     load_route,
     read_curriculum,
+    s_rank_time,
     safe_name,
     save_best_run,
 )
@@ -59,7 +60,13 @@ CYBERGRIND_SCENE = "Endless"
 CAMPAIGN_INFO_KEYS = ("kills", "style", "deaths", "completed", "fresh_start", "level_seconds",
                       "checkpoints_level", "cells_new", "exit_dist_min", "exit_ground_dist_min", "oob_frac",
                       "gates_reached", "wedged_steps", "level_started", "look_gate_frac", "slide_forced_frac",
-                      "targets_parked", "exit_banished", "route_source", "ladder_collapsed")
+                      "targets_parked", "exit_banished", "route_source", "ladder_collapsed",
+                      # The speed stage (docs/superpowers/specs/2026-09-18-speed-stages.md): the level's target
+                      # time, the raw S-rank threshold it was scaled from, and what the completion edge paid.
+                      # `target_seconds` is how the driver learns the target at all -- it travels
+                      # env -> status.json -> driver_state.json -> the sidecar, and `s_rank_seconds` rides with
+                      # it so the sidecar can say what the game itself calls S.
+                      "target_seconds", "s_rank_seconds", "completion_bonus")
 
 YAW_CAP = max(abs(b) for b in YAW_BINS)  # 90 degrees per decision, the widest look bin
 PITCH_CAP = max(abs(b) for b in PITCH_BINS)  # 20 degrees per decision
@@ -137,6 +144,21 @@ class EnvConfig:
     max_locked_skip_s: float = 120.0  # longest input lock (landing, cutscene) stepped through without the policy
     explore_dir: str = ""  # folder for the exploration archive, so a resumed run keeps its visit counts ("" = memory only)
     best_runs_dir: str = ""  # folder for the fastest fresh-start completion of each level ("" = off)
+    # A SPEED STAGE (docs/superpowers/specs/2026-09-18-speed-stages.md). Off everywhere else, and off is today's
+    # behaviour exactly: `rewards.completion_bonus` returns the plain weight when it is handed no target.
+    speed_bonus: bool = False  # scale `level_complete` by target_seconds / official_seconds on a fresh completion
+    # 0.0 -- the default -- means the level's OWN S-rank time threshold, read live off `campaign.ranks.time[-1]`
+    # at the first observation of the run. A positive number is a per-level override from the plan, and the env
+    # reports whichever it is as `info["target_seconds"]`, so the reward and the driver's rule agree by
+    # construction. Never a hand-picked number chosen away from the level.
+    speed_target_seconds: float = 0.0
+    # What the level's own S-rank threshold is MULTIPLIED by to get the target (§8). Measured 2026-09-18: the
+    # 0-2 specialist's 139.5 s is already inside 0-2's S window, so a bare S threshold would have promoted that
+    # stage with zero improvement -- an S-rank time is what a competent human run scores, not a fast one. The
+    # scale is applied HERE and nowhere else, so `info["target_seconds"]` is the single number the reward and
+    # the driver's promotion rule both read. An explicit `speed_target_seconds` is a decision already made and
+    # is NEVER scaled.
+    speed_target_scale: float = 0.75
     # Route gates (campaign.gates): the door-graph ladder GateProgress walks.
     gate_reach_m: float = 8.0  # horizontal radius at which a gate counts as reached (2x while it is open)
     gate_reach_v_m: float = 6.0  # vertical half-height of the same test, so a roof over a door is not "reached"
@@ -415,6 +437,15 @@ class UltrakillEnv(gym.Env):
         self._behaviour = dict.fromkeys(BEHAVIOUR_KEYS, 0)
         self._arena_spawn: list[float] | None = None
         self._episode_start_stats: dict[str, Any] = {}
+        # A speed stage's target time, in game seconds. The override wins; 0 leaves it None until the first
+        # observation carrying `campaign.ranks` sets it (see `_note_speed_target`). None on every other run,
+        # which is what makes `compute_reward` pay the plain `level_complete`.
+        self._speed_target: float | None = (float(self.cfg.speed_target_seconds)
+                                            if campaign and self.cfg.speed_bonus and self.cfg.speed_target_seconds > 0
+                                            else None)
+        # The level's RAW S-rank threshold, before `speed_target_scale`. Reported and recorded beside the target
+        # so a sidecar says both what was demanded and what the game calls S; nothing is measured against it.
+        self._s_rank_seconds: float | None = None
 
         # Campaign state. The exploration archive counts, per game and per level, how many earlier episodes
         # entered each cell, so the novelty reward fades where this game has already been. A curriculum run keeps
@@ -590,6 +621,7 @@ class UltrakillEnv(gym.Env):
             self._exit_banished = self.exit_guard.banished  # a load that is already banished stays flagged
             self._start_checkpoint = self._current_checkpoint(self._raw)
             self._level_started = bool((self._raw.get("campaign") or {}).get("level_started"))
+            self._note_speed_target(self._raw)
             player = self._raw.get("player")
             if player:
                 self._last_pos = list(player["pos"])
@@ -679,10 +711,20 @@ class UltrakillEnv(gym.Env):
         # policy caused; `prev` is needed as well, because kills and style reset the stuck clock.
         campaign_step = self._campaign_progress(prev, cur) if campaign else None
         wedged = campaign and self._note_wedge(prev, cur)
-        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, died=died,
-                                campaign=campaign_step, buttons=command["buttons"])
-
+        # Graded BEFORE the reward, because a speed stage's completion bonus needs the official time of this
+        # very frame. It reads only `cur`, so nothing below it can change the answer.
         completed = bool(campaign and (cur.get("stats", {}).get("level_complete") or (cur.get("campaign") or {}).get("level_over")))
+        # A speed stage scales `level_complete` by the clock, but only on a FRESH-START completion: a checkpoint
+        # respawn begins partway through the level with the timer already running, so its "official time" says
+        # nothing about how fast the level was played and it pays the plain weight, exactly as every other run
+        # does. `_level_result` falls back to 0.0 when the block is gone, which `completion_bonus` reads as "no
+        # time" and also pays plain.
+        official = (self._level_result(cur)["seconds"]
+                    if (campaign and completed and self._fresh_start and self._speed_target) else None)
+        reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, died=died,
+                                campaign=campaign_step, buttons=command["buttons"],
+                                target_seconds=self._speed_target, official_seconds=official)
+
         if campaign:
             if died and player is not None and not completed:
                 # A death does not end a campaign episode: the penalty is paid above, then the player respawns at
@@ -731,6 +773,10 @@ class UltrakillEnv(gym.Env):
 
         info = self._info(cur)
         info["reward_parts"] = reward.parts
+        # What this step actually paid for finishing: 0 on every step but the completion edge, `level_complete`
+        # on a plain completion, and the time-scaled figure on a speed stage's fresh-start one. The one number
+        # that says the speed mechanism is live, next to `target_seconds`.
+        info["completion_bonus"] = reward.parts.get("level_complete", 0.0)
         if reason:
             info["end_reason"] = reason
             info["reset_seconds"] = self._reset_seconds
@@ -1891,6 +1937,31 @@ class UltrakillEnv(gym.Env):
         return CampaignStep(checkpoints=checkpoints, arenas=arenas, doors=doors, novelty=novelty, path_gain=path_gain,
                             gates=gates_new, gate_approach=approach, item_pickups=pickups, item_placements=placements)
 
+    def _note_speed_target(self, raw: dict[str, Any]) -> None:
+        """Reads the level's own S-rank time off the first observation that carries one, once.
+
+        Only on a speed stage, and only while the raw threshold has not been read yet, so the numbers are
+        constants for the run and a first load whose campaign block was missing still gets them at the next
+        reset.
+
+        The TARGET is `s_rank_seconds * speed_target_scale` (§8): an S-rank time is a competent human run, not a
+        fast one, and the 0-2 specialist was already inside it before any speed stage existed. An override from
+        the config is a decision already made -- it is set in `__init__`, is never overwritten here, and is never
+        scaled -- but the raw threshold is still recorded beside it, because a sidecar that says "target 82 s"
+        without saying what S is cannot be read a month later.
+        """
+        if not self.cfg.speed_bonus or self._s_rank_seconds is not None:
+            return
+        s_rank = s_rank_time(raw.get("campaign"))
+        if s_rank is None:
+            return
+        self._s_rank_seconds = s_rank
+        if self._speed_target is None:
+            scaled = s_rank * float(self.cfg.speed_target_scale)
+            self._speed_target = scaled if scaled > 0.0 else None  # a zero or negative scale means "no target"
+        self.envlog.event("speed_target", level=self.level, s_rank_seconds=s_rank,
+                          scale=self.cfg.speed_target_scale, target_seconds=self._speed_target)
+
     def _level_result(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Official time, kills, style, restarts and rank as the game's results screen would count them."""
         camp = raw.get("campaign") or {}
@@ -2005,6 +2076,12 @@ class UltrakillEnv(gym.Env):
                                             else self._exit_ground_dist_min)
             info["completed"] = 0  # set to 1 on the step that ends with level_complete
             info["level_seconds"] = None  # official time, only for a fresh-start completion
+            # The speed stage's two numbers. `target_seconds` is the level's own S-rank time (or the config's
+            # override) and is None on every run that is not a speed stage; `completion_bonus` is overwritten in
+            # step() with what the completion edge actually paid. Both numeric, so both survive `_num`.
+            info["target_seconds"] = self._speed_target
+            info["s_rank_seconds"] = self._s_rank_seconds
+            info["completion_bonus"] = 0.0
             # Route gates. `gates_reached` is numeric and always present so it can be charted; `gate_hops_best`
             # is None until a gate is reached, so it only ever reaches episodes.jsonl. Both are inherited by a
             # respawn episode from its level load, so judge them on fresh starts.

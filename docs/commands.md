@@ -125,14 +125,30 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
   `--start-at` and `--init` are read on the FIRST launch only; after that `runs/specialists/driver_state.json`
   decides, so a restart of the driver resumes the stage it was on rather than the top of the ladder. Run it once
   with `--dry-run` first: it reports the decision and exits, changing nothing.
+  - **`--start-at` is refused in two cases** (2026-09-18 review), because it bypasses `choose_stage`, which is
+    where every other rule lives. It will not start a stage at or after the plan's `hold_before` while a stage
+    in front of the line is not `"done"` — pass `--ignore-hold` to lift the line for that one start, which the
+    driver logs — and it will not start a stage that has already run, which is what a restart of
+    `runs/start_driver.cmd` after a `"held"` exit would otherwise do (`current` is null then, exactly as on a
+    first launch); pass `--rerun-stage` to give a finished stage another round on purpose. The message names
+    the flag in both cases.
+  - **A `"held"` exit (code 1) is not a crash.** It means every stage in front of the hold line is blocked —
+    normally because each has had its `speed.max_rounds` (3) and none reached its target. Do not restart the
+    driver into it: retune `speed.target_scale` or add a per-level `speed.targets` override in
+    `configs/specialists.yaml` first. Every round's weights are still in `models/spec_<level>_speed/`.
   - **Pause it before any planned pause**, exactly as with the supervisor and for the same reason (a deliberate
     stop looks like a crash to it):
     ```powershell
     New-Item runs\specialists\DRIVER_PAUSE        # from python/; it then does nothing at all
     Remove-Item runs\specialists\DRIVER_PAUSE     # when the pause is over
     ```
-  - **Watch it**: `python scripts/specialists_status.py` (stage, steps into it, rate and window, best time,
-    settle left, the promoted table) and the monitor's `report.py --run spec_0-1` for the stage's own numbers.
+  - **Watch it**: `python scripts/specialists_status.py` (stage, steps into it, rate and window, the MEDIAN
+    official time over the last 50 fresh episodes beside the best one ever recorded, the hold line and what it
+    is waiting on, settle left, the promoted table) and the monitor's `report.py --run spec_0-1` for the
+    stage's own numbers. A speed stage promotes on the **median**, never on the best: `campaign.best_time` is
+    a run-lifetime minimum that one lucky load sets for good, and on the live runs it is about half the median
+    (see `docs/superpowers/specs/2026-09-18-speed-stages.md` §9a). `keep_best --metric time` scores the median
+    for the same reason.
     `python scripts/dashboard.py --run spec_0-1 --monitor 1` works unchanged — a stage is a single-level run, so
     its campaign block is the one the dashboard has always drawn.
   - **Chain the specialists into a full-game run**, on ONE game and never a port a trainer is using:

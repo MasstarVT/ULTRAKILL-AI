@@ -9,15 +9,24 @@ This copies the checkpoint nearest each new best to `best.zip` and records how i
 `best.json`. It only reads `metrics_log.csv` (written by poll_status.py) and copies files, so it is
 safe to leave running alongside training and never touches the bridge ports.
 
-Scoring, smoothed over several consecutive samples in both modes:
+Scoring, smoothed over several consecutive samples in every mode:
 - `--metric kills_per_min` (default, Cyber Grind): kills per game-minute, only from samples backed by a
   full 100-episode window. Ties break on lower deaths.
 - `--metric campaign`: the completion rate over the last 50 fresh-start episodes, only from samples
   backed by at least 20 of them. Ties break on the lower best official time.
+- `--metric time` (a SPEED STAGE, 2026-09-18): the lowest MEDIAN official time over the last 50 fresh episodes,
+  but only from samples whose completion rate is at least `--min-rate` (0.3) -- a fast time set by one lucky
+  load in a hundred is not a policy, and neither is the run's all-time best, which never moves back up. Ties
+  break on the higher completion rate.
+
+A run's `best.json` records which tie-break chose it (`penalty_name`), and this refuses to start against a
+file written by another metric: the three scores are not comparable, and overwriting one would throw away a
+run's best weights.
 
     python scripts/keep_best.py --run cybergrind_ppo_v2            # watch until stopped
     python scripts/keep_best.py --run cybergrind_ppo_v2 --once     # report and exit
     python scripts/keep_best.py --run campaign_ppo --metric campaign
+    python scripts/keep_best.py --run spec_0-1_speed --metric time
 """
 
 from __future__ import annotations
@@ -36,21 +45,43 @@ from typing import NamedTuple
 SMOOTH = 9          # samples per smoothing window (~4.5 min at a 30 s poll)
 MIN_WINDOW = 100    # kills_per_min: require a full episode window behind every mean
 MIN_FRESH_WINDOW = 20  # campaign: fresh-start episodes behind the completion rate (its window holds 50)
+MIN_RATE = 0.3      # time: the completion rate a sample needs before its clock is worth ranking at all
 
 
 class Metric(NamedTuple):
     window: str     # CSV column counting the episodes behind the means
     min_window: int
-    score: str      # CSV column, higher is better
-    penalty: str    # CSV column that breaks ties, lower is better; also `penalty_name` in best.json
-    missing: float  # penalty when no sample in a smoothing window has one
+    score: str      # CSV column, ranked higher-is-better AFTER `score_sign`
+    penalty: str    # CSV column that breaks ties, lower-is-better AFTER `penalty_sign`; also `penalty_name`
+    missing: float  # penalty when no sample in a smoothing window has one (already signed)
     unit: str
+    # -1 turns a column where LOWER is better into the shape `rank_key` wants, without touching the ranking
+    # itself. Both default to +1, so `kills_per_min` and `campaign` behave exactly as they always have.
+    score_sign: float = 1.0
+    penalty_sign: float = 1.0
+    gate: str = ""       # an extra column a sample must reach to count at all ("" = no gate)
+    min_gate: float = 0.0
 
 
 METRICS = {
     "kills_per_min": Metric("window", MIN_WINDOW, "kills_per_min", "deaths", 0.0, "kills/min"),
     # No completed run means no best time: an infinite penalty, so the first finite time wins the tie.
     "campaign": Metric("fresh_window", MIN_FRESH_WINDOW, "fresh_completion_rate", "best_time", math.inf, "fresh completion rate"),
+    # A speed stage. The score is the official time NEGATED so that "higher is better" still holds everywhere
+    # below, and the tie-break is the completion rate negated for the same reason -- a faster time wins, and at
+    # equal times the more reliable policy does. `gate` is what stops a single lucky load setting the record:
+    # a sample whose completion rate is under `min_gate` is not scored at all. `missing` is 0.0 because a
+    # window with no rate at all cannot pass the gate in the first place.
+    # SCORED ON THE MEDIAN, NOT ON `best_time` (2026-09-18 review). `best_time` is the run's LIFETIME MINIMUM:
+    # it only ever falls, so `-best_time` is monotone non-decreasing, every sample after the last record ties
+    # at the maximum, and `rank_key` is then decided entirely by the tie-break -- `--metric time` would quietly
+    # behave as `--metric campaign` with a gate, and the "current is well below best" warning below could never
+    # fire, because `raw_new > raw_best` cannot hold for a running minimum. `median_time_50` is a real
+    # per-sample statistic of the policy that produced the window, it moves in both directions, and it is
+    # already a column of metrics_log.csv (poll_status.CAMPAIGN_FIELDS).
+    "time": Metric("fresh_window", MIN_FRESH_WINDOW, "median_time_50", "fresh_completion_rate", 0.0,
+                   "s (median official time)",
+                   score_sign=-1.0, penalty_sign=-1.0, gate="fresh_completion_rate", min_gate=MIN_RATE),
 }
 
 
@@ -64,15 +95,22 @@ def num(row: dict, key: str) -> float | None:
         return None
 
 
-def scored(csv_path: Path, metric: str = "kills_per_min") -> list[tuple[float, float, float, float]]:
-    """(score, penalty, reward, timesteps), smoothed, newest last."""
+def scored(csv_path: Path, metric: str = "kills_per_min", *,
+           min_rate: float | None = None) -> list[tuple[float, float, float, float]]:
+    """(score, penalty, reward, timesteps), smoothed, newest last. Higher score and lower penalty are better.
+
+    `min_rate` overrides a gated metric's own `min_gate` (`--metric time` only); it is ignored by the others,
+    which carry no gate.
+    """
     m = METRICS[metric]
+    gate_at = m.min_gate if min_rate is None else float(min_rate)
     try:
         with csv_path.open(encoding="utf-8", newline="") as f:
             rows = list(csv.DictReader(f))
     except OSError:
         return []
-    rows = [r for r in rows if (num(r, m.window) or 0) >= m.min_window and num(r, m.score) is not None]
+    rows = [r for r in rows if (num(r, m.window) or 0) >= m.min_window and num(r, m.score) is not None
+            and (not m.gate or (num(r, m.gate) or 0.0) >= gate_at)]
     out = []
     half = SMOOTH // 2
     for i in range(half, len(rows) - half):
@@ -83,8 +121,8 @@ def scored(csv_path: Path, metric: str = "kills_per_min") -> list[tuple[float, f
         if any(v is None for v in score):
             continue
         out.append((
-            statistics.mean(score),
-            statistics.mean([p for p in pen if p is not None] or [m.missing]),
+            m.score_sign * statistics.mean(score),
+            m.penalty_sign * statistics.mean([p for p in pen if p is not None] or [m.missing]),
             statistics.mean([v for v in rew if v is not None] or [0.0]),
             num(rows[i], "timesteps") or 0.0,
         ))
@@ -154,7 +192,10 @@ def save_if_better(series: list[tuple[float, float, float, float]], model_dir: P
         return best
     shutil.copy2(src, model_dir / "best.zip")
     (model_dir / "best.json").write_text(json.dumps({
-        "score_metric": "%s, smoothed over %d samples" % (m.score, SMOOTH),
+        # `score` and `penalty` are stored SIGNED, the way they are ranked, so a restart compares like with
+        # like. The string says which way round they read, because -118.5 in a file is otherwise a puzzle.
+        "score_metric": ("%s, smoothed over %d samples" % (m.score, SMOOTH) if m.score_sign > 0 else
+                         "-%s (lower is better), smoothed over %d samples" % (m.score, SMOOTH)),
         "score": round(score, 4),
         "penalty": round(penalty, 4) if math.isfinite(penalty) else None,  # null: no completed run yet
         "penalty_name": m.penalty,
@@ -163,7 +204,8 @@ def save_if_better(series: list[tuple[float, float, float, float]], model_dir: P
         "checkpoint": src.name,
         "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }, indent=2), encoding="utf-8")
-    print(f"[keep_best] new best {score:.2f} {m.unit} ({m.penalty} {penalty:.2f}) at {ts:,.0f} -> {src.name}", flush=True)
+    print(f"[keep_best] new best {m.score_sign * score:.2f} {m.unit} "
+          f"({m.penalty} {m.penalty_sign * penalty:.2f}) at {ts:,.0f} -> {src.name}", flush=True)
     return score, penalty
 
 
@@ -173,7 +215,10 @@ def main() -> None:
     ap.add_argument("--runs-dir", default="runs")
     ap.add_argument("--models-dir", default="models")
     ap.add_argument("--metric", choices=sorted(METRICS), default="kills_per_min",
-                    help="kills_per_min (Cyber Grind) or campaign (fresh-start completion rate, then best time)")
+                    help="kills_per_min (Cyber Grind), campaign (fresh-start completion rate, then best "
+                         "time) or time (a speed stage: the best official time, gated on --min-rate)")
+    ap.add_argument("--min-rate", type=float, default=MIN_RATE,
+                    help="--metric time only: the fresh completion rate a sample needs before its time counts")
     ap.add_argument("--interval", type=float, default=60.0)
     ap.add_argument("--once", action="store_true")
     a = ap.parse_args()
@@ -191,14 +236,20 @@ def main() -> None:
     best = stored_best(best_json)
 
     while True:
-        series = scored(csv_path, a.metric)
+        series = scored(csv_path, a.metric, min_rate=a.min_rate)
         if series:
             best = save_if_better(series, model_dir, a.metric, best)
             newest = series[-1]
             # Warn when the current policy has fallen well below the best: that is the signal to roll back.
-            if best is not None and best[0] > 0 and newest[0] < best[0] * 0.85:
-                print(f"[keep_best] WARNING current {newest[0]:.2f} {metric.unit} is "
-                      f"{(1 - newest[0]/best[0])*100:.0f}% below best {best[0]:.2f} "
+            # Measured on the RAW column, so a negated score (`--metric time`) reads the same way round as the
+            # others: 15% off the best time is 15% off, whichever sign it is stored with.
+            raw_best = metric.score_sign * best[0] if best is not None else None
+            raw_new = metric.score_sign * newest[0]
+            worse = raw_best is not None and raw_best > 0 and (
+                raw_new < raw_best * 0.85 if metric.score_sign > 0 else raw_new > raw_best / 0.85)
+            if worse:
+                print(f"[keep_best] WARNING current {raw_new:.2f} {metric.unit} is "
+                      f"{abs(1 - raw_new/raw_best)*100:.0f}% off best {raw_best:.2f} "
                       f"(best.zip holds the good weights)", flush=True)
         if a.once:
             if best_json.exists():

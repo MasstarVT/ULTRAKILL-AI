@@ -557,6 +557,116 @@ def test_completion_after_a_checkpoint_respawn_has_no_official_time():
         assert not (Path(tmp) / "Level_0-1.json").exists()
 
 
+# ---------------------------------------------------------------------------
+# Speed stages (docs/superpowers/specs/2026-09-18-speed-stages.md)
+# ---------------------------------------------------------------------------
+
+
+def speed_env(**overrides):
+    """A speed stage's env: the same rewards as a complete stage, with the scaled completion bonus on."""
+    rewards = RewardConfig(time=0.01, checkpoint=10.0, arena_clear=10.0, level_complete=100.0)
+    return make_env(rewards=rewards, speed_bonus=True, **overrides)
+
+
+def test_a_speed_stage_reads_the_levels_own_s_rank_time_as_its_target():
+    """Never a hand-picked number: the target is `campaign.ranks.time[-1]` scaled, the game's own idea of S."""
+    env, fake = speed_env()
+    _, info = env.reset(seed=0)
+    assert RANKS["time"][-1] == 30
+    # The default scale is 0.75 (spec §8b): an S-rank time is a competent run, not a fast one.
+    assert env._speed_target == 22.5 and info["target_seconds"] == 22.5
+    assert env._s_rank_seconds == 30.0 and info["s_rank_seconds"] == 30.0, "the raw threshold travels too"
+    assert info["completion_bonus"] == 0.0, "nothing has been completed yet"
+    env.close()
+
+    # ... and a run that is not a speed stage carries no target at all, so it pays the plain weight.
+    plain, _ = make_env(rewards=RewardConfig(level_complete=100.0))
+    _, info = plain.reset(seed=0)
+    assert plain._speed_target is None and info["target_seconds"] is None
+    assert info["s_rank_seconds"] is None
+    plain.close()
+
+
+def test_the_target_scale_multiplies_the_s_threshold_and_is_applied_only_here():
+    """§8b: one place, the env, so `info["target_seconds"]` is what the reward AND the driver both read."""
+    for scale, expected in ((1.0, 30.0), (0.75, 22.5), (0.5, 15.0)):
+        env, _ = speed_env(speed_target_scale=scale)
+        _, info = env.reset(seed=0)
+        assert info["target_seconds"] == expected and info["s_rank_seconds"] == 30.0
+        assert env.cfg.rewards.level_complete == 100.0, "the scale never touches a reward weight"
+        env.close()
+
+
+def test_a_config_override_wins_over_the_live_threshold_and_is_never_scaled():
+    """A per-level `speed.targets` entry is a decision already made: 8 s means 8 s, not 8 x 0.75 (§8b)."""
+    env, fake = speed_env(speed_target_seconds=8.0, speed_target_scale=0.5)
+    _, info = env.reset(seed=0)
+    assert env._speed_target == 8.0 and info["target_seconds"] == 8.0, "the plan's per-level override"
+    assert info["s_rank_seconds"] == 30.0, "the raw threshold is still recorded beside it"
+    env.close()
+
+
+def test_a_level_load_with_no_ranks_leaves_the_target_unread():
+    """An older mod, or a block the mod could not build: no target, the plain bonus, and nothing raises."""
+    env, fake = speed_env()
+    fake.drop_campaign_steps = 1  # the reset observation has no campaign block at all
+    _, info = env.reset(seed=0)
+    assert env._speed_target is None and info["target_seconds"] is None
+    assert env._s_rank_seconds is None and info["s_rank_seconds"] is None
+    info = run_forward_until_end(env)
+    assert info["end_reason"] == "level_complete"
+    assert info["completion_bonus"] == 100.0, "the plain weight: no target means today's rule exactly"
+    env.close()
+
+
+def run_forward_until_end(env: UltrakillEnv, limit: int = 200) -> dict:
+    for _ in range(limit):
+        _, _, terminated, truncated, info = env.step(forward())
+        if terminated or truncated:
+            return info
+    raise AssertionError(f"episode did not end within {limit} steps")
+
+
+def test_a_fast_fresh_start_completion_pays_the_scaled_bonus():
+    """The fake corridor is finished in about four seconds against a 22.5 s target, so it hits the 2.0 ceiling."""
+    env, fake = speed_env()
+    _, info = env.reset(seed=0)
+    info = run_forward_until_end(env)
+    assert info["end_reason"] == "level_complete" and info["fresh_start"] == 1
+    assert info["level_seconds"] == fake.seconds and fake.seconds < 22.5
+    assert info["completion_bonus"] == 200.0 == info["reward_parts"]["level_complete"]
+    assert info["target_seconds"] == 22.5 and info["s_rank_seconds"] == 30.0
+    env.close()
+
+
+def test_the_bonus_tracks_the_official_time_between_the_two_clips():
+    """With the target set to twice the corridor's own time the bonus is exactly half the ceiling."""
+    env, fake = speed_env(speed_target_seconds=4.0)
+    env.reset(seed=0)
+    info = run_forward_until_end(env)
+    seconds = info["level_seconds"]
+    assert seconds is not None and seconds > 0
+    assert abs(info["completion_bonus"] - 100.0 * min(2.0, 4.0 / seconds)) < 1e-9
+    assert 25.0 <= info["completion_bonus"] <= 200.0
+    env.close()
+
+
+def test_a_checkpoint_respawn_completion_pays_the_plain_bonus():
+    """Its official timer carries over from an earlier episode, so its "time" says nothing about the run."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake = speed_env(fresh_start_prob=0.0, max_steps=25, best_runs_dir=tmp)
+        env.reset(seed=0)
+        for _ in range(25):
+            _, _, terminated, truncated, info = env.step(forward())
+        assert truncated and info["end_reason"] == "max_steps"
+        _, info = env.reset()
+        assert info["fresh_start"] == 0
+        info = run_forward_until_end(env)
+        assert info["end_reason"] == "level_complete" and info["level_seconds"] is None
+        assert info["completion_bonus"] == 100.0, "the plain weight, exactly as on a complete stage"
+        env.close()
+
+
 def test_death_after_the_checkpoint_respawns_inside_the_episode():
     env, fake = make_env()
     env.reset(seed=0)

@@ -131,6 +131,12 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   >= 30, latched) **and** 300k steps have passed since `keep_best.py` last moved `best.zip`; else at the 6M-step
   cap, recorded `"unfinished"`. It then promotes `best.zip` to `models/specialists/<level>.zip` with a JSON
   sidecar, and the next stage resumes from that file. Games are not relaunched between stages.
+- A **speed stage** (`{level, kind: speed}`) adds the clock: its `median_time_50` — never `best_time`, a
+  lifetime minimum one lucky load sets for good — must also be under `0.75 x` the level's own S-rank time, at
+  rate 0.4, cap 8M, at most 3 rounds. It does NOT overwrite the level's specialist unless it ends `"done"`.
+  The **hold line** `hold_before: "Level 0-4"` stops the ladder there and round-robins 0-1..0-3 until every
+  stage in front is done; when they run out of rounds the driver exits `HELD` (code 1) for a human to retune
+  `speed.target_scale`. Spec and the review that shaped it: `docs/superpowers/specs/2026-09-18-speed-stages.md`.
 - **Live: stage 3, `Level 0-3`, run `spec_0-3`**, initialised from `Level_0-2.zip`, started at 18.75M
   cumulative steps, 12 games on ports 47800-47811, `mem_guard.py` alongside.
 - Promoted so far: **0-1** (fresh rate 0.48 over 50, best 4:03.4) and **0-2** (0.72, best 2:19.5). Both are
@@ -143,9 +149,11 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   against a completion's 100. Trimmed to the 4 rungs every recorded completion used (2026-09-18, `route-0-3`);
   `rung_overrides.json` now carries `drop` entries; trainer bounced onto it at **21,701,566** steps. Judge at
   +400k on wing endings and `exit_ground_dist_min` (131.8 m at the bounce), never on `gates_reached` — see the log.
-- In flight: branch **`speed-stages`** (currently level with `main`, nothing built yet) for the S-rank time
-  targets and the time-scaled completion bonus; guard T's mid-name-fork blind spot still unfixed campaign-wide;
-  and the memory work — another engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
+- In flight: **`speed-stages` is merged** (2026-09-18, after an adversarial review that fixed one blocker and
+  five majors — §9 of the spec, log entry 2026-09-18) and the driver runs it; no speed stage has been TRAINED
+  yet, so none of the speed mechanism is validated in game. Also: guard T's mid-name-fork blind spot still
+  unfixed campaign-wide; a **0-3 mid-level wall probe** still to run; and the memory work above — another
+  engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
   (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2** installed; **33 of 35**
   levels ship; Violent, with all weapons unlocked in memory for AI runs only.

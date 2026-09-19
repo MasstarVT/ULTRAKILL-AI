@@ -54,6 +54,46 @@ class RewardConfig:
     item_placed: float = 0.0  # per altar puzzle first solved in a level load
 
 
+# The speed stage's time-scaled completion bonus (docs/superpowers/specs/2026-09-18-speed-stages.md §2).
+# The ceiling stops a bogus near-zero official time paying unbounded reward; the FLOOR is the safety property
+# that matters -- a completion must never be worth less than staying in the level, whatever the clock says,
+# because the first campaign run spent 2.5M steps proving that a policy will refuse to terminate an episode
+# whose continuation pays better. At `level_complete: 100` the band is 25..200.
+SPEED_BONUS_MIN = 0.25
+SPEED_BONUS_MAX = 2.0
+
+
+def completion_bonus(cfg: "RewardConfig", target_seconds: float | None = None,
+                     official_seconds: float | None = None) -> float:
+    """What one level completion pays: the plain weight, or it scaled by the clock.
+
+    With either argument missing or non-positive this is `cfg.level_complete` and nothing else, so every run
+    that is not a speed stage -- and every completion inside one that has no official time (a frame that
+    arrived after the campaign block was gone) -- is unchanged.
+
+    THE FLOOR IS APPROACHED, NEVER REACHED (2026-09-18 review). A hard `max(target/official, 0.25)` clip is
+    flat wherever the policy is more than 4x its target, and that is exactly where every policy starts: over
+    the 68 fresh Level 0-1 completions in the live `spec_0-1` log the median is 481.9 s against a 90 s target,
+    so 58 of 68 (85%) sat precisely ON the clip -- a flat 75% pay cut with d(bonus)/d(time) == 0, which pays
+    less for the behaviour the policy already has and says nothing about how to improve it. Below the target
+    the scale is still `target/official` (the spec's own number, so the meaning at and under the target is
+    unchanged); above it the ratio is mapped into `(MIN, 1]` instead of being clipped into `[MIN, 1]`:
+
+        scale = MIN + (1 - MIN) * target/official
+
+    which is 1.0 at exactly the target, strictly decreasing for every slower completion, and strictly greater
+    than MIN at any finite time. The floor's safety property is therefore stronger than it was -- a completion
+    can never pay less than `MIN * level_complete` -- while a slower completion always pays strictly less than
+    a faster one. At `level_complete: 100` and a 90 s target: 482 s pays 39.0, 243 s pays 52.8, 150 s pays
+    70.0, 90 s pays 100.0. NOT VALIDATED IN GAME: no speed stage has been trained with this.
+    """
+    if not target_seconds or not official_seconds or target_seconds <= 0.0 or official_seconds <= 0.0:
+        return cfg.level_complete
+    ratio = target_seconds / official_seconds
+    scale = min(ratio, SPEED_BONUS_MAX) if ratio >= 1.0 else SPEED_BONUS_MIN + (1.0 - SPEED_BONUS_MIN) * ratio
+    return cfg.level_complete * scale
+
+
 @dataclass
 class CampaignStep:
     """What the level did this step, measured by the env (see campaign.py)."""
@@ -144,6 +184,8 @@ def compute_reward(
     died: bool | None = None,
     campaign: CampaignStep | None = None,
     buttons: Sequence[str] = (),
+    target_seconds: float | None = None,
+    official_seconds: float | None = None,
 ) -> RewardResult:
     r = RewardResult()
     ps, cs = prev.get("stats", {}), cur.get("stats", {})
@@ -151,7 +193,9 @@ def compute_reward(
         # Paid before the player check, on the rising edge. The frame that ends a level arrives while the scene
         # is unloading and often has no player, and returning early there would pay nothing for the one outcome
         # the campaign run is for. It reads only the stats, so it is safe this early.
-        r.add("level_complete", cfg.level_complete)
+        # `target_seconds`/`official_seconds` are a SPEED STAGE's two numbers and are None everywhere else, in
+        # which case `completion_bonus` is `cfg.level_complete` exactly.
+        r.add("level_complete", completion_bonus(cfg, target_seconds, official_seconds))
     if "punch" in buttons:
         # The punch button is an independent coin flip in the action space with no cost and, outside a parry, no
         # effect, so nothing ever taught the policy to stop pressing it and it flails constantly. A small charge

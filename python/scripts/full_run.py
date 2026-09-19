@@ -43,7 +43,8 @@ cap_blas_threads()  # before numpy: OpenBLAS reserves ~785 MB of commit for thre
 import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 
-from campaign_driver import load_plan, specialist_path, stage_config_path, stage_run_name  # noqa: E402
+from campaign_driver import (  # noqa: E402
+    COMPLETE, load_plan, specialist_path, stage_config_path, stage_run_name)
 from ultrakill_ai.campaign import ExplorationArchive, safe_name  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.times import TimeEntry, format_time, record_file  # noqa: E402
@@ -80,6 +81,20 @@ class LevelResult:
 def find_specialist(models_dir: Path, level: str) -> Path | None:
     path = specialist_path(models_dir, level)
     return path if path.exists() else None
+
+
+def specialist_mode(models_dir: Path, level: str) -> str:
+    """Which KIND of stage promoted this level's specialist: "complete" or "speed" (the sidecar's `mode`).
+
+    It decides which run's `env_config.yaml` and exploration archives the level is played with, because a
+    speed stage is a run of its own (`spec_0-1_speed`). A sidecar written before stage kinds existed, or none
+    at all, reads as "complete" -- which is what it was.
+    """
+    sidecar = specialist_path(models_dir, level).with_suffix(".json")
+    try:
+        return str(json.loads(sidecar.read_text(encoding="utf-8")).get("mode") or COMPLETE)
+    except (OSError, ValueError, AttributeError):
+        return COMPLETE
 
 
 def run_chain(levels: Iterable[str], models_dir: Path,
@@ -156,15 +171,20 @@ def post_results(times_md: Path, results: list[LevelResult], *, gen: str | None 
 # ---------------------------------------------------------------------------
 
 
-def eval_config(level: str, model: Path, plan, cwd: Path, *, port: int) -> EnvConfig:
+def eval_config(level: str, model: Path, plan, cwd: Path, *, port: int, mode: str = COMPLETE) -> EnvConfig:
     """The env one level is played with: the specialist's own training config, made eval-safe.
 
     Preference order, so a specialist is always played under the settings it was TRAINED under when they are
     still on disk: the stage's `env_config.yaml` (written by train.py), then the generated stage config, then
-    the plan's own template. Every one of them is then forced into eval shape the same way `eval.py` does it.
+    the plan's own template. `mode` is the sidecar's -- a specialist promoted by a speed stage was trained in
+    `spec_<level>_speed`, so that run's config is looked at first. Every one of them is then forced into eval
+    shape the same way `eval.py` does it; `speed_bonus` rides along harmlessly, since nothing here reads the
+    reward.
     """
-    sources = [cwd / "models" / stage_run_name(level) / "env_config.yaml",
-               cwd / stage_config_path(level)]
+    runs = [stage_run_name(level, mode)] + ([stage_run_name(level, COMPLETE)] if mode != COMPLETE else [])
+    sources = [cwd / "models" / run / "env_config.yaml" for run in runs]
+    sources += [cwd / stage_config_path(level, kind=kind)
+                for kind in ([mode, COMPLETE] if mode != COMPLETE else [COMPLETE])]
     data: dict | None = None
     for path in sources:
         if not path.exists():
@@ -186,10 +206,14 @@ def eval_config(level: str, model: Path, plan, cwd: Path, *, port: int) -> EnvCo
     return cfg
 
 
-def load_archive(env: UltrakillEnv, level: str, cwd: Path, port: int) -> int:
+def load_archive(env: UltrakillEnv, level: str, cwd: Path, port: int, mode: str = COMPLETE) -> int:
     """Gives the policy the visit counts it was trained with. Read-only: `explore_dir` is empty, so nothing
-    is ever written back."""
-    path = cwd / "models" / stage_run_name(level) / ("explore_%s_%d.npz" % (safe_name(level), port))
+    is ever written back. A speed-stage specialist reads its own run's archives, falling back to the complete
+    stage's when that run never saved one for this port."""
+    name = "explore_%s_%d.npz" % (safe_name(level), port)
+    runs = [stage_run_name(level, mode)] + ([stage_run_name(level, COMPLETE)] if mode != COMPLETE else [])
+    path = next((p for p in (cwd / "models" / run / name for run in runs) if p.exists()),
+                cwd / "models" / runs[0] / name)
     env.archive = ExplorationArchive.load(path, env.cfg.cell_size)
     return len(env.archive.counts)
 
@@ -250,13 +274,15 @@ def main() -> None:
         ap.error("not in the plan's order: %s" % ", ".join(unknown))
 
     def play(level: str, model_path: Path) -> LevelResult:
-        cfg = eval_config(level, model_path, plan, cwd, port=a.port)
+        mode = specialist_mode(Path(a.models_dir), level)
+        cfg = eval_config(level, model_path, plan, cwd, port=a.port, mode=mode)
         model = PPO.load(str(model_path), device="cpu")
         env = UltrakillEnv(cfg)
         attempts: list[LevelResult] = []
         try:
-            cells = load_archive(env, level, cwd, a.port)
-            print("%s: %s (%d exploration cells)" % (level, model_path.name, cells), flush=True)
+            cells = load_archive(env, level, cwd, a.port, mode)
+            print("%s: %s (%s stage, %d exploration cells)"
+                  % (level, model_path.name, mode, cells), flush=True)
             for _ in range(max(1, a.episodes)):
                 result = play_level(level, env, model, deterministic=not a.stochastic)
                 print("  %s time=%s kills=%d deaths=%d end=%s"

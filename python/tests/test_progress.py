@@ -132,6 +132,12 @@ class FakeCampaignEnv(gym.Env):
             "look_gate_frac": 0.3,
             "slide_forced_frac": 0.0,
             "start_checkpoint": None if self.fresh else "40,-2,414",
+            # A speed stage: the target, the raw S threshold it was scaled from, and what the completion edge
+            # paid. 0-1's real thresholds are [300, 240, 180, 120], so S is 120 s and the 0.75 scale (§8b)
+            # makes the target 90 s.
+            "target_seconds": 90.0,
+            "s_rank_seconds": 120.0,
+            "completion_bonus": 200.0 if completed else 0.0,
             "end_pos": [40.0, -0.5, 361.2 + self.steps],
             "reward_parts": {"time": -0.01, "novelty": 0.5, "gate": 15.0},
         }
@@ -306,8 +312,12 @@ def test_campaign_progress():
         assert len(fresh) > progress_mod.FRESH_WINDOW and fresh_times, "the fake run is too short"
 
         c = s["campaign"]
-        assert set(c) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time"}, \
-            "a single-level run's campaign block is exactly what it has always been"
+        assert set(c) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time",
+                          "target_seconds", "s_rank_seconds"}, \
+            "a single-level run's campaign block, plus the target and the S threshold behind it"
+        # The target is what the env computed live (0.75 x the level's own S-rank time), carried straight
+        # through: it is how campaign_driver learns the number at all -- the driver only ever reads files.
+        assert c["target_seconds"] == 90.0 and c["s_rank_seconds"] == 120.0
         assert c["fresh_window"] == progress_mod.FRESH_WINDOW
         assert 0.0 <= c["fresh_completion_rate"] <= 1.0
         assert abs(c["fresh_completion_rate"] - sum(ep["completed"] for ep in window) / len(window)) < 1e-9
@@ -732,7 +742,10 @@ def test_a_run_with_no_levels_writes_no_curriculum_file():
         cb._write(time.time())
         assert not (run / "curriculum.json").exists()
         s = read_json(run / "status.json")["campaign"]
-        assert set(s) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time"}
+        assert set(s) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time",
+                          "target_seconds", "s_rank_seconds"}
+        assert s["target_seconds"] is None and s["s_rank_seconds"] is None, \
+            "None until a speed stage's env reports them"
 
 
 def test_episodes_jsonl_carries_the_level_it_ran_on():
@@ -986,6 +999,9 @@ def test_every_campaign_info_key_survives_the_numeric_pipeline():
         "gates_reached": 4, "wedged_steps": 0, "level_started": True, "look_gate_frac": 0.31,
         "slide_forced_frac": 0.0, "targets_parked": 0, "exit_banished": 0, "route_source": 2,
         "ladder_collapsed": 1,
+        # The speed stage's three. They are None on every run that is not one, which is a missing VALUE, not a
+        # non-numeric type -- the same shape `level_seconds` has had all along.
+        "target_seconds": 22.5, "s_rank_seconds": 30.0, "completion_bonus": 200.0,
     }
     assert set(info) == set(CAMPAIGN_INFO_KEYS), "the representative info has to cover exactly the tuple"
     for key in CAMPAIGN_INFO_KEYS:

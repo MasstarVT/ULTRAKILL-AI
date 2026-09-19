@@ -138,6 +138,13 @@ class ProgressCallback(BaseCallback):
         self.best_gates_reached: float | None = None
         self.best_gate_hops: float | None = None
         self.best_time: float | None = None  # fastest fresh-start completion, official level seconds
+        # A speed stage's target: the level's own S-rank time scaled by `speed_target_scale`, as the env
+        # computed it live. The last non-None value wins (it is a constant per level), and it is how
+        # `campaign_driver` learns the target at all -- the driver only ever reads files, so the number has to
+        # travel through status.json to reach it. `s_rank_seconds` is the unscaled threshold, carried only so
+        # the promoted specialist's sidecar can record what the game itself calls S.
+        self.target_seconds: float | None = None
+        self.s_rank_seconds: float | None = None
         self.fresh_recent: deque[tuple[float, float | None]] = deque(maxlen=FRESH_WINDOW)  # (completed, level_seconds)
         self.campaign = False  # set once an episode reports fresh_start
         self.per_env: dict[int, dict] = {}
@@ -181,6 +188,8 @@ class ProgressCallback(BaseCallback):
         if isinstance(old.get("campaign"), dict):
             self.campaign = True
             self.best_time = _num(old["campaign"].get("best_time"))
+            self.target_seconds = _num(old["campaign"].get("target_seconds"))
+            self.s_rank_seconds = _num(old["campaign"].get("s_rank_seconds"))
             self._restore_levels(old["campaign"].get("levels"))
         self.previous_elapsed_s = _num(old.get("elapsed_s")) or 0.0
         self.ppo_metrics = {k: v for k, v in (old.get("ppo") or {}).items() if isinstance(v, (int, float))}
@@ -443,6 +452,11 @@ class ProgressCallback(BaseCallback):
             "route_source": field("route_source"),
             "wedged_steps": field("wedged_steps"),
             "level_started": field("level_started"),
+            # Speed stage: the level's target time and the raw S threshold behind it (both constants, None
+            # elsewhere) and what the completion edge paid this episode -- 0 on every episode that did not finish.
+            "target_seconds": field("target_seconds"),
+            "s_rank_seconds": field("s_rank_seconds"),
+            "completion_bonus": field("completion_bonus"),
             "look_free_frac": field("look_free_frac"),
             "look_enemy_frac": field("look_enemy_frac"),
             "look_gate_frac": field("look_gate_frac"),
@@ -462,6 +476,10 @@ class ProgressCallback(BaseCallback):
             self.best_wave = stats["wave"]
         if stats["checkpoints_level"] is not None and (self.best_checkpoints_level is None or stats["checkpoints_level"] > self.best_checkpoints_level):
             self.best_checkpoints_level = stats["checkpoints_level"]
+        if stats["target_seconds"] is not None:
+            self.target_seconds = stats["target_seconds"]
+        if stats["s_rank_seconds"] is not None:
+            self.s_rank_seconds = stats["s_rank_seconds"]
         if stats["fresh_start"] is not None:
             self.campaign = True
             if stats["fresh_start"]:
@@ -624,6 +642,11 @@ class ProgressCallback(BaseCallback):
             "fresh_completion_rate": sum(completed for completed, _ in self.fresh_recent) / n if n else None,
             "median_time_50": statistics.median(times) if times else None,
             "best_time": self.best_time,
+            # Additive, and None on every run that is not a speed stage: the target
+            # `campaign_driver.stage_verdict` compares `best_time` against before promoting, and the raw S-rank
+            # threshold it was scaled from.
+            "target_seconds": self.target_seconds,
+            "s_rank_seconds": self.s_rank_seconds,
         }
         if not self.order:
             return stats  # single level: byte-identical to what this block has always been

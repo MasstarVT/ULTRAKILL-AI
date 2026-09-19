@@ -138,6 +138,35 @@ def test_the_eval_config_prefers_the_specialists_own_training_settings():
             EnvConfig().max_steps
 
 
+def test_a_speed_stage_specialist_is_played_with_its_own_runs_settings():
+    """`mode` in the sidecar says which stage promoted the file, and a speed stage is a run of its own."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        models = cwd / "models"
+        specialist = models / "specialists" / "Level_0-1.zip"
+        specialist.parent.mkdir(parents=True)
+        specialist.write_bytes(b"weights")
+        assert full_run.specialist_mode(models, LEVEL) == "complete", "no sidecar reads as the old behaviour"
+        specialist.with_suffix(".json").write_text(json.dumps({"level": LEVEL, "status": "done"}),
+                                                   encoding="utf-8")
+        assert full_run.specialist_mode(models, LEVEL) == "complete", "a sidecar written before kinds existed"
+        specialist.with_suffix(".json").write_text(
+            json.dumps({"level": LEVEL, "mode": "speed", "target_seconds": 120.0}), encoding="utf-8")
+        assert full_run.specialist_mode(models, LEVEL) == "speed"
+
+        for run, steps in (("spec_0-1", 111), ("spec_0-1_speed", 222)):
+            d = models / run
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "env_config.yaml").write_text(
+                yaml.safe_dump(EnvConfig(mode="campaign", level=LEVEL, max_steps=steps).to_dict()),
+                encoding="utf-8")
+        assert full_run.eval_config(LEVEL, specialist, PLAN, cwd, port=47800, mode="speed").max_steps == 222
+        assert full_run.eval_config(LEVEL, specialist, PLAN, cwd, port=47800).max_steps == 111
+        # ... and a speed run that never wrote one falls back to the complete stage's, not to the defaults.
+        (models / "spec_0-1_speed" / "env_config.yaml").unlink()
+        assert full_run.eval_config(LEVEL, specialist, PLAN, cwd, port=47800, mode="speed").max_steps == 111
+
+
 # ---------------------------------------------------------------------------
 # Playing one level, against the fake bridge
 # ---------------------------------------------------------------------------
