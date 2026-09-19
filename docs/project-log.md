@@ -2013,8 +2013,10 @@ rows lead it) while `EXPECTED_SHIPPED` is sorted, so `--validate` had been print
 since that grouping was written — a permanently red gate is the same as no gate. It now compares the
 level sets, which have always agreed.
 
-**Live signal to judge this on, within 400k steps of the restart, on fresh episodes.** Baseline taken at
-**timesteps 23,683,450** (the bounce point), over the 264 fresh episodes above:
+**Live signal to judge this on, within 400k steps of the restart, on fresh episodes.** The trainer was
+bounced at **timesteps 23,731,594** — the step count the driver's own log records resuming from — so the
++400k check falls at about **24,130,000**. The baseline is the 264 fresh episodes above (all of them
+before the bounce):
 
 1. **Primary, ladder-independent — read this one, not `gates_reached`:** share of fresh episodes with
    `end_pos` y > 40 rises from **0.057** to >= 0.12, and y > 48 from **0.027** to >= 0.06.
@@ -2046,3 +2048,19 @@ says the blocker is climb 1. The measured candidate if it becomes the wall is tr
 files. (4) Nothing was run in game: no socket, no `games.py launch/stop`, no `supervise.py`, no mod build.
 (5) `route_Level_0-3.json`'s `start_room` still reads `3 - Side Arena - Floor 1`, a room the drop list
 removes — a diagnostic field nothing in `campaign.py` reads, but it is wrong.
+
+**The bounce, and the route confirmed live.** `runs/specialists/DRIVER_PAUSE` created, the trainer's two
+processes and its twelve `spawn_main` workers stopped individually by PID (never a game, never the driver,
+never `taskkill /T`), all twelve ports re-checked as listening so nothing needed `relaunch`, then the pause
+file removed. The driver restarted the trainer 20 s later from `latest.zip` at **23,731,594 steps** — the
+dying trainer's teardown wrote it, so against the 23,728,342 read just before the kill **no steps were
+lost**. No `route file ... is unreadable` line in any `env_478*.log`.
+
+The first ten post-bounce fresh episodes carry `gate_hops_best` 3 in nine of them with `gates_reached` 3,
+which is the marker that the SIX-rung file is what the envs loaded: under the four-rung ladder
+`_seed_start` absorbed hops 3 itself, so `gate_hops_best` 3 could only ever come with `gates_reached` 1.
+Under the new one it means the hallway (hops 4) and then `WP1` (hops 3) — the first waypoint on the climb,
+y 21.6. The tenth reached hops 1, Floor 2, and the ten end heights run to a maximum of y 47.9. Ten
+episodes is not evidence of improvement and is not offered as any; it is proof the file is live. Watch
+`targets_parked`, which is 5 of those 10 at >= 1 against a baseline of 42 of 264 — far too small a sample
+to read, and the first thing to re-measure at the +400k check.
