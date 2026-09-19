@@ -2369,3 +2369,122 @@ recovery or merely accompanying it â€” the lagged correlations in both prio
 FOLLOWS behaviour, so the ramp is most likely a response to the same dip, not the repair. No causal claim is
 made either way; the point is only that the proposed cap would bind there.
 
+## 2026-09-19 — Where Level 0-1 loses its time: a recorded time budget of the speed stage
+
+**What was done.** `scripts/probe_rollout.py` was extended (the official clock and `timer_running`,
+kills/style/restarts, hp/dead, the enemies on screen, arena/door state, and `beh` -- the per-decision diff of
+the env's own behaviour counters, which is the only way to read the APPLIED look mode and whether a shot was
+on target) and run for 20 episodes on a HAND-STARTED private game on port 47812, against a COPY of
+`models/spec_0-1_speed/ckpt_21751558_steps.zip` and the stage's own
+`configs/generated/spec_0-1_speed.yaml`: stochastic sampling, fresh starts, Violent, exploration counts read
+from `explore_Level_0-1_47800.npz` and never written back. No trainer port was ever connected to. Recordings:
+`python/runs/probe_0-1_speed/` (146 MB, 20 files plus `rollout_summary.json`).
+
+**What the 13th game cost the live run.** `mem_guard` was already recycling a game every 7-8 minutes before
+the probe started (03:57, 04:05, 04:13, 04:18, 04:25); during the probe the cadence was 4-6 minutes (04:32
+47804, 04:36 47802, 04:42 47810, 04:48 47801, 04:52 47808, 05:04 47800) -- about **two extra trainer
+recycles**, ~48 s of one worker each. At 04:57 the guard recycled the PRIVATE game, because `--ports 32`
+covers 47812 and it was the fattest; that truncated one probe episode as `bridge_reset` and the probe
+reconnected to the replacement by itself. Budget for both effects before adding a 13th game to this box.
+
+**The probe reproduces the live run.** 20 episodes, **9 completions (45%)**, median official time **343.3 s**
+against the live `status.json` median of 345.5 s (`mean_100.level_seconds` 377.3). Fresh completion rate came
+out lower than the live 0.64, on n=20. The ladder is 11 rungs, hops 9..0: `40,1,408` -> `40,1,470` ->
+`40,-9,490` -> `40,-9,552` -> `40,11,624` -> `66,21,640` -> `146,31,640` -> `192,31,594` -> `202,56,452` ->
+`202,56,432`, exit ground `[202, ~42, 354]`.
+
+**The headline: the path is twice as long, not twice as slow.** A median completion walks **13,362 m in
+343.3 s** (38.9 m/s of 3-D path); the 156.98 s best run walks **6,929 m** (44.1 m/s). Median horizontal speed
+16.2 m/s against 19.3; under 2 m/s for 20.4% of decisions against 11.5%. So **distance accounts for ~165 s of
+the ~186 s gap and movement speed for ~20 s**. Slide is pressed on 55% of decisions, jump 42%, dash 13% --
+the policy already chains movement tech, it chains it in the wrong direction.
+
+**The time budget, split by rung credited** (leg h = between crediting rung h and rung h-1; median / best of
+9 completions, official-clock seconds; `med_dec` is the median decision count, which is the clock-free
+comparison against the best run's own leg lengths):
+
+| leg | median s | best s | gap s | med_dec | best-run dec | what it is |
+|---|---|---|---|---|---|---|
+| 2 (`192,31,594` -> `202,56,452`) | **150.5** | 54.9 | **95.6** | 2272 | 426 | a 25 m climb in one shaft |
+| 3 (`146,31,640` -> `192,31,594`) | 51.4 | 31.1 | 20.3 | 806 | 608 | arena leg; 33 s is a forced fight |
+| 6 (`40,-9,552` -> `40,11,624`) | 37.3 | 18.0 | 19.3 | 562 | 171 | travel |
+| 9 (`40,1,408` -> `40,1,470`) | 42.9 | 27.2 | 15.7 | 677 | 567 | the first arena; 8 s is fight |
+| others (8,7,5,4,1,0,pre) | 61.2 | 35.5 | 25.7 | 952 | 1005 | leg 1 is FASTER than the best run's |
+| **total** | **343.3** | **166.7** | **176.6** | 5419 | 2777 | |
+
+The top three legs are **135 s of the 177 s**. Sum-of-leg-bests is 166.7 s, within 10 s of the run's lifetime
+best, so the whole gap is inside the policy's existing repertoire -- it is consistency, not capability.
+
+**Leg 2 is one failed climb, repeated.** 82% of its decisions are spent in 5 m cells the episode had already
+visited during that same leg, and only **5.0%** set a new closest approach to the target. Height oscillates
+between y~7 and y~100 (the rung is at y=56) with a median of **23 up-down cycles** against 8 in the fastest
+leg; once the policy reaches y~65 near x~205 it covers the last 92 m and credits the rung in ~14 s, every
+single time. Median horizontal distance to the target across the leg is 95 m; 2,983 m travelled for 142 m of
+net displacement. No arena is alive for any of it -- this is navigation, not combat.
+
+**Deaths, fights and stalls are NOT where the time goes.** A death costs a 39-80 m setback and a measured
+**1.5-8.3 s** re-run (median 4.5 s) at ~0.8 deaths per completion: **~4 s per median run**. Door-gated arena
+time is 67.5 s of 343.3 s and is irreducible. Hunting the last arena enemy ("arena alive, none on screen") is
+5.8 s. Grounded under 2 m/s is 19.4 s. Splitting the arena legs: leg 9 is 9 s before the first arena enemy,
+10 s of fight, then **23 s after the last one dies**; leg 3 is 33 s of fight then 14 s; leg 0 is 8 s then
+13 s -- so ~50 s of the run is spent in rooms that are already clear. Aim is poor and cheap: the policy fires
+on **74.1%** of decisions and is on target for **18.0%**.
+
+**Why the reward lets it happen.** Over the nine completions' leg 2 (1186 s of recording) the reward parts per
+second are `time` -0.300, `gate_approach` +0.162, `gate` +0.114, `checkpoint` +0.076, `kill` +0.043,
+`damage_dealt` +0.043, `novelty` +0.035, `punch` -0.030, `damage_taken` -0.015, `death` -0.004 -- **net
++0.123/s**. The one-off payments fall whenever the rung falls, so the MARGINAL rate of one extra second in
+the shaft is **-0.23/s**: 100 extra seconds cost 23 reward against a standard deviation of 21 across the
+completions' episode rewards. **The single largest time loss in the level is worth about one sigma.**
+
+**And the time-scaled completion bonus cannot reach it.** At `gamma: 0.998` the horizon is 500 decisions =
+33 game seconds. Leg 2 begins ~2700 decisions from the end, where the discount is 4.5e-3 (2.7e-5 at the
+spawn). Finishing 100 s sooner is worth +13.3 of bonus raw but **+0.06 discounted to the moment the time is
+actually lost**, against +9.50 for the per-decision `time` term over the same 1500 decisions -- **159:1**.
+The 2026-09-18 reviewer's undiscounted 13.8-vs-71.7 understates the imbalance by an order of magnitude. A
+TERMINAL bonus cannot shape a mid-episode dawdle at this gamma; only a per-decision term can, so
+`speed.target_scale` is not a lever.
+
+**Three recurring dead ends account for every non-completion** (11 of 20; one of those was the
+guard-induced `bridge_reset`): (a) **the level never starts** -- 4 episodes (rollout_0, 4, 14, 15, plus
+rollout_5 whose clock ran 5 s) ended in the opening room at z 402-429 with `timer_running` false, no enemy
+ever spawning and no door unlocking, burning 115-260 game seconds each; two of them parked on a ledge at
+**y=10.5, z~428**. In runs that work the clock starts at decision ~165 at `[37.7, -0.5, 407.6]`, on the
+floor. HYPOTHESIS, NOT VERIFIED IN GAME: entering the first hall along that ledge instead of across the floor
+skips the volume that starts the level. This is the same zero-kill wander the 2026-09-18 entry tracks
+(`kills == 0` in every one of them). (b) **the hops-8 -> hops-7 drop**: rollout_1 and rollout_11 ended at
+`[43, -1.2, 487]`, standing 8 m ABOVE the rung at `[40, -9, 490.5]`. (c) **the leg-2 shaft**: rollout_7, 17
+and 18 died there, one of them after 649 game seconds. The `novelty > 0` clause in `_campaign_progress`
+re-arms the stuck clock on any first-visit 4 m cell, which is why a shaft full of new cells never truncates.
+
+**Proposal (NOT implemented, NOT validated in game).** Raise the per-decision `time` weight for SPEED STAGES
+ONLY, **0.02 -> 0.05**. It is the only lever that is (i) per-decision, so it is visible where the time is
+lost; (ii) a pure cost, so it creates nothing to farm -- the most it can pay without finishing is 0, and a
+policy cannot choose to end an episode (a truncation bootstraps V(s), so triggering `stuck` gains nothing);
+(iii) strictly monotone in duration, so faster always beats slower, by 0.76 reward per game second instead of
+0.30. Finishing beats not finishing by MORE than today: on this probe a completion is gross +500 ex-time and
+the longest stall gross +333, so the gap widens from 260 to 398. The marginal cost of a second in the shaft
+moves -0.23 -> -0.70/s, taking 100 s of shaft from 1.1 to 3.3 standard deviations of episode reward. It does
+not bias climbing against running -- the term is uniform per second -- and the forced arena fights stay net
+positive (`arena_clear` 10 + `door_unlock` 15 against 33 s of fight). Ranked alternatives, both comparable in
+magnitude and both less safe: `gate` 15 -> 30 (the same ~+14 of "hurry" pressure, but it raises the value of
+collecting rungs WITHOUT finishing, which is the direction this project has been burned by), and `novelty`
+0.2 -> 0.0 (leg 2 only moves +0.123 -> +0.088/s; too small alone, though it is also what keeps the stuck
+clock re-arming in the shaft). `speed:` in `configs/specialists.yaml` has no `rewards:` override today, so
+this needs ~5 lines in `campaign_driver.stage_config` plus a plan value; `tests/test_specialists_config.py`
+pins `env.rewards` against `campaign_gates_full.yaml`, so the override must live under `speed:`, never in
+`env:`.
+
+**Live signal and revert trigger.** Within 50k steps `status.json.reward_parts_mean_100.time` must move from
+~-104 to ~-260 -- that is the check that the config took at all. Then `mean_100.level_seconds` and the
+driver's `median official time` (05:45.518 now; S is 02:30.000) at 400k and at 800k steps. Expect <= 320 s at
+400k and <= 290 s at 800k with `mean_100.completed` >= 0.5. **Revert to 0.02 if, at two consecutive checks at
+least 400k steps apart, `completed` < 0.45 or `level_seconds` is not below 345 s.** One change at a time.
+
+**Not verified.** No policy edit was made or trained; everything above is an offline read of a recording, and
+by this project's own rule that cannot settle a policy question. The level-start trigger geometry is a
+hypothesis from positions, not from the game's colliders. Per-leg medians are n=9 completions. The best run's
+2777 recorded decisions do not reconcile with its 156.98 s official clock at the probe's measured 0.0656 s
+per decision (the probe's own clock and decision count agree to 1.6%), so the best run's per-leg SECONDS are
+approximate; its per-leg DECISIONS (49 / 567 / 27 / 62 / 171 / 83 / 173 / 608 / 426 / 365, 246 tail) are
+exact. `speed.target_scale` and `gamma` were not tested.

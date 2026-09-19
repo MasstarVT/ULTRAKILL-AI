@@ -111,14 +111,71 @@ def gate_state(env: UltrakillEnv, pos, names: dict[str, str]) -> dict:
     return out
 
 
+def behaviour_delta(env: UltrakillEnv, prev: dict) -> tuple[dict, dict]:
+    """What `_note_behaviour` counted for THIS decision, by diffing the per-episode counters.
+
+    The env grades the look mode that actually drove the camera (modes 1 and 2 fall back to 0 when there is
+    nothing to aim at), and whether the shot was on target, and keeps only episode sums. The diff is the only
+    way to get either per step without duplicating the env's aim maths here.
+    """
+    cur = {k: float(v) for k, v in env._behaviour.items()}
+    out = {}
+    for k, v in cur.items():
+        d = v - prev.get(k, 0.0)
+        if d:
+            out[k] = round(d, 4)
+    return out, cur
+
+
+def world_state(raw: dict, pos) -> dict:
+    """The parts of the raw frame a time budget needs: the clock, the fight, the doors and the deaths."""
+    camp = raw.get("campaign") or {}
+    stats = raw.get("stats") or {}
+    enemies = raw.get("enemies") or []
+    visible = [e for e in enemies if e.get("visible")]
+    locked = [d for d in (camp.get("locked_doors") or ()) if isinstance(d, dict)]
+    out = {
+        "kills": stats.get("kills"),
+        "style": stats.get("style"),
+        "restarts": stats.get("restarts"),
+        "level_complete": stats.get("level_complete"),
+        "timer_running": camp.get("timer_running"),
+        "input_locked": camp.get("input_locked"),
+        "level_over": camp.get("level_over"),
+        "dead": p_dead(raw),
+        "anti_hp": (raw.get("player") or {}).get("anti_hp"),
+        "weapon_slot": (raw.get("player") or {}).get("weapon_slot"),
+        "n_enemies": len(enemies),
+        "n_visible": len(visible),
+        "nearest_dist": round(float(enemies[0]["dist"]), 2) if enemies else None,
+        "nearest_vis_dist": round(float(visible[0]["dist"]), 2) if visible else None,
+        "cleared_arenas": len(camp.get("cleared_arenas") or ()),
+        "unlocked_doors": len(camp.get("unlocked_doors") or ()),
+        "n_locked_doors": len(locked),
+    }
+    if locked and pos:
+        near = min(locked, key=lambda d: sum((d["pos"][k] - pos[k]) ** 2 for k in range(3))
+                   if d.get("pos") else float("inf"))
+        if near.get("pos"):
+            out["locked_door_dist"] = round(math.dist(near["pos"], pos), 2)
+            out["locked_door_id"] = near.get("id")
+    return out
+
+
+def p_dead(raw: dict):
+    return (raw.get("player") or {}).get("dead")
+
+
 def step_record(i: int, raw: dict, action, obs, reward: float, info: dict,
-                env: UltrakillEnv, names: dict[str, str]) -> dict:
+                env: UltrakillEnv, names: dict[str, str], beh: dict | None = None) -> dict:
     p = raw.get("player") or {}
     pos = p.get("pos")
+    vel = p.get("vel") or (0.0, 0.0, 0.0)
     a = np.asarray(action, dtype=np.int64).tolist()
     bi = 2 + len(BUTTONS)
     rec = {
         "i": i,
+        "hspeed": round(math.hypot(float(vel[0]), float(vel[2])), 2),
         "pos": [round(float(v), 2) for v in pos] if pos else None,
         "vel": [round(float(v), 2) for v in p.get("vel", ())] or None,
         "local_vel": [round(float(v), 2) for v in p.get("local_vel", ())] or None,
@@ -147,6 +204,9 @@ def step_record(i: int, raw: dict, action, obs, reward: float, info: dict,
         "reward": round(float(reward), 4),
         "reward_parts": {k: round(float(v), 4) for k, v in (info.get("reward_parts") or {}).items() if v},
     }
+    rec.update(world_state(raw, pos))
+    if beh:
+        rec["beh"] = beh
     rec.update(gate_state(env, pos, names))
     return rec
 
@@ -226,6 +286,7 @@ def main() -> None:
             path = out / f"{args.tag}_{ep}.jsonl"
             obs, _ = env.reset()
             state, i, total, t0 = {}, 0, 0.0, time.monotonic()
+            beh_prev = {k: float(v) for k, v in env._behaviour.items()}
             with path.open("w", encoding="utf-8") as fh:
                 fh.write(json.dumps({
                     "meta": True, "episode": ep, "level": env.level, "port": args.port,
@@ -240,7 +301,8 @@ def main() -> None:
                         action, _ = model.predict(obs, deterministic=args.deterministic)
                     obs, reward, terminated, truncated, info = env.step(action)
                     total += reward
-                    rec = step_record(i, env._raw, action, obs, reward, info, env, names)
+                    beh, beh_prev = behaviour_delta(env, beh_prev)
+                    rec = step_record(i, env._raw, action, obs, reward, info, env, names, beh)
                     if terminated or truncated:
                         rec["end_reason"] = info.get("end_reason")
                         rec["info"] = {k: info.get(k) for k in (
@@ -258,6 +320,8 @@ def main() -> None:
                    "end_reason": info.get("end_reason"), "hops": info.get("gate_hops_best"),
                    "parked": info.get("targets_parked"), "end_pos": info.get("end_pos"),
                    "completed": info.get("completed"), "seconds": round(time.monotonic() - t0, 1),
+                   "level_seconds": info.get("level_seconds"), "deaths": info.get("deaths"),
+                   "episode_seconds": info.get("episode_seconds"), "gates_reached": info.get("gates_reached"),
                    "file": str(path)}
             summary.append(row)
             print(json.dumps(row), flush=True)
