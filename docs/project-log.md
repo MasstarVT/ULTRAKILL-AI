@@ -2488,3 +2488,121 @@ hypothesis from positions, not from the game's colliders. Per-leg medians are n=
 per decision (the probe's own clock and decision count agree to 1.6%), so the best run's per-leg SECONDS are
 approximate; its per-leg DECISIONS (49 / 567 / 27 / 62 / 171 / 83 / 173 / 608 / 426 / 365, 246 tail) are
 exact. `speed.target_scale` and `gamma` were not tested.
+
+## 2026-09-19 -- 0-1 speed: the `time` weight refused, and why the shaft is a geometry problem
+
+**What was asked.** Land ONE reward change on the live `spec_0-1_speed` stage to make it faster: the
+per-decision `time` weight `0.02 -> 0.05` (conservative variant 0.04), speed stages only, off the recorded
+time budget in the entry above. **Nothing was changed.** No reward weight, config, plan, policy, process,
+port or game was touched. The trainer was NOT bounced. This is the second refusal on this run today (see the
+`ent_coef_max` entry above) and it has the same shape: the proposal is measured against a premise the run
+has already overtaken.
+
+**What reproduced.** Streaming all 20 recordings in `runs/probe_0-1_speed/` independently reproduces the
+time budget to the decimal. Per-leg medians over the 9 completions, bucketed by the recording's own
+`target_hops`: hops 1 (the `192,31,594 -> 202,56,452` shaft climb) **150.5 s median against a 54.9 s best,
+a 95.6 s gap** on 2272 median decisions against 831; hops 2 51.4/31.1; hops 5 37.3/18.0; hops 0 3.9/1.5.
+Shaft-leg reward rates per game second, pooled: `time` -0.3024, `gate_approach` +0.1628, `gate` +0.1147,
+`checkpoint` +0.0765, `kill` +0.0438, `damage_dealt` +0.0435, `novelty` +0.0349, `punch` -0.0305,
+`damage_taken` -0.0152, `death` -0.0042 -> **NET +0.124/s, MARGINAL (recurring only) -0.230/s**. The
+discounting finding also holds and is the best thing in the budget: at `gamma` 0.998 the horizon is 500
+decisions (~32 s), the shaft ends ~2700 decisions before the end, so a terminal bonus is discounted ~4.7e-3
+where the time is actually lost. **`speed.target_scale` is a dead lever** and should not be tried.
+
+**Correction 1 -- the run has not plateaued; it is at its best point of the stage.** The budget was written
+against a reading of "350-375 s for the last 1.5M steps". `metrics_log.csv` (697 rows) in 0.25M buckets:
++0.00M 499.9, +0.50M 349.2, +1.25M 312.3, +2.00M **428.6**, +2.50M 357.9, +3.00M 326.4, +3.50M 369.9,
++3.75M 342.7, **+4.00M 294.3, +4.25M 289.1**. That is not a plateau, it is a +/-50 s oscillation on a
+~0.5M-step scale, and the current point is the **lowest `median_time_50` the stage has ever recorded**.
+Live at 22,355,422 steps (+4.30M into a 9M cap): `median_time_50` **289.12**, `fresh_completion_rate`
+**0.82** against a 0.40 bar, `mean_100.completed` 0.71, `level_started` 0.96, `explained_variance` 0.941,
+`reward_parts_mean_100.time` -95.0. The only unmet promotion clause is the clock, and the clock is the thing
+that is moving.
+
+**Correction 2 -- the proposed evaluation plan could not have judged the change.** Its success bar
+("median `level_seconds` <= 320 s at 400k, <= 290 s at 800k") is **already met with no change**, and its
+revert trigger ("`level_seconds` not below 345 s") is already satisfied by the status quo by 30 s, so it
+could essentially never fire: a harmful change would have been kept. And the control is too noisy for the
+window. From `episodes.jsonl` (817 episodes, 443 fresh completions, mean 369.4 s, median 348.0, sd 111.7):
+completion throughput is **105 per 1M steps, so 400k steps = 42 completions = ONE 40-completion window**,
+and the sd of non-overlapping 40-completion medians across the stage is **36.5 s**, with a median
+absolute change of **44.4 s between ADJACENT windows with nothing changed**. A 25-55 s claimed effect read
+at 400k is indistinguishable from the run's own oscillation. Roughly 1.5-2M steps per arm would be needed.
+
+**Correction 3 -- two of the supporting numbers are wrong in the proposal's favour.** (a) The "1.1 -> 3.3
+sigma" headline divides the new cost by the OLD spread; raising `time` also inflates the spread of episode
+return, because episode length varies. Recomputed per episode with the time part rescaled: at 0.02 mean
++374.3 sd 27.7 (100 shaft seconds cost 23.0 = **0.83 sigma**), at 0.04 mean +263.3 sd 44.0 (**1.24 sigma**),
+at 0.05 mean +207.8 sd 52.7 (**1.33 sigma**). The real gain is 1.6x, not 3x -- and 0.04 buys 1.24 of the
+1.33 for half the return shift. (b) "Finishing beats not finishing by MORE, the gap widens 260 -> 398" is
+backwards: it compares the best completion against the worst stall. Worst completion against best
+non-completion gives **+117.0 at 0.02, +102.6 at 0.04, +95.4 at 0.05** -- the margin **narrows by 18%**,
+because a slow completion is charged more than a short stall. The invariant still holds at every weight
+(finishing still strictly beats not finishing, faster still strictly beats slower, the 25..200 band is
+untouched), but it holds by less, not more.
+
+**Correction 4, and the reason not to retry this lever later -- the shaft is a DIRECTION problem, and a
+uniform cost has no direction.** Inside the shaft leg, the running-best 3-D distance to the rung by decile
+(median over the 9 completions) is 103.6, 83.8, 83.6, 83.2, 82.8, 82.8, 82.8, 82.8, 82.3, 29.7 m, while
+median player `y` runs 33.5, 34.2, 35.0, 36.4, 38.0, 38.3, 36.6, 50.1, 56.6, 57.2 against a rung at y=56.
+So over deciles 2-9 -- 80% of the leg, ~125 s of the 150 s median -- **best-ever distance improves by 1.5 m
+in total** while the agent mills at the bottom of a shaft whose rung is 20 m above it. `gate_approach` paid
+by quintile: Q1 +91.3 (47.7%), **Q2 +0.6 (0.3%), Q3 +6.9 (3.6%), Q4 +12.1 (6.3%)**, Q5 +80.7 (42.1%). The
+directional signal in the stretch that holds the loss is **+0.002/s against a -0.30/s uniform cost**. The
+geometry is why: the rung is 142 m away in z and only 25 m up, so climbing the entire shaft at constant x,z
+buys 151.5 -> 142.6 m = 8.9 m of "closeness" = 1.34 reward at 0.15/m. `gate_approach` is a bounded potential
+that is flat over exactly the move the policy cannot make. Raising a uniform per-decision cost makes the
+direction-to-cost ratio inside the shaft **2.5x worse**, not better. `rewards.py` lines 200-204 already say
+this in the project's own words, about `punch`: a per-press charge is "a gradient it can actually act on,
+unlike a flat per-step cost, which the value baseline absorbs."
+
+**The change would also not have loaded or taken effect as specified.** Three facts, all verified by
+reading: (1) `campaign_driver.load_plan` validates the `speed:` block's keys against `StageRule`'s fields
+after popping only `targets` and `target_scale`, so a `speed.rewards` block **raises and takes the driver
+down**; it needs a pop, a `Plan` field and a merge in `stage_config`, three sites. (2) `write_stage_config`
+is called from exactly one place, `start_stage` (line 952), so editing `specialists.yaml` changes nothing
+until a stage or round begins -- applying it to the live stage means hand-editing the "GENERATED ... do not
+edit" `configs/generated/spec_0-1_speed.yaml` AND bouncing the trainer, which per CLAUDE.md costs up to 50k
+steps. (3) `tests/test_specialists_config.py:145` (`test_a_speed_stage_only_adds_the_bonus_switch_to_the_env`)
+pins `changed == {"fresh_start_prob"}` and `cfg.rewards == EnvConfig.from_dict(complete).rewards`, and
+`stage_config`'s own docstring states the invariant: "A SPEED stage is the same config with `speed_bonus` on
+-- no reward weight moves". Landing any reward change on speed stages means deliberately retiring that
+invariant, which is a design decision and not a test fix.
+
+**Alternative rejected outright: `gate` 15 -> 30.** `gate` already pays **150.0 per 0-1 completion against a
+`level_complete` of ~57.9** -- the ladder pays 2.6x what finishing pays, and doubling it makes that 5.2x.
+This project has already been burned by exactly this and the evidence is committed: `routes/rung_overrides.json`,
+entry "3 - Side Arena - Floor 1", records 115 of 238 fresh 0-3 episodes (48%) walking a wing for 7 x 15.0 =
+105 reward, MORE than the 100.0 a completion paid, with zero fresh completions; seven rungs were dropped to
+stop it. Raising `gate` raises the value of collecting rungs WITHOUT finishing. Do not.
+
+**What to do instead.** (1) **Change nothing while the clock is falling.** Re-read `status.json` at +5.0M
+and +5.5M. If `median_time_50` is still descending, let the stage run to its cap -- it may promote on its
+own; it needs 150 s and it has come 500 -> 289 unaided. (2) **Only if `median_time_50` flattens above ~250 s
+for 1.5M steps** is a reward change worth its cost, and then it is `time: 0.02 -> 0.04` (not 0.05), on
+branch `speed-stages`, with the three code sites and the retired test above, judged against a baseline
+measured immediately before the edit and read at **+1.7M steps, not 400k**. The guard must be
+`mean_100.level_started` (0.96 now; revert below 0.85 sustained over 250k steps) because the zero-kill
+wander is this run's established failure signature and it leads `completed`; secondary guard
+`mean_100.completed < 0.55`, not 0.45. (3) **The mechanism fix is not a reward weight.** The measured defect
+is that `gate_approach` is flat across the shaft, so the fix is an intermediate waypoint up the shaft --
+`rung_overrides.json`'s `insert_after`, which exists for precisely this ("a leg a room trunk cannot express
+... gets waypoints on the real path"). It does not apply yet: `routes/` has 14 trunks and **no
+`route_Level_0-1.json`**, 0-1 runs off the door-graph gate ladder, and `prefer_route_when_collapsed` only
+fires on a detected-collapsed ladder. A rung also adds +15 of `gate` income to an already 2.6:1 imbalance,
+so it needs the `gate`-vs-completion balance looked at in the same spec. That is spec-sized work, and it is
+the only proposal on the table that targets the measured cause. The time budget ranked it 7th on the grounds
+that it "does not touch the median completion time"; its own data contradicts that -- the shaft leg is 54%
+of the median gap.
+
+**Not verified.** No game was started, no socket opened, no test run, no A/B performed; this is file reading
+and arithmetic over the same 20 recordings, and by this project's own rule that cannot settle a policy
+question -- which is the argument for leaving the live run alone, not for acting on it. n=9 completions
+underlies every per-leg median, the same sample as the budget's. The budget's "leg 9" (42.9 s) does not
+match the `target_hops == 8` bucket (34.4 s median); its other legs match to 0.1 s and the discrepancy is
+unexplained and small. I did not re-derive the per-episode distance figures (my shaft-leg path length
+disagrees with the budget's, 5,294 m against 2,983 m, while the whole-episode 13,362 m matches exactly, so
+the disagreement is in the leg split; it changes no conclusion). The "level never starts" and "hops-8 drop"
+geometry remain hypotheses from positions -- no collider was inspected. Whether arena enemies re-spawn after
+a checkpoint respawn (which would let `kill`/`damage_dealt` be re-collected in a stall) was not checked.
+System commit was 73% throughout; only short streaming read-only Python processes were run.

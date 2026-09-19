@@ -166,10 +166,12 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   `rung_overrides.json` now carries `drop` entries; trainer bounced onto it at **21,701,566** steps. Judge at
   +400k on wing endings and `exit_ground_dist_min` (131.8 m at the bounce), never on `gates_reached` — see the log.
 - **Live: stage 4, `Level 0-1` (SPEED), run `spec_0-1_speed`**, resumed from `Level_0-1.zip` at 18.05M, target
-  median 150.00 s. It dipped hard (rate 0.68 -> 0.28, zero-kill wanders 0.05 -> 0.46) and then **recovered on
-  its own** to rate 0.58 / median 390 s by 20.60M; best **156.98 s**, a project record for 0-1. A proposed
-  `ent_coef_max` cap and a rollback were both **refused** on the data — numbers, live signal and the revert
-  trigger are in `docs/project-log.md`, 2026-09-19. Also: guard T's mid-name-fork blind spot still
+  median 150.00 s. It dipped hard (rate 0.68 -> 0.28, zero-kill wanders 0.05 -> 0.46), **recovered on its
+  own**, and at **22.36M** stands at the stage's best yet: rate **0.82**, `median_time_50` **289.1 s** (from
+  500), best **156.98 s**. The clock is still falling unaided, so an `ent_coef_max` cap, a rollback AND a
+  `time` 0.02->0.05 raise were all **refused** on the data — a recorded per-leg time budget (54% of the gap is
+  one 25 m shaft climb where `gate_approach` is flat), the corrected numbers and the revert triggers are in
+  `docs/project-log.md`, 2026-09-19. Also: guard T's mid-name-fork blind spot still
   unfixed campaign-wide; a **0-3 mid-level wall probe** still to run; and the memory work above — another
   engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
