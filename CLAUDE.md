@@ -66,7 +66,8 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - **The live trainer is the specialist driver** (`scripts/campaign_driver.py`): start it detached through
   `runs/start_driver.cmd`, which carries **no flags** — `driver_state.json` decides the stage, and `--start-at`
   is refused once a stage has run. `--dry-run` decides and exits. Pause: `New-Item runs\specialists\DRIVER_PAUSE`.
-- Watch it: `python scripts/specialists_status.py` (read-only), and per stage
+- Watch it: `python scripts/check_run.py` (one cheap health reading with an ALERTS line; exit 1 = look),
+  `python scripts/specialists_status.py` (read-only), and per stage
   `python scripts/dashboard.py --run spec_0-3 --monitor 1`.
 - Memory guard, required beside the driver:
   `python scripts/mem_guard.py --run spec_0-3 --game-limit-gb 2.5 --commit-limit-frac 0.93`.
