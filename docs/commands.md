@@ -251,6 +251,13 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
     (`-aibridge-port N -screen-fullscreen 0 -screen-width 368 -screen-height 207 -job-worker-count 3`,
     `SteamAppId`/`SteamGameId` 1229490, detached + below-normal, cwd the game folder), note its PID, and at the
     end `taskkill /PID <pid> /F` that PID alone. Verify before and after with `games.py status` (netstat-based).
+- Record a policy playing, one JSON line per decision (**a PRIVATE port only -- never 47800-47811**):
+  `python scripts/probe_rollout.py --model <ckpt.zip> --config configs/generated/spec_0-3.yaml --port 47812
+  --episodes 10 --out runs/probe_0-3`. It writes `pos`, `vel`, `grounded`, `ground_ray_center`, the action, the
+  reward parts and the whole target/ladder state per step, which is how the 0-3 climb was diagnosed in game
+  (`docs/project-log.md`, 2026-09-18). `--deterministic` is argmax instead of sampling and `--scripted` drives
+  by hand instead of by policy (the geometry probe). `--model` must be a **COPY** of a checkpoint, never the
+  trainer's own file. Start the game by hand per the bullet above; the probe process peaks at ~330 MB.
 - Campaign eval (one game on port 47800, e.g. `python scripts/games.py launch --count 1 --monitor 1`):
   `python scripts/eval.py models/campaign_gates/best.zip --level "Level 0-1" --episodes 10`. Fresh level loads,
   deterministic actions, real deaths; prints completed, official time, rank, kills, style, restarts and deaths per

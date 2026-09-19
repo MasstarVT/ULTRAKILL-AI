@@ -2234,6 +2234,125 @@ def test_a_block_less_frame_cannot_drop_a_gates_level_onto_its_trunk():
 
 
 # ---------------------------------------------------------------------------
+# ... and parking is OFF on exactly that load (2026-09-18)
+# ---------------------------------------------------------------------------
+
+# `ultrakill_ai/routes/route_Level_0-3.json` as it ships, rung for rung: the trunk the live run walks.
+L03_TRUNK_SHIPPED = [
+    {"key": "0,-10,300", "pos": [0.0, -10.0, 300.0], "hops": 5, "name": "1 - Main Room - Floor 1",
+     "gated_by": [], "open": False, "locked": False, "active": True},
+    {"key": "0,10,340", "pos": [0.0, 10.0, 340.0], "hops": 4, "name": "2 - Side Hallway - Floor 1",
+     "gated_by": [], "open": False, "locked": False, "active": True},
+    {"key": "-11,22,327", "pos": [-10.7, 21.6, 327.2], "hops": 3, "name": "WP1 - Main Room Stack Foot",
+     "gated_by": [], "open": False, "locked": False, "active": True, "waypoint": True},
+    {"key": "5,37,329", "pos": [5.3, 36.7, 328.9], "hops": 2, "name": "WP2 - Main Room Stack Top",
+     "gated_by": [], "open": False, "locked": False, "active": True, "waypoint": True},
+    {"key": "-7,48,315", "pos": [-7.1, 48.5, 315.2], "hops": 1, "name": "10 - Main Room - Floor 2",
+     "gated_by": [], "open": False, "locked": False, "active": True},
+    {"key": "-82,90,315", "pos": [-82.0, 90.0, 315.0], "hops": 0,
+     "name": "10B - Second Encounter + 11 - Boss Arena - Floor 2",
+     "gated_by": [], "open": False, "locked": False, "active": True},
+]
+# Recorded live on port 47812, `runs/probe_0-3/rollout_6.jsonl` decision 867: the agent is STANDING on 0-3's
+# Floor 2 here, the one time in 13 rollouts it ever got there. Reproduced as a literal because runs/ is
+# gitignored. The recording's own numbers at that decision: target_dist3 36.64, target_dy -27.31.
+R6_FLOOR2_STAND = (-6.8, 48.9, 303.1)
+
+
+def _l03_route():
+    """The loaded document for 0-3, `exit_pos` null exactly as the shipped file has it."""
+    return {"level": "Level 0-3", "exit_pos": None, "rungs": [dict(r) for r in L03_TRUNK_SHIPPED]}
+
+
+def _l03_live_tracker(**kw):
+    """0-3 exactly as the live stage runs it: collapsed gate ladder, shipped trunk, flag on."""
+    p = GateProgress(patience_steps=PATIENCE, route=_l03_route(),
+                     prefer_route_when_collapsed=True, patience_mode="collapsed", **kw)
+    p.new_level_load(gates_block(L03_GATES, exit_pos=None), L03_SPAWN)
+    return p
+
+
+def test_parking_is_off_on_a_load_the_collapse_verdict_handed_its_trunk():
+    """The switch itself. `patience_mode: collapsed` and `prefer_route_when_collapsed` read the SAME verdict.
+
+    One turns parking on because the gate ladder collapsed; the other then walks the room trunk instead. On the
+    trunk the fallback has nothing useful to find -- `_note_reached`'s docstring has said parking is "nearly
+    INERT" and "can only mislead" there since the trunk shipped -- so the two must not both fire, and this is
+    the only configuration where the answer changes.
+    """
+    camp = gates_block(L03_GATES, exit_pos=None)
+    route = _l03_route()
+    on_the_trunk = _l03_live_tracker()
+    assert on_the_trunk._prefers_route() is True and on_the_trunk.route_source == ROUTE_SOURCE_ROOMS
+    assert on_the_trunk.patience_active is False, "the trunk load: parking off"
+
+    # The three neighbouring configurations are untouched, which is what keeps this narrow.
+    gates_and_patience = GateProgress(patience_steps=PATIENCE, route=route, patience_mode="collapsed")
+    gates_and_patience.new_level_load(camp, L03_SPAWN)
+    assert gates_and_patience._prefers_route() is False
+    assert gates_and_patience.patience_active is True, "collapsed ladder, flag off: still gates plus patience"
+
+    no_trunk = GateProgress(patience_steps=PATIENCE, patience_mode="collapsed",
+                            prefer_route_when_collapsed=True)
+    no_trunk.new_level_load(camp, L03_SPAWN)
+    assert no_trunk.patience_active is True, "collapsed with no trunk (1-1, 1-2, 2-3, 8-1): untouched"
+
+    healthy = GateProgress(patience_steps=PATIENCE, route=route, patience_mode="collapsed",
+                           prefer_route_when_collapsed=True)
+    healthy.new_level_load(gates_block(L01_GATES, exit_pos=None), L01_SPAWN)
+    assert healthy.patience_active is False, "0-1 was already off, and for its own reason"
+
+
+def test_a_park_can_no_longer_aim_0_3_off_its_own_floor_2_and_back_down():
+    """The measured harm, as behaviour: `runs/probe_0-3/rollout_6.jsonl` decision 867.
+
+    The agent had climbed to Floor 2 -- once in 13 recorded rollouts -- with WP1 still uncredited behind it.
+    The boss rung 78 m away could not be approached, so patience PARKED it, and `_pick`'s fallback ("the
+    nearest active gate that is neither reached nor parked", with no hop constraint) handed back WP1: 36.6 m
+    away and 27.3 m BELOW, off the climb entirely. The agent went down and the level reloaded. Worse, the
+    descent was PAID: 31 decisions across the 13 rollouts collected `gate_approach` while losing height under a
+    fallback target, +3.87 in total.
+    """
+    p = _l03_live_tracker()
+    camp = gates_block(L03_GATES, exit_pos=None)
+    p.update(camp, L03_SPAWN, ground=(True, 0.4))
+    assert p.best_hops == 5, "`_seed_start` absorbs the Floor 1 rung at the spawn"
+    # The route rollout_6 actually took: hallway, then WP2 and Floor 2, with WP1 SKIPPED (hops 3 unreached).
+    for pos in ((0.0, 10.0, 340.0), (5.3, 36.7, 328.9), (-7.1, 48.5, 315.2)):
+        p.update(camp, pos, ground=(True, 0.4))
+    assert p.best_hops == 1 and "-11,22,327" not in p.reached, "on Floor 2, WP1 still behind and uncredited"
+    assert p.target["key"] == "-82,90,315", "the ladder points at the boss rung, the only hops 0"
+
+    for _ in range(p.patience_steps + 2):  # stand still on Floor 2: the boss rung never gets closer
+        p.update(camp, R6_FLOOR2_STAND, ground=(True, 0.4))
+
+    assert p.parked == set(), "nothing parks on a trunk load any more"
+    assert p.target["key"] == "-82,90,315", "so the target stays on the rung above, not the one 27 m below"
+    assert p.target["key"] != "-11,22,327", "WP1 is 36.6 m away and 27.3 m DOWN from here (recorded)"
+    assert p.parks == 0, "and `targets_parked` reports 0 for the episode"
+
+
+def test_a_route_fallback_trunk_still_parks_because_nothing_else_can_rescue_a_bad_rung():
+    """The narrowing, pinned from the other side: only the COLLAPSE-VERDICT trunk changes.
+
+    The 12 levels whose gate ladder is unusable reach their trunk through the route fallback, not through
+    `_prefers_route`, and there a parked rung is the only rescue a wrong rung has. `patience_mode: always`
+    because a trunk is a total order and the detector calls it healthy -- the same structural fact
+    `test_a_route_rung_goes_through_the_same_patience_and_parking_machinery` rests on.
+    """
+    route = trunk(TRUNK, exit_pos=(0.0, 0.0, 200.0))
+    p = GateProgress(patience_steps=PATIENCE, route=route, patience_mode="always",
+                     prefer_route_when_collapsed=True)
+    # The spawn is at the TRUNK'S TOP, which is what makes the detector call a total order healthy and is the
+    # real geometry of all twelve fallback levels: rung `hops` 9 is the first thing a route file lists.
+    p.new_level_load({"gates_ordered": True, "gates": []}, (50.0, 0.0, 0.0))
+    p.update({"gates_ordered": True, "gates": []}, (50.0, 0.0, 0.0), ground=(True, 0.4))
+    assert p.ladder_collapsed is False, "a trunk walked from its own top is a healthy ladder"
+    assert p._prefers_route() is False, "no gate ladder at all: the fallback, not the collapse verdict"
+    assert p.patience_active is True, "so the mechanism is exactly as it was"
+
+
+# ---------------------------------------------------------------------------
 # ExitGuard: the banished FinalPit
 # ---------------------------------------------------------------------------
 
