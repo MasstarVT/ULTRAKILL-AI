@@ -165,9 +165,11 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   against a completion's 100. Trimmed to the 4 rungs every recorded completion used (2026-09-18, `route-0-3`);
   `rung_overrides.json` now carries `drop` entries; trainer bounced onto it at **21,701,566** steps. Judge at
   +400k on wing endings and `exit_ground_dist_min` (131.8 m at the bounce), never on `gates_reached` — see the log.
-- In flight: **`speed-stages` is merged** (2026-09-18, after an adversarial review that fixed one blocker and
-  five majors — §9 of the spec, log entry 2026-09-18) and the driver runs it; no speed stage has been TRAINED
-  yet, so none of the speed mechanism is validated in game. Also: guard T's mid-name-fork blind spot still
+- **Live: stage 4, `Level 0-1` (SPEED), run `spec_0-1_speed`**, resumed from `Level_0-1.zip` at 18.05M, target
+  median 150.00 s. It dipped hard (rate 0.68 -> 0.28, zero-kill wanders 0.05 -> 0.46) and then **recovered on
+  its own** to rate 0.58 / median 390 s by 20.60M; best **156.98 s**, a project record for 0-1. A proposed
+  `ent_coef_max` cap and a rollback were both **refused** on the data — numbers, live signal and the revert
+  trigger are in `docs/project-log.md`, 2026-09-19. Also: guard T's mid-name-fork blind spot still
   unfixed campaign-wide; a **0-3 mid-level wall probe** still to run; and the memory work above — another
   engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**

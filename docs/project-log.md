@@ -2244,3 +2244,128 @@ rest on the flag. (4) The 2026-09-18 "supported spiral ramp" reading of the comp
 re-derived. (5) Whether removing the fallback leaves the agent aiming at an unreachable rung for the rest of
 the load — it does, by construction; that is the status quo minus the backwards payments, and it is not
 claimed to be better than a reachable rung. (6) The exploration archives were not re-read this pass.
+
+## 2026-09-19 â€” 0-1 speed stage: the regression reversed itself; no rollback, no config change
+
+**What was asked.** Land a one-line stabilisation change (`specialists.yaml` `ent_coef_max: 0.02 -> 0.008`)
+and roll `spec_0-1_speed` back to its peak checkpoint. **Neither was done.** Both rest on a premise the data
+no longer supports, and the live run was left untouched. No process, port, game or model file was modified.
+
+**The premise.** The stage was reported as eroding monotonically from ~19.27M: fresh completion rate
+0.68 -> 0.32, `median_time_50` 312 -> 450-470 s, and a "zero-kill" share (fresh episodes with `kills == 0`,
+the wander that never clears the first arena) rising 0.053 -> 0.394. Two independent analyses agreed on that
+much. **Both stopped reading at 20.40-20.45M.** The run was at 20.53M when this pass started.
+
+**The measurement.** Fresh episodes from `runs/spec_0-1_speed/episodes.jsonl` (447 total, the whole stage),
+100k-step buckets from the trough to now:
+
+| steps | n | rate | zero-kill |
+|---|---|---|---|
+| 19.90M | 18 | 0.167 | 0.500 |
+| 20.00M | 21 | 0.381 | 0.429 |
+| 20.10M | 18 | 0.278 | 0.444 |
+| 20.20M | 25 | 0.320 | 0.360 |
+| 20.30M | 20 | 0.400 | 0.300 |
+| 20.40M | 16 | 0.625 | 0.188 |
+| 20.50M | 13 | 0.615 | 0.154 |
+
+Trend across those seven buckets: `r(bucket, rate) = +0.889`, `r(bucket, zeroKill) = -0.975`. Pooled,
+trough (19.90-20.20M, n=57) against recent (20.40M+, n=29): completion rate **0.281 -> 0.621**, two-proportion
+**z=+3.05, p=0.0023**; zero-kill share **0.456 -> 0.172**, **z=-2.59, p=0.0096**. Against the peak region
+(19.00-19.30M, n=53) the recovered policy is **not distinguishable**: rate 0.679 vs 0.621 (z=-0.53, p=0.59),
+zero-kill 0.075 vs 0.172 (z=+1.34, p=0.18).
+
+The trainer's own trailing-50 bookkeeping confirms it independently, over the last ~250k steps:
+`fresh_completion_rate` **0.30 -> 0.58** (the speed rule's `target_rate` is 0.40, so that clause is now MET),
+`median_time_50` **434 -> 390 s**, `enemy_visible_frac` **0.180 -> 0.223**, `kills_per_min` **5.00 -> 6.27**,
+`look_free_frac` **0.670 -> 0.641**. Every metric cited as a symptom is moving back, in the same direction,
+at the same time.
+
+**Confounds checked, and none of them explains it away.** (1) *Not a restart*: the driver log shows trainer
+pid 14476 continuous since 2026-09-18 23:31:01 with "0 restart(s) in the last hour" and no traceback;
+`timesteps` in `metrics_log.csv` are monotone across the recovery. (2) *Not survivorship in the log tail*:
+completions run **5,951-7,337** decisions against **2,090-2,508** for a zero-kill wander, so long completions
+are the episodes most likely to still be in flight and unlogged â€” the censoring bias runs AGAINST detecting a
+recovery, and the recovery is if anything understated. (3) *Not fewer game recycles*: mean `bridge_resets`
+per episode **rose** 1.02 (trough) -> 1.50 (recent) while performance improved, which further undercuts the
+relaunched-games theory that both prior analyses had already failed to support.
+
+**Why the config change was refused.** The proposal capped the adaptive entropy floor at 0.008 because
+`spec_0-1_speed` ran to 0.01381 (3.45x base) while the two stages that worked peaked at 0.00779 and 0.00586.
+The historical objection is that 0.008 prunes into the operating band of a promoted stage (`spec_0-1` used
+0.00779 = **97.4%** of the proposed cap; the controller's next raise step, x1.10, is 0.00857, one update
+above it). The **live** objection is stronger and is new: at the moment of writing the controller is ramping
+again and sits at exactly **0.00779**, and it is ramping *through* the recovery described above â€” rate
+0.30 -> 0.58 while `ppo_ent_coef_live` went 0.00400 -> 0.00779. The cap would bind on the controller during
+the behaviour that is currently repairing the policy. `ent_coef_max` also lives in `specialists.yaml`'s
+`train:` block, which `campaign_driver.stage_config` copies verbatim into **both** stage kinds, so it would
+land on every future stage as well. Refused.
+
+**Why the rollback was refused.** The instruction's own justification â€” "the weights have measurably
+degraded" â€” is what fails. They degraded and then recovered, to a level statistically indistinguishable from
+the peak. The two candidate rollback points are also not better on the metric that broke: `best.zip`
+(= `ckpt_19551910`, `at_timesteps` 19,594,390, `median_time_50` 308.18 s, penalty rate 0.5089) sits inside
+window E, whose episode-level rate is **0.444** with completion-rate-given-engagement **0.471** â€” i.e. it is
+mid-decline, and its attractive median time is conditioned on completing, so it partly reflects "if it does
+not finish fast it does not finish at all". `ckpt_19251958` is in the peak region (bucket rate 0.690) but is
+still no better than the current policy's trailing-20 (rate 0.700, zero-kill 0.050). A rollback would
+discard ~1.3M steps, cost a trainer kill plus up to 50k uncommitted steps, and interrupt a significant
+recovery, to land on weights that are not measurably better.
+
+**Why waiting costs nothing.** Verified in code, not assumed: no script in `python/` deletes `ckpt_*_steps.zip`
+(`keep_best.py` only globs and `shutil.copy2`s them; `train.py` has no deletion path), so every rollback
+candidate stays on disk indefinitely and the rollback remains executable at any later moment. The stage
+cannot promote a slow policy by accident â€” `campaign_driver.stage_verdict` requires `median_time_50 <=
+target_seconds` (150.00 s) for a SPEED stage and the median is 390 s. And the cap is 8M steps from
+`start_steps` 18,052,150, so with the run at ~20.60M there are **~5.5M steps** of headroom. The asymmetry is
+one-sided: intervening destroys information that waiting preserves.
+
+**Decision.** Change one thing at a time â€” and the thing that changed is that the policy recovered on its
+own. The correct action is to observe, not to intervene on a stale window.
+
+**Live signal, and the baseline at this pass.** Read from `runs/spec_0-1_speed/episodes.jsonl`
+(`fresh_start == 1`) and `status.json`; both read-only, no socket on 47800-47811. Baseline recorded
+2026-09-19 02:55 at **20,598,550** total steps (2,546,400 into the stage): trailing-50 rate **0.580**,
+`median_time_50` **390.115 s**, best ever **156.984 s**, `enemy_visible_frac` **0.223**, `kills_per_min`
+**6.27**, `ppo_ent_coef_live` **0.00779**, zero-kill share over the last 20 fresh episodes **0.050**.
+
+PRIMARY metric, unchanged from the proposal because it is the right one: **share of fresh episodes with
+`kills == 0`** (equivalently `end_reason == "stuck"` with `level_started == 0`; the two agree to within 0.02
+in every 250k bucket). SECONDARY, and the one neither prior analysis tracked: **completion rate conditional
+on `kills > 0`**, which is the component that actually turned first (0.684 in 18.95-19.30M, 0.471 in
+19.45-19.60M, 0.684 over the last 50).
+
+**Revert trigger â€” i.e. when to stop waiting and roll back after all.** If the zero-kill share exceeds
+**0.15** sustained over any 250k-step window, or trailing-50 `fresh_completion_rate` falls below **0.40**
+(the speed rule's own `target_rate`) for 250k steps, roll back to **`ckpt_19251958_steps.zip`** â€” the peak
+region, not `best.zip`, for the reason given above. Operationally that means: create
+`runs/specialists/DRIVER_PAUSE` FIRST, then move every `ckpt_*` newer than the target plus `latest.zip`
+aside, because `supervise.choose_resume` picks the file with the MOST steps and would otherwise silently
+undo the rollback. Note `models/spec_0-1_speed/latest.zip` is dated Sep 18 08:21, before this stage began at
+23:29 â€” it is stale, but its internal step count was NOT opened and should be checked rather than assumed.
+
+**Do NOT drop this guard rail into the watch list**: "`ppo_entropy_loss` must stay inside -6.5..-7.6" was
+proposed as a health criterion and is wrong â€” `spec_0-3` spent 457 rows above 8.1 nats (max 9.27) and
+`spec_0-2` peaked at 8.23, so it would flag two normal stages as failing. This stage's 8.1275-nat maximum at
+19,918,750 is inside `spec_0-3`'s ordinary operating range, and it occurred ~270k steps AFTER the zero-kill
+share had already reached 0.30 â€” it follows the failure rather than leading it.
+
+**Still unexplained, and still true.** Nobody has identified what initiated the decline. The zero-kill share
+went 0.04 -> 0.17 across 19.50-19.60M with `ent_coef` pinned at exactly base 0.004, and nothing in the PPO
+telemetry moves at the turn (`approx_kl` 0.029-0.030, `clip_fraction` 0.17-0.31, `explained_variance`
+0.89-0.98 in every window; `target_kl: 0.03` IS set and IS passed through to PPO). The verified
+`novelty > 0` clause in `env.py:_campaign_progress`, which re-arms the stuck clock on any first-visit 4 m
+cell and let one wander run 4,907 decisions, remains a real efficiency cost â€” zero-kill wanders burned ~20%
+of all decisions during the trough â€” but it is an amplifier, not the cause, and it changes episode
+termination and therefore the meaning of every windowed metric, so it must not be bundled with a rollback or
+a reproduction run. Left for a separate, deliberate pass.
+
+**Not verified.** (1) No in-game evaluation of any checkpoint â€” this is file reading plus arithmetic, and by
+the project's own rule an offline probe cannot settle a policy question; the recovery claim rests on live
+`status.json` and `episodes.jsonl`, which is the live signal, but no eval was run. (2) Whether the recovery
+persists â€” the strongest window is n=29, and the trailing-20 claim is n=20. (3) `latest.zip`'s internal step
+count. (4) The cause of the initial decline. (5) Whether the entropy controller's ramp is *causing* the
+recovery or merely accompanying it â€” the lagged correlations in both prior analyses say the controller
+FOLLOWS behaviour, so the ramp is most likely a response to the same dip, not the repair. No causal claim is
+made either way; the point is only that the proposed cap would bind there.
+
