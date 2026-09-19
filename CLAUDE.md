@@ -15,8 +15,9 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   completion is reliable.
 - **Training is hidden from Steam**: every training game launches with `-aibridge-nosteam` (`--steam` opts
   out). No playtime is credited for training; the user accepted that.
-- **No LLM monitor agents unless the user asks.** The driver/supervisor, `mem_guard.py` and
-  `post_times.py --watch` cover a run token-free.
+- **Check on the run, cheaply.** No always-on LLM monitor agents (the driver, `mem_guard.py` and
+  `post_times.py --watch` restart things token-free), but the lead session checks hourly with
+  `scripts/check_run.py` and acts on stalls — the user asked for that on 2026-09-18.
 - **Do not promote past 0-3 until 0-1..0-3 are much faster.** Speed stages (S-rank time targets, time-scaled
   bonus) come before Level 0-4 gets a specialist.
 
