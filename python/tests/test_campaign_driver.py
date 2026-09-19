@@ -865,7 +865,27 @@ def test_a_speed_stage_inherits_its_own_levels_exploration_archives():
 # ---------------------------------------------------------------------------
 
 
-REAL_STATE = Path("F:/Github/ULTRAKILL-AI/python/runs/specialists/driver_state.json")
+# The live driver's state file exactly as it stood on 2026-09-18, BEFORE stage kinds, rounds and the hold line
+# existed (no "kind", no "round"). A literal, not a read of runs/: the live file moves on with the run, and a test
+# that depends on it goes red the moment the driver changes stage (it did, at 24,757,714 steps).
+PRE_KINDS_STATE = {
+    "version": 1,
+    "current": {"level": "Level 0-3", "run": "spec_0-3", "index": 2,
+                "init": "F:/Github/ULTRAKILL-AI/python/models/specialists/Level_0-2.zip",
+                "start_steps": 18752038.0, "started_at": 1789745506.3306668, "target_reached_at": None},
+    "history": [
+        {"level": "Level 0-1", "run": "spec_0-1", "status": "done", "index": 0, "start_steps": 17002318.0,
+         "end_steps": 18362686.0, "fresh_completion_rate": 0.48, "fresh_window": 50, "best_time": 243.441513,
+         "init": "models/campaign_gates/ckpt_17002318_steps.zip",
+         "specialist": "F:/Github/ULTRAKILL-AI/python/models/specialists/Level_0-1.zip",
+         "source_checkpoint": "best.zip", "finished_at": "2026-09-18 08:45:39"},
+        {"level": "Level 0-2", "run": "spec_0-2", "status": "done", "index": 1, "start_steps": 18052150.0,
+         "end_steps": 19089202.0, "fresh_completion_rate": 0.72, "fresh_window": 50, "best_time": 139.530548,
+         "init": "F:/Github/ULTRAKILL-AI/python/models/specialists/Level_0-1.zip",
+         "specialist": "F:/Github/ULTRAKILL-AI/python/models/specialists/Level_0-2.zip",
+         "source_checkpoint": "best.zip", "finished_at": "2026-09-18 10:31:46"},
+    ],
+}
 
 
 def held_harness(tmp, **kwargs):
@@ -1255,16 +1275,13 @@ def test_specialists_status_reports_the_hold_line_and_the_round():
 
 
 def test_the_real_live_state_file_loads_into_the_new_plan_and_keeps_stage_three_running():
-    """A COPY of the file the live driver is using right now (read-only), against the new plan.
+    """The state file the live driver was using when stage kinds shipped (a literal copy), against the new plan.
 
     Stage 3 is `Level 0-3` complete, started at 18,752,038 steps, with 0-1 and 0-2 done. The three speed
     stages and the hold line were added underneath it, and none of that may disturb it: `reconcile` renumbers
     it, `tick` keeps driving it, and `choose_stage` is not consulted at all while a stage is current.
     """
-    if not REAL_STATE.exists():
-        print("  (skipped: %s is not on this machine)" % REAL_STATE)
-        return
-    raw = json.loads(REAL_STATE.read_text(encoding="utf-8"))
+    raw = json.loads(json.dumps(PRE_KINDS_STATE))  # a deep copy: the driver may back-fill keys in place
     assert raw["current"]["level"] == "Level 0-3" and "kind" not in raw["current"], \
         "this test is about a state file written BEFORE stage kinds existed"
     with tempfile.TemporaryDirectory() as tmp:
@@ -1275,7 +1292,7 @@ def test_the_real_live_state_file_loads_into_the_new_plan_and_keeps_stage_three_
         h.plan = cd.load_plan(write_plan(Path(tmp), order=order, hold_before="Level 0-4"))
         state_path = h.tmp / "runs" / "specialists" / "driver_state.json"
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps(raw), encoding="utf-8")   # a COPY; the real file is never written
+        state_path.write_text(json.dumps(raw), encoding="utf-8")
         driver = cd.Driver(cd.DriverConfig(plan_path=str(h.tmp / "configs" / "specialists.yaml"), cwd=h.tmp,
                                            python="PY.EXE", start_grace_seconds=0.0),
                            h.plan,
