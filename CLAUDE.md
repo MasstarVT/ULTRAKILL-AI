@@ -44,11 +44,12 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - `python/ultrakill_ai/` — the env package: `protocol.py` (socket client), `env.py` (`UltrakillEnv`, campaign
   mode, bridge recovery), `spaces.py` (obs packing, action spaces), `rewards.py`, `campaign.py` (gate ladder,
   milestones, exploration archive, curriculum), `progress.py` (`status.json` / `episodes.jsonl`), `times.py`,
-  `envlog.py`, `windows.py`, and `routes/` (14 committed room trunks plus `rung_overrides.json`).
+  `envlog.py`, `windows.py`, and `routes/` (14 committed room trunks plus `rung_overrides.json`, whose
+  entries move, drop or — since 2026-09-18 — INSERT a rung; the generator stays the only writer).
 - `python/scripts/` — `train.py`, `eval.py`, `games.py`, `campaign_driver.py` (the specialist driver),
   `supervise.py`, `mem_guard.py`, `full_run.py`, `specialists_status.py`, `poll_status.py`, `keep_best.py`,
   `post_times.py`, `dashboard.py`, `build_routes.py`, `campaign_check.py`, `skull_check.py`, `bridge_test.py`.
-- `python/tests/` — 29 no-game test files, ~670 named tests, about 2 minutes for the lot.
+- `python/tests/` — 30 no-game test files, ~774 named tests, about 3 minutes for the lot.
 - `python/configs/` — `specialists.yaml` (the specialist plan; **not** a training config),
   `campaign_gates_full.yaml` (the shared-run config it is pinned against), `campaign_0-1.yaml`,
   `cybergrind.yaml`, `il_records.yaml`, and the earlier campaign configs kept as rollbacks.
@@ -143,6 +144,11 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   Spec and the review that shaped it: `docs/superpowers/specs/2026-09-18-speed-stages.md`.
 - **Live: stage 3, `Level 0-3`, run `spec_0-3`**, initialised from `Level_0-2.zip`, started at 18.75M
   cumulative steps, 12 games on ports 47800-47811, `mem_guard.py` alongside.
+- 0-3's route went 4 rungs -> **6** on 2026-09-18 (two `insert_after` waypoints on the main-room spiral ramp
+  plus the Floor-2 rung moved off its centroid): the hallway -> Floor 2 leg was 76 degrees, so the target
+  vector carried no heading and 219 of 264 fresh episodes wedged at y ~20 with zero completions in 4.3M
+  steps. Steepest leg now 43.2 degrees; the ladder is still 5 hops deep, so the no-finish pay ceiling is
+  unchanged at 75. Baseline, live signal and revert triggers: `docs/project-log.md`, 2026-09-18.
 - Promoted so far: **0-1** (fresh rate 0.48 over 50, best 4:03.4) and **0-2** (0.72, best 2:19.5). Both are
   still **slower** than the shared run's leaderboard rows below — which is exactly why nothing promotes past
   0-3 until the speed work lands.

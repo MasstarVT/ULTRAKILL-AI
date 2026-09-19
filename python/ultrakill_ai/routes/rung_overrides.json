@@ -4,6 +4,13 @@
     "BEFORE every measurement, so a regeneration after a game update keeps a measured fix instead of",
     "silently undoing it. Read the OVERRIDES_NAME comment in build_routes.py for the three rules.",
     "An entry moves one rung and never adds or reorders one.",
+    "An entry with `insert_after` instead of `was` ADDS a rung behind the one it names, so a leg a",
+    "room trunk cannot express -- 0-3's 76-degree climb out of the Side Hallway -- gets waypoints on",
+    "the real path. `insert_after` may name an earlier accepted insert, which is what orders several",
+    "waypoints; `anchor_was` is the anchor's SHIPPED position (inserts are applied after the moves)",
+    "and an insert anchored on another insert carries none. Names live in the reserved `WP<n> - `",
+    "namespace, the whole list for a level is refused if any one entry is, and a refused list ships",
+    "the generated+dropped+moved trunk. See build_routes.py's OVERRIDES_NAME comment, rules 7-17.",
     "An entry with `drop: true` instead of `pos`/`was` REMOVES that rung: guard T only sees a",
     "LEADING branch letter, so a fork spelled mid-name ('5 - Path 1 - ...' vs '7 - Path 2 - ...')",
     "ships both branches chained in series. Drops are applied between I2 and R1, by name, and the",
@@ -56,6 +63,29 @@
       "name": "9 - Windtunnel",
       "drop": true,
       "why": "The wing, see '3 - Side Arena - Floor 1'. The return half of the Path 2 dead end."
+    },
+    {
+      "name": "10 - Main Room - Floor 2",
+      "was": [0.0, 50.0, 330.0],
+      "pos": [-7.1, 48.5, 315.2],
+      "why": "THE MAIN-ROOM ASCENT, PART 1 OF 3 (this entry and the two waypoints below). The room centroid (0,50,330) is at the EDGE of the second floor, not on it: over the 106 consecutive samples of the AI's own 263.9 s completion that sit on Floor 2 (runs/campaign_gates/best_runs/Level_0-3.json, indices 1033-1138, y 44-52) the player walks x -14.5..4.4, z 309.1..324.7, and enters the centroid's 8 m x 6 m cylinder only once, at index 1137, on its way out. (-7.1,48.5,315.2) is the median of those 106 samples: R4 reports 714 standable cells inside its cylinder against the centroid's 654, nearest 0.4 m out. The move is also what makes the climb spaceable -- WP2 below sits 14.4 m from the centroid, inside I2's 16 m, and 21.9 m from here. Legs: WP2 -> here is 18.5 m horizontal / 11.8 m vertical (32.6 deg), here -> the boss arena 74.9 / 41.5 (29.0 deg), against the centroid's 81.4 deg and 25.6 deg. last_rung_to_exit_m is unchanged at 119.7 (it measures the LAST rung, which is the boss arena)."
+    },
+    {
+      "name": "WP1 - Main Room Stack Foot",
+      "insert_after": "2 - Side Hallway - Floor 1",
+      "anchor_was": [0.0, 10.0, 340.0],
+      "pos": [-10.7, 21.6, 327.2],
+      "start_pos": [0.0, 0.5, 253.0],
+      "source": "runs/campaign_gates/best_runs/Level_0-3.json#1014",
+      "why": "PART 2 OF 3. THE WEDGE: from the Side Hallway rung (0,10,340) the next rung was Floor 2 (0,50,330) -- 10.0 m of horizontal against 40.0 m of vertical, 76.0 degrees -- so the target vector in observation slots 448-455 said 'up' and carried no heading, and the only physical way up (a spiral ramp round the main room) starts by moving 18.7 m AWAY from that target, which gate_approach punishes. Measured 2026-09-18 on runs/spec_0-3/episodes.jsonl, 264 fresh episodes since timesteps 21,701,566 (4.3M stage steps): ZERO completions, gate_hops_best 2 (the hallway) in 219 of them, median end height y 17.8, end positions piled at (0..10, 20, 330..350), end_reason stuck in 237. This waypoint is trace index 1014 of the AI's OWN completing run, on the ramp where it climbs: R4 reach=True, 122 standable cells in the cylinder. It makes the hallway leg 16.7 m horizontal / 11.6 m vertical (34.8 deg), and from the stall point (0,20,340) its vector is dx -10.7, dz -12.9, dy +1.6 -- almost pure heading. Credit-order checked against all 4064 trace positions: first credit at index 688, after the hallway's 651 and before WP2's 1021, so the ladder is monotone on the one run that finished. Not creditable from (0,20,340) (16.7 m out), from the main floor below (31.6 m down) or from Floor 2 above (26.9 m up). 77.9 m from the level start against rung 1's 48.2 m, so _seed_start still absorbs rung 1."
+    },
+    {
+      "name": "WP2 - Main Room Stack Top",
+      "insert_after": "WP1 - Main Room Stack Foot",
+      "pos": [5.3, 36.7, 328.9],
+      "start_pos": [0.0, 0.5, 253.0],
+      "source": "runs/campaign_gates/best_runs/Level_0-3.json#1024",
+      "why": "PART 3 OF 3. Trace index 1024, the top of the north-wall stack, two thirds of the way up the same ramp: R4 reach=True, 276 standable cells. The climb from index 1000 to 1042 is ONE continuous supported run in the trace -- per-sample vertical speed holds +1.0 to +1.7 m with no gravity signature (free fall on this level is -0.175 m per sample, measured over five clean onsets) -- so these waypoints sit on ground the player runs over, not on a jump arc. Legs: WP1 -> here 16.1 m horizontal / 15.1 m vertical (43.2 deg), here -> Floor 2 18.5 / 11.8 (32.6 deg). With both waypoints the steepest leg on the whole ladder is 43.2 degrees, down from 76.0. Separations: 22.1 m to WP1 and 21.9 m to the moved Floor 2, and no pair of rungs anywhere on this ladder has both a horizontal gap <= 16 m and a vertical gap <= 12 m, so no single arrival can be credited for two rungs. First credited at trace index 1021, between WP1's 688 and Floor 2's 1034. THE LADDER IS STILL FIVE HOPS DEEP (six rungs, the first absorbed by _seed_start), so the gate income a level load can earn WITHOUT finishing is unchanged at 5 x 15.0 = 75.0 against level_complete 100.0 -- the arithmetic that condemned the side wing is not re-created. REVERT by deleting these three entries and regenerating; the file returns to its four rungs, because the generator is the only writer."
     }
   ]
 }
