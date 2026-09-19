@@ -54,6 +54,7 @@ from ultrakill_ai.procmem import MB as PROC_MB
 from ultrakill_ai.procmem import derive_game_limit, private_bytes
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
 from ultrakill_ai.spaces import PITCH_BINS, YAW_BINS, ObsLayout, action_space, decode_action, pack_observation, yaw_frame
+from ultrakill_ai.times import valid_official_seconds
 
 CYBERGRIND_SCENE = "Endless"
 # Per-episode info the campaign Monitor records (scripts/train.py); every key is in every campaign info.
@@ -717,8 +718,8 @@ class UltrakillEnv(gym.Env):
         # A speed stage scales `level_complete` by the clock, but only on a FRESH-START completion: a checkpoint
         # respawn begins partway through the level with the timer already running, so its "official time" says
         # nothing about how fast the level was played and it pays the plain weight, exactly as every other run
-        # does. `_level_result` falls back to 0.0 when the block is gone, which `completion_bonus` reads as "no
-        # time" and also pays plain.
+        # does. `_level_result` returns None for a time the game never reported (a frame from after the stats
+        # reset, or a missing block), which `completion_bonus` reads as "no time" and also pays plain.
         official = (self._level_result(cur)["seconds"]
                     if (campaign and completed and self._fresh_start and self._speed_target) else None)
         reward = compute_reward(self.cfg.rewards, prev, cur, self._enemy_max_health, died=died,
@@ -1963,15 +1964,26 @@ class UltrakillEnv(gym.Env):
                           scale=self.cfg.speed_target_scale, target_seconds=self._speed_target)
 
     def _level_result(self, raw: dict[str, Any]) -> dict[str, Any]:
-        """Official time, kills, style, restarts and rank as the game's results screen would count them."""
+        """Official time, kills, style, restarts and rank as the game's results screen would count them.
+
+        `seconds` is None -- and with it `rank`, which is computed FROM the clock -- whenever the frame carries
+        no usable official time (`times.valid_official_seconds`). That is not hypothetical: on 2026-09-19 a
+        completion frame on `spec_0-2_speed` arrived after the game's own level stats had reset and reported
+        0.0 s with 3 restarts behind a 4,120-decision episode. A missing time must stay missing all the way
+        out: it pays the plain completion bonus, writes no best run, and reaches `info` as None so that
+        nothing downstream can mistake it for a record. `seconds_raw` keeps what the frame actually said, for
+        the log line only.
+        """
         camp = raw.get("campaign") or {}
         stats = raw.get("stats", {})
-        seconds = camp.get("seconds", stats.get("seconds", 0.0))
+        raw_seconds = camp.get("seconds", stats.get("seconds", 0.0))
+        seconds = valid_official_seconds(raw_seconds)
         restarts = camp.get("restarts", stats.get("restarts", 0))
         kills, style = stats.get("kills", 0), stats.get("style", 0)
         ranks = camp.get("ranks")
-        rank = compute_rank(seconds, kills, style, restarts, ranks) if ranks else None
-        return {"seconds": seconds, "kills": kills, "style": style, "restarts": restarts, "rank": rank}
+        rank = compute_rank(seconds, kills, style, restarts, ranks) if (ranks and seconds is not None) else None
+        return {"seconds": seconds, "seconds_raw": raw_seconds, "kills": kills, "style": style,
+                "restarts": restarts, "rank": rank}
 
     def _end_campaign_episode(self, raw: dict[str, Any], reason: str, info: dict[str, Any]) -> None:
         if reason == "level_complete":
@@ -1982,6 +1994,13 @@ class UltrakillEnv(gym.Env):
                 info["level_seconds"] = result["seconds"]
                 info["restarts"] = result["restarts"]
                 info["rank"] = result["rank"]
+                if result["seconds"] is None:
+                    # The completion was real; only its clock is not. Logged with what the frame did say and
+                    # how many restarts it counted, because that pair is the only evidence of WHY -- the
+                    # 2026-09-19 row read seconds 0.0 with restarts 3, i.e. the stats had already reset.
+                    self.envlog.event("official_time_missing", level=self.level,
+                                      seconds=result["seconds_raw"], restarts=result["restarts"],
+                                      steps=self._steps)
                 # A save failure here (this project has hit Windows PermissionError on these paths) must not
                 # end a training worker mid-run, the same way close() releases the game even when its own
                 # archive write fails, and progress.py warns rather than raises on a status-file write failure.
@@ -2000,6 +2019,8 @@ class UltrakillEnv(gym.Env):
         if not self.cfg.best_runs_dir:
             return
         result = self._level_result(raw)
+        if result["seconds"] is None:
+            return  # no official time, no best run: `save_best_run` ranks on `seconds`, and a 0.0 wins forever
         run = {
             "level": self.level,
             "seconds": result["seconds"],

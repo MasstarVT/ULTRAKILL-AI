@@ -74,6 +74,30 @@ def test_missing_episode_row_still_posts_without_a_step_count():
         assert len(posted) == 1 and "(campaign_gates)" in posted[0]
 
 
+def test_a_best_run_with_no_official_time_is_never_posted():
+    """The 2026-09-19 bug in one line: `best_runs/<level>.json` held a 0.0 s completion of a 4,120-step episode."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run, times = make_run(Path(tmp), 0.0)
+        before = times.read_text(encoding="utf-8")
+        assert post_times.post(run, times, "spec_0-2_speed") == []
+        assert times.read_text(encoding="utf-8") == before
+        assert "00:00.000" not in times.read_text(encoding="utf-8")
+
+
+def test_a_real_time_replaces_an_invalid_leaderboard_row():
+    """Only a FASTER time is ever posted, so a 00:00.000 row has to read as no row at all."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run, times = make_run(Path(tmp), 300.5, steps=7_000_000)
+        bogus = "| 0-1 | 00:00.000 | A | spec_0-1_speed@18.80M | Violent | 2026-09-19 | training episode |"
+        times.write_text(TIMES_MD.replace("| — | — | — | — | — | — | No completed runs yet |", bogus),
+                         encoding="utf-8")
+        assert post_times.held_time(times.read_text(encoding="utf-8"), "Level 0-1") is None
+        posted = post_times.post(run, times, "campaign_gates")
+        text = times.read_text(encoding="utf-8")
+        assert len(posted) == 1 and "| 0-1 | 05:00.500 | B | campaign_gates@7.00M |" in text
+        assert "| 0-1 | 00:00.000 |" not in text
+
+
 def test_push_stages_only_times_md():
     calls = []
 

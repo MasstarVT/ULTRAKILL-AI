@@ -29,18 +29,24 @@ from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
 cap_blas_threads()  # before ultrakill_ai.times, which reaches numpy through ultrakill_ai.campaign
 
 from ultrakill_ai.times import (  # noqa: E402
-    LEADERBOARD_HEADING, TimeEntry, _data_rows, _ms, _table, format_time, parse_time, record_file, short_level)
+    LEADERBOARD_HEADING, TimeEntry, _data_rows, _ms, _table, format_time, parse_time, record_file, short_level,
+    valid_official_seconds)
 
 TIMES_MD = ROOT.parent / "times.md"
 
 
 def held_time(markdown: str, level: str) -> float | None:
-    """The leaderboard's current time for `level` (scene name), or None when the level has no row."""
+    """The leaderboard's current time for `level` (scene name), or None when the level has no USABLE row.
+
+    A row whose own time is not a time the game could have reported (`valid_official_seconds`) reads as no
+    row at all. Without that, the 00:00.000 row this file posted on 2026-09-19 would be unbeatable forever:
+    nothing is faster than zero, and only a faster time is ever posted.
+    """
     lines = markdown.splitlines()
     start, end = _table(lines, LEADERBOARD_HEADING)
     for cells in _data_rows(lines[start:end]):
         if cells[0] == short_level(level):
-            return parse_time(cells[1])
+            return valid_official_seconds(parse_time(cells[1]))
     return None
 
 
@@ -72,7 +78,9 @@ def post(run_dir: Path, times_md: Path, run: str) -> list[str]:
     posted = []
     for path in sorted((run_dir / "best_runs").glob("*.json")):
         best = json.loads(path.read_text(encoding="utf-8"))
-        level, seconds = best["level"], float(best["seconds"])
+        level, seconds = best["level"], valid_official_seconds(best.get("seconds"))
+        if seconds is None:
+            continue  # a best run the game gave no official time: never postable, whatever times.md holds
         held = held_time(times_md.read_text(encoding="utf-8"), level)
         if held is not None and _ms(seconds) >= _ms(held):
             continue

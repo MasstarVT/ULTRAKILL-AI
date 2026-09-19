@@ -203,6 +203,24 @@ def test_time_ranks_the_policys_median_and_not_the_runs_lifetime_best():
         assert not keep_best.is_better((-240.0, -0.52), (-120.0, -0.45))
 
 
+def test_a_median_the_game_cannot_have_produced_never_scores_on_time():
+    """metrics_log.csv is append-only: rows written before the 2026-09-19 fix still hold impossible times.
+
+    `--metric time` ranks on the LOWEST median, so a zero would be the unbeatable best for the rest of the
+    run -- and it would drag every smoothing window that contains it down with it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        rows = campaign_rows([0.6] * 10, [88.0] * 10, median_times=[150.0] * 5 + [0.0] + [150.0] * 4)
+        series = keep_best.scored(write_log(Path(tmp), rows), "time")
+        assert len(series) == 1 and abs(series[0][0] + 150.0) < 1e-9, "the zero sample is dropped, not averaged"
+        allzero = campaign_rows([0.6] * 12, [88.0] * 12, median_times=[0.0] * 12)
+        assert keep_best.scored(write_log(Path(tmp), allzero), "time") == []
+        # `--metric campaign` breaks ties on `best_time`, where a 0.0 would be the best tie-break forever.
+        camp = campaign_rows([0.5] * 9, [0.0] * 9)
+        series = keep_best.scored(write_log(Path(tmp), camp), "campaign")
+        assert len(series) == 1 and series[0][1] == math.inf, "an impossible best time reads as no time at all"
+
+
 def test_a_faster_time_wins_and_the_rate_breaks_the_tie():
     assert keep_best.is_better((-118.0, -0.5), (-131.0, -0.5)), "118 s beats 131 s"
     assert not keep_best.is_better((-140.0, -0.9), (-131.0, -0.5)), "a higher rate does not buy a slower time"

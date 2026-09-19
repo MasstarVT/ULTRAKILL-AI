@@ -2606,3 +2606,63 @@ the disagreement is in the leg split; it changes no conclusion). The "level neve
 geometry remain hypotheses from positions -- no collider was inspected. Whether arena enemies re-spawn after
 a checkpoint respawn (which would let `kill`/`damage_dealt` be re-collected in a stall) was not checked.
 System commit was 73% throughout; only short streaming read-only Python processes were run.
+
+## 2026-09-19 -- A 0.0 s "official time" poisoned the 0-2 leaderboard, and the one predicate that ends it
+
+**The bug.** At 18,801,478 steps, env 7 of `spec_0-2_speed` finished a fresh-start Level 0-2 in 4,120
+decisions and the completion frame reported `seconds` **0.0** with `restarts` **3**: the mod's campaign block
+was read after the game's own level stats had already reset, so the episode's "official time" was the clock of
+a level that had just started. Every reader of an official time took it at face value, and the value is the
+minimum of everything: it became `campaign.best_time` in `status.json` (a lifetime minimum `ProgressCallback`
+also restores across restarts, so no real completion could ever be the best again), it became
+`runs/spec_0-2_speed/best_runs/Level_0-2.json` (`save_best_run` keeps the FASTEST, and nothing is faster than
+zero), and from there the `post_times.py --watch` helper posted `| 0-2 | 00:00.000 | A |` to `times.md` and
+pushed it to GitHub -- over a real `02:07.927 (S)` row, and unreplaceable, because a time is posted only when
+it BEATS the row already there. It was also one sample inside `median_time_50`, which is the speed stage's
+promotion gate (`median <= target_seconds`), so a few of these could have promoted a slow policy.
+
+**Why the mod cannot say more.** The evidence of the cause is exactly two numbers in that frame -- `seconds`
+0.0 beside `restarts` 3 -- which is the stats-reset signature and not a timer that failed to start. The mod
+was NOT changed (its DLL is locked while the games run). The env now logs the pair as
+`official_time_missing` (level, raw seconds, restarts, steps) in `env_<port>.log` whenever it discards one,
+so the next occurrence carries its own evidence.
+
+**The fix, one predicate.** `times.valid_official_seconds(seconds)` returns the time or None, rejecting
+missing, non-numeric, non-finite and anything at or under **1.0 s** (`MIN_OFFICIAL_SECONDS`; the fastest human
+IL record in the first act is 6.6 s, so the floor cannot touch a real run). Applied at the source in
+`env._level_result`, so a completion with no usable clock reports `level_seconds` None and `rank` None, pays
+the PLAIN `level_complete` weight (the completion itself is real, and `completion_bonus` already reads "no
+time" as plain), and writes no best run at all; and as defence in depth in `progress.py` (the pooled and
+per-level `best_time`, the fresh deques behind `median_time_50`, and `_restore`/`_restore_levels`, so a
+poisoned `status.json` HEALS at the next trainer start), in `post_times.py` (an invalid best run is never
+posted; an invalid leaderboard row reads as NO row, so a real time can replace it), in `times.record` (refuses
+an invalid entry outright, and treats an invalid held row and an invalid history predecessor as absent), in
+`keep_best.py` (`--metric time` ranks on the lowest `median_time_50` and `--metric campaign` ties on
+`best_time`; both now pass the predicate, because `metrics_log.csv` is append-only and still holds rows
+written before this fix), and in `campaign_driver.read_sample` (an invalid `median_time_50` reads as "not
+measured yet", which the speed rule already refuses to latch on).
+
+**Data repaired.** `times.md`: the leaderboard row restored to `02:07.927 | S | campaign_gates@10.18M |
+2026-09-17` and the bogus `00:00.000` history row deleted. The stage's fastest REAL completion, **123.537 s at
+19,004,158 steps (env 3, 65 kills, 2 deaths)**, would genuinely beat 127.927 s, but it was NOT posted: its
+`best_runs` record had already been overwritten by the 0.0 run and `episodes.jsonl` carries no `style` or
+`restarts`, so its rank cannot be established honestly. The fixed watcher will post the next real best by
+itself. `best_runs/Level_0-2.json` was renamed to `Level_0-2.json.bogus-0s` BEFORE the bounce so the old
+watcher could not re-post it; `status.json`'s 0.0 healed through the restore guard at the next trainer start.
+
+**Swept for the same poison, read-only** (streamed `episodes.jsonl`, fresh-start completions with
+`level_seconds <= 1.0`): `spec_0-2_speed` 1 of 50 -- the row above; `spec_0-1_speed` 0 of 1,101; `spec_0-1` 0
+of 68; `spec_0-2` 0 of 85; `spec_0-3` 0 of 0; `campaign_gates` 0 of 264. No other `times.md` row is invalid,
+and no `models/specialists/*.json` sidecar carries an invalid `best_time` (0-1 243.44, 0-2 139.53, 0-3 null).
+`runs/spec_0-2_speed/metrics_log.csv` has **no** polluted `median_time_50` row (the zero never was the median)
+but **87 rows with `best_time` 0.0**; `best_time` is only the tie-break of `--metric campaign` and this stage
+runs `--metric time`, so the live `keep_best.py` was never misled and was left running.
+
+**Tests.** Nine new assertions across six files, each verified to FAIL with its own guard neutered: env
+completion with an official 0.0 (`level_seconds` None, plain bonus, no best-run file), progress ignoring it
+for best/median and healing a poisoned `status.json`, `times.record` refusing it and replacing an invalid row,
+`post_times` refusing it and replacing an invalid row, `keep_best --metric time` dropping a zero median (and
+`--metric campaign` reading a zero `best_time` as no time), and the speed verdict refusing to latch on a zero
+median. Two fixtures reported times no real level could produce and were corrected to the range a real run
+lives in (`test_progress`'s fake campaign env, `test_campaign_check`'s fake game clock). Whole no-game suite,
+one file at a time: 30 files, 0 failures.

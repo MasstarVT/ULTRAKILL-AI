@@ -104,8 +104,10 @@ class FakeCampaignEnv(gym.Env):
             "deaths": self.steps // 8,
             "completed": completed,
             "fresh_start": self.fresh,
-            # The env reports the official time only for fresh-start completions.
-            "level_seconds": round(self.steps * 2 / 15, 3) if completed and self.fresh else None,
+            # The env reports the official time only for fresh-start completions. The 60 s base keeps these
+            # fake times in the range a real level run can produce: a time at or under a second is what the
+            # 2026-09-19 bug looked like, and the trainer now discards those (times.valid_official_seconds).
+            "level_seconds": round(60.0 + self.steps * 2 / 15, 3) if completed and self.fresh else None,
             "checkpoints_level": min(3, self.steps // 4),
             "cells_new": self.steps * 2,
             "oob_frac": 0.1,  # fraction of steps with no ground under the player
@@ -411,6 +413,56 @@ def curriculum_callback(tmp: Path, **overrides) -> ProgressCallback:
 
 def read_json(path: Path) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------------------------
+# Official times the game never reported (2026-09-19)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_an_official_time_the_game_never_reported_is_not_a_record():
+    """A completion frame read after the level stats reset gave 0.0 s on a 4,120-decision episode.
+
+    It is still a COMPLETION -- the rate must not move -- but it is not a time: not the best, not in the
+    median window (which is a speed stage's promotion gate), not anywhere a real run could be measured against.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-2_speed"
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-2_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        for seconds in (150.0, 200.0, 250.0):
+            cb._record_episode(0, episode_info("Level 0-2", completed=1, seconds=seconds))
+        cb._record_episode(0, episode_info("Level 0-2", completed=1, seconds=0.0))
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert c["best_time"] == 150.0, "0.0 is not the fastest completion, it is no completion time at all"
+        assert c["median_time_50"] == 200.0, "the median is over the three real times, not four"
+        assert c["fresh_window"] == 4 and c["fresh_completion_rate"] == 1.0, "the completion itself still counts"
+
+
+def test_a_poisoned_best_time_heals_when_the_trainer_restarts():
+    """`_restore` carries `best_time` across every bounce, so a 0.0 left in status.json is forever otherwise."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-2_speed"
+        run.mkdir(parents=True)
+        (run / "status.json").write_text(json.dumps({
+            "run_name": "spec_0-2_speed", "episodes": 312, "best_reward": 531.99,
+            "campaign": {"fresh_window": 50, "fresh_completion_rate": 0.86, "median_time_50": 0.0,
+                         "best_time": 0.0, "target_seconds": 120.0, "s_rank_seconds": 120.0,
+                         "levels": {"Level 0-2": {"unlocked": True, "best_time": 0.0, "episodes": 312,
+                                                  "fresh_episodes": 120}}}}), encoding="utf-8")
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-2_speed", 1, update_every_s=0.0,
+                              levels=["Level 0-2"], curriculum_path=run / "curriculum.json")
+        assert cb.best_time is None, "the poisoned lifetime minimum must not be restored"
+        assert cb._level_record("Level 0-2")["best_time"] is None
+        assert cb.episodes == 312 and cb._level_record("Level 0-2")["unlocked"] is True, "everything else carries"
+        assert cb.target_seconds == 120.0, "and so does the speed target"
+        cb._on_training_start()
+        cb._record_episode(0, episode_info("Level 0-2", completed=1, seconds=123.5368))
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert c["best_time"] == 123.5368, "the first real completion after the bounce IS the best again"
+        assert c["levels"]["Level 0-2"]["best_time"] == 123.5368
 
 
 def test_curriculum_file_is_written_before_any_episode_and_lists_every_level():

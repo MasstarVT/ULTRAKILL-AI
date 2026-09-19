@@ -32,6 +32,7 @@ from ultrakill_ai.campaign import (
     progress_score,
     unlock_next,
 )
+from ultrakill_ai.times import valid_official_seconds
 
 EPISODE_WINDOW = 100
 FRESH_WINDOW = 50  # campaign completion rate and median time are over this many fresh-start episodes
@@ -187,7 +188,10 @@ class ProgressCallback(BaseCallback):
         self.best_gate_hops = _num(old.get("best_gate_hops"))
         if isinstance(old.get("campaign"), dict):
             self.campaign = True
-            self.best_time = _num(old["campaign"].get("best_time"))
+            # Through the predicate, so a poisoned status.json HEALS on the next trainer start instead of
+            # carrying an impossible minimum forever (2026-09-19: a 0.0 restored here would have kept every
+            # real completion out of `best_time` for the rest of the run).
+            self.best_time = valid_official_seconds(old["campaign"].get("best_time"))
             self.target_seconds = _num(old["campaign"].get("target_seconds"))
             self.s_rank_seconds = _num(old["campaign"].get("s_rank_seconds"))
             self._restore_levels(old["campaign"].get("levels"))
@@ -211,7 +215,7 @@ class ProgressCallback(BaseCallback):
                 continue
             record = self._level_record(str(name))
             record["unlocked"] = bool(old.get("unlocked")) or record["unlocked"]
-            record["best_time"] = _num(old.get("best_time"))
+            record["best_time"] = valid_official_seconds(old.get("best_time"))  # healed on restore, as above
             record["episodes"] = int(_num(old.get("episodes")) or 0)
             # Cumulative, so it carries like `episodes` and NOT like the windows: the safety valve counts how
             # many fresh tries a level has had in total, and a restart must not hand it a clean slate or a run
@@ -286,7 +290,8 @@ class ProgressCallback(BaseCallback):
             }
         if not with_weights:
             return table
-        times = {level: [s for c, s in self._level_record(level)["fresh"] if c and s is not None] for level in table}
+        times = {level: [s for c, s in self._level_record(level)["fresh"] if c and valid_official_seconds(s)]
+                 for level in table}
         weights = dict(level_weights(list(table), table, floor=self.level_weight_floor,
                                      rule=self.curriculum_weighting, cap=self.curriculum_weight_cap,
                                      blocked_fresh_episodes=self.curriculum_blocked_fresh_episodes))
@@ -483,7 +488,9 @@ class ProgressCallback(BaseCallback):
         if stats["fresh_start"] is not None:
             self.campaign = True
             if stats["fresh_start"]:
-                completed, seconds = stats["completed"] or 0.0, stats["level_seconds"]
+                # A completion whose official time the game never reported counts as a COMPLETION with no
+                # time: the rate is unaffected, and the clock statistics below simply have one fewer sample.
+                completed, seconds = stats["completed"] or 0.0, valid_official_seconds(stats["level_seconds"])
                 self.fresh_recent.append((completed, seconds))
                 if completed and seconds is not None and (self.best_time is None or seconds < self.best_time):
                     self.best_time = seconds
@@ -531,7 +538,7 @@ class ProgressCallback(BaseCallback):
                                  "targets_parked": stats["targets_parked"]})
         if stats["fresh_start"]:
             record["fresh_episodes"] += 1
-            completed, seconds = stats["completed"] or 0.0, stats["level_seconds"]
+            completed, seconds = stats["completed"] or 0.0, valid_official_seconds(stats["level_seconds"])
             record["fresh"].append((completed, seconds))
             if completed and seconds is not None and (record["best_time"] is None or seconds < record["best_time"]):
                 record["best_time"] = seconds
@@ -636,7 +643,11 @@ class ProgressCallback(BaseCallback):
 
     def _campaign_stats(self) -> dict:
         n = len(self.fresh_recent)
-        times = [seconds for completed, seconds in self.fresh_recent if completed and seconds is not None]
+        # `median_time_50` is a SPEED STAGE'S PROMOTION GATE (campaign_driver.stage_verdict), so the predicate
+        # is applied again here and not only where the deque is filled: a zero in this window drags the median
+        # down and could promote a slow policy.
+        times = [seconds for completed, seconds in self.fresh_recent
+                 if completed and valid_official_seconds(seconds) is not None]
         stats = {
             "fresh_window": n,
             "fresh_completion_rate": sum(completed for completed, _ in self.fresh_recent) / n if n else None,

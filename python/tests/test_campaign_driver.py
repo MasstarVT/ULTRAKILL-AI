@@ -121,6 +121,31 @@ def test_read_sample_survives_a_missing_or_half_written_file():
         assert got == cd.StageSample(11_000_000.0, 0.52, 41, 118.5, 10_900_000.0)
 
 
+def test_a_speed_stage_cannot_latch_on_a_clock_the_game_never_reported():
+    """2026-09-19: one completion frame read after the level stats reset wrote a 0.0 s time into status.json.
+
+    The speed rule promotes when `median_time_50 <= target_seconds`, so a median dragged to zero by times
+    that never happened would latch instantly on whatever policy happened to be running. An invalid clock
+    reads as "not measured yet", which the rule already refuses to promote on.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "status.json").write_text(json.dumps({
+            "timesteps": 19_000_000,
+            "campaign": {"fresh_completion_rate": 0.86, "fresh_window": 50, "best_time": 0.0,
+                         "median_time_50": 0.0, "target_seconds": 120.0, "s_rank_seconds": 120.0}}),
+            encoding="utf-8")
+        got = cd.read_sample(root / "status.json", root / "nope.json")
+        assert got.median_time is None and got.best_time is None, "neither clock is a time the game reported"
+        assert got.fresh_rate == 0.86 and got.target_seconds == 120.0, "everything else is read as before"
+        assert cd.stage_verdict(got, 18_750_000, None, SPEED_RULE, kind=cd.SPEED,
+                                target_seconds=120.0) == ("running", None)
+        # ... and a real median at the target still latches, so the guard has not disabled the clause.
+        real = got._replace(median_time=118.0)
+        assert cd.stage_verdict(real, 18_750_000, None, SPEED_RULE, kind=cd.SPEED,
+                                target_seconds=120.0)[1] == 19_000_000
+
+
 # ---------------------------------------------------------------------------
 # The plan and the generated per-stage config
 # ---------------------------------------------------------------------------

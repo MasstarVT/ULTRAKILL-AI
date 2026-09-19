@@ -91,7 +91,11 @@ class FakeGame:
     def step(self, action):
         self.steps += 1
         if not self.level_over:
-            self.seconds += 2 / 30
+            # One game SECOND per step: this corridor is crossed in a handful of steps, and a level time under
+            # a second is exactly what the env now discards as "the game never reported one"
+            # (times.valid_official_seconds), so a miniature clocked in frames would hand check 5 a time no
+            # real run can have. The check compares the env's time with the block's, whatever the rate is.
+            self.seconds += 1.0
         if self.triggers and not self.dead:
             for i, cp in enumerate(CHECKPOINTS):
                 if i not in self.activated and math.dist(self.pos, cp) <= TRIGGER_RADIUS:

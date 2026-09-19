@@ -651,6 +651,31 @@ def test_the_bonus_tracks_the_official_time_between_the_two_clips():
     env.close()
 
 
+def test_a_completion_the_game_gave_no_official_time_pays_the_plain_bonus():
+    """2026-09-19, live on `spec_0-2_speed`: the completion frame arrived AFTER the level stats had reset.
+
+    The episode ran 4,120 decisions and the frame said `seconds` 0.0 with `restarts` 3. The completion is
+    real and still ends the episode; only its clock is missing, so it pays the plain weight, reports no time
+    and no rank, and writes no best run -- a 0.0 in `best_runs/` is a record nothing real can ever beat.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake = speed_env(best_runs_dir=tmp)
+        env.reset(seed=0)
+        info = None
+        for _ in range(200):
+            if fake.z >= EXIT_Z - 2.0:
+                fake.seconds, fake.restarts = 0.0, 3  # StatsManager reset under us, one frame early
+            _, _, terminated, truncated, info = env.step(forward())
+            if terminated or truncated:
+                break
+        assert info["end_reason"] == "level_complete" and info["completed"] == 1 and info["fresh_start"] == 1
+        assert fake.seconds <= 1.0, "the fake really did report a time no level run can have taken"
+        assert info["level_seconds"] is None and info["rank"] is None
+        assert info["completion_bonus"] == 100.0 == info["reward_parts"]["level_complete"], "the plain weight"
+        assert not list(Path(tmp).glob("*.json")), "no official time, no best run"
+        env.close()
+
+
 def test_a_checkpoint_respawn_completion_pays_the_plain_bonus():
     """Its official timer carries over from an earlier episode, so its "time" says nothing about the run."""
     with tempfile.TemporaryDirectory() as tmp:

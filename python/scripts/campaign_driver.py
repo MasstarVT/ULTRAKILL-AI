@@ -106,7 +106,7 @@ import yaml  # noqa: E402
 
 import supervise  # noqa: E402
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS_SHIPPED, safe_name  # noqa: E402
-from ultrakill_ai.times import short_level  # noqa: E402
+from ultrakill_ai.times import short_level, valid_official_seconds  # noqa: E402
 
 # `ultrakill_ai.progress.write_json_atomic` is the same nine lines, but importing that module pulls in
 # stable_baselines3 and therefore torch. The driver polls beside twelve games and a trainer, and
@@ -414,10 +414,14 @@ def read_sample(status_path: Path, best_json: Path) -> StageSample:
         if isinstance(campaign, dict):
             rate = _num(campaign.get("fresh_completion_rate"))
             window = int(_num(campaign.get("fresh_window")) or 0)
-            best_time = _num(campaign.get("best_time"))
+            # The two CLOCKS go through the shared predicate, never `_num`: a status.json written before the
+            # 2026-09-19 fix (or by an older trainer still running) can carry an impossible time, and the
+            # speed rule promotes when `median_time <= target_seconds` -- a zero median would latch instantly.
+            # An invalid clock reads as "not measured yet", which the rule already handles: it cannot latch.
+            best_time = valid_official_seconds(campaign.get("best_time"))
             target = _num(campaign.get("target_seconds"))
             s_rank = _num(campaign.get("s_rank_seconds"))
-            median = _num(campaign.get("median_time_50"))
+            median = valid_official_seconds(campaign.get("median_time_50"))
     try:
         best = json.loads(best_json.read_text(encoding="utf-8"))
         best_at = _num(best.get("at_timesteps")) if isinstance(best, dict) else None

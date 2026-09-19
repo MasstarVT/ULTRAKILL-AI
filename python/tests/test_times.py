@@ -8,7 +8,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ultrakill_ai.times import TimeEntry, format_delta, format_time, parse_time, record, record_file  # noqa: E402
+from ultrakill_ai.times import (  # noqa: E402
+    TimeEntry, format_delta, format_time, parse_time, record, record_file, valid_official_seconds)
 
 # times.md at the repo root, exactly as committed before any campaign run.
 TIMES_MD = """# Times
@@ -139,6 +140,35 @@ def test_html_comment_survives():
         out = record(out, entry(seconds=seconds))
     assert out.endswith(comment) and out.count("<!--") == 1
     assert skeleton(out) == skeleton(TIMES_MD)
+
+
+PLACEHOLDER = "| — | — | — | — | — | — | No completed runs yet |"
+BOGUS_ROW = "| 0-2 | 00:00.000 | A | spec_0-2_speed@18.80M | Violent | 2026-09-19 | training episode |"
+
+
+def test_a_time_the_game_never_reported_is_refused():
+    """2026-09-19: a completion frame read after the level stats reset produced a 00:00.000 leaderboard row."""
+    for seconds in (0.0, 1.0, -5.0, float("nan"), float("inf")):
+        try:
+            record(TIMES_MD, entry(seconds=seconds))
+        except ValueError:
+            continue
+        raise AssertionError(f"{seconds!r} was recorded as an official time")
+    assert "01:23.250" in record(TIMES_MD, entry(seconds=83.25)), "a real time still records"
+    assert valid_official_seconds(1.001) == 1.001 and valid_official_seconds(6.6) == 6.6, "the human IL floor"
+    assert valid_official_seconds(None) is None and valid_official_seconds("") is None
+
+
+def test_an_invalid_leaderboard_row_is_replaced_by_a_real_time():
+    """Nothing is faster than zero, so without this the bogus row would hold the level's spot forever."""
+    poisoned = TIMES_MD.replace(PLACEHOLDER, BOGUS_ROW)
+    out = record(poisoned, entry(level="Level 0-2", seconds=123.5368, rank="S", generation="spec_0-2_speed@19.00M"))
+    rows = table_rows(out, "## Leaderboard")
+    assert len(rows) == 1 and "00:00.000" not in rows[0]
+    assert "| 0-2 | 02:03.537 | S | spec_0-2_speed@19.00M |" in rows[0]
+    # ... and a valid held row still wins against a slower run, exactly as before.
+    kept = record(out, entry(level="Level 0-2", seconds=200.0, rank="B"))
+    assert "| 0-2 | 02:03.537 |" in table_rows(kept, "## Leaderboard")[0]
 
 
 def test_record_file_rewrites_in_place():

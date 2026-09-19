@@ -38,9 +38,18 @@ import math
 import re
 import shutil
 import statistics
+import sys
 import time
 from pathlib import Path
 from typing import NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
+
+cap_blas_threads()  # before ultrakill_ai.times, which reaches numpy through ultrakill_ai.campaign
+
+from ultrakill_ai.times import valid_official_seconds  # noqa: E402
 
 SMOOTH = 9          # samples per smoothing window (~4.5 min at a 30 s poll)
 MIN_WINDOW = 100    # kills_per_min: require a full episode window behind every mean
@@ -61,12 +70,19 @@ class Metric(NamedTuple):
     penalty_sign: float = 1.0
     gate: str = ""       # an extra column a sample must reach to count at all ("" = no gate)
     min_gate: float = 0.0
+    # Which of the two columns hold an OFFICIAL LEVEL TIME, and so have to pass `valid_official_seconds`
+    # before they are ranked on. metrics_log.csv is an append-only history: rows written before the
+    # 2026-09-19 fix still carry the impossible times that bug produced, and `--metric time` ranks on the
+    # LOWEST median -- a single zero in the history would otherwise be the unbeatable best forever.
+    score_is_time: bool = False
+    penalty_is_time: bool = False
 
 
 METRICS = {
     "kills_per_min": Metric("window", MIN_WINDOW, "kills_per_min", "deaths", 0.0, "kills/min"),
     # No completed run means no best time: an infinite penalty, so the first finite time wins the tie.
-    "campaign": Metric("fresh_window", MIN_FRESH_WINDOW, "fresh_completion_rate", "best_time", math.inf, "fresh completion rate"),
+    "campaign": Metric("fresh_window", MIN_FRESH_WINDOW, "fresh_completion_rate", "best_time", math.inf, "fresh completion rate",
+                       penalty_is_time=True),
     # A speed stage. The score is the official time NEGATED so that "higher is better" still holds everywhere
     # below, and the tie-break is the completion rate negated for the same reason -- a faster time wins, and at
     # equal times the more reliable policy does. `gate` is what stops a single lucky load setting the record:
@@ -81,7 +97,8 @@ METRICS = {
     # already a column of metrics_log.csv (poll_status.CAMPAIGN_FIELDS).
     "time": Metric("fresh_window", MIN_FRESH_WINDOW, "median_time_50", "fresh_completion_rate", 0.0,
                    "s (median official time)",
-                   score_sign=-1.0, penalty_sign=-1.0, gate="fresh_completion_rate", min_gate=MIN_RATE),
+                   score_sign=-1.0, penalty_sign=-1.0, gate="fresh_completion_rate", min_gate=MIN_RATE,
+                   score_is_time=True),
 }
 
 
@@ -93,6 +110,18 @@ def num(row: dict, key: str) -> float | None:
         return float(v)
     except ValueError:
         return None
+
+
+def _score(row: dict, m: Metric) -> float | None:
+    """The sample's score column, or None when it is a time the game cannot have reported."""
+    v = num(row, m.score)
+    return valid_official_seconds(v) if m.score_is_time else v
+
+
+def _penalty(row: dict, m: Metric) -> float | None:
+    """The sample's tie-break column, on the same terms: an invalid time reads as "this sample has none"."""
+    v = num(row, m.penalty)
+    return valid_official_seconds(v) if m.penalty_is_time else v
 
 
 def scored(csv_path: Path, metric: str = "kills_per_min", *,
@@ -109,14 +138,14 @@ def scored(csv_path: Path, metric: str = "kills_per_min", *,
             rows = list(csv.DictReader(f))
     except OSError:
         return []
-    rows = [r for r in rows if (num(r, m.window) or 0) >= m.min_window and num(r, m.score) is not None
+    rows = [r for r in rows if (num(r, m.window) or 0) >= m.min_window and _score(r, m) is not None
             and (not m.gate or (num(r, m.gate) or 0.0) >= gate_at)]
     out = []
     half = SMOOTH // 2
     for i in range(half, len(rows) - half):
         w = rows[i - half:i + half + 1]
-        score = [num(r, m.score) for r in w]
-        pen = [num(r, m.penalty) for r in w]
+        score = [_score(r, m) for r in w]
+        pen = [_penalty(r, m) for r in w]
         rew = [num(r, "reward") for r in w]
         if any(v is None for v in score):
             continue
