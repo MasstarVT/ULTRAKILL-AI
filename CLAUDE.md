@@ -143,8 +143,13 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   it ends `"done"`. The **hold line** `hold_before: "Level 0-4"` stops the ladder there and round-robins
   0-1..0-3 for as long as it takes (`max_rounds: 0`): a `HELD` exit would idle twelve games nobody watches.
   Spec and the review that shaped it: `docs/superpowers/specs/2026-09-18-speed-stages.md`.
-- **Live: stage 3, `Level 0-3`, run `spec_0-3`**, initialised from `Level_0-2.zip`, started at 18.75M
-  cumulative steps, 12 games on ports 47800-47811, `mem_guard.py` alongside.
+- **The 0-3 stage ended at its 6M cap** (24,757,714 steps, recorded `"unfinished"`, 0 fresh completions); the
+  driver is now on the **`Level 0-1` speed** stage, 12 games on ports 47800-47811, `mem_guard.py` alongside.
+  Round-robin order means the next 0-3 window is **round 2**, after the 0-1 and 0-2 speed stages.
+- **Parking is off on a collapsed-ladder trunk load** (2026-09-18, `patience_active` + `_prefers_route`): on
+  0-3 a park aimed the agent 27.3 m back DOWN off Floor 2 and `gate_approach` paid +3.87 for descents over 13
+  recorded rollouts. The proposed waypoint move was REFUSED — it fails the generator's own `SEP`/`co_credit`
+  guards and credits earlier and lower. Baseline, live signal and revert trigger: `docs/project-log.md`.
 - 0-3's route went 4 rungs -> **6** on 2026-09-18 (two `insert_after` waypoints on the main-room spiral ramp
   plus the Floor-2 rung moved off its centroid): the hallway -> Floor 2 leg was 76 degrees, so the target
   vector carried no heading and 219 of 264 fresh episodes wedged at y ~20 with zero completions in 4.3M

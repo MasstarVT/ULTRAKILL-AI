@@ -2142,3 +2142,105 @@ player was soft-dead and sliding for most of it. (3) Whether the 0-3 completion 
 ramp" reading is right — this pass found no ramp, but it did not re-derive that trace. (4) The probe wedged
 the private game once (a `reset` after a death timed out at 300 s, `Responding` false, ~1 s of CPU in 20 s);
 it was killed by pid and restarted, and no training game was involved.
+
+## 2026-09-18 (late) — 0-3: parking is switched off on a collapsed-ladder trunk load
+
+**The fourth pass on the 0-3 main-room climb, and the first that changed code.** The handover proposed moving
+both inserted waypoints onto measured block tops. **That fix was refused on its own evidence**; a different
+one shipped. Branch `route-0-3-climb`, merged `--no-ff`.
+
+**Why the route move was refused.** Three independent reasons, each checked against the generator's own
+constants and the 13 recorded rollouts in `runs/probe_0-3/` (89,458 decisions, re-streamed for this pass):
+
+1. **The generator refuses it.** Proposed WP1 `(-3.5, 21.5, 329.5)` is **15.96 m** in 3-D from `2 - Side
+   Hallway - Floor 1` `(0, 10, 340)`, under I2's `SEP` of 16.0, *and* trips `co_credit` (horizontal 11.07 m
+   against 16, vertical 11.50 m against 12). `apply_inserts` is all-or-nothing (rule 17), so the whole 0-3
+   insert list would be withheld and the regenerated trunk would ship **4 rungs**, restoring the 76-degree
+   Side-Hallway-to-Floor-2 leg the waypoints exist to remove.
+2. **It would make the wrong-side credit worse, not better.** Replaying the proposed cylinder over the
+   recordings (inside 8x6 **and** passing `_on_ground`), the proposed WP1 is creditable in **13 of 13**
+   episodes and its first creditable step comes **strictly earlier** than the shipped WP1's in **11 of 13** —
+   `rollout_4` i=233 against i=2141, `rollout_0` i=645 against i=1506 — and in the same mid-air band
+   **y 15.7-17.5**, four to six metres *below* the ledge it is meant to mark. **59 recorded steps** lie inside
+   the hallway rung's cylinder *and* the proposed WP1's while passing `_on_ground`: one arrival, two
+   instalments, which is exactly what `co_credit` exists to stop.
+3. **The WP2 move buys nothing.** Proposed WP2 `(5.0, 39.8, 328.9)` is creditable in the same **2 of 13**
+   episodes as the shipped WP2. WP2 is the rung that has never been credited at scale, and moving it there
+   changes no episode's outcome.
+
+**The handover's stated mechanism was also wrong.** It claimed `_on_ground` "refuses the credit on every frame
+the policy is inside those cylinders". It does not: `_on_ground` **short-circuits on the game's `grounded`
+flag before it looks at the ray** (`campaign.py`, and the docstring says so). Measured over the 13 rollouts:
+**11,954 of 89,458 decisions (13.4%) read grounded**, and **2,613 of those (21.9%) have the centre ray more
+than 8 m below, 681 at the 30 m "nothing hit" sentinel**. The shipped WP1's cylinder holds 1,600 steps of
+which only 35 are grounded but **418 pass `_on_ground`** — the credits come from the *drop test* over the
+y 10-11 hallway floor, not from a void. The "nothing supports the player under WP1 for 80 m" reading does not
+survive that.
+
+**What shipped instead: one condition in `GateProgress.patience_active`.** Parking, the fallback target and
+the fallback payment are **off whenever `_prefers_route()` is true** — a load the collapse verdict handed its
+room trunk. The two switches were designed against each other and nobody noticed when the second shipped:
+`gate_patience_mode: collapsed` takes its verdict from the **gate** ladder, so on 0-3 it turns parking on,
+while `prefer_route_when_collapsed` (flipped true 2026-09-17 21:58) makes the same verdict walk the **room
+trunk** — and `_note_reached`'s docstring has said since the trunk shipped that parking is "nearly INERT"
+there and "can only mislead".
+
+**The harm, measured in game.** 23 parks across the 13 rollouts. `_pick`'s fallback is "the nearest active
+gate that is neither reached nor parked" with **no hop constraint**, so it aims backwards and downwards:
+recorded parked targets read dy **-2.6, -5.7, -8.4** and, in `rollout_6` at decision 867 — the one episode in
+13 that ever stood on 0-3's Floor 2 — the boss rung parked while the player was at `(-6.8, 48.9, 303.1)` and
+the target became WP1, **36.6 m away and 27.3 m below** (observation slot 449 read -0.5463). The agent went
+back down and the load ended. **And the descent was paid**: 31 decisions collected `gate_approach` while
+losing height under a fallback target, **+3.87 in total**. Live over the same window, **84 of 126** fresh
+episodes (67%) parked at least once and none completed.
+
+**The credit patience earned on 0-3 does not carry over.** "Patience is what made 0-3 move at all"
+(`detect_collapsed_ladder`) was measured under **gates plus patience** — the configuration abandoned on
+2026-09-17 21:58, when 0-3 sat at **0 of 75** fresh completions with 8 parks per episode and the flag was
+flipped to walk the trunk (`configs/campaign_gates_full.yaml:119`). Nothing measured is being switched off.
+
+**Scope.** Only the collapse-verdict trunk changes: 0-3 and 4-3, and only while `prefer_route_when_collapsed`
+is true (every rollback config has it false, where the line cannot fire). A collapsed level with **no** trunk
+(1-1, 1-2, 2-3, 8-1) keeps gates plus patience. A **route-fallback** trunk keeps parking, because the detector
+grades the trunk itself there and a total order walked from its own top rung is healthy — that last one is a
+property of the *data*, not of the rule, and a fallback level whose spawn sat off its top rung would lose
+parking too. **No route file, config or reward weight was touched.**
+
+**Tests.** `tests/test_campaign.py` +3, with the `rollout_6` geometry and the shipped 0-3 trunk copied in as
+literals (`runs/` is gitignored): the switch itself against all four neighbouring configurations; the
+decision-867 scenario, which without the change parks and retargets WP1 and with it keeps the boss rung; and
+the fallback-trunk guard. The first two **fail without the one-line change**, verified by removing it. Whole
+no-game suite run one file at a time, 30 files — all pass except a **pre-existing, unrelated** failure in
+`test_campaign_driver.py::test_the_real_live_state_file_loads_into_the_new_plan_and_keeps_stage_three_running`,
+which asserts the **live** `runs/specialists/driver_state.json` is still the pre-kinds Level 0-3 file; the
+driver has moved on to `Level 0-1` speed, so its own precondition fires. It fails identically on `main`
+without this change.
+
+**Live signal, and the baseline to beat.** Read with `scripts/check_run.py` from
+`runs/spec_0-3/episodes.jsonl`, `fresh_start == 1`, timesteps at or above the round-2 relaunch step.
+Baselines, all from the round-1 stage: `targets_parked >= 1` in **67%** of fresh episodes (84/126) — this
+should go to **0**, and it is the only prediction this change makes directly. Then: `gate_hops_best == 2`
+(a WP2 credit) **0 of 126**; `gate_hops_best == 1` **8 of 126**; completions **0**; median end y **17.2**;
+share of fresh episodes ending above y 40 **0.063** (0.057 before the waypoints, so that number has never
+moved). **This change is not predicted to make WP2 reachable** — WP2 is credited in 2 of 13 recorded episodes
+whether or not it fires. What it removes is a measured wrong gradient.
+
+**Revert trigger.** If, 400k steps into the next 0-3 round, `targets_parked` is not ~0, the change did not
+take effect — check `_prefers_route()` is true on that load before anything else. If `targets_parked` is 0 but
+`gate_hops_best` 3 has fallen below round 1's 114/126 share, or median end y has dropped below 17.2, revert
+the one condition and say so here. **Do not stack a route change on top while this is being measured.**
+
+**Activation.** Nothing was bounced. The driver had already ended the 0-3 stage at its 6M cap (24,757,714
+steps, recorded `"unfinished"`) and moved to `Level 0-1` speed, so the next 0-3 round picks up the new code
+when it starts. No live process, game or port was touched by this pass.
+
+**Not verified.** (1) No live confirmation — this ships on recorded rollouts plus code reading, and 13
+episodes on one checkpoint (`ckpt_24181522`) on one game is the whole in-game sample. (2) `build_routes.py`
+was **not** run; the SEP/`co_credit`/seed-margin arithmetic above was re-applied from the generator's own
+constants, not by executing it. (3) Why `gc.onGround` stays true through parts of the ascent is still
+unexplained — the infinite-jump reading is inference from vy resetting to 26.8 six times with the ray at the
+sentinel, not from the mod's code path, and it means the "supported/airborne" counts in the previous entry
+rest on the flag. (4) The 2026-09-18 "supported spiral ramp" reading of the completion trace was not
+re-derived. (5) Whether removing the fallback leaves the agent aiming at an unreachable rung for the rest of
+the load — it does, by construction; that is the status quo minus the backwards payments, and it is not
+claimed to be better than a reachable rung. (6) The exploration archives were not re-read this pass.

@@ -1346,8 +1346,46 @@ class GateProgress:
         While the verdict is still None -- a mid-load frame with no ladder or no player -- "collapsed" reads as
         OFF. That is the conservative direction: a level whose block never arrives behaves exactly as it did
         before the patience spec.
+
+        AND IT IS OFF WHENEVER THE COLLAPSE VERDICT HANDED THIS LOAD ITS TRUNK (`_prefers_route`), which is the
+        2026-09-18 correction and the only case that changes. The two switches were designed against each other
+        and nobody noticed when the second shipped: `patience_mode: collapsed` takes its verdict from the GATE
+        ladder, so on 0-3 it turns parking ON, while `prefer_route_when_collapsed` makes the same verdict walk
+        the ROOM TRUNK instead -- and the docstring on `_note_reached`'s payment rules already says parking is
+        "nearly INERT" on a trunk and "can only mislead" there. Measured in game on 0-3 (13 recorded rollouts of
+        ckpt_24181522, 89,458 decisions, `runs/probe_0-3/`): 23 parks, and the fallback -- `_pick`'s "nearest
+        unreached, unparked gate" with NO hop constraint -- then aimed the agent BACKWARDS and DOWNWARDS off the
+        climb it was meant to make. Parked targets read dy -2.6, -5.7, -8.4 and, in the one episode that ever
+        stood on 0-3's Floor 2, -27.3 m: the boss rung parked at decision 867 and the target became the stack
+        foot 36.6 m away and 27.3 m below. Worse than permitted, the descent was PAID: 31 decisions collected
+        `gate_approach` totalling +3.87 while losing height under a fallback target. Live over the same period,
+        67% of fresh episodes parked at least once (84 of 126) and not one completed.
+
+        The credit patience earned on 0-3 ("what made 0-3 move at all", `detect_collapsed_ladder`) was measured
+        under gates PLUS patience -- the configuration abandoned on 2026-09-17 21:58, when 0-3 sat at 0 of 75
+        fresh completions with 8 parks per episode and the flag was flipped to walk the trunk instead
+        (`configs/campaign_gates_full.yaml:119`). It does not carry over to the trunk, so nothing measured is
+        being switched off here.
+
+        DELIBERATELY NARROW, and `_prefers_route` is what makes it so. A collapsed level with NO trunk (1-1,
+        1-2, 2-3, 8-1) keeps gates plus patience, untouched and unmeasured either way. With
+        `prefer_route_when_collapsed` false -- every rollback config -- this line cannot fire at all. A trunk
+        reached by the ROUTE FALLBACK (the 12 levels with no usable gate ladder) keeps parking, because the
+        detector grades the trunk itself there and a total order walked from its own top rung is HEALTHY, so
+        `ladder_collapsed` is false and `_prefers_route` with it --
+        `test_a_route_fallback_trunk_still_parks_because_nothing_else_can_rescue_a_bad_rung`. That last one is a
+        property of the DATA, not of this rule: a fallback level whose spawn sat somewhere other than its top
+        rung would read collapsed and lose parking too. No shipped route file is shaped that way (rung `hops`
+        counts down from the first entry), and `tests/test_route_walk.py` is what would catch one that was.
+
+        With parking off there is no fallback either (`_pick` returns None and the ladder keeps its pick), so
+        the target stays on the rung above and the wrong gradient is simply gone. That does NOT by itself make
+        an unreachable rung reachable -- 0-3's WP2 is credited in 2 of 13 recorded episodes whether or not this
+        fires -- and it is not claimed to.
         """
         if not self.patience_steps or self.patience_mode == "off":
+            return False
+        if self._prefers_route():
             return False
         return True if self.patience_mode == "always" else bool(self.ladder_collapsed)
 
