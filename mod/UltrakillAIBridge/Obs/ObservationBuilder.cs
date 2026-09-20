@@ -65,6 +65,7 @@ namespace UltrakillAIBridge.Obs
 
         private readonly List<(EnemyIdentifier eid, float dist)> sorted = new List<(EnemyIdentifier, float)>();
         private readonly CampaignObserver campaign = new CampaignObserver();
+        private readonly TechObserver tech = new TechObserver();
 
         // The enemies BuildEnemies already fetched from EnemyTracker this step, reused for the campaign
         // block's arena_enemies_alive so CampaignObserver doesn't re-walk and re-allocate the same list.
@@ -84,6 +85,12 @@ namespace UltrakillAIBridge.Obs
             GroundRayRadius = cfg["ground_ray_radius"]?.Value<float>() ?? GroundRayRadius;
             GroundRayLength = cfg["ground_ray_length"]?.Value<float>() ?? GroundRayLength;
             ReportMemory = cfg["report_memory"]?.Value<bool>() ?? ReportMemory;
+            // mod 0.8.0 technique blocks. All default OFF, so a client that knows nothing about them gets
+            // the 0.7.2 observation exactly; turning one on is a config flip, not a protocol change.
+            tech.EmitMove = cfg["obs_move_tech"]?.Value<bool>() ?? tech.EmitMove;
+            tech.EmitWeapon = cfg["obs_weapon_tech"]?.Value<bool>() ?? tech.EmitWeapon;
+            tech.EmitProjectiles = cfg["obs_projectiles"]?.Value<bool>() ?? tech.EmitProjectiles;
+            tech.MaxProjectiles = Mathf.Max(0, cfg["max_projectiles"]?.Value<int>() ?? tech.MaxProjectiles);
         }
 
         public static bool PlayerReady()
@@ -126,6 +133,7 @@ namespace UltrakillAIBridge.Obs
             obs["ground_ray_center"] = GroundRayCenter(nm, playerPos, envMask);
             obs["stats"] = BuildStats(nm);
             if (ReportMemory) obs["mem"] = BuildMemory();
+            BuildTech(obs, nm);
 
             var sm = MonoSingleton<StatsManager>.Instance;
             if (CampaignObserver.IsCampaignScene(sm))
@@ -203,6 +211,33 @@ namespace UltrakillAIBridge.Obs
                 ["soft_death_instakill"] = Env.TrainingSpeed.LastSoftDeathInstakill,
             };
         }
+
+        /// <summary>
+        /// The optional 0.8 technique blocks. Each is behind its own config flag and each failure is
+        /// swallowed after one warning, for the same reason the campaign block is: EndOfFrame's outer catch
+        /// would turn the whole reply into an error, which the Python client raises as BridgeError, killing
+        /// that SubprocVecEnv worker and the run. A lost block must cost the block.
+        /// </summary>
+        private void BuildTech(JObject obs, NewMovement nm)
+        {
+            if (!tech.EmitMove && !tech.EmitWeapon && !tech.EmitProjectiles) return;
+            try
+            {
+                if (tech.EmitMove) obs["move_tech"] = tech.BuildMove(nm);
+                if (tech.EmitWeapon) obs["weapon_tech"] = tech.BuildWeapon();
+                if (tech.EmitProjectiles) obs["projectiles"] = tech.BuildProjectiles(nm);
+            }
+            catch (System.Exception e)
+            {
+                if (!techBuildFailWarned)
+                {
+                    techBuildFailWarned = true;
+                    Plugin.Log.LogWarning($"TechObserver failed, omitting the technique blocks: {e}");
+                }
+            }
+        }
+
+        private bool techBuildFailWarned;
 
         /// <summary>Weapons in each slot, slot 1 first (empty until GunControl has started).</summary>
         private static JArray SlotCounts(GunControl gun)

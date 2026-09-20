@@ -187,9 +187,11 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   FLOOR (25), not the full 100, when a speed stage's official time is missing. Neither is validated in game.
   Still open: guard T's mid-name-fork blind spot; a 0-3 wall probe; the memory work (another engineer owns
   `python/`, `mod/`, that note); branch `dormant-levers` — S0 slot counters on, S1/S2 + S5 OFF (`docs/commands.md`).
+- **Mod v0.8.0 source is merged but NOT installed** — GO on the SSJ macro, M2 `ssj_wall` cut to reserved; the
+  S7 install is a 15-25 min full pause still to schedule. `docs/project-log.md` 2026-09-20.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
-  (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2** installed; **33 of 35**
-  levels ship; Violent, with all weapons unlocked in memory for AI runs only.
+  (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2 installed, v0.8.0 in
+  source**; **33 of 35** levels ship; Violent, all weapons unlocked in memory for AI runs only.
 - Machines (backups and migration steps in `docs/machines.md`). This PC:
   `C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL`, Ryzen 9 3900X (12C/24T), 32 GB, RTX 2080 SUPER,
   **one display** — pass `--monitor 1` everywhere. Original PC:
