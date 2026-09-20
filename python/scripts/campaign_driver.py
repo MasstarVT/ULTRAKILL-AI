@@ -97,6 +97,27 @@ JSON sidecar (rate, best time, steps, source checkpoint, difficulty). `best.zip`
 the zips rather than trusting `latest.zip`'s name -- `latest.zip` is only written on a graceful stop and a
 killed trainer leaves it stale. The next stage then resumes from that promoted file.
 
+**FOCUS / RECORD CHASE** (2026-09-20, `docs/superpowers/specs/2026-09-18-speed-stages.md` §11). The user:
+"can we focuse on one level tell we get it to a point that is close to the speed run record". A `focus:` block
+in the plan names ONE level and a LADDER of median times, and while it is set the driver trains nothing else:
+
+    focus:
+      level: "Level 0-1"
+      targets: [120, 100, 85, 72, 60, 50, 42, 35, 30, 25]   # median official seconds
+
+Each `targets` entry is a RUNG: a speed stage of that level whose `target_seconds` is that number exactly,
+never the S-rank time and never scaled. It uses the level's own speed run (`spec_0-1_speed`), resumed through
+`round_init` from that run's own newest weights, and it promotes by the ordinary speed rule -- fresh rate at
+or above `speed.target_rate` AND `median_time_50` at or under the rung's target, latched, then the settle. A
+rung that is met is recorded `"done"` WITH ITS TARGET and the specialist is overwritten (the rung's median is
+by construction faster than the last promoted one); a round that runs out of steps is `"unfinished"`, does
+NOT overwrite the specialist (`refuse_promotion`) and repeats the same rung. Which rung is current is derived
+from the history, not stored: `focus_rung` walks the ladder and skips every target a `"done"` speed round has
+already met, either by its own target or by its recorded median -- so today's `"done"` 0-1 speed round at
+target 150 with median 147.16 puts the focus on the 120 rung. When the last rung is done the focus STOPS,
+says so loudly, and the ordinary plan takes over. `focus: null` (or no block at all) is exactly today's
+behaviour.
+
 **State** lives in `runs/specialists/driver_state.json` (current stage, its start step count, the history), so
 restarting the driver resumes the stage it was on instead of starting the ladder again. The plan file is
 re-read on every start and the state is matched to it by `(level, kind)` (`DriverState.reconcile`), so stages
@@ -228,6 +249,85 @@ class StageRule:
     seed_explore_from: str = "campaign_gates"
 
 
+@dataclass(frozen=True)
+class FocusPlan:
+    """The `focus:` block: ONE level, and a ladder of median times to chase down it (§11, 2026-09-20).
+
+    `targets` is strictly decreasing seconds. Each one is a RUNG -- a speed stage of `level` measured against
+    that exact number. `record_seconds` is the human inbounds IL record, carried only so a report can print
+    "x.xx x the record"; nothing in the rule reads it.
+    """
+
+    level: str
+    targets: tuple[float, ...]
+    record_seconds: float | None = None
+
+
+class Rung(NamedTuple):
+    """Which rung of the focus ladder is current: its 0-based position, its target, and how many there are."""
+
+    index: int
+    target: float
+    total: int
+
+    @property
+    def number(self) -> int:
+        """1-based, for a log line or a report -- "rung 1 of 10"."""
+        return self.index + 1
+
+
+# `begin_stage(rung=...)`'s default: ASK, rather than assume there is no rung. `None` has to keep meaning "this
+# stage is not a rung of the ladder", so "nothing was said" needs a value of its own (2026-09-20 review).
+AUTO_RUNG = "auto"
+
+
+def entry_target(entry: dict) -> float | None:
+    """The `target_seconds` a history entry was measured against, or None. Never raises on an old entry."""
+    return _num(entry.get("target_seconds"))
+
+
+def rung_met(entries: Iterable[dict], target: float) -> bool:
+    """Has a `"done"` round already MEASURED a median at or under `target`?
+
+    One way only, and it is the measurement: the median the round recorded when it ended. A round aimed at a
+    harder target that did not actually get there proves nothing, and a round aimed higher that did get there
+    counts in full -- which is how a ladder skips rungs the level is already past instead of spending 8M steps
+    re-proving them (today's 0-1 round, aimed at 150 and measuring 147.16, meets every rung at or above 147.16
+    and no rung below it).
+
+    IT IS NOT THE ROUND'S OWN TARGET (2026-09-20 review). `stage_verdict` latches on the FIRST 50-episode
+    window whose rate and median clear the bar and never un-latches, so `"done"` can be written on one window
+    and the 300k-step settle can end with the median drifted back above the target -- with keep_best never
+    moving `best.zip`, `promote` re-copying the identical file, and the ladder nevertheless walking on to a
+    rung the policy has never been near. Reading the recorded median makes a second, independent window agree
+    before the ladder moves; a round whose median drifted back simply runs the same rung again. That is why
+    `finish_stage` writes `median_time` into every entry, and why an entry with no clock at all meets nothing.
+    """
+    for entry in entries:
+        if str(entry.get("status") or "") != "done":
+            continue
+        median = valid_official_seconds(entry.get("median_time"))
+        if median is not None and median <= target:
+            return True
+    return False
+
+
+def focus_rung(plan: "Plan", state: "DriverState") -> Rung | None:
+    """The rung the focus is on, or None when there is no focus or the whole ladder is done.
+
+    Pure: the plan and the state, nothing on disk. `specialists_status.py` calls it directly, so the read-only
+    report cannot disagree with the driver about which rung is being trained.
+    """
+    focus = plan.focus
+    if focus is None:
+        return None
+    entries = state.entries_for((focus.level, SPEED))
+    for index, target in enumerate(focus.targets):
+        if not rung_met(entries, target):
+            return Rung(index, target, len(focus.targets))
+    return None
+
+
 class StageSpec(NamedTuple):
     """One entry of the plan. `(level, kind)` is a stage's identity everywhere: names, state, history."""
 
@@ -267,6 +367,14 @@ class Plan:
     # round until it is "done", and only then does the next one start. The user, 2026-09-19: "shouldnt we
     # just work on 0-1 untell its finished before working on the other levels".
     hold_order: str = ROUND_ROBIN
+    # THE FOCUS / RECORD CHASE (§11, 2026-09-20). `None` -- the default, and what every plan written before
+    # this key means -- is exactly today's behaviour: the hold line and `hold_order` decide everything. Set,
+    # it overrides both: only that level's speed stage runs, one rung of its ladder at a time.
+    focus: FocusPlan | None = None
+
+    def focus_stage(self) -> StageSpec | None:
+        """The stage the focus trains: its level's SPEED stage, or None when there is no focus."""
+        return None if self.focus is None else StageSpec(self.focus.level, SPEED)
 
     def hold_index(self) -> int | None:
         """The plan position the hold line sits in front of, or None when there is no line.
@@ -361,8 +469,55 @@ def load_plan(path: str | Path) -> Plan:
         raise ValueError("%s: unknown hold_order %r (expected %s)" % (path, order_rule, list(HOLD_ORDERS)))
     plan = Plan(stages=stages, rule=StageRule(**dict(data.get("stage", {}) or {})), speed=speed, targets=targets,
                 target_scale=scale, speed_rewards=speed_rewards, hold_before=hold, hold_order=order_rule,
+                focus=_focus_plan(path, data.get("focus"), stages),
                 env=dict(data.get("env", {}) or {}), train=dict(data.get("train", {}) or {}))
     return plan
+
+
+FOCUS_KEYS = ("level", "targets", "record_seconds")
+
+
+def _focus_plan(path, block, stages: list[StageSpec]) -> FocusPlan | None:
+    """The `focus:` block, validated LOUDLY (§11). `None`/absent is today's behaviour and is not an error.
+
+    Every check here is a hard error for the same reason `hold_before`'s typo check is: a focus that silently
+    does nothing -- or that silently names the wrong level -- spends days of twelve games on the wrong thing
+    with nobody watching, and there are no LLM monitors on this run by the user's own instruction.
+    """
+    if not block:
+        return None
+    if not isinstance(block, dict):
+        raise ValueError("%s: `focus:` must be a block with `level:` and `targets:`, not %r" % (path, block))
+    unexpected = sorted(set(block) - set(FOCUS_KEYS))
+    if unexpected:
+        raise ValueError("%s: unknown focus settings %s (expected %s)" % (path, unexpected, list(FOCUS_KEYS)))
+    level = str(block.get("level") or "")
+    if not level:
+        raise ValueError("%s: `focus:` has no `level:`" % path)
+    if level not in {s.level for s in stages}:
+        raise ValueError("%s: focus.level %r is not a level in the plan" % (path, level))
+    if (level, SPEED) not in {s.key for s in stages}:
+        # The focus trains that level's SPEED stage, and every name, path and index comes from the plan entry
+        # for it. Without the entry `begin_stage` would raise on `index_of` at the moment the stage starts.
+        raise ValueError("%s: focus.level %r has no `{level: %s, kind: speed}` entry under `order:`"
+                         % (path, level, level))
+    raw = block.get("targets") or []
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError("%s: focus.targets must be a non-empty list of median seconds" % path)
+    try:
+        ladder = [float(value) for value in raw]
+    except (TypeError, ValueError):
+        raise ValueError("%s: focus.targets must all be numbers: %r" % (path, list(raw))) from None
+    bad = [value for value in ladder if not (value > 0.0)]
+    if bad:
+        raise ValueError("%s: focus.targets must all be positive seconds: %s" % (path, bad))
+    flat = [(a, b) for a, b in zip(ladder, ladder[1:]) if b >= a]
+    if flat:
+        # A ladder that does not get harder is either a typo or a rung that can never be reached by getting
+        # faster, and `focus_rung` walks it assuming each target is strictly under the one before it.
+        raise ValueError("%s: focus.targets must be strictly decreasing (a ladder toward the record); "
+                         "these do not decrease: %s" % (path, flat))
+    return FocusPlan(level=level, targets=tuple(ladder), record_seconds=_num(block.get("record_seconds")))
 
 
 def order_rule_text(hold_order: str, levels: Iterable[str]) -> str:
@@ -381,7 +536,8 @@ def order_rule_text(hold_order: str, levels: Iterable[str]) -> str:
     return "depth-first: one stage at a time, in plan order"
 
 
-def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind: str = COMPLETE) -> dict:
+def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind: str = COMPLETE,
+                 target_seconds: float | None = None) -> dict:
     """The real single-level training config for one stage: `{env: ..., train: ...}`, ready to write as YAML.
 
     `timesteps` is the run TOTAL in train.py, and every stage resumes from the previous specialist, so the
@@ -423,7 +579,11 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
             # be the one mutated object and would still compare equal. Pinned by the order-independence test
             # in tests/test_speed_death_weight.py.
             env["rewards"] = {**env["rewards"], **plan.speed_rewards}
-        target = plan.target_for(level)
+        # A FOCUS RUNG's target wins over the plan's per-level override, which wins over reading the level's
+        # own S-rank time live (§11). All three arrive at the env down the ONE path, `speed_target_seconds`,
+        # which the env reports back as `info["target_seconds"]` -- so the reward and the promotion rule are
+        # measured against the same number whichever of the three set it.
+        target = target_seconds if target_seconds else plan.target_for(level)
         if target:
             env["speed_target_seconds"] = float(target)
     train = dict(plan.train)
@@ -434,13 +594,16 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
 
 
 def write_stage_config(plan: Plan, level: str, cwd: Path, *, init_steps: int | None = None,
-                       generated_dir: str = GENERATED_DIR, kind: str = COMPLETE) -> Path:
+                       generated_dir: str = GENERATED_DIR, kind: str = COMPLETE,
+                       target_seconds: float | None = None) -> Path:
     path = cwd / stage_config_path(level, generated_dir, kind)
     path.parent.mkdir(parents=True, exist_ok=True)
     header = ("# GENERATED by scripts/campaign_driver.py from configs/specialists.yaml -- do not edit.\n"
-              "# Stage: %s (%s), run %s. Edit the plan file and let the driver rewrite this.\n"
-              % (level, kind, stage_run_name(level, kind)))
-    path.write_text(header + yaml.safe_dump(stage_config(plan, level, init_steps=init_steps, kind=kind),
+              "# Stage: %s (%s), run %s%s. Edit the plan file and let the driver rewrite this.\n"
+              % (level, kind, stage_run_name(level, kind),
+                 (", FOCUS rung at %.2f s" % target_seconds) if target_seconds else ""))
+    path.write_text(header + yaml.safe_dump(stage_config(plan, level, init_steps=init_steps, kind=kind,
+                                                         target_seconds=target_seconds),
                                             sort_keys=False),
                     encoding="utf-8")
     return path
@@ -597,6 +760,7 @@ def refuse_promotion(models_dir: Path, level: str, *, kind: str, status: str) ->
 def promote(model_dir: Path, models_dir: Path, level: str, *, sample: StageSample, status: str,
             start_steps: float, difficulty: int, run: str, kind: str = COMPLETE,
             target_seconds: float | None = None, s_rank_seconds: float | None = None, round: int = 1,
+            rung: int | None = None,
             zip_steps: Callable[[Path], int | None] = supervise.zip_timesteps,
             copy: Callable[[Path, Path], object] = shutil.copy2) -> tuple[Path | None, dict]:
     """Copies the stage's checkpoint to `models/specialists/<level>.zip` and writes its JSON sidecar.
@@ -619,6 +783,7 @@ def promote(model_dir: Path, models_dir: Path, level: str, *, sample: StageSampl
         "target_seconds": target_seconds,       # what a speed stage was actually measured against
         "s_rank_seconds": s_rank_seconds,       # ... and the raw S threshold it was scaled from (§8b)
         "round": round,                         # which attempt at this stage produced the file (§8a)
+        "rung": rung,                           # 0-based position on the focus ladder, or None (§11)
         "status": status,                       # "done" (the target rate was reached) or "unfinished" (the cap)
         "fresh_completion_rate": sample.fresh_rate,
         "fresh_window": sample.fresh_window,
@@ -719,6 +884,12 @@ class Stage:
     # and later round only happens while the HOLD LINE is up (§8a), when a stage that ended "unfinished" is
     # given another budget instead of the ladder moving on to a level it is not allowed to reach yet.
     round: int = 1
+    # WHICH RUNG of the focus ladder this stage is (§11, 2026-09-20), 0-based, or None when the driver is not
+    # focusing. `target_seconds` above carries the rung's actual target; this is only its position, so a log
+    # line and a report can say "rung 3 of 10" and `stage_blocked` can count rounds of THIS rung rather than
+    # of every rung the level has ever run. None on every stage written before the focus existed, which is
+    # exactly right for them: they were measured against the S-rank time, not against a ladder.
+    rung: int | None = None
     # Samples at or below this step count belong to an EARLIER ROUND of this stage and are ignored (2026-09-18
     # review). A round reuses the run directory, so `runs/<run>/status.json` still holds the previous round's
     # final numbers -- the same rate, the same window, the same lifetime `best_time` -- until the new trainer
@@ -784,6 +955,18 @@ class DriverState:
         """How many rounds of this stage have already ENDED. The next one is this plus one."""
         return len(self.entries_for(key))
 
+    def rung_rounds(self, key: tuple[str, str], target: float | None) -> int:
+        """How many rounds of this stage were measured against `target` (§11). `None` falls back to `rounds`.
+
+        A focus ladder runs many rounds of ONE (level, speed) stage, each against a different target, so a
+        round cap has to be per RUNG -- otherwise the tenth rung would start already out of rounds because of
+        the nine before it. The shipped plan sets `max_rounds: 0` (unbounded), so this only bites if someone
+        turns a cap back on; it must still be the right count when they do.
+        """
+        if target is None:
+            return self.rounds(key)
+        return len([h for h in self.entries_for(key) if entry_target(h) == target])
+
     def stage_status(self, key: tuple[str, str]) -> str | None:
         """The status of the LATEST round of this stage, or None when it has never run.
 
@@ -838,8 +1021,13 @@ def stage_blocked(plan: Plan, state: DriverState, spec: StageSpec, models_dir: P
     depth-first instruction forbids, and it must not be invisible to the daily check).
     """
     cap = plan.rule_for(spec.kind).max_rounds
-    if cap > 0 and state.rounds(spec.key) >= cap:
-        # Only ever reachable under the hold line: the ladder itself runs each stage once.
+    # Under a FOCUS the rounds are counted per RUNG: the ladder deliberately runs this one stage over and
+    # over, and a cap meant for "this stage cannot reach its target" must not fire because of rungs already
+    # passed. `focus_rung` is None once the ladder is done, and then this is the ordinary count again.
+    rung = focus_rung(plan, state) if plan.focus is not None and spec.key == (plan.focus.level, SPEED) else None
+    spent = state.rung_rounds(spec.key, rung.target if rung is not None else None)
+    if cap > 0 and spent >= cap:
+        # Only ever reachable under the hold line or a focus: the ladder itself runs each stage once.
         return "it has had its %d rounds and is still not done" % cap
     if spec.kind != SPEED:
         return ""
@@ -1044,6 +1232,34 @@ class Driver:
         """Why this stage cannot start yet, or `""` when it can -- the module-level rule, on this driver."""
         return stage_blocked(self.plan, self.state, spec, self.cfg.cwd / self.cfg.models_dir)
 
+    def held_message(self, blocked: str) -> str:
+        """The line the driver stops on, leading with what is ACTUALLY blocking (2026-09-20 review).
+
+        Under a focus the hold line is not the reason and naming it first sends an operator to the wrong part
+        of the plan file. Either way the games are not children of this process and keep running after it
+        exits, so the line says so: on a commit-bound box, 12 idle instances are the expensive part.
+        """
+        if blocked.startswith("FOCUS ") and self.plan.focus is not None:
+            return ("FOCUS on %s and its speed stage cannot start: %s. Stopping so a human can look -- the "
+                    "games are STILL RUNNING, so fix this or stop them."
+                    % (self.plan.focus.level, blocked.split(": ", 1)[-1]))
+        return ("HELD before %s and nothing can run: %s. Stopping so a human can look -- the games are STILL "
+                "RUNNING." % (self.plan.hold_before, blocked))
+
+    def focus_rung(self) -> Rung | None:
+        """The rung of the focus ladder to train now, or None (no focus, or every rung is done)."""
+        return focus_rung(self.plan, self.state)
+
+    def rung_for(self, spec: StageSpec) -> Rung | None:
+        """The focus rung `spec` would be started as, or None when it is an ordinary stage.
+
+        `choose_stage` keeps its three-value shape (every caller and every test unpacks it), so the rung is
+        asked for separately by the two places that actually begin a stage.
+        """
+        if self.plan.focus is None or spec.key != (self.plan.focus.level, SPEED):
+            return None
+        return self.focus_rung()
+
     def held_by(self) -> list[StageSpec]:
         """The stages in front of the hold line that are not `"done"`, in plan order. Empty = the line is open.
 
@@ -1074,8 +1290,53 @@ class Driver:
             plan order that can run, and the same one again next time, until it is `"done"`. A blocked stage
             is passed over only because nothing in front of it can run; the reason is logged.
 
+        A FOCUS (§11) overrides both: while one is set and its ladder still has a rung left, the ONLY stage
+        this ever returns is that level's speed stage, whatever the hold line or the plan order would say.
+        When the ladder is exhausted the focus stops -- loudly -- and the rules below take over again.
+
         Either way a stage picked for another round resumes from its OWN newest weights (`round_init`).
         """
+        focus = self.plan.focus
+        if focus is not None:
+            spec = StageSpec(focus.level, SPEED)
+            rung = self.focus_rung()
+            if rung is None:
+                self.log_once("focus_done:%s" % focus.level,
+                              "FOCUS COMPLETE: every one of the %d rungs for %s is done (the last was %.2f s). "
+                              "The focus is over; the ordinary plan decides from here. Clear `focus:` in %s, "
+                              "or add faster rungs to keep chasing."
+                              % (len(focus.targets), focus.level, focus.targets[-1], self.cfg.plan_path),
+                              slot="focus")
+            else:
+                why = self.stage_blocked(spec)
+                if why and self.state.stage_status((focus.level, COMPLETE)) != "done":
+                    # THE FOCUS FINISHES ITS LEVEL FIRST (2026-09-20 review). A speed stage resumes from its
+                    # level's promoted specialist, so a level whose complete stage is not done has nothing for
+                    # it to resume from -- and "focus on Level X" plainly means get X done and then chase its
+                    # clock, not stop. Exiting instead left 12 games running on a commit-bound box with no
+                    # trainer until a human noticed, which is the one outcome `max_rounds: 0` exists to avoid,
+                    # and `focus.level` is a single line of the plan that the user's own direction invites
+                    # changing. The complete stage is an ordinary stage and is never a rung.
+                    first = StageSpec(focus.level, COMPLETE)
+                    blocked_too = self.stage_blocked(first)
+                    if not blocked_too:
+                        self.log_once("focus_complete_first:%s" % focus.level,
+                                      "FOCUS on %s: its speed stage cannot start yet (%s), so the focus is "
+                                      "running its COMPLETE stage first. The ladder starts once that stage is "
+                                      "done." % (focus.level, why), slot="focus")
+                        return first, [], ""
+                    why = "%s, and its complete stage cannot run either (%s)" % (why, blocked_too)
+                if why:
+                    return None, [spec], "FOCUS %s (%s): %s" % (spec.level, spec.kind, why)
+                self.log_once("focus:%s@%g" % (focus.level, rung.target),
+                              "FOCUS on %s: rung %d of %d, median must reach %.2f s%s. Nothing else in the "
+                              "plan starts while the focus is set."
+                              % (focus.level, rung.number, rung.total, rung.target,
+                                 (" (%.2fx the %.3f s record)" % (rung.target / focus.record_seconds,
+                                                                  focus.record_seconds))
+                                 if focus.record_seconds else ""),
+                              slot="focus")
+                return spec, [], ""
         waiting = self.held_by()
         if waiting:
             eligible = [s for s in waiting if not self.stage_blocked(s)]
@@ -1135,8 +1396,24 @@ class Driver:
             return own  # this stage ran before and promoted; that file is its own newest weights
         return self.initial_checkpoint(spec.level, spec.kind)
 
-    def begin_stage(self, level: str, init: Path, kind: str = COMPLETE) -> Stage:
-        """Prepares a stage's files and records it as current. Starting the trainer is `ensure_trainer`."""
+    def begin_stage(self, level: str, init: Path, kind: str = COMPLETE, *, rung: Rung | None | str = AUTO_RUNG
+                    ) -> Stage:
+        """Prepares a stage's files and records it as current. Starting the trainer is `ensure_trainer`.
+
+        A FOCUS RUNG (§11) is the same speed stage of the same level with an explicit `target_seconds` instead
+        of the level's S-rank time, written into the generated config so the env scales the completion bonus
+        against the very number the promotion rule will read back.
+
+        WHICH RUNG IS A PROPERTY OF THE STAGE, NOT OF THE CALLER (2026-09-20 review). `rung` defaults to
+        `AUTO_RUNG`, which asks `rung_for`, so every path that begins a stage -- `tick`, `finish_stage` and
+        `main()`'s `--start-at` -- gets the same answer. Before that, `--start-at` was the one caller that
+        forgot: `start_at_objection` deliberately permits the focus level's own speed stage, so an operator
+        restarting it by hand began it with no rung, the env reported the level's S-rank time live, the tick
+        clause accepted that number because `stage.rung` was None, and the stage would latch and promote on a
+        bar the level had already passed. Passing `rung=None` explicitly still means "not a rung".
+        """
+        if rung is AUTO_RUNG:
+            rung = self.rung_for(StageSpec(level, kind))
         model_dir = self.model_dir(level, kind)
         model_dir.mkdir(parents=True, exist_ok=True)
         self.stage_run_dir(level, kind).mkdir(parents=True, exist_ok=True)
@@ -1164,19 +1441,22 @@ class Driver:
                          % (level, kind, resume.name, "{:,}".format(int(resume_steps)), Path(init).name,
                             "{:,}".format(int(init_steps))))
             init_steps = resume_steps
+        rung_target = rung.target if rung is not None else None
         if not self.cfg.dry_run:
             path = write_stage_config(self.plan, level, self.cfg.cwd, init_steps=init_steps,
-                                      generated_dir=self.cfg.generated_dir, kind=kind)
+                                      generated_dir=self.cfg.generated_dir, kind=kind,
+                                      target_seconds=rung_target)
             self.log("stage config %s (init %s steps)" % (path, "{:,}".format(init_steps) if init_steps else "?"))
         round_n = self.state.rounds((level, kind)) + 1
         # Whatever the run's status.json says right now was written by an EARLIER round of this stage (the run
         # directory is reused), and the latch has just been reset: those samples are ignored until the new
         # trainer's own numbers pass them. See `Stage.stale_below`.
         stale = read_sample(self.stage_run_dir(level, kind) / "status.json", model_dir / "best.json").timesteps
+        target = rung_target or (self.plan.target_for(level) if kind == SPEED else None)
         stage = Stage(level=level, run=stage_run_name(level, kind), index=self.plan.index_of(level, kind),
                       init=init.as_posix(), start_steps=float(init_steps or 0), started_at=self.now(),
-                      kind=kind, target_seconds=self.plan.target_for(level) if kind == SPEED else None,
-                      round=round_n, stale_below=stale)
+                      kind=kind, target_seconds=target,
+                      round=round_n, rung=rung.index if rung is not None else None, stale_below=stale)
         self.state.current = stage
         self.save_state()
         self.sup = None  # the next supervisor_for() builds one for this stage
@@ -1189,9 +1469,20 @@ class Driver:
                      % (round_n, level, kind, "{:,}".format(self.plan.rule_for(kind).max_steps_per_stage), init))
         if kind == SPEED:
             self.log("%s is a SPEED stage: it promotes only once median_time_50 <= %s"
-                     % (level, ("%.2f s (the plan's override)" % stage.target_seconds) if stage.target_seconds
+                     % (level, ("%.2f s (%s)" % (stage.target_seconds,
+                                                 "FOCUS rung %d of %d" % (rung.number, rung.total)
+                                                 if rung is not None else "the plan's override"))
+                        if stage.target_seconds
                         else "%.2f x the level's own S-rank time, read live from the first observation"
                              % self.plan.target_scale))
+        if rung is not None:
+            # The stale window matters more here than anywhere else: a rung reuses the run directory of every
+            # rung before it, so `runs/spec_<level>_speed/status.json` still holds the PREVIOUS rung's median
+            # -- which passed its own, easier target -- until the new trainer overwrites it. Say the number.
+            self.log("FOCUS rung %d of %d for %s: target %.2f s; ignoring %s's status.json until the trainer "
+                     "passes %s steps, so this rung cannot latch on the previous rung's median"
+                     % (rung.number, rung.total, level, rung.target, stage.run,
+                        "{:,.0f}".format(stale) if stale is not None else "?"))
         return stage
 
     def seed_archives(self, level: str, model_dir: Path, kind: str = COMPLETE) -> list[str]:
@@ -1332,11 +1623,14 @@ class Driver:
                 model_dir, models_dir, stage.level,
                 sample=sample, status=status, start_steps=stage.start_steps, difficulty=difficulty,
                 run=stage.run, kind=stage.kind, target_seconds=stage.target_seconds,
-                s_rank_seconds=stage.s_rank_seconds, round=stage.round,
+                s_rank_seconds=stage.s_rank_seconds, round=stage.round, rung=stage.rung,
                 zip_steps=self.zip_steps, copy=self.copy)
             self.log("promoted %s -> %s" % (sidecar.get("source_checkpoint", "?"), destination))
         entry = {"level": stage.level, "kind": stage.kind, "run": stage.run, "status": status,
                  "index": stage.index, "round": stage.round,
+                 # WHICH RUNG of the focus ladder this round was, or None (§11). `target_seconds` below is what
+                 # `rung_met` actually reads -- this is the position, for a report and for the round count.
+                 "rung": stage.rung,
                  # Why it ended, when that was not its own rule. None for every stage the rule ended.
                  "reason": reason,
                  "start_steps": stage.start_steps, "end_steps": sample.timesteps,
@@ -1361,8 +1655,7 @@ class Driver:
                      % (len(self.state.history), self.cfg.cwd / self.cfg.models_dir / SPECIALIST_DIR))
             return "finished"
         if nxt is None:
-            self.log("HELD before %s and nothing can run: %s. Stopping so a human can look."
-                     % (self.plan.hold_before, blocked))
+            self.log(self.held_message(blocked))
             return "held"
         if waiting:
             self.log("holding before %s (%s): waiting on %s"
@@ -1372,7 +1665,7 @@ class Driver:
         # neither of which is the file this stage just promoted: that one belongs to the level that ended.
         # The freshly promoted checkpoint stays the fallback for the ordinary "next level up" case.
         init = self.round_init(nxt) or destination or Path(stage.init)
-        started = self.begin_stage(nxt.level, init, nxt.kind)
+        started = self.begin_stage(nxt.level, init, nxt.kind, rung=self.rung_for(nxt))
         self.ensure_trainer(started, self.supervisor_for(started), self.processes())
         return "advanced"
 
@@ -1466,8 +1759,7 @@ class Driver:
                 self.log_once("finished", "every stage in the plan is finished; nothing to drive")
                 return "finished"
             if spec is None:
-                self.log("HELD before %s and nothing can run: %s. Stopping so a human can look."
-                         % (self.plan.hold_before, blocked))
+                self.log(self.held_message(blocked))
                 return "held"
             if waiting:
                 self.log_once("holding:%s" % spec.key[0] + spec.key[1],
@@ -1479,7 +1771,7 @@ class Driver:
                 self.log("NO INIT CHECKPOINT for %s (%s): pass --init on the first start. Stopping."
                          % (spec.level, spec.kind))
                 return "no_init"
-            stage = self.begin_stage(spec.level, init, spec.kind)
+            stage = self.begin_stage(spec.level, init, spec.kind, rung=self.rung_for(spec))
 
         sup = self.supervisor_for(stage)
         procs = self.processes()
@@ -1497,7 +1789,10 @@ class Driver:
         # The target time is read LIVE off the run, because only the env can see the level's `campaign.ranks`.
         # A plan override is already in the stage and wins; otherwise the first status.json carrying one sets it
         # for good, so the promotion rule and the reward are measured against the same number.
-        if (stage.kind == SPEED and sample.target_seconds is not None
+        # A FOCUS RUNG's target is a decision already made, exactly like a `speed.targets:` override, so it is
+        # never replaced by whatever the run reports -- not even by the previous rung's number lingering in a
+        # status.json the stale filter has stopped covering.
+        if (stage.kind == SPEED and sample.target_seconds is not None and stage.rung is None
                 and not self.plan.target_for(stage.level) and stage.target_seconds != sample.target_seconds):
             stage.target_seconds = sample.target_seconds
             self.save_state()
@@ -1575,6 +1870,26 @@ class Driver:
                         "{:,}".format(speed.max_steps_per_stage),
                         ("at most %d rounds each" % speed.max_rounds) if speed.max_rounds > 0
                         else "no round cap"))
+        focus = self.plan.focus
+        if focus is not None:
+            rung = self.focus_rung()
+            self.log("FOCUS on %s: the ONLY stage that runs is its speed stage, one rung at a time. "
+                     "Ladder %s s%s. %s"
+                     % (focus.level, ", ".join("%g" % t for t in focus.targets),
+                        " -- the record is %.3f s" % focus.record_seconds if focus.record_seconds else "",
+                        ("now on rung %d of %d, target %.2f s (%d of the ladder's rungs are already met)"
+                         % (rung.number, rung.total, rung.target, rung.index)) if rung is not None
+                        else "EVERY RUNG IS DONE: the focus is over and the ordinary plan decides."))
+            current = self.state.current
+            if rung is not None and current is not None and current.key != (focus.level, SPEED):
+                # The focus never interrupts a running stage -- `tick` does not consult `choose_stage` while
+                # one is current -- so say plainly that it takes over at the next stage boundary, and how to
+                # bring that boundary forward.
+                self.log("the stage running now is %s (%s), which the focus SUPERSEDES: it keeps running "
+                         "until its own rule ends it or you write %s. The next stage after it will be "
+                         "%s (speed), FOCUS rung %d of %d at %.2f s."
+                         % (current.level, current.kind, self.end_stage_path, focus.level,
+                            rung.number, rung.total, rung.target))
         if self.plan.hold_before:
             waiting = self.held_by()
             self.log("HOLD LINE before %s (%s): no stage at or after it starts until every stage before it is "
@@ -1636,6 +1951,16 @@ def start_at_objection(plan: Plan, driver: Driver, level: str, kind: str, *, pla
         an operator who reads exit code 1 as a crash and re-runs it would begin a second round of the finished
         0-1 stage -- measuring its budget from the wrong origin and promoting over its specialist.
     """
+    focus = plan.focus
+    if focus is not None and level != focus.level and focus_rung(plan, driver.state) is not None:
+        # `--start-at` bypasses `choose_stage`, which is where the focus lives, so it could start 0-3 under a
+        # focus on 0-1 and nothing would ever notice. Clearing the block is the way to change the subject.
+        # BOTH of the focus level's own stages are allowed, because both are stages the focus itself can
+        # choose to run: its speed stage is the ladder, and its complete stage is what the focus falls back to
+        # while the level is not finished yet (2026-09-20).
+        return ("a FOCUS on %s (speed) is set in %s and its ladder is not finished: %s (%s) cannot be started "
+                "by hand. Clear `focus:` in the plan to train anything else."
+                % (focus.level, plan_path, level, kind))
     if (level, kind) in driver.state.finished_stages() and not rerun_stage:
         return ("%s (%s) has already run (status %r): drop --start-at/--init and let the state file decide, "
                 "or pass --rerun-stage to give it another round on purpose"

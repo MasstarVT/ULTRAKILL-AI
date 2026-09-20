@@ -651,12 +651,18 @@ def test_the_bonus_tracks_the_official_time_between_the_two_clips():
     env.close()
 
 
-def test_a_completion_the_game_gave_no_official_time_pays_the_plain_bonus():
+def test_a_completion_the_game_gave_no_official_time_pays_the_floor():
     """2026-09-19, live on `spec_0-2_speed`: the completion frame arrived AFTER the level stats had reset.
 
     The episode ran 4,120 decisions and the frame said `seconds` 0.0 with `restarts` 3. The completion is
-    real and still ends the episode; only its clock is missing, so it pays the plain weight, reports no time
-    and no rank, and writes no best run -- a 0.0 in `best_runs/` is a record nothing real can ever beat.
+    real and still ends the episode; only its clock is missing, so it reports no time and no rank and writes
+    no best run -- a 0.0 in `best_runs/` is a record nothing real can ever beat.
+
+    IT PAYS THE FLOOR, NOT THE PLAIN WEIGHT (2026-09-20). Paying the full 100 made a completion with NO clock
+    the best-paying completion on the whole stage: every genuine one slower than the target pays 39-99. The
+    floor is what the slowest genuine completion approaches and never reaches, so a lost timer can never be
+    worth more than a real run -- and it still pays four times what not finishing pays, which is the other
+    safety property. NOT VALIDATED IN GAME.
     """
     with tempfile.TemporaryDirectory() as tmp:
         env, fake = speed_env(best_runs_dir=tmp)
@@ -671,13 +677,20 @@ def test_a_completion_the_game_gave_no_official_time_pays_the_plain_bonus():
         assert info["end_reason"] == "level_complete" and info["completed"] == 1 and info["fresh_start"] == 1
         assert fake.seconds <= 1.0, "the fake really did report a time no level run can have taken"
         assert info["level_seconds"] is None and info["rank"] is None
-        assert info["completion_bonus"] == 100.0 == info["reward_parts"]["level_complete"], "the plain weight"
+        assert info["completion_bonus"] == 25.0 == info["reward_parts"]["level_complete"], "the floor"
         assert not list(Path(tmp).glob("*.json")), "no official time, no best run"
         env.close()
 
 
-def test_a_checkpoint_respawn_completion_pays_the_plain_bonus():
-    """Its official timer carries over from an earlier episode, so its "time" says nothing about the run."""
+def test_a_checkpoint_respawn_completion_pays_the_floor_on_a_speed_stage():
+    """Its official timer carries over from an earlier episode, so its "time" says nothing about the run.
+
+    On a SPEED STAGE that makes it the same case as a lost timer, and since 2026-09-20 it is priced the same
+    way: the floor, never the full weight. It cannot arise on a shipped speed stage at all -- they force
+    `fresh_start_prob: 1.0` precisely so that the stage never trains on episodes it does not score -- and this
+    test builds one by hand to pin the price if a future stage lowers that. A complete stage has no target and
+    is untouched: it pays the plain weight for every completion, respawn or not.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         env, fake = speed_env(fresh_start_prob=0.0, max_steps=25, best_runs_dir=tmp)
         env.reset(seed=0)
@@ -688,7 +701,7 @@ def test_a_checkpoint_respawn_completion_pays_the_plain_bonus():
         assert info["fresh_start"] == 0
         info = run_forward_until_end(env)
         assert info["end_reason"] == "level_complete" and info["level_seconds"] is None
-        assert info["completion_bonus"] == 100.0, "the plain weight, exactly as on a complete stage"
+        assert info["completion_bonus"] == 25.0, "the floor: no usable clock, so it cannot out-earn a real run"
         env.close()
 
 

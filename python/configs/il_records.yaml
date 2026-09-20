@@ -1,8 +1,10 @@
 # Human individual-level (IL) speedrun records for ULTRAKILL, in seconds of in-game time.
 #
 # RESEARCH ARTIFACT FOR TARGET-SETTING ONLY. Nothing in the training pipeline reads this file: it is not an
-# EnvConfig, it is not loaded by train.py or eval.py, and no reward term references it. It exists so a human
-# comparing times.md against what people actually achieve has the numbers in one machine-readable place.
+# EnvConfig, it is not loaded by train.py or eval.py, and no reward, gate or observation references it. It
+# exists so a human comparing times.md against what people actually achieve has the numbers in one
+# machine-readable place. ONE read-only reporter uses it: scripts/specialists_status.py prints the INBOUNDS
+# time beside the focus ladder ("4.11x the record", spec §11). That is display, and nothing decides on it.
 #
 # Source:   speedrun.com REST API, https://www.speedrun.com/api/v1, game id 369p3p81
 # Fetched:  2026-09-18

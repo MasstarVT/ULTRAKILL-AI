@@ -7,7 +7,10 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 ## The goal, in the user's terms
 - **Finish every shipped main level, as fast as possible.** 33 of the 35 campaign levels ship in this build
   (9-1 and 9-2 do not). **Speed, not kills** — combat rewards exist only because some doors are arena-gated.
-  The next tuning step is a completion bonus scaled by official time, then movement tech.
+- **RECORD CHASE ON LEVEL 0-1** (the user, 2026-09-20: "can we focuse on one level tell we get it to a point
+  that is close to the speed run record"). The whole machine stays on 0-1's speed stage, one rung of a median
+  ladder at a time (120 → 25 s), until it is close to the **19.798 s** human inbounds IL record. Nothing on
+  any other level starts while `focus:` is set in `configs/specialists.yaml`. Spec §11.
 - **It learns alone.** No human demos and no recorded human routes (`routes.py` / `record_route.py` were
   deleted 2026-09-16). Route signal comes from the game's own door graph and from offline room trunks.
 - **Violent now; Brutal (difficulty 4) for the later speed pass**, switched on together with the time-scaled
@@ -18,8 +21,8 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - **Check on the run, cheaply.** No always-on LLM monitor agents (the driver, `mem_guard.py` and
   `post_times.py --watch` restart things token-free), but the lead session checks hourly with
   `scripts/check_run.py` and acts on stalls — the user asked for that on 2026-09-18.
-- **Do not promote past 0-3 until 0-1..0-3 are much faster.** Speed stages (S-rank time targets, time-scaled
-  bonus) come before Level 0-4 gets a specialist.
+- **Do not promote past 0-3 until 0-1..0-3 are much faster**, and the focus comes first: 0-1 to the record,
+  then the `hold_before: "Level 0-4"` line and the speed stages as before.
 
 ## Workflow rules
 - **Always push after a change**: commit, then `git push origin main`.
@@ -128,7 +131,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - **Input:** injected through virtual Input System devices rather than Harmony patches on `InputActionState` getters, which Mono may inline.
 - **Rewards and observations:** computed in Python from raw mod data, so tuning needs no mod rebuild.
 
-## Current state (2026-09-18)
+## Current state (2026-09-20)
 - **Per-level specialists: one policy per level, trained sequentially** by `scripts/campaign_driver.py`, which
   replaces `supervise.py` and supervises each stage with the supervisor's own code. The shared multi-level run
   `campaign_gates` was stopped at 17,002,318 steps because the mixture thrashed — whichever level got the
@@ -148,45 +151,39 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   plan order runs round after round until it is `"done"`, and the plan is level-major (0-1 complete, 0-1
   speed, 0-2 complete, ...), so Level 0-1 is finished before any 0-2 stage starts (the user: "shouldnt we
   just work on 0-1 untell its finished"). `runs/specialists/END_STAGE` ends the running stage early through
-  the normal path (never Ctrl+C). Spec: `docs/superpowers/specs/2026-09-18-speed-stages.md` §8a, §10.
-- **The 0-3 stage ended at its 6M cap** (24,757,714 steps, recorded `"unfinished"`, 0 fresh completions), and
-  0-1's first speed round ended at its own cap; 12 games on ports 47800-47811, `mem_guard.py` alongside.
-  Under the depth-first order the next windows are 0-1 speed (round 2) until 0-1 is done, then 0-2 speed,
-  then 0-3 complete — 0-3's speed stage cannot start until its complete stage is `"done"`.
-- **Parking is off on a collapsed-ladder trunk load** (2026-09-18, `patience_active` + `_prefers_route`): on
-  0-3 a park aimed the agent 27.3 m back DOWN off Floor 2 and `gate_approach` paid +3.87 for descents over 13
-  recorded rollouts. The proposed waypoint move was REFUSED — it fails the generator's own `SEP`/`co_credit`
-  guards and credits earlier and lower. Baseline, live signal and revert trigger: `docs/project-log.md`.
-- 0-3's route went 4 rungs -> **6** on 2026-09-18 (two `insert_after` waypoints on the main-room spiral ramp
-  plus the Floor-2 rung moved off its centroid): the hallway -> Floor 2 leg was 76 degrees, so the target
-  vector carried no heading and 219 of 264 fresh episodes wedged at y ~20 with zero completions in 4.3M
-  steps. Steepest leg now 43.2 degrees; the ladder is still 5 hops deep, so the no-finish pay ceiling is
-  unchanged at 75. Baseline, live signal and revert triggers: `docs/project-log.md`, 2026-09-18.
+  the normal path (never Ctrl+C). Spec: `docs/superpowers/specs/2026-09-18-speed-stages.md` §8a, §10, §11.
+- **Level 0-3 is parked while the focus is on** (nothing of it runs). Its history, all dated in
+  `docs/project-log.md` 2026-09-18: parking off on a collapsed-ladder trunk load, the REFUSED waypoint move,
+  the route 4 rungs -> 6 -> trimmed back to the 4 every recorded completion used, and a mid-level wall probe
+  still to run. Read the log before touching 0-3 again — several levers there were refused on the data.
 - Promoted so far: **0-1 SPEED stage DONE** 2026-09-19 23:18 (round 2, fresh rate 0.92, `median_time_50`
   **147.16 s** vs the 150 s S-rank target, best **81.46 s**; `Level_0-1.zip` is now the fast policy) and **0-2**
   complete (0.72, best 2:19.5; its speed stage is the live one). 0-3 complete is `"unfinished"` (0 completions).
 - `times.md` leaderboard, all Violent: **0-1 01:21.464**, **0-2 01:37.645**, **0-3 04:23.904 (B)**. The human
   reference playthrough of 0-1 is **146.58 s**; human IL records, the real speed targets, are in
   `docs/il-records.md`.
-- 0-3's trunk shipped BOTH branches of the level's fork chained in series, and a 7-rung detour tour paid 105
-  against a completion's 100. Trimmed to the 4 rungs every recorded completion used (2026-09-18, `route-0-3`);
-  `rung_overrides.json` now carries `drop` entries; trainer bounced onto it at **21,701,566** steps. Judge at
-  +400k on wing endings and `exit_ground_dist_min` (131.8 m at the bounce), never on `gates_reached` — see the log.
-- **Live: `Level 0-2` (SPEED) ROUND 2, run `spec_0-2_speed`**, resumed 2026-09-19 23:18 from the stage's own
-  weights at ~23.31M steps, target median 120.00 s (round 1: median 306 -> ~190 s, best 97.65 s, ended with
-  `END_STAGE` when the order became depth-first). Order: 0-2 speed, 0-3 complete, 0-3 speed, then 0-4.
-  0-1 speed took two rounds (8M + 2.3M steps): median 500 -> 147 s with NO reward change. In
-  its round 1 an `ent_coef_max` cap, a rollback AND a
-  `time` 0.02->0.05 raise were all **refused** on the data — a recorded per-leg time budget (54% of the gap is
-  one 25 m shaft climb where `gate_approach` is flat), the corrected numbers and the revert triggers are in
-  `docs/project-log.md`, 2026-09-19. Also: guard T's mid-name-fork blind spot still
-  unfixed campaign-wide; a **0-3 mid-level wall probe** still to run; and the memory work above — another
-  engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
-- **0-2 speed is a DEATH problem, not navigation** (2026-09-20, no change landed): live over 1,960 fresh
-  completions, zero-death episodes finish at a **123.6 s** median against the 120 s target while >=9-death
-  ones take 378 s; OLS **+22.3 s/death, intercept 121.1 s**. Route potential, ghost_max, path-distance,
-  waypoints and per-leg time budgets were all **refused on the data — do not re-propose**. Classify the deaths
-  (93% at hp >= 70, three 15 m clusters) before picking a lever: `docs/project-log.md`, 2026-09-20.
+- **THE FOCUS (spec §11, 2026-09-20).** `focus: {level: "Level 0-1", targets: [120, 100, 85, 72, 60, 50, 42,
+  35, 30, 25]}` in `configs/specialists.yaml`. Each target is a RUNG: 0-1's speed stage with that exact
+  median as `target_seconds` (never the S-rank time, never scaled), same run `spec_0-1_speed`, resumed from
+  its own newest weights. A met rung promotes and the next starts; an `"unfinished"` round repeats the same
+  rung and promotes nothing. Which rung is current is DERIVED from the history, so the 2026-09-19 round (done
+  at 150 s, median 147.16) puts it on **120**. The last rung, 25 s, is 1.26x the record. Set `focus: null`
+  to go back to the plan; the focus stops itself, loudly, when the ladder is done. **The plan is read once,
+  at driver start** — a running driver must be restarted before any `focus:` edit means anything.
+- **Live: `Level 0-2` (SPEED) ROUND 2, run `spec_0-2_speed`** at ~23.31M steps, target median 120 s, 12 games
+  on ports 47800-47811 with `mem_guard.py` alongside — the stage the focus SUPERSEDES. End it with
+  `runs/specialists/END_STAGE` (never Ctrl+C) and the next stage is 0-1 speed at rung 120. Its own finding:
+  0-2 speed is a DEATH problem, not navigation (OLS
+  **+22.3 s/death**, intercept 121.1 s; route potential, ghost_max, path-distance and waypoints all
+  **refused on the data — do not re-propose**). 0-1 speed took two rounds (8M + 2.3M): median 500 -> 147 s
+  with NO reward change, after an `ent_coef_max` cap, a rollback and a `time` 0.02->0.05 raise were all
+  refused on a recorded per-leg budget (54% of the gap is one 25 m shaft climb). All in `docs/project-log.md`.
+- **Two shared-path reward bugs fixed 2026-09-20** (they change every stage; the focus's first rung is the new
+  baseline): `damage_dealt` is bounded to [0, 1] per enemy — an overkilled enemy with no known health bar paid
+  **-250 in one step**, 3.4% of 0-2 completions had a negative total — and `completion_bonus` now pays the
+  FLOOR (25), not the full 100, when a speed stage's official time is missing. Neither is validated in game.
+  Still open: guard T's mid-name-fork blind spot; a 0-3 mid-level wall probe; the memory work (another
+  engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`).
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
   (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2** installed; **33 of 35**
   levels ship; Violent, with all weapons unlocked in memory for AI runs only.

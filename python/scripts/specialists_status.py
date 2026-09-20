@@ -21,14 +21,40 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import yaml  # noqa: E402
+
 from campaign_driver import (  # noqa: E402
-    COMPLETE, DRIVER_RUN, SPECIALIST_DIR, SPEED, DriverState, StageSpec, load_plan, order_rule_text, read_sample,
-    specialist_path, stage_blocked, stage_run_name, stage_verdict)
-from ultrakill_ai.times import format_time  # noqa: E402
+    COMPLETE, DRIVER_RUN, SPECIALIST_DIR, SPEED, DriverState, StageSpec, entry_target, focus_rung, load_plan,
+    order_rule_text, read_sample, specialist_path, stage_blocked, stage_run_name, stage_verdict)
+from ultrakill_ai.times import format_time, valid_official_seconds  # noqa: E402
+
+IL_RECORDS = "configs/il_records.yaml"
 
 
 def fmt(value, digits=2, dash="-"):
     return dash if value is None else "%.*f" % (digits, value)
+
+
+def record_seconds(cwd: Path, level: str, path: str = IL_RECORDS) -> float | None:
+    """The human INBOUNDS individual-level record for `level`, in seconds, or None.
+
+    Display only, and the INBOUNDS time rather than the Any% one: the Any% route leaves the level, so it is
+    not a target the campaign env could ever reach. Nothing in the training pipeline reads this file -- no
+    reward, no gate and no observation -- and a missing or unparsable file is simply no record to print.
+    """
+    try:
+        data = yaml.safe_load((cwd / path).read_text(encoding="utf-8")) or {}
+        entry = ((data.get("levels") or {}).get(level) or {}).get("inbounds") or {}
+        return valid_official_seconds(entry.get("seconds"))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def times_record(value, record: float | None) -> str:
+    """"4.11x" -- how many times the record a time is, or "-" when either number is missing."""
+    if value is None or not record:
+        return "-"
+    return "%.2fx" % (float(value) / record)
 
 
 def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
@@ -62,6 +88,26 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
     out["order_rule"] = order_rule_text(plan.hold_order, [h["level"] for h in out["held_by"]])
     out["target_scale"] = plan.target_scale
     stage = state.current
+    # THE FOCUS / RECORD CHASE (§11). While it is set it overrides the hold line and the plan order entirely,
+    # so it is printed FIRST and the reader is told which rung of the ladder the machine is on.
+    out["focus"] = None
+    if plan.focus is not None:
+        rung = focus_rung(plan, state)
+        record = plan.focus.record_seconds or record_seconds(cwd, plan.focus.level)
+        done = [{"target": entry_target(h), "median": valid_official_seconds(h.get("median_time")),
+                 "best": valid_official_seconds(h.get("best_time")), "round": h.get("round"),
+                 "rung": h.get("rung"),
+                 "stage_steps": ((h.get("end_steps") or 0) - (h.get("start_steps") or 0))
+                 if h.get("end_steps") is not None else None}
+                for h in state.entries_for((plan.focus.level, SPEED))
+                if str(h.get("status") or "") == "done"]
+        out["focus"] = {
+            "level": plan.focus.level, "targets": list(plan.focus.targets), "record_seconds": record,
+            "rung": ({"index": rung.index, "number": rung.number, "target": rung.target, "total": rung.total}
+                     if rung is not None else None),
+            "rungs_done": done,
+            "running": stage is not None and (stage.level, stage.kind) == (plan.focus.level, SPEED),
+        }
     if stage is not None:
         rule = plan.rule_for(stage.kind)
         sample = read_sample(cwd / runs_dir / stage_run_name(stage.level, stage.kind) / "status.json",
@@ -99,8 +145,45 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
     return out
 
 
+def render_focus(data: dict) -> list[str]:
+    """The focus block: which level, which rung, how far off the record, and the rungs already met."""
+    focus = data.get("focus")
+    if not focus:
+        return []
+    record, current = focus.get("record_seconds"), data.get("current") or {}
+    lines = ["FOCUS: %s -- chasing the human inbounds IL record%s"
+             % (focus["level"], (" of %s" % format_time(record)) if record else " (record unknown)")]
+    rung = focus.get("rung")
+    if rung is None:
+        lines.append("  EVERY RUNG IS DONE (%d of them): the focus is over and the ordinary plan decides. "
+                     "Clear `focus:` or add faster rungs." % len(focus["targets"]))
+    else:
+        lines.append("  rung %d of %d: the median must reach %s%s"
+                     % (rung["number"], rung["total"], format_time(rung["target"]),
+                        ("  (%s the record)" % times_record(rung["target"], record)) if record else ""))
+        if not focus.get("running"):
+            lines.append("  NOT RUNNING YET: the stage on screen above is not %s's speed stage" % focus["level"])
+    lines.append("  ladder: %s" % ", ".join("%g" % t for t in focus["targets"]))
+    if focus.get("running"):
+        lines.append("  best %s (%s the record)   median %s (%s the record)"
+                     % (format_time(current["best_time"]) if current.get("best_time") is not None else "-",
+                        times_record(current.get("best_time"), record),
+                        format_time(current["median_time"]) if current.get("median_time") is not None else "-",
+                        times_record(current.get("median_time"), record)))
+    done = focus.get("rungs_done") or []
+    lines.append("  rungs done (%d):%s" % (len(done), "" if done else " none yet"))
+    for row in done:
+        lines.append("    target %-10s median %-10s (%s the record)  %s steps  round %s"
+                     % (format_time(row["target"]) if row.get("target") else "-",
+                        format_time(row["median"]) if row.get("median") is not None else "-",
+                        times_record(row.get("median"), record),
+                        "{:,.0f}".format(row["stage_steps"]) if row.get("stage_steps") is not None else "?",
+                        row.get("round")))
+    return lines + [""]
+
+
 def render(data: dict) -> str:
-    lines = []
+    lines = render_focus(data)
     rule = data["rule"]
     current = data["current"]
     if current is None:
@@ -160,6 +243,11 @@ def render(data: dict) -> str:
             lines.append("  no stage at or after %s starts until every one of those is done; order rule -- %s"
                          % (data["hold_before"],
                             data.get("order_rule") or "round robin: fewest rounds first, ties in plan order"))
+            if (data.get("focus") or {}).get("rung"):
+                # While a focus is set the order above is NOT the order anything will run in: nothing here
+                # starts at all. Saying so beside the list is the difference between a report and a trap.
+                lines.append("  ...but the FOCUS above overrides this: none of them start while the focus is "
+                             "set and its ladder has a rung left")
             # A waiting stage that CANNOT start is the one way the order above is not the order it will run
             # in: the rule passes over it and the next runnable stage -- a later level -- takes the machine.
             stuck = [h for h in held if h.get("blocked") and not h.get("current")

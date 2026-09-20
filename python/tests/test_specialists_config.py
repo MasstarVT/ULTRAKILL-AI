@@ -21,6 +21,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import campaign_driver  # noqa: E402
 import train  # noqa: E402
+import yaml  # noqa: E402
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS, CAMPAIGN_LEVELS_SHIPPED  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.rewards import RewardConfig  # noqa: E402
@@ -235,6 +236,47 @@ def test_a_specialist_checkpoint_has_the_same_shape_as_the_shared_policy():
     finally:
         shared.close()
         stage.close()
+
+
+def test_the_shipped_focus_is_level_0_1_on_a_ladder_down_to_the_record():
+    """§11, 2026-09-20. The user: "can we focuse on one level tell we get it to a point that is close to the
+    speed run record". The shipped block is the one thing that decides what the machine trains, so every
+    number in it is pinned here."""
+    p = plan()
+    focus = p.focus
+    assert focus is not None and focus.level == "Level 0-1"
+    assert focus.level in CAMPAIGN_LEVELS_SHIPPED
+    assert (focus.level, campaign_driver.SPEED) in {s.key for s in p.stages}, \
+        "the focus trains that level's SPEED stage, so the plan must list it"
+    assert list(focus.targets) == [120.0, 100.0, 85.0, 72.0, 60.0, 50.0, 42.0, 35.0, 30.0, 25.0]
+    assert all(b < a for a, b in zip(focus.targets, focus.targets[1:])), "a ladder only ever gets harder"
+    # The first rung is below the 150 s S-rank target the 2026-09-19 round already passed (median 147.16), so
+    # the focus starts by actually asking for something new.
+    assert focus.targets[0] < 150.0
+    # And the last rung is close to, but not under, the human inbounds IL record it is chasing.
+    records = yaml.safe_load((ROOT / "configs" / "il_records.yaml").read_text(encoding="utf-8"))
+    record = records["levels"]["Level 0-1"]["inbounds"]["seconds"]
+    assert record == 19.798
+    assert focus.targets[-1] > record and focus.targets[-1] / record < 1.3
+    # The block carries the record itself, so the DRIVER's log can print "x the record" too. Without it both
+    # log sites fall silent and the sample in docs/commands.md describes a line the shipped config cannot
+    # produce (2026-09-20 review). Nothing in the rule reads it, so it only ever has to match the record file.
+    assert focus.record_seconds == record
+
+
+def test_a_focus_rung_generates_the_speed_config_with_an_explicit_target():
+    """A rung changes exactly one thing about the generated speed config: the target it is measured against."""
+    p = plan()
+    speed = campaign_driver.stage_config(p, "Level 0-1", kind=campaign_driver.SPEED)["env"]
+    rung = campaign_driver.stage_config(p, "Level 0-1", kind=campaign_driver.SPEED,
+                                        target_seconds=p.focus.targets[0])["env"]
+    assert {k for k in set(rung) | set(speed) if rung.get(k) != speed.get(k)} == {"speed_target_seconds"}
+    assert rung["speed_target_seconds"] == 120.0
+    cfg = EnvConfig.from_dict(rung)
+    assert cfg.speed_target_seconds == 120.0 and cfg.speed_bonus is True
+    # The scale is still written for the record and is NOT applied on top of an explicit target: the env sets
+    # `_speed_target` from `speed_target_seconds` in __init__ and `_note_speed_target` never overwrites it.
+    assert cfg.speed_target_scale == 1.0
 
 
 if __name__ == "__main__":
