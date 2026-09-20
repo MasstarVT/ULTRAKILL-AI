@@ -3582,6 +3582,234 @@ bounded by geometry the way `gate_approach` is.
   they do not shorten it.** Rungs at 120 s and maybe 100 s are in reach; 60/42/30/25 s need a shorter route,
   which a memoryless 512x512 MLP cannot represent, and nothing here addresses that.
 
+## 2026-09-20 — Three DORMANT levers for the speedrun-tech stages (branch `dormant-levers`)
+
+Built from `docs/superpowers/specs/2026-09-20-speedrun-tech.md`, stages S0, S1/S2, S3 and S5. Everything
+here is `python/` only (another engineer owns `mod/`), **nothing is merged**, and the live run —
+`spec_0-1_speed`, focus rung 1 of 10, 120 s, twelve games on 47800-47811 — was not touched, paused or
+connected to at any point. Three of the four are inert until a value is edited into
+`configs/specialists.yaml`; S0 is always on and is a measurement, not a behaviour. How each is switched on,
+with the exact driver procedure, is in `docs/commands.md` ("The three dormant levers").
+
+### S0 — the weapon channel, measured at last (always on, passive)
+
+§3.4 of the spec reports that a probe of the **promoted** `Level_0-1.zip` pressed the slot key of the weapon
+it was **already holding** on 76.0 % of steps (39,371 of 51,772). With `PrefsManager.WeaponRedrawBehaviour`
+defaulting to 0 (cycle variation) that press re-draws the weapon, `Revolver.OnEnable` sets `gunReady = false`
+and only the `ReadyGun()` animation event clears it, so the agent would be suppressing its own primary fire
+most of the time. The spec is explicit that the figure is from **a different checkpoint** and that
+`status.json` has never carried a slot histogram. S0 is the re-measurement.
+
+Added to `env._behaviour`, `info`, `status.json`'s `mean_100`, `metrics_log.csv` and `episodes.jsonl`:
+`slot_press_frac`, **`slot_same_frac`** (the 76 % re-taken, same denominator — every decision of the
+episode), `slot_switch_frac`, `slot_press_per_s` (per GAME second, beside `kills_per_min`), `fire1_frac`,
+`fire2_frac`, `punch_frac` (`firing_frac` is the OR of the two fire buttons and never separated them;
+`punch` was not counted at all although `rewards.punch` charges for it), `slot_held_top_frac`,
+`slot_known_frac`, and — as lists, to `episodes.jsonl` only — `slot_held_frac` (six-slot time share) and
+`slot_kills` (kills per held slot, `max(0, delta)` so the respawn rollback contributes nothing).
+
+**The pin that it is passive.** `tests/test_slot_counters.py::test_the_counters_cannot_change_a_single_step_output`
+runs the same nine actions through two envs, one with the whole behaviour-counting layer replaced by no-ops,
+and requires the packed observation's **bytes**, the reward, `terminated`, `truncated` and the command dict
+handed to the client to be identical on every step. A second test pins `info`'s key set against the 52 keys
+the main tree produced at 259a2c5, so "the counters added nothing else" is checked rather than asserted.
+
+Ordering, deliberately: the counters are taken **before** the S5 lever rewrites the command, because
+`slot_same_frac` is a fact about the POLICY and has to stay comparable before and after S5 is switched on.
+Measured after the rewrite it would read ~0 by construction. What the lever suppressed is counted separately
+(`slot_dropped_frac`, `slot_blocked_frac`, both 0.0 while the lever is off).
+
+`metrics_log.csv` is append-only and keeps its own header, so the eleven new columns need the old file moved
+aside.
+
+### S1 / S2 — `speed.train:`, and what a resumed SB3 model actually does with gamma
+
+`speed.train:` is a speed-stage-only override of `train.hyperparams`, the third block of its kind beside
+`speed.rewards:` and the new `speed.env:`. Absent — which is what ships — generates, for both kinds, exactly
+the config it always did. Keys are validated against `SPEED_TRAIN_KEYS` (PPO's own numeric constructor
+arguments); a misspelt or non-numeric one is a hard error at plan load, on the same reasoning as the
+`hold_before` typo check: a plan that silently trains at the old gamma while the file says 0.999 costs a
+round of twelve games and reads as "the gamma change did nothing". Ints are not coerced to float, because
+`n_epochs: 5.0` would reach `range()`.
+
+**The hazard this had to clear.** Every round of a focus stage is `train.py --resume`, a saved SB3 zip
+carries the hyperparameters it was saved with, and `RolloutBuffer` keeps its **own** copies of `gamma` and
+`gae_lambda`, taken at construction and used by `compute_returns_and_advantage`.
+
+**Measured, not assumed, against the installed stable_baselines3 2.9.0:** `BaseAlgorithm.load` does
+`model.__dict__.update(data)` then `model.__dict__.update(kwargs)` **before** `model._setup_model()`, and
+`OnPolicyAlgorithm._setup_model` builds the buffer from `self.gamma` / `self.gae_lambda`. So the config
+already wins, in the model and in the buffer, and `training.apply_resume_hyperparams` moves nothing today.
+It is kept because that is an undocumented ordering inside a third-party library, and
+`tests/test_resume_hyperparams.py` asserts the no-op explicitly — the first thing that fails at an SB3
+upgrade is a test, not a round. `train.py` now also prints, on both the fresh and the resume path,
+`hyperparameters in force: … | rollout buffer: gamma=…, gae_lambda=…`, read off the model rather than the
+config, so a gamma round is verifiable from its own train log.
+
+`training.main`'s inline PPO defaults were lifted to `DEFAULT_HYPERPARAMS` unchanged (same values, same
+merge order) so the resume path can name the two a buffer is built from.
+
+**Not built:** the two rungs themselves. The lead's ruling is two steps, 0.999 then 0.9995, each with
+`gae_lambda` 0.98; the plan file carries neither.
+
+### S3 — nothing was missing
+
+`speed.rewards:` was already validated against every `RewardConfig` field, so it carries `level_complete`,
+`novelty` and `punch` exactly the way it carries `death`, and `completion_bonus` returns
+`level_complete * scale` — so the speed band is a **multiple** of the weight and moves with it: 25..200 at
+100, **75..600 at 300**. Both confirmed by test rather than by reading. That 75.0 is the figure §4.5's
+farmability table quotes against the 10.0 `tech` cap. Nothing is set: S3 is not approved to run in this
+workflow, and **S4 is not approved at all** (an earlier measurement says cutting gate pay lowers the speed
+gradient; it needs its own evidence after S1–S3).
+
+One latent bug fixed while confirming it: `stage_config` indexed `env["rewards"]`, so a plan that named
+`speed.rewards:` and no shared `env.rewards:` block raised `KeyError` instead of generating a config. Now
+`.get`, pinned by a test.
+
+### S5 — the sticky weapon slot (`EnvConfig.sticky_weapon_slot`, default False)
+
+On, it does two things and can only ever turn a slot press into "keep" — it adds no press and substitutes no
+slot, so the wire message stays inside the existing protocol and the mod needs no change:
+
+1. a press of the slot **already held** becomes `slot: 0` (that press is the redraw);
+2. a switch to a **different** slot is honoured at most once per `sticky_slot_switch_every` decisions,
+   because a switch draws too. The cooldown is read as it stood at the start of the decision and spent at the
+   end of it, so 3 means honour / refuse / refuse / honour; it is cleared by a level load and by a respawn,
+   alongside `_slide_latch`.
+
+Nothing is charged for a refusal — the same rule §4.2 states for a refused macro: charging teaches the policy
+to avoid the channel rather than to use it well. An unknown held slot (`weapon_slot` -1, before `GunControl`
+starts — 0-1 has no weapon at all until the revolver pickup) is passed through untouched rather than guessed.
+
+Reachable for a speed stage through the new `speed.env:` block, validated against `EnvConfig`'s field names
+(`from_dict` DROPS an unknown key, so a typo would train at the default) and refusing `level`, `rewards`, the
+multi-level keys and the four the speed rule owns. `tests/test_sticky_slot.py` pins that off is the action
+stream byte for byte, and that no shipped config or generated stage turns it on.
+
+### Not verified (this entry)
+
+- **Nothing here has run in game.** No lever was switched on, no training config was changed, and the live
+  `spec_0-1_speed` run's behaviour is unchanged by construction: `sticky_weapon_slot` is False everywhere,
+  `speed.train:` and `speed.env:` are absent from the plan, and S0 is pinned byte-identical.
+- **The 76 % is still the promoted checkpoint's.** `slot_same_frac` exists now; no live value has been read,
+  because reading one means a run whose trainer was started after this branch landed. **S5 must not be
+  switched on before that number exists.**
+- **`sticky_slot_switch_every: 3` is a starting value, not a measurement.** The weapon draw animation's real
+  length cannot be read from the decompiled C# — the clips are serialized. 3 is the decisions covered by the
+  nearest documented window in the spec's own table (the 200 ms `JumpReady` cooldown) at 66.7 ms per
+  decision. It also trades against "swap cancel" (§2), a technique that wants rapid switching.
+- The SB3 finding is **version-specific**: stable_baselines3 2.9.0, Python 3.12.10, this venv. It says
+  nothing about any other version, and `apply_resume_hyperparams` exists precisely because it may change.
+- `apply_resume_hyperparams` writes only `gamma` and `gae_lambda`. A future `speed.train:` key that a buffer
+  or a schedule also copies at construction (`clip_range` is turned into a schedule in `_setup_model`, and
+  `learning_rate` into `lr_schedule`) is **not** covered by it, only by SB3's own kwargs handling.
+- The per-slot kill attribution credits the slot held on the frame the policy **acted on**, which is the
+  weapon that fired. It has not been checked against a real game's kill timing, only against the corridor
+  fake.
+- No measurement of what any of these levers is worth. S0 is the only one that produces a number, and it
+  will produce its first one on whatever round starts after this branch merges.
+
+## 2026-09-20 — Review of the dormant levers: the sticky slot's cooldown, and two S5 preconditions
+
+Branch `dormant-levers`, commit `5501cf6`, against the reviewer's seven findings. Four fixed in code, one
+rejected with a test that pins why it is not a bug, two documentation. The live `spec_0-1_speed` control arm
+is untouched by all of it: every lever is still dormant and S0 is still pinned byte-identical.
+
+### The one that would have corrupted the S5 round (major, fixed)
+
+`_sticky_slot` charged its switch cooldown on the **request**, not on a switch the game could perform.
+`GunControl.SwitchWeapon` cannot move `currentSlotIndex` into a slot with no weapon in it, so a press of an
+empty slot draws nothing and suppresses nothing — but it still locked out real switching for
+`sticky_slot_switch_every` decisions. **On 0-1 that is most of the level**: the revolver is the first pickup
+and the other four slots fill one at a time, so a policy pressing 2..5 early would have spent its entire
+switch budget on switches that never happened. The lever would have cut real switching by up to 3× while
+`slot_blocked_frac` read as though the cooldown were doing its job, and the round's judged metrics
+(`kills_per_min`, `firing_on_target_frac`, the median) could not have separated "sticky slot did not help"
+from "the cooldown was spent on non-events".
+
+`player.slot_counts` was already on the wire (`ObservationBuilder.SlotCounts`, one count per `GunControl.slots`
+entry, slot 1 first) and read by nothing but `campaign_check.py`. A press of a **known-empty** slot is now
+passed through free. **Unknown is a third outcome, never "empty"**: an empty array — which is what the mod
+sends before `GunControl` starts — or a mod older than v0.5.0 falls through and is still charged, because
+guessing "empty" would disable the rule on an old mod rather than relax it.
+
+### Two S5 preconditions that did not exist (minor, fixed — both passive, both live now)
+
+- **`slot_unowned_frac`**: the share of decisions pressing a slot `slot_counts` reports empty. It is the
+  measurement behind the fix above — it says how much of the policy's slot channel is aimed at keys that do
+  nothing — and it is taken now, with the lever off, so the gate can be judged before it is needed.
+- **`variation0_frac`** (plus `variation_known_frac` in status/csv, `held_variation_frac` per episode). The
+  press S5 drops **is** the redraw, and the redraw is `WeaponRedrawBehaviour` 0 = cycle to the next variation
+  — the policy's only way to change variation at all until the `variant` dim lands at S9. So the sticky slot
+  **freezes the variation for the episode**, and variation 0 is Piercer / Core Eject / Electric Railcannon /
+  Freezeframe (§3.5), the set every technique in the spec is built on. A round frozen on the Marksman would
+  have shown a worse `kills_per_min` and `firing_on_target_frac`, fired the documented revert criterion, and
+  been recorded as "sticky slot is worse" when what was measured was "variation 1 is worse".
+  `weapon_variation` has been on the wire and thrown away since the mod first sent it.
+
+Both read off `prev` — the observation the decision was made on — like every other counter here, so they
+answer "what was the policy holding when it chose".
+
+### Rejected, and pinned (major, not a bug)
+
+Rule 1 cannot fire while slot index **5** is held: `slot == held + 1` would need key 6, and the action space
+stops at 5 (`NUM_WEAPON_CHOICES` 6 = keep plus keys 1..5, against `NUM_WEAPON_SLOTS` 6). That is correct
+rather than a gap — the policy has no way to press key 6, so it can never re-draw slot 5, and every key it
+*can* press while holding slot 6 names a genuinely different slot.
+`test_on_holding_slot_6_makes_every_press_a_switch_and_that_is_correct` states it so nobody re-files it.
+
+### The dry run that decides nothing (major, documented)
+
+`campaign_driver.py --dry-run` **while `DRIVER_PAUSE` exists** prints the banner, prints `PAUSED: ... doing
+nothing`, and exits 0: `Driver.tick()` returns `"paused"` as its first statement and `Driver.run()` returns
+after one tick under `--dry-run`. The documented activation procedure ran it there and told the operator to
+read what it says, so after a plan edit they would have believed they had previewed which rung starts, which
+checkpoint it resumes from and what config would be written. It does prove exactly one thing — `load_plan` is
+called in `main()` before the Driver is built, so a typo or a wrong type in `speed.train:` / `speed.env:` is a
+hard error caught right there — and `docs/commands.md` now says that is all it proves, with the real preview
+moved **after** `Remove-Item DRIVER_PAUSE`, driver still stopped. Verified by reading that `save_state`,
+`seed_archives`, `ensure_games`, `ensure_trainer`, `stop_stage` and the supervisor's own `restart` and
+`ensure_helpers` are all dry-run guarded, and that `StageSupervisor.tick()`'s remaining side effect is a log
+line. **`Driver.log` is not guarded**, so a dry run does append its banner to the live driver log; the doc
+says so rather than claiming otherwise.
+
+### The rest
+
+- **`_speed_env` now validates value TYPES**, not only key names, against each `EnvConfig` field's declared
+  annotation. `EnvConfig.from_dict` does not coerce, so the quoted `sticky_weapon_slot: "false"` that YAML
+  will hand you is a truthy string and would have turned the lever **on** while the plan file read off — the
+  exact silent-wrong-value failure `_speed_train`'s number check exists to prevent. A non-numeric
+  `sticky_slot_switch_every` was worse than that: it passed load and raised inside a SubprocVecEnv worker on
+  the first honoured switch, mid-episode, leaving the driver to restart the trainer into the same config.
+- **`END_STAGE` costs up to 50k steps**, now stated beside it in `docs/commands.md`. `end_stage_now` to
+  `finish_stage` to `stop_stage` kills the trainer by pid, so `latest.zip` is not written and `round_init`
+  falls back to the highest-step `ckpt_*_steps.zip`. Waiting for the round and ending it now are not equal
+  options and the number should be in view when choosing.
+- A code comment pointed at `tests/test_speed_train_override.py`, which does not exist. The pin is
+  `test_the_train_block_does_not_leak_between_stage_kinds_in_either_order` in `tests/test_speed_overrides.py`.
+
+### Attribution
+
+The three earlier commits on this branch (`2487e43`, `e4e7769`, `1c8f833`) carry
+`Co-Authored-By: Claude Fable 5.1`, which the builder took from its task text. This session's harness
+specifies `Claude Opus 5 (1M context)`. Correcting them would need a force-push of an already-pushed branch,
+which the operating rules discourage, so they are left as they are and the review commit and the merge commit
+carry the right trailer. **Nothing after the merge should rewrite them.**
+
+### Not verified (this entry)
+
+- **Still nothing in game for the levers themselves.** No lever was switched on; `sticky_weapon_slot` is
+  False everywhere, `speed.train:` and `speed.env:` are absent from the shipped plan.
+- **Whether `weapon_slot` lags one decision behind an honoured slot press in the real game.** The corridor
+  fake never moves its slot by itself. If it does lag, rule 1 could drop a legitimate switch-back one
+  decision after a switch. Unchanged by this review and still open.
+- **`slot_counts`'s refresh latency in the real game** — the same question for the ownership gate. The fix is
+  conservative in the direction that matters (a stale "empty" costs a cooldown charge, not a wrong action),
+  but it has only been tested against the fake.
+- **`sticky_slot_switch_every: 3` is still a starting value, not a measurement**, for the reason the previous
+  entry gives.
+- No measurement of what any lever is worth. S0 is the only one that produces numbers, and the first of them
+  come from the round that starts after this merges.
 ## 2026-09-20 — mod v0.8.0 built and verified on a private game (S6/S7 mod half, branch `mod-0.8`)
 
 Built the mod half of `docs/superpowers/specs/2026-09-20-speedrun-tech.md` in worktree
