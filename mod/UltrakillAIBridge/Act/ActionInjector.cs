@@ -395,6 +395,12 @@ namespace UltrakillAIBridge.Act
 
             // MacroKind.SsjWall
             if (frames < 2) return "frameskip_lt_2";
+            // WallJump only reaches TrySSJ through `sliding || currentTime - slideTimestamp < 0.032`, and
+            // SlideCancelled only records slideTimestamp `if (sliding)`. Without an active slide the macro
+            // would fire an ORDINARY wall jump and report a success it did not have. Measured 2026-09-20:
+            // without this test, 11 of 25 wall attempts reported "ran" and not one reached TrySSJ.
+            // Note this means M2 needs an AIRBORNE slide, which is a much rarer state than a ground slide.
+            if (!nm.sliding) return "not_sliding";
             if (nm.gc.onGround) return "grounded";
             // HandleInputs' FIRST jump block wins whenever `!falling`, or whenever the player is airborne with
             // coyote time or an enemy under the feet. It calls Jump(), sets jumpCooldown, and the WallJump
@@ -409,12 +415,19 @@ namespace UltrakillAIBridge.Act
             return null;
         }
 
-        /// <summary>Re-checked on the wall macro's second frame; the world moved for two frames since the request.</summary>
+        /// <summary>
+        /// Re-checked on the wall macro's second frame; the world moved for two frames since the request.
+        /// `sliding` is deliberately NOT re-tested -- frame 1's own event is what ended the slide. What is
+        /// tested instead is that the grace the release opened has not already run out, because a wall jump
+        /// past it is an ordinary wall jump.
+        /// </summary>
         private static string WallStillValid()
         {
             var nm = MonoSingleton<NewMovement>.Instance;
             if (nm == null || !nm.activated || nm.dead) return "no_player";
             if (nm.gc == null) return "no_ground_check";
+            if (InputState.currentTime - nm.slideTimestamp >= PlayerFields.SsjMaxFrames(nm) * 0.008f)
+                return "slide_grace_expired";
             if (nm.gc.onGround) return "grounded";
             if (PlayerFields.JumpCooldown(nm)) return "jump_cooldown";
             if (nm.currentWallJumps >= 3) return "wall_jumps_spent";

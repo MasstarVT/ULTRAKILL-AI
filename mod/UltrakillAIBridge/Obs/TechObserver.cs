@@ -83,6 +83,10 @@ namespace UltrakillAIBridge.Obs
                 ["velocity_after_slide"] = ObservationBuilder.Vec(afterSlide),
                 ["riding_rocket"] = RidingRocket(),
                 ["ssj"] = MovementPatches.BuildCounters(),
+                // The last TrySSJ attempt whether or not a macro asked for it, so a PLAIN slide jump is
+                // measured by the same instrument as a macro one. Compare its `frame` against the obs `frame`
+                // to tell "this step" from "some earlier jump".
+                ["ssj_last"] = MovementPatches.BuildLast(-1),
             };
         }
 
