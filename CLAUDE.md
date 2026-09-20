@@ -168,7 +168,8 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   its own newest weights. A met rung promotes and the next starts; an `"unfinished"` round repeats the same
   rung and promotes nothing. Which rung is current is DERIVED from the history, so the 2026-09-19 round (done
   at 150 s, median 147.16) puts it on **120**. The last rung, 25 s, is 1.26x the record. Set `focus: null`
-  to go back to the plan; the focus stops itself, loudly, when the ladder is done.
+  to go back to the plan; the focus stops itself, loudly, when the ladder is done. **The plan is read once,
+  at driver start** — a running driver must be restarted before any `focus:` edit means anything.
 - **Live: `Level 0-2` (SPEED) ROUND 2, run `spec_0-2_speed`** at ~23.31M steps, target median 120 s, 12 games
   on ports 47800-47811 with `mem_guard.py` alongside — the stage the focus SUPERSEDES. End it with
   `runs/specialists/END_STAGE` (never Ctrl+C) and the next stage is 0-1 speed at rung 120. Its own finding:

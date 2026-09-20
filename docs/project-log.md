@@ -3214,6 +3214,11 @@ or under it, or by its recorded `median_time` being at or under it. Nothing migr
 focus on **120**, which is pinned by a literal-state test. An `"unfinished"` round proves nothing however good
 its median looked; an impossible time is rejected by `times.valid_official_seconds`.
 
+**The plan is read ONCE, when the driver process starts.** Editing `focus:` does nothing to a driver that
+is already running: it has to be paused, stopped, and started again (no flags -- the state file decides).
+A running STAGE is still never interrupted; the focus takes the machine at the next stage boundary, which
+`END_STAGE` can bring forward.
+
 `load_plan` refuses a bad block loudly (unknown level, a level with no `kind: speed` entry, empty targets, a
 non-numeric/zero/negative target, a ladder that is not strictly decreasing, an unknown key), and
 `--start-at` is refused for any other stage while a focus with rungs left is set. When the last rung is done

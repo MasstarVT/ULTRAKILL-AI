@@ -159,9 +159,12 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
   - **FOCUS one level on the record** (2026-09-20, spec §11). The user: *"can we focuse on one level tell we
     get it to a point that is close to the speed run record"*. A `focus:` block in
     `configs/specialists.yaml` holds the WHOLE machine on one level's speed stage until it is close to the
-    human record, one target at a time. It is read on every driver start, so changing it takes effect at the
-    next stage boundary (or at the next driver restart), and it overrides `order:`, `hold_before:` and
-    `hold_order:` completely — while it is set, nothing on any other level starts.
+    human record, one target at a time. It overrides `order:`, `hold_before:` and `hold_order:` completely —
+    while it is set, nothing on any other level starts. **The plan is read ONCE, when the driver process
+    starts**, so editing `focus:` does nothing to a driver that is already running: pause it, stop it, clear
+    the pause and start it again through `runs\start_driver.cmd` with no flags (the state file decides), and
+    only then does the block take effect. A running STAGE is still never interrupted — the focus takes the
+    machine at the next stage boundary, which `END_STAGE` can bring forward.
     ```yaml
     focus:
       level: "Level 0-1"
