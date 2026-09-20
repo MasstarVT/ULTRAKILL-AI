@@ -1,0 +1,20 @@
+{
+  "level": "Level 0-1",
+  "run": "spec_0-1_speed",
+  "mode": "speed",
+  "target_seconds": 150.0,
+  "s_rank_seconds": 150.0,
+  "round": 2,
+  "status": "done",
+  "fresh_completion_rate": 0.92,
+  "fresh_window": 50,
+  "best_time": 81.46376,
+  "median_time": 147.1586145,
+  "timesteps": 28392790.0,
+  "stage_steps": 2329680.0,
+  "source_checkpoint": "best.zip",
+  "source_kind": "best",
+  "difficulty": 3,
+  "env_config": "F:/Github/ULTRAKILL-AI/python/models/spec_0-1_speed/env_config.yaml",
+  "saved_at": "2026-09-19 23:18:06"
+}

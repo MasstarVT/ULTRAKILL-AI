@@ -160,21 +160,21 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   vector carried no heading and 219 of 264 fresh episodes wedged at y ~20 with zero completions in 4.3M
   steps. Steepest leg now 43.2 degrees; the ladder is still 5 hops deep, so the no-finish pay ceiling is
   unchanged at 75. Baseline, live signal and revert triggers: `docs/project-log.md`, 2026-09-18.
-- Promoted so far: **0-1** (fresh rate 0.48 over 50, best 4:03.4) and **0-2** (0.72, best 2:19.5). Both are
-  still **slower** than the shared run's leaderboard rows below — which is exactly why nothing promotes past
-  0-3 until the speed work lands.
-- `times.md` leaderboard, all Violent, all set by `campaign_gates`: **0-1 03:03.628 (A)**, **0-2 02:07.927
-  (S)**, **0-3 04:23.904 (B)**. The human reference playthrough of 0-1 is **146.58 s**; human IL records, the
-  real speed targets, are in `docs/il-records.md`.
+- Promoted so far: **0-1 SPEED stage DONE** 2026-09-19 23:18 (round 2, fresh rate 0.92, `median_time_50`
+  **147.16 s** vs the 150 s S-rank target, best **81.46 s**; `Level_0-1.zip` is now the fast policy) and **0-2**
+  complete (0.72, best 2:19.5; its speed stage is the live one). 0-3 complete is `"unfinished"` (0 completions).
+- `times.md` leaderboard, all Violent: **0-1 01:21.464**, **0-2 01:37.645**, **0-3 04:23.904 (B)**. The human
+  reference playthrough of 0-1 is **146.58 s**; human IL records, the real speed targets, are in
+  `docs/il-records.md`.
 - 0-3's trunk shipped BOTH branches of the level's fork chained in series, and a 7-rung detour tour paid 105
   against a completion's 100. Trimmed to the 4 rungs every recorded completion used (2026-09-18, `route-0-3`);
   `rung_overrides.json` now carries `drop` entries; trainer bounced onto it at **21,701,566** steps. Judge at
   +400k on wing endings and `exit_ground_dist_min` (131.8 m at the bounce), never on `gates_reached` — see the log.
-- **Live: stage 2, `Level 0-1` (SPEED) ROUND 2, run `spec_0-1_speed`**, resumed 2026-09-19 19:35 from the
-  stage's own `latest.zip` at **26,063,110** steps, target median 150.00 s. Round 1 ended at its 8M cap
-  `"unfinished"` (rate 0.70, `median_time_50` **177.37 s** from 500, best **117.46 s**); 0-2's speed round 1
-  was ended with `END_STAGE` at 23,310,130 steps and its weights stay in `models/spec_0-2_speed/` for its next
-  round. In round 1 an `ent_coef_max` cap, a rollback AND a
+- **Live: `Level 0-2` (SPEED) ROUND 2, run `spec_0-2_speed`**, resumed 2026-09-19 23:18 from the stage's own
+  weights at ~23.31M steps, target median 120.00 s (round 1: median 306 -> ~190 s, best 97.65 s, ended with
+  `END_STAGE` when the order became depth-first). Order: 0-2 speed, 0-3 complete, 0-3 speed, then 0-4.
+  0-1 speed took two rounds (8M + 2.3M steps): median 500 -> 147 s with NO reward change. In
+  its round 1 an `ent_coef_max` cap, a rollback AND a
   `time` 0.02->0.05 raise were all **refused** on the data — a recorded per-leg time budget (54% of the gap is
   one 25 m shaft climb where `gate_approach` is flat), the corrected numbers and the revert triggers are in
   `docs/project-log.md`, 2026-09-19. Also: guard T's mid-name-fork blind spot still
