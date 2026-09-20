@@ -140,7 +140,9 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - A **speed stage** (`{level, kind: speed}`) adds the clock: its `median_time_50` — never `best_time`, a
   lifetime minimum one lucky load sets for good — must also reach the level's own S-rank time (`target_scale:
   1.0`, since the gate is a median), at rate 0.4, cap 8M. It does NOT overwrite the level's specialist unless
-  it ends `"done"`. The **hold line** `hold_before: "Level 0-4"` stops the ladder there and keeps training
+  it ends `"done"`. Since 2026-09-20 it also carries its own reward weight, `speed.rewards.death: 12.0`
+  (complete stages stay at 5.0): the clock on 0-2 IS deaths, and 5.0 priced one at under half its objective
+  cost. The **hold line** `hold_before: "Level 0-4"` stops the ladder there and keeps training
   0-1..0-3 for as long as it takes (`max_rounds: 0`): a `HELD` exit would idle twelve games nobody watches.
   Since 2026-09-19 `hold_order: sequential` makes that **depth-first by level** — the first not-done stage in
   plan order runs round after round until it is `"done"`, and the plan is level-major (0-1 complete, 0-1

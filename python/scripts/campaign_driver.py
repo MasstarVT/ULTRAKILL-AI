@@ -129,6 +129,7 @@ import yaml  # noqa: E402
 
 import supervise  # noqa: E402
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS_SHIPPED, safe_name  # noqa: E402
+from ultrakill_ai.rewards import RewardConfig  # noqa: E402
 from ultrakill_ai.times import short_level, valid_official_seconds  # noqa: E402
 
 # `ultrakill_ai.progress.write_json_atomic` is the same nine lines, but importing that module pulls in
@@ -251,6 +252,10 @@ class Plan:
     speed: dict = field(default_factory=dict)     # per-kind overrides of the stage rule for a speed stage
     targets: dict[str, float] = field(default_factory=dict)  # per-level override of the S-rank target time
     target_scale: float = DEFAULT_TARGET_SCALE    # what a level's own S threshold is multiplied by (§8b)
+    # A SPEED STAGE'S OWN REWARD WEIGHTS, merged over `env.rewards` for that kind and no other (2026-09-20).
+    # Empty by default, so a plan written before this key -- and every test that loads one -- generates
+    # exactly the config it always did, for both kinds.
+    speed_rewards: dict[str, float] = field(default_factory=dict)
     # THE HOLD LINE (§8a): the level at which the ladder stops until everything before it is "done". `None`
     # lifts it. The lead's instruction on 2026-09-18 was "dont have it promote to 0-4 untell it gets better
     # times on these levels", and a stage that hits its step cap is recorded "unfinished" and walked past --
@@ -330,6 +335,14 @@ def load_plan(path: str | Path) -> Plan:
     speed = dict(data.get("speed", {}) or {})
     targets = {str(k): float(v) for k, v in (speed.pop("targets", {}) or {}).items()}
     scale = float(speed.pop("target_scale", DEFAULT_TARGET_SCALE))
+    # A speed stage's own reward weights. Popped here, with `targets` and `target_scale`, because the block
+    # below refuses every `speed:` key that is not a StageRule field -- and validated against RewardConfig for
+    # the same reason that check exists: `EnvConfig.from_dict` drops a weight it does not know, so a misspelt
+    # one would train at the shared weight while the plan file said otherwise.
+    speed_rewards = {str(k): float(v) for k, v in (speed.pop("rewards", {}) or {}).items()}
+    unknown_weights = sorted(set(speed_rewards) - {f.name for f in dataclasses.fields(RewardConfig)})
+    if unknown_weights:
+        raise ValueError("%s: unknown speed reward weights %s" % (path, unknown_weights))
     for name, block in (("stage", dict(data.get("stage", {}) or {})), ("speed", speed)):
         unexpected = sorted(set(block) - known)
         if unexpected:  # a misspelt knob would silently use its default, exactly as EnvConfig.from_dict would
@@ -347,7 +360,7 @@ def load_plan(path: str | Path) -> Plan:
     if order_rule not in HOLD_ORDERS:
         raise ValueError("%s: unknown hold_order %r (expected %s)" % (path, order_rule, list(HOLD_ORDERS)))
     plan = Plan(stages=stages, rule=StageRule(**dict(data.get("stage", {}) or {})), speed=speed, targets=targets,
-                target_scale=scale, hold_before=hold, hold_order=order_rule,
+                target_scale=scale, speed_rewards=speed_rewards, hold_before=hold, hold_order=order_rule,
                 env=dict(data.get("env", {}) or {}), train=dict(data.get("train", {}) or {}))
     return plan
 
@@ -376,8 +389,10 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
     no readable step count in the init file it falls back to the plan's own `timesteps`, or to the cap plus
     slack, either of which only has to exceed what the stage rule will allow.
 
-    A SPEED stage is the same config with `speed_bonus` on -- no reward weight moves, no observation or action
-    changes, so the level's own specialist loads into it unchanged. `speed_target_seconds` is set only when the
+    A SPEED stage is the same config with `speed_bonus` on, plus whatever the plan's `speed.rewards:` block
+    overrides (2026-09-20: `death: 12.0`). No observation or action changes, and a reward weight is not a
+    policy parameter, so the level's own specialist still loads into it unchanged. The override is REBOUND,
+    never mutated in place -- see the comment at the merge. `speed_target_seconds` is set only when the
     plan overrides it for this level; 0 tells the env to read the level's own S-rank time live and scale it by
     `speed_target_scale`. The scale is written into every speed stage's config even when it is the default, so
     a generated file says what the run was actually measured against.
@@ -400,6 +415,14 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
         # way through the level anyway. Deaths still respawn at checkpoints INSIDE an episode; only the
         # episode's own start is forced.
         env["fresh_start_prob"] = 1.0
+        if plan.speed_rewards:
+            # REBIND, NEVER MUTATE. `env` above is a SHALLOW copy of `plan.env`, so `env["rewards"]` IS the
+            # plan's own dict: an in-place `.update()` here would leak this stage's weights into every
+            # complete stage generated afterwards from the same Plan object -- and the pin that a complete
+            # stage's weights are `campaign_gates_full.yaml`'s would not catch it, because both dicts would
+            # be the one mutated object and would still compare equal. Pinned by the order-independence test
+            # in tests/test_speed_death_weight.py.
+            env["rewards"] = {**env["rewards"], **plan.speed_rewards}
         target = plan.target_for(level)
         if target:
             env["speed_target_seconds"] = float(target)
