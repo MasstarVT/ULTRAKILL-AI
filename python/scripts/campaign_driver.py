@@ -801,6 +801,32 @@ class DriverState:
         return missing
 
 
+def stage_blocked(plan: Plan, state: DriverState, spec: StageSpec, models_dir: Path) -> str:
+    """Why this stage cannot start yet, or `""` when it can. Pure: the plan, the state and one directory.
+
+    Only a SPEED stage is ever blocked, and only by its own level: it resumes from that level's promoted
+    specialist, so a level whose complete stage has not finished has nothing for it to resume FROM. Starting it
+    anyway would either train the clock on a policy that cannot reach the exit or, worse, silently pick up some
+    other level's weights.
+
+    `Driver.stage_blocked` is this function, and `specialists_status.py` calls it directly, so the read-only
+    report cannot disagree with the driver about which waiting stage is actually able to run (2026-09-19
+    review: under `sequential` a blocked stage hands the machine to a LATER level, which is the one thing the
+    depth-first instruction forbids, and it must not be invisible to the daily check).
+    """
+    cap = plan.rule_for(spec.kind).max_rounds
+    if cap > 0 and state.rounds(spec.key) >= cap:
+        # Only ever reachable under the hold line: the ladder itself runs each stage once.
+        return "it has had its %d rounds and is still not done" % cap
+    if spec.kind != SPEED:
+        return ""
+    if state.stage_status((spec.level, COMPLETE)) != "done":
+        return "its complete stage is not done yet"
+    if not specialist_path(models_dir, spec.level).exists():
+        return "no specialist file for the level yet"
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Process control
 # ---------------------------------------------------------------------------
@@ -903,7 +929,10 @@ class Driver:
         # new plan by (level, kind) before anything else runs.
         self.unplanned = self.state.reconcile(plan)
         self.sup: StageSupervisor | None = None
-        self._last_state: str | None = None
+        # One "what is it doing now" key per SLOT. `log_once` logs when a slot's key CHANGES, so two lines
+        # written in the same tick need two slots: sharing one made their keys alternate and both were
+        # re-logged every single poll, forever (2026-09-19 review, the stuck-END_STAGE case).
+        self._slots: dict[str, str] = {}
 
     # -- logging (the supervisor's own rule: stdout AND the file, needing only one to work) ---------
 
@@ -920,10 +949,16 @@ class Driver:
         except OSError:
             pass
 
-    def log_once(self, key: str, message: str) -> None:
-        if key != self._last_state:
+    def log_once(self, key: str, message: str, *, slot: str = "state") -> None:
+        """Logs `message` only when `key` differs from the last key logged in `slot`.
+
+        The default slot is the driver's running commentary -- paused / holding / this stage's health -- where
+        one line at a time is the whole point. A line that is written in the SAME tick as one of those needs
+        its own slot, or the two keys alternate and `log_once` degrades into `log`.
+        """
+        if self._slots.get(slot) != key:
             self.log(message)
-        self._last_state = key
+        self._slots[slot] = key
 
     # -- per-stage paths and the supervisor behind the current stage --------------------------------
 
@@ -948,6 +983,28 @@ class Driver:
         self.sup.metric = "time" if stage.kind == SPEED else "campaign"
         return self.sup
 
+    def current_sample(self, stage: Stage) -> StageSample:
+        """This stage's numbers from disk, with an EARLIER ROUND's tail filtered out (`Stage.stale_below`).
+
+        EVERY reader goes through here (2026-09-19 review). `tick` filtered and `end_stage_now` did not, so a
+        stage ended by the operator inside the stale window -- up to the whole `start_grace_seconds` wide, at
+        every round boundary -- recorded the PREVIOUS round's rate, median and best as its own, and on a
+        COMPLETE stage `promote` wrote those numbers into the committed `models/specialists/<level>.json`.
+        Nothing decides on them, so no weights moved; the damage was a false record in git.
+        """
+        sample = read_sample(self.stage_run_dir(stage.level, stage.kind) / "status.json",
+                             self.model_dir(stage.level, stage.kind) / "best.json")
+        if (stage.stale_below is not None and sample.timesteps is not None
+                and sample.timesteps <= stage.stale_below):
+            # An earlier round of this stage wrote that file and the new trainer has not caught up with it yet.
+            # Reading it would let the round re-latch on numbers the previous round's cap had just rejected.
+            self.log_once("stale:%s:%s" % (stage.level, stage.kind),
+                          "%s (%s): ignoring round %d's own status.json until the trainer passes %s steps"
+                          % (stage.level, stage.kind, stage.round - 1, "{:,.0f}".format(stage.stale_below)),
+                          slot="sample")
+            return EMPTY_SAMPLE
+        return sample
+
     # -- starting a stage ---------------------------------------------------------------------------
 
     def next_stage(self) -> StageSpec | None:
@@ -961,24 +1018,8 @@ class Driver:
         return stage.level if stage is not None else None
 
     def stage_blocked(self, spec: StageSpec) -> str:
-        """Why this stage cannot start yet, or `""` when it can.
-
-        Only a SPEED stage is ever blocked, and only by its own level: it resumes from that level's promoted
-        specialist, so a level whose complete stage has not finished has nothing for it to resume FROM. Starting
-        it anyway would either train the clock on a policy that cannot reach the exit or, worse, silently pick up
-        some other level's weights.
-        """
-        cap = self.plan.rule_for(spec.kind).max_rounds
-        if cap > 0 and self.state.rounds(spec.key) >= cap:
-            # Only ever reachable under the hold line: the ladder itself runs each stage once.
-            return "it has had its %d rounds and is still not done" % cap
-        if spec.kind != SPEED:
-            return ""
-        if self.state.stage_status((spec.level, COMPLETE)) != "done":
-            return "its complete stage is not done yet"
-        if not specialist_path(self.cfg.cwd / self.cfg.models_dir, spec.level).exists():
-            return "no specialist file for the level yet"
-        return ""
+        """Why this stage cannot start yet, or `""` when it can -- the module-level rule, on this driver."""
+        return stage_blocked(self.plan, self.state, spec, self.cfg.cwd / self.cfg.models_dir)
 
     def held_by(self) -> list[StageSpec]:
         """The stages in front of the hold line that are not `"done"`, in plan order. Empty = the line is open.
@@ -1026,10 +1067,16 @@ class Driver:
                 if passed:
                     # Say why the depth-first order is NOT taking the stage that comes first: the only reason
                     # is that it cannot start at all, and a silent skip here reads as the rule being ignored.
-                    self.log_once("sequential-skip:" + ";".join("%s/%s" % s.key for s in passed),
-                                  "depth-first order: %s cannot start, so the first stage that can is %s (%s)"
+                    # The key carries the ROUND, so every 8M-step round spent on a LATER level says again what
+                    # the earlier one is waiting for (2026-09-19 review) instead of once per driver process,
+                    # and `slot="order"` keeps it out of the running-stage line's slot.
+                    self.log_once("skip:%s>%s/%s@%d" % (";".join("%s/%s" % s.key for s in passed),
+                                                        pick.level, pick.kind, self.state.rounds(pick.key)),
+                                  "depth-first order: %s cannot start, so the first stage that can is %s (%s), "
+                                  "round %d of it"
                                   % ("; ".join("%s (%s) -- %s" % (s.level, s.kind, self.stage_blocked(s))
-                                               for s in passed), pick.level, pick.kind))
+                                               for s in passed), pick.level, pick.kind,
+                                     self.state.rounds(pick.key) + 1), slot="order")
                 return pick, waiting, ""
             pick = min(eligible, key=lambda s: (self.state.rounds(s.key), self.plan.index_of(s.level, s.kind)))
             return pick, waiting, ""
@@ -1239,7 +1286,7 @@ class Driver:
                  % (stage.level, stage.kind, status, (" -- %s" % reason) if reason else "",
                     _fmt(sample.fresh_rate, 3), sample.fresh_window,
                     _fmt(sample.median_time, 2), _fmt(sample.best_time, 2), _fmt(stage.target_seconds, 2),
-                    "{:,.0f}".format((sample.timesteps or 0) - stage.start_steps)))
+                    _steps_into(sample, stage.start_steps)))
         self.stop_stage(stage, procs, sup)
         self.sleep(supervise.STOP_WAIT_S)
         model_dir = self.model_dir(stage.level, stage.kind)
@@ -1320,10 +1367,12 @@ class Driver:
         except FileNotFoundError:
             return True
         except OSError as exc:
-            self.log_once("end_stage_stuck",
+            # Its own slot: this line is written in the same tick as the running-stage line, and two keys in
+            # one slot alternate, which turned a stuck file into two log lines a minute forever.
+            self.log_once("stuck:%s" % type(exc).__name__,
                           "END_STAGE: could not remove %s (%s: %s), so NO stage is being ended -- a file that "
                           "cannot be removed would end every stage in turn. Delete it by hand."
-                          % (self.end_stage_path, type(exc).__name__, exc))
+                          % (self.end_stage_path, type(exc).__name__, exc), slot="end_stage_stuck")
             return False
 
     def end_stage_now(self) -> str | None:
@@ -1341,14 +1390,17 @@ class Driver:
             text = ""  # unreadable is not a reason to refuse: an empty file means "whatever is running"
         stage = self.state.current
         if stage is None:
-            self.log("END_STAGE: no stage is running, so there is nothing to end; removing the file")
+            self.log_once("idle", "END_STAGE: no stage is running, so there is nothing to end; removing the "
+                                  "file", slot="end_stage")
             self.clear_end_stage()
             return None
         objection = end_stage_objection(stage, text)
         if objection:
-            self.log_once("end_stage_refused:%s/%s" % stage.key,
+            # `slot="end_stage"`, not the default: a file the driver cannot delete is re-read every poll, and
+            # sharing the running-stage slot made both lines repeat every poll instead of once.
+            self.log_once("refused:%s/%s:%s" % (stage.key + (objection,)),
                           "END_STAGE REFUSED: %s. Nothing was ended; removing the file and leaving %s (%s) "
-                          "running." % (objection, stage.level, stage.kind))
+                          "running." % (objection, stage.level, stage.kind), slot="end_stage")
             self.clear_end_stage()
             return None
         if self.cfg.dry_run:
@@ -1362,8 +1414,9 @@ class Driver:
             return None
         sup = self.supervisor_for(stage)
         procs = self.processes()
-        sample = read_sample(self.stage_run_dir(stage.level, stage.kind) / "status.json",
-                             self.model_dir(stage.level, stage.kind) / "best.json")
+        # THE SAME reader `tick` uses, filter and all: an operator picks the moment, and the moment may well be
+        # inside the stale window at the start of a round >= 2 (2026-09-19 review).
+        sample = self.current_sample(stage)
         self.log("END_STAGE: ending %s (%s, round %d) now, at the operator's request"
                  % (stage.level, stage.kind, stage.round))
         return self.finish_stage(stage, "unfinished", sample, procs, sup, reason=END_STAGE_REASON)
@@ -1417,16 +1470,7 @@ class Driver:
             return health
 
         rule = self.plan.rule_for(stage.kind)
-        sample = read_sample(self.stage_run_dir(stage.level, stage.kind) / "status.json",
-                             self.model_dir(stage.level, stage.kind) / "best.json")
-        if (stage.stale_below is not None and sample.timesteps is not None
-                and sample.timesteps <= stage.stale_below):
-            # An earlier round of this stage wrote that file and the new trainer has not caught up with it yet.
-            # Reading it would let the round re-latch on numbers the previous round's cap had just rejected.
-            self.log_once("stale:%s:%s" % (stage.level, stage.kind),
-                          "%s (%s): ignoring round %d's own status.json until the trainer passes %s steps"
-                          % (stage.level, stage.kind, stage.round - 1, "{:,.0f}".format(stage.stale_below)))
-            sample = EMPTY_SAMPLE
+        sample = self.current_sample(stage)
         # The target time is read LIVE off the run, because only the env can see the level's `campaign.ranks`.
         # A plan override is already in the stage and wins; otherwise the first status.json carrying one sets it
         # for good, so the promotion rule and the reward are measured against the same number.
@@ -1454,7 +1498,7 @@ class Driver:
                           "%s (%s): %s, %s steps into the stage, rate %s over %d fresh, median %s (best %s) "
                           "vs target %s"
                           % (stage.level, stage.kind, health,
-                             "{:,.0f}".format((sample.timesteps or 0) - stage.start_steps),
+                             _steps_into(sample, stage.start_steps),
                              _fmt(sample.fresh_rate, 3), sample.fresh_window, _fmt(sample.median_time, 2),
                              _fmt(sample.best_time, 2), _fmt(stage.target_seconds, 2)))
             return health
@@ -1542,6 +1586,16 @@ class Driver:
 
 def _fmt(value: float | None, digits: int) -> str:
     return "-" if value is None else "%.*f" % (digits, value)
+
+
+def _steps_into(sample: StageSample, start_steps: float) -> str:
+    """"12,240" -- how far into the stage a sample is, for a log line, or "an unknown number of".
+
+    A FILTERED sample (`Driver.current_sample`) has no step count at all, and `(None or 0) - start_steps`
+    printed the run's whole step count as a negative number of steps into the stage.
+    """
+    return ("an unknown number of" if sample.timesteps is None
+            else "{:,.0f}".format(sample.timesteps - start_steps))
 
 
 def start_at_objection(plan: Plan, driver: Driver, level: str, kind: str, *, plan_path: str = "the plan",

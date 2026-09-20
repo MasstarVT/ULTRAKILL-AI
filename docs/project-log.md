@@ -2723,3 +2723,40 @@ isolated scratch directory holding only copies of the plan, the real `driver_sta
 before Level 0-2) ... waiting on Level 0-1 (speed), Level 0-2 (speed), Level 0-3 (complete), Level 0-3
 (speed)` and left the running stage alone (`Level 0-2 (speed): ok, 4,285,128 steps into the stage, rate 0.900
 over 50 fresh, median 199.62 (best 97.65) vs target 120.00`).
+
+### 2026-09-19 — review of the depth-first branch: one real bug, two log fixes, three doc corrections
+
+An adversarial review of `hold-order` (branch at 98ab1a8) could not reproduce any of the four hazards it was
+pointed at — index collisions, a history entry matched to the wrong stage, rounds counted wrong, or the ladder
+passing the hold line — but found five other things. Fixed before the merge:
+
+- **The real one (major).** `end_stage_now` read `status.json` with `read_sample` directly and never applied
+  the `stale_below` filter `tick` applies, so a stage ended by hand in the first minutes of a round >= 2
+  recorded the PREVIOUS round's rate, median and best as its own. The window is not the step gap alone:
+  `runs/<run>/status.json` keeps the old round's contents until the new trainer's first write, and
+  `start_grace_seconds` is 900, so it is ~15 minutes wide at every round boundary. On a COMPLETE stage
+  `promote` wrote those numbers into the committed `models/specialists/<level>.json`. Nothing decides on them
+  (the hold line reads `status`, `round_init` reads files), so no weights could move and no stage could be
+  mis-chosen — the damage was a false record in git. Both readers now go through one `Driver.current_sample`,
+  and a filtered sample prints "an unknown number of steps into the stage" instead of the run's whole step
+  count as a negative.
+- **`log_once` had one key for the whole driver**, so two messages written in the same tick alternated and
+  both were re-logged every poll: an `END_STAGE` file the driver cannot unlink (an editor holding it, an ACL)
+  meant two lines a minute forever and the "this is stuck" signal lost in them. It takes a `slot` now — one
+  per concern, and the running commentary keeps the default.
+- **A blocked leading stage was announced once per driver process.** Under `sequential` a stage that cannot
+  start is passed over and a LATER level takes the machine for a whole 8M-step round, which is the one thing
+  the user's instruction forbids; it now says so for every round the later level takes, and
+  `specialists_status.py` prints `BLOCKED (the order passes over it): ...` beside the order rule from the
+  driver's own `stage_blocked`, which moved to module level so the report cannot drift from it.
+- **Three doc corrections**, all behaviour that was right and described wrongly: a COMPLETE stage ended by
+  `END_STAGE` DOES promote its `best.zip` (`refuse_promotion` declines only for a speed stage); under
+  `sequential`, ending the stage that is already first in the order starts the next ROUND of that same stage,
+  not another level; and "the games are not touched" is too strong — the next stage's `ensure_games` relaunches
+  all twelve if a port is not listening, which is why the recipe now says to check `games.py status` first.
+
+**Tests.** +3 in `tests/test_campaign_driver.py` (an `END_STAGE` inside a round-2 stale window records `None`s
+and its complete-stage sidecar does too; a control file the driver cannot unlink says so once across three
+polls while the stage line is still logged once; a blocked leading stage is named every round and shown by
+`specialists_status`). All three were run against the pre-fix code first and failed there. `test_campaign_driver.py`
+69 passed, `test_specialists_config.py` 12 passed, then the whole suite one file at a time.

@@ -344,13 +344,26 @@ the driver's next poll through `finish_stage` -- the ordinary stage-end path:
 
 - status `"unfinished"` with `"reason": "ended by operator"` in the history entry, so every other rule reads
   it exactly as it reads a stage that ran out of steps;
-- `refuse_promotion` therefore applies unchanged: a speed stage's weights do NOT replace the level's promoted
+- `refuse_promotion` therefore applies unchanged: a SPEED stage's weights do NOT replace the level's promoted
   specialist, and nothing in `models/` is deleted -- the round's weights stay in `models/<run>/`, which is
-  where its next round resumes from;
-- the trainer and its helpers are stopped exactly as at any stage end, and the games are not touched;
+  where its next round resumes from. A **COMPLETE** stage is the other case and DOES promote its `best.zip`
+  to `models/specialists/<level>.zip` with a fresh sidecar, exactly as it does at the step cap; the source is
+  `keep_best`'s lifetime peak for that model directory, so the weights cannot regress, but a committed file
+  does change (2026-09-19 review);
+- the sample is read through `Driver.current_sample`, the same reader (and the same `stale_below` filter)
+  `tick` uses: an operator picks the moment, and a moment inside the first `start_grace_seconds` of a round
+  >= 2 would otherwise record the PREVIOUS round's rate, median and best as this round's, and write them into
+  that committed sidecar (2026-09-19 review);
+- the trainer and its helpers are stopped exactly as at any stage end, and the games are not deliberately
+  restarted -- but, as at ANY stage change, `ensure_games` relaunches all twelve if a port is not listening
+  when the next stage starts, so check `games.py status` before writing the file;
 - the file is deleted BEFORE the stage ends, so one file can only ever end one stage, and a file that cannot
-  be deleted ends nothing at all;
-- then the plan's own rule chooses and starts the next stage.
+  be deleted ends nothing at all (it says so once, in its own log slot);
+- then the plan's own rule chooses and starts the next stage. Under `sequential` that is the first not-done
+  stage in plan order -- which, when the stage just ended IS that stage, is the **next round of the same
+  stage** with a fresh budget. `END_STAGE` moves the machine to another level only when the one it ended was
+  not the leading one; to stop working on a level, change `hold_order`, set a positive `max_rounds`, or
+  retune its target.
 
 The file's text may name the stage it means (`Level 0-2 speed`, `Level 0-2/speed`, `Level 0-2`, or empty for
 "whatever is running"). A name that does not match the running stage is refused, logged and deleted: a stale
@@ -374,3 +387,9 @@ after it, 0-4 last); `END_STAGE` ends the right stage once, removes the file, re
 specialist and the model files alone, is refused when stale or mismatched, loses to `DRIVER_PAUSE` and only
 reports under `--dry-run`. `tests/test_specialists_config.py`: the shipped plan is `sequential` and
 level-major, and `Plan.order` is untouched.
+
+The 2026-09-19 review added three more: an `END_STAGE` inside a round-2 stale window records `None` for the
+rate, median, best and step count rather than the previous round's numbers (and the complete-stage sidecar it
+promotes carries the same `None`s); a control file the driver cannot unlink says so ONCE across three polls
+instead of alternating with the running-stage line every poll; and a blocked leading stage is named again for
+every round a later level takes, and is printed by `specialists_status.py` beside the order rule.

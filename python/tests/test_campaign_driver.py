@@ -1730,6 +1730,115 @@ def test_the_pause_file_wins_over_end_stage_and_a_dry_run_only_reports_it():
         assert len(dry.driver.state.history) == 4, "nothing was recorded either"
 
 
+def test_end_stage_inside_a_stale_window_records_none_of_the_previous_rounds_numbers():
+    """FOUND BY THE 2026-09-19 REVIEW, and the reason `Driver.current_sample` exists.
+
+    `tick` filtered the previous round's `status.json` (`Stage.stale_below`) and `end_stage_now` read it raw,
+    so a stage ended by the operator in the first minutes of a round >= 2 recorded round N-1's rate, median and
+    best as its OWN -- and a COMPLETE stage wrote them into the committed `models/specialists/<level>.json`.
+    The window is the whole `start_grace_seconds`, and the operator, unlike the stage rule, picks the moment.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp)
+        driver = h.driver
+        # What round 1 of 0-1's speed stage left in the run directory: rate 0.70, median 177.37 s, best 117.46.
+        h.write_status("spec_0-1_speed", 26_063_110, 0.7, 50, best_time=117.46, median_time=177.37,
+                       target_seconds=150.0)
+        ckpt = h.tmp / "models" / "spec_0-1_speed" / "ckpt_26062882_steps.zip"
+        stage = driver.begin_stage("Level 0-1", ckpt, cd.SPEED)
+        assert stage.round == 2 and stage.stale_below == 26_063_110
+        h.trainer_up("spec_0-1_speed")
+        driver.end_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        driver.end_stage_path.write_text("Level 0-1 speed\n", encoding="utf-8")
+
+        assert driver.tick() == "advanced"
+        entry = driver.state.history[-1]
+        assert (entry["level"], entry["kind"], entry["round"], entry["status"]) == \
+            ("Level 0-1", "speed", 2, "unfinished")
+        assert entry["end_steps"] is None and entry["fresh_completion_rate"] is None, \
+            "round 1's numbers are not round 2's"
+        assert entry["median_time"] is None and entry["best_time"] is None
+        assert "an unknown number of steps into the stage" in driver.log_path.read_text(encoding="utf-8")
+
+        # A COMPLETE stage ended by hand DOES promote its best.zip, exactly as it does at the step cap -- so
+        # the sidecar it writes must not carry the previous round's numbers either.
+        h.write_status("spec_0-3", 24_757_714, 0.42, 50, best_time=260.0, median_time=300.0)
+        older = h.tmp / "models" / "spec_0-3" / "ckpt_24700000_steps.zip"
+        older.parent.mkdir(parents=True, exist_ok=True)
+        older.write_bytes(b"0-3 round one's weights")
+        h.zip_steps[older.as_posix()] = 24_700_000
+        third = driver.begin_stage("Level 0-3", older, cd.COMPLETE)
+        assert third.round == 2 and third.stale_below == 24_757_714
+        h.trainer_up("spec_0-3")
+        driver.end_stage_path.write_text("Level 0-3 complete\n", encoding="utf-8")
+        assert driver.tick() == "advanced"
+        assert driver.state.history[-1]["promoted"] is True, "a complete stage promotes on an operator end too"
+        sidecar = json.loads(cd.specialist_path(h.tmp / "models", "Level 0-3").with_suffix(".json")
+                             .read_text(encoding="utf-8"))
+        assert (sidecar["status"], sidecar["round"]) == ("unfinished", 2)
+        assert sidecar["fresh_completion_rate"] is None and sidecar["median_time"] is None, \
+            "a committed record may not claim the previous round's rate and median as this round's"
+        assert sidecar["timesteps"] is None and sidecar["stage_steps"] is None
+
+
+def test_an_end_stage_file_the_driver_cannot_remove_says_so_once_not_every_poll():
+    """FOUND BY THE 2026-09-19 REVIEW. `log_once` kept ONE key, and this line shares its tick with another.
+
+    A control file the driver can see and cannot unlink is re-read every poll. With both messages in one slot
+    their keys alternated, so both were written every single poll -- two lines a minute forever, and the "this
+    is stuck" signal lost in the noise. One slot per concern.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp)
+        driver = h.driver
+        h.trainer_up("spec_0-2_speed")
+        h.write_status("spec_0-2_speed", 22_700_000, 0.3, 50, best_time=150.0, median_time=190.0,
+                       target_seconds=120.0)
+        # A DIRECTORY is exactly that: `exists()` is true, `read_bytes` and `unlink` both raise OSError, which
+        # is what a file held open by an editor or denied by an ACL does.
+        driver.end_stage_path.mkdir(parents=True, exist_ok=True)
+        for _ in range(3):
+            assert driver.tick() == "ok", "the running stage is still supervised while the file is stuck"
+        lines = driver.log_path.read_text(encoding="utf-8").splitlines()
+        assert sum("could not remove" in line for line in lines) == 1
+        assert sum("(speed): ok," in line for line in lines) == 1, \
+            "the running-stage line keeps its own slot and is still logged once"
+        assert driver.end_stage_path.exists() and len(driver.state.history) == 4
+        assert driver.state.current.key == ("Level 0-2", "speed") and h.killed == []
+
+
+def test_a_blocked_leading_stage_is_named_again_every_round_and_in_the_status_report():
+    """FOUND BY THE 2026-09-19 REVIEW. Under `sequential` a blocked stage hands the machine to a LATER level.
+
+    That is the one thing the depth-first instruction forbids, so it may not be invisible: the driver says it
+    again for every round the later level takes, and the read-only daily check prints it beside the order rule.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp, state={"version": 1, "current": None, "history": [
+            {"level": "Level 0-1", "kind": "complete", "status": "done", "round": 1}]})
+        driver = h.driver
+        cd.specialist_path(h.tmp / "models", "Level 0-1").unlink()  # the file its speed stage resumes FROM
+        assert driver.stage_blocked(cd.StageSpec("Level 0-1", cd.SPEED)) == "no specialist file for the level yet"
+        picks = []
+        for _ in range(3):
+            pick, _, blocked = driver.choose_stage()
+            assert blocked == ""
+            picks.append(pick.key)
+            end_round(h, pick.key, "unfinished")
+        assert picks == [("Level 0-2", cd.COMPLETE)] * 3, "three whole rounds on a LATER level"
+        log = driver.log_path.read_text(encoding="utf-8")
+        assert log.count("depth-first order: Level 0-1 (speed) -- no specialist file for the level yet") == 3, \
+            "once per driver process is not enough: say it for every round the later level takes"
+
+        import specialists_status  # noqa: PLC0415 - a script, imported only where it is tested
+
+        data = specialists_status.collect(h.tmp, "configs/specialists.yaml", "runs", "models")
+        assert [(x["level"], x["kind"], x["blocked"]) for x in data["held_by"]][0] == \
+            ("Level 0-1", "speed", "no specialist file for the level yet")
+        assert "BLOCKED (the order passes over it): Level 0-1 (speed) -- no specialist file for the level yet" \
+            in specialists_status.render(data)
+
+
 def test_an_end_stage_file_with_no_stage_running_is_just_removed():
     with tempfile.TemporaryDirectory() as tmp:
         h = depth_first_harness(tmp, state={"version": 1, "current": None, "history": [
