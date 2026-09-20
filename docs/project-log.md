@@ -4178,3 +4178,248 @@ Unity Doorstop 4.5.0 and the override argument is `--doorstop-target-assembly`. 
 is not committed and does not travel between machines — recreate it by copying `BepInEx\core` and
 `BepInEx\config` on any machine that needs it. The 0.8.0 build currently there is 93,696 bytes, 2026-09-20,
 and is now **stale** relative to this session's fixes: re-copy before the next private run.
+
+
+## 2026-09-20 — Frozen-policy A/B/C of the sticky weapon slot (S5): **activate neither**, and the lever is off by one
+
+Measurement only. Nothing in the repo's behaviour changed, nothing was activated, and the live record chase
+(`spec_0-1_speed`, rung 1, control arm, 12 games on 47800-47811 under `campaign_driver.py`) ran untouched
+throughout: no connection was ever made to a trainer port, no `games.py launch` / `stop`, no
+`supervise.py`. One private game was hand-started on **47812** with `-aibridge-nosteam` through
+`games.start_instance` (a bare `Popen` of the installed Steam build — never `games.py launch`, which calls
+`stop_all()`), and killed at the end by the pid that owned the port; 12 games were listening before and
+after, and 47812 is closed.
+
+**The question.** The S0 counters, live since 29.6M steps, said the 0-1 policy presses a weapon-slot key
+**10.8 times per game second** and switches on **55%** of its decisions. Before spending millions of steps
+on the dormant `EnvConfig.sticky_weapon_slot` lever, measure what it does to the **same frozen policy**.
+
+### Method
+
+One env, one socket, one model, one exploration-archive snapshot for the whole session; the only thing that
+changed between blocks was the two `EnvConfig` fields, which `_sticky_slot` reads fresh every decision.
+Three arms **interleaved in blocks of 5** so drift and game recycles could not favour one:
+
+| arm | `sticky_weapon_slot` | `sticky_slot_switch_every` |
+|---|---|---|
+| **A** | false (today) | — |
+| **B** | true | 3 |
+| **C** | true | 8 |
+
+`Level 0-1`, the stage's own `configs/generated/spec_0-1_speed.yaml`, fresh starts only
+(`fresh_start_prob 1.0`), **stochastic sampling** as in training, a scratch COPY of
+`models/spec_0-1_speed/ckpt_29717542_steps.zip`, and a scratch copy of `explore_Level_0-1_47800.npz` loaded
+once and never written back. 4 rounds x 3 arms x 5 episodes = **60 episodes, 20 per arm, 71.8 min**.
+Recordings: `python/runs/probe_0-1_sticky/<arm>_<n>.jsonl`, one JSON line per decision plus a final line
+carrying the whole `info` dict. The harness reused `probe_rollout.probe_config`, so it was read-only by
+construction (private port, no archive / best-run / curriculum / env-log writes, no bridge relaunch);
+**`probe_rollout.py` itself was not modified** and nothing was committed but this file.
+
+**One deliberate deviation, identical for all three arms:** an extra cap of **4500 decisions
+(300 game-seconds)** below the stage's own `max_steps` of 12000 (800 s), so that an arm which broke the
+policy could not spend the whole budget by itself. Completion rates below therefore mean *completed within
+300 s* and are **not** comparable with the live run's 0.92 over 39 fresh episodes, which is measured on the
+800 s cap.
+
+### Per-arm result (20 episodes each)
+
+| | **A** sticky off | **B** every 3 | **C** every 8 |
+|---|---|---|---|
+| completed | **17 / 20 = 0.85** | 12 / 20 = 0.60 | 9 / 20 = 0.45 |
+| completion 95% CI | [0.70, 1.00] | [0.40, 0.80] | [0.25, 0.65] |
+| official time **median** | **132.07 s** | 173.03 s | 175.93 s |
+| p25 / p75 | 113.57 / 153.11 | 137.36 / 187.76 | 159.15 / 207.02 |
+| best | 101.29 s | 109.25 s | **98.75 s** |
+| median 95% CI | [113.6, 153.1] | [134.5, 188.0] | [135.3, 224.3] |
+| kills / min (median) | **16.53** | 12.84 | 13.36 |
+| deaths per episode (mean / median) | **0.35 / 0** | 1.85 / 2 | 3.65 / 3.5 |
+| arena-gated time, lock to clear (median / mean s) | 30.4 / 28.9 | 27.0 / 31.6 | 25.5 / 34.7 |
+| fire presses per game second | 14.25 | 13.55 | 13.90 |
+| on-target share of firing decisions | **0.095** | 0.078 | 0.066 |
+| end reasons | 17 complete, 3 max_steps | 12 complete, 5 max_steps, **2 stuck**, 1 bridge_reset | 9 complete, 7 max_steps, **2 stuck**, 2 bridge_reset |
+| zero-kill episodes | 0 | 0 | 2 |
+| arenas cleared (median) | 3 | 3 | 1.5 |
+| gates reached (median) | 10 | 10 | 7.5 |
+
+**Switches per game second, requested vs actually EXECUTED** (executed = `weapon_slot` on the wire actually
+changed between two decisions, which is ground truth and independent of the env's own counters):
+
+| | A | B | C |
+|---|---|---|---|
+| slot presses requested / s | 11.43 | 12.04 | 12.37 |
+| genuine switches requested / s | 8.44 | 9.21 | 9.83 |
+| **switches EXECUTED / s** | **7.75** | **2.82** | **1.24** |
+| executed / requested | 0.92 | 0.31 | 0.13 |
+| `slot_dropped_frac` / `slot_blocked_frac` | 0.0 / 0.0 | 0.143 / 0.344 | 0.134 / 0.487 |
+
+The lever is unambiguously live and does what it claims to the *rate*: executed switching falls **64%** at
+B and **84%** at C. The policy does not compensate — it asks for slightly *more* switches when refused
+(8.44 -> 9.83 requested/s), so the refusals are not being learned around within an episode.
+
+**Differences, 95% bootstrap CI (4000 resamples, each arm resampled independently; a CI spanning 0 is
+inside the noise):**
+
+| vs A | completion rate | median official time | kills/min | arena seconds | deaths |
+|---|---|---|---|---|---|
+| **B - A** | [-0.50, **0.00**] | [**+2.09**, +68.63] | [-7.59, +0.33] | [-17.07, +3.07] | [**+0.90**, +2.05] |
+| **C - A** | [**-0.65**, **-0.10**] | [**+7.28**, +91.90] | [-11.33, +2.05] | [-10.60, +2.70] | [**+1.90**, +4.80] |
+
+What is **outside** the noise: B and C are both **slower** (median time), and both **die more**. C's
+completion rate is clearly lower; B's only touches zero at the top. What is **inside** the noise:
+kills/min (the point estimates fall, 16.5 -> 12.8 / 13.4, but the CIs cross 0) and arena time.
+
+The **per-round** view is the strongest part of the result, because the interleaving makes it drift-proof —
+every arm got faster round over round as the game warmed, and the ordering never moved:
+
+| round | A completed / median | B | C |
+|---|---|---|---|
+| 0 | 3/5, 157.3 s | 3/5, 188.6 s | 4/5, 201.8 s |
+| 1 | 4/5, 139.9 s | 3/5, 166.7 s | 2/5, 191.7 s |
+| 2 | 5/5, 117.4 s | 3/5, 154.0 s | 2/5, 155.6 s |
+| 3 | 5/5, 113.6 s | 3/5, 140.2 s | 1/5, 173.2 s |
+
+**A < B < C on the median in all four rounds, and A >= B >= C on completions in three of four.**
+
+`mem_guard.py` recycled the private game on 47812 twice during the run (14:46 and 14:59), which is what the
+three `bridge_reset` episodes are. Dropping them does not move anything: A 17/20 = 0.85, B 12/19 = 0.63,
+C 9/18 = 0.50.
+
+**Stranding.** Mostly *not* the failure mode. The longest unbroken run of decisions with fire pressed and
+nothing visible is the same in all three arms (median 179 / 182 / 183 decisions), and no arm sat in the
+first arena. What does appear is **2 `stuck` endings in each of B and C against 0 in A**, 2 zero-kill
+episodes in C, and C reaching materially less of the level (1.5 arenas cleared and 7.5 gates against 3 and
+10). The held-weapon mix barely moves (slot time share A [0.20, 0.24, 0.36, 0.08, 0.12] vs C
+[0.27, 0.15, 0.35, 0.08, 0.15] for slots 1-5), and neither does what it kills with, except that damping
+shifts kills off the nailgun and onto the revolver and the rocket launcher — kills per slot 1-5 over the
+whole arm, A [113, 136, **316**, 33, 132], B [230, 143, 290, 55, 163], C [**239**, 203, 263, 60, **253**].
+**Variation 0 stays dominant in every arm**
+(0.774 / 0.768 / 0.807), so the spec's "the round froze on the Marksman" confound did **not** fire and is
+not what is being measured here.
+
+### Mechanism, from the decompiled game
+
+Read out of `decompiled/` (class and method names only):
+
+- **A switch costs a draw gate whose length is not in the C#.** `Revolver.OnDisable`/`OnEnable`,
+  `Shotgun.OnDisable`, `ShotgunHammer.OnDisable` set `gunReady = false`; `Nailgun.OnDisable` sets
+  `canShoot = false`. They are set true again **only by an animation event** — `Revolver.ReadyGun`,
+  `Shotgun.ReadyGun`, `Nailgun.CanShoot`, driven by `RevolverAnimationReceiver` / `ShotgunAnimationReceiver`
+  / `NailgunAnimationReceiver`. The duration lives in the serialized clip, **not** in the source, so it
+  cannot be read — which is exactly why `sticky_slot_switch_every: 3` was a guess and not a measurement.
+  Fire input is **dropped, not buffered**, while the gate is shut (`Revolver.Update`, `Shotgun.Update`,
+  `Nailgun.FixedUpdate` all test the flag).
+- **But a switch also REFUNDS a real cooldown, and that is the part S5 did not account for.**
+  `Revolver.OnEnable` sets `shootCharge = 100f` outright, which fully refunds the revolver's 0.5 s refire
+  cooldown (`Revolver.Shoot` sets `shootCharge = 0f`, regenerating at 200/s), and
+  `ShotgunHammer.OnDisable` zeroes `hammerCooldown` after a 0.5 s swing. That is **swap-cancel**, and it is
+  code-visible rather than folklore. `StyleHUD.DecayFreshness` additionally regenerates freshness only for
+  weapons in a *different* slot, and `EnemyIdentifier` pays `ultrakill.arsenal` +50 for a kill involving two
+  weapons — the game is built to reward rotation.
+- **Switching costs no ammo or heat.** `WeaponCharges` is a global singleton that keeps charging while a
+  weapon is stowed, and `Nailgun` explicitly saves and restores its heat across the swap. What a switch
+  *does* destroy is accumulated per-weapon charge — shotgun pump count and core-eject charge, the revolver's
+  charged-shot windup, the hammer's swing charge.
+- `ultrakill.quickdraw` (awarded when `Revolver`/`Shotgun` fire while the animator is in `PickUp`/`Equip`)
+  proves there is a **live firing window inside the draw clip**, so the gate is shorter than the clip.
+
+So the net of a weapon switch for this policy is *a refund of a 0.5 s cooldown, minus a draw gate shorter
+than the draw animation*, plus free access to whatever weapon suits the enemy in front of it. The frozen
+policy is exploiting that, and rationing it takes the refund away: fewer executed switches, a lower
+on-target share (0.095 -> 0.066), fewer kills per minute, and — the largest and cleanest effect —
+**deaths rising 0.35 -> 1.85 -> 3.65 per episode**, which is what then turns into timeouts and `stuck`.
+
+### The lever is off by one, and so are the S0 counters it was to be judged on
+
+Found while reading the recordings, and it changes what the table above is a measurement *of*.
+
+`mod/UltrakillAIBridge/Obs/ObservationBuilder.cs:207` sends `gun.currentSlotIndex` **raw**, and the
+decompiled `GunControl.currentSlotIndex` is **1-based** (a 1-based index into `slots`, clamped to
+`[1, slots.Count]` by `SwitchWeapon`); the mod's own `Obs/TechObserver.cs:202` does
+`int i = gun.currentSlotIndex - 1;` to index an array, which corroborates it. The recordings confirm it
+directly: `weapon_slot` only ever took the values **1..5, never 0**, on a level where all five slots hold
+weapons.
+
+`ultrakill_ai/env.py` assumes 0-based in three places, and its docstring says so explicitly:
+
+- `_sticky_slot` (~1634) tests `slot == held + 1` for "the slot already held". With 1-based `held` that
+  drops a press of the key **one above** the held slot — a genuine switch — and lets the real redraw through
+  to be charged the switch cooldown. **Rule 1 never fires on a redraw at all.**
+- `_note_behaviour` (~1703) splits `slot_same` / `slot_switch` on the same test, so **every
+  `slot_same_frac` / `slot_switch_frac` ever written to a `status.json` is mis-labelled**. Measured here:
+  the env's `slot_same_frac` is 0.107 on arm A while the **true** redraw rate (press == previous frame's
+  `weapon_slot`) is **0.175**, and the two sets are disjoint. The live figures quoted at 29.6M steps
+  (`slot_same_frac` 0.0992, `slot_switch_frac` 0.5542) are pre-fix values and mean something other than
+  their names.
+- `_note_slot_kills` (~1670) and the `held_slot_%d` counter (~1701) index by `held` directly, so element 0
+  of `slot_held_frac` / `slot_kills` is always zero and every weapon reads one index low — visible in every
+  row above, which is why the slot shares are quoted as slots 1-5.
+
+`_slot_owned` is **correct** (`counts[slot - 1]` against a `SlotCounts` array that starts at slot 1) and
+must not be touched. `tests/test_sticky_slot.py:92` and `tests/test_slot_counters.py:105` both state the
+0-based premise in their docstrings and set `client.weapon_slot = 0` to mean "holding slot 1", so the
+suite encodes the same misunderstanding as the code and **cannot catch this**. Filed as a separate task;
+not fixed here, because this session was measurement-only.
+
+**What that means for the table.** Arms B and C measured **the lever as it would actually ship**, which is
+the useful thing — but the rule they exercised is *"drop presses of the next slot up, and ration everything
+else, including the redraw"*, not the rule S5 designed. So:
+
+- The result **does** settle the dominant half: **rationing weapon switching hurts this policy**, badly and
+  monotonically in the damping strength.
+- The result **does not test** the redraw-suppression half at all. Arm B cut the true redraw rate only from
+  0.175 to 0.173 — i.e. not at all. §3.4's premise, that the policy suppresses its own fire by constantly
+  re-drawing, is **still unmeasured**.
+
+### Recommendation: **activate neither B nor C**
+
+Not `sticky_slot_switch_every: 3`, not 8, not any value — on this policy the lever is harmful at every
+setting tried, the harm grows with the damping, and the mechanism says why: the game *refunds* a cooldown
+for switching, so rationing switches removes a benefit rather than a cost. Leave `sticky_weapon_slot`
+dormant and at its default.
+
+**The honest limit of this result:** a frozen-policy A/B shows only the immediate effect of a rule on a
+policy trained *without* it. It cannot show what a policy trained *with* the rule would learn; a policy that
+had never been able to flip freely might route its behaviour differently and be better rather than worse.
+This measurement says the rule is not free to switch on mid-run, and that the specific justification for it
+(§3.4's redraw suppression) is not established — not that the idea is impossible.
+
+**If S5 is ever revisited, fix the indexing first**, then re-run exactly this probe, because with the fix
+rule 1 finally bites on the 17.5% of decisions that are true redraws and the lever becomes a genuinely
+different intervention from the one measured here.
+
+**Live signal an activation would have to watch**, per the standing rule (one thing at a time, >= 400k
+steps, judge on the median over 50 fresh):
+
+- **Is it live at all:** `slot_dropped_frac` and `slot_blocked_frac` off `status.json` must be non-zero.
+  Expect roughly 0.14 / 0.34 at `every: 3` — this run's numbers are the reference.
+- **The judged metrics:** `median_time_50` and `fresh_completion_rate` first, then `kills_per_min` and
+  `firing_on_target_frac`, with `variation0_frac` beside them as the control for the frozen-variation
+  confound (it stayed ~0.77-0.81 in all three arms here, so a large move would mean something else broke).
+- **The tell this run found, and the one to watch hardest: `deaths`.** It was the earliest, largest and
+  cleanest effect (0.35 -> 1.85 -> 3.65 per episode), and it moved long before the completion rate did.
+
+**Revert trigger:** the standing one — median or completion worse at the next two checks — *plus* an
+immediate revert if mean deaths per episode rises by more than ~1.0 against the pre-activation baseline at
+any single check, because on this evidence that is the leading indicator and waiting for the median to
+confirm it costs a round of twelve games.
+
+### Not verified (this entry)
+
+- **The draw/ready gate was never timed.** It is in a serialized animation clip and unreadable from C#; no
+  in-game measurement of it was made, so "the refund outweighs the gate" is an inference from the outcome
+  plus the code, not a timing.
+- **Completion rates are censored at 300 game-seconds** and are not comparable with the live run's 0.92 on
+  the 800 s cap. The A/B comparison is internally consistent because all three arms share the cap.
+- **One checkpoint, one level, one policy.** `ckpt_29717542_steps.zip` on `Level 0-1` only. Nothing here
+  says anything about 0-2, 0-3, or a level whose arenas are harder.
+- **`kills_per_min` and arena time are inside the noise** at n=20 per arm. Only the median time, the deaths
+  and C's completion rate are outside it; B's completion-rate CI touches zero at the top.
+- **The off-by-one was not fixed and its blast radius beyond the three named sites was not audited.** No
+  behaviour changed in this session.
+- The probe's novelty reward read a shared, mutating exploration archive across arms; the observation does
+  not read the archive (`spaces.py` never touches it), so this cannot have changed the frozen policy's
+  actions, only the reward totals, which nothing here is judged on.
+- The extra private game raised the games' total working set by ~1.4 GB and so brought forward
+  `mem_guard.py`'s total-budget recycles, which were already running on a ~7-minute cadence before it
+  started (13:27, 13:35, 13:42). No trainer restart or `GIVING UP` followed, and the driver logged
+  `healthy` throughout.
