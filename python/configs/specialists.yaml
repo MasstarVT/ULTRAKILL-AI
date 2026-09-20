@@ -159,6 +159,33 @@ speed:
   # once", not at "stand still". Pinned by tests/test_speed_death_weight.py.
   rewards:
     death: 12.0
+# THE FOCUS / RECORD CHASE (spec §11). The user, 2026-09-20: "can we focuse on one level tell we get it to a
+# point that is close to the speed run record". While this block is set the driver trains NOTHING ELSE: not
+# 0-2, not 0-3, not 0-4, whatever `order:`, `hold_before:` and `hold_order:` above would otherwise say. It runs
+# the named level's SPEED stage over and over, one RUNG of `targets:` at a time, each rung an explicit median
+# in official seconds -- never the S-rank time, never scaled by `target_scale` above.
+#
+# WHY LEVEL 0-1. It is the first level, it has the most trained brain in the project (28.39M cumulative steps),
+# and it is the only level whose speed stage has ever passed: on 2026-09-19 it met its S-rank rung with
+# median_time_50 147.16 s against a 150 s target at a 0.92 fresh rate, best single run 81.46 s. The human
+# INBOUNDS individual-level record is 19.798 s (configs/il_records.yaml, docs/il-records.md; the 4.915 s Any%
+# leaves the level and is not a target a campaign policy can reach). So the AI's median is 7.4x the record and
+# its best is 4.1x it -- which is what this ladder exists to close.
+#
+# THE LADDER. Each rung is a target the policy has to make TYPICAL, not once: the promotion rule is the speed
+# rule unchanged, fresh rate >= 0.4 AND median_time_50 <= the rung. The steps are ~15-20% apart at the top,
+# where the loss is route length rather than execution, and tighten toward the bottom; the last rung, 25 s, is
+# about 1.26x the record, which is "close to the speed run record" without pretending a memoryless MLP with no
+# hazard channel will beat a human. A rung that is already met is SKIPPED (see `focus_rung`), so the 150 s
+# round already recorded puts the focus straight on 120. A round that runs out of steps repeats its own rung,
+# unbounded, because `speed.max_rounds` above is 0. When the last rung is done the focus stops, says so, and
+# the ordinary plan takes over -- it does NOT silently keep training.
+#
+# TO STOP THE FOCUS: delete this block, or set `focus: null`. The driver then behaves exactly as it did before
+# it existed, from the same state file.
+focus:
+  level: "Level 0-1"
+  targets: [120, 100, 85, 72, 60, 50, 42, 35, 30, 25]
 # THE HOLD LINE (spec §8a). No stage at or after this level starts until EVERY stage before it is "done".
 # The lead, 2026-09-18: "dont have it promote to 0-4 untell it gets better times on these levels". Without this
 # key a speed stage that burns its 8M-step cap is recorded "unfinished" and the ladder walks on to 0-4 carrying
