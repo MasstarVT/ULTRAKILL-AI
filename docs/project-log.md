@@ -3338,3 +3338,85 @@ recipe in `docs/commands.md`:
   reasoning.
 - The `test_speed_death_weight.py` farmability table (6.17 per respawn) was measured under the OLD damage
   clamp and was not recomputed; the file still passes.
+
+## 2026-09-20 — THE FOCUS IS LIVE: the whole machine is on Level 0-1, rung 1 of 10 (120 s)
+
+The user, verbatim: *"can we focuse on one level tell we get it to a point that is close to the speed run
+record"*. The lead chose Level 0-1 — the first level, and the fastest brain. This entry records the switch.
+
+### What was ended, and what it did NOT decide
+
+`Level 0-2 (speed)` round 2 was ended by the operator at **29,231,794** steps (started 23,310,382, so
+**5,921,412** steps of its 8M budget), recorded `"unfinished" — "ended by operator"`, `promoted: false`.
+`models/specialists/Level_0-2.zip` is byte-identical across the switch (SHA-256
+`F3C3A29A…7E12B4B8` before and after) and `models/spec_0-2_speed/` still holds all 224 files.
+
+**The death-weight experiment (5.0 → 12.0 at 27,422,782 steps) has NO VERDICT.** It was cut short on the
+user's new direction, not on its numbers. What it did get, measured by streaming
+`runs/spec_0-2_speed/episodes.jsonl` (3,003 rows across both rounds):
+
+| | episodes | deaths/episode | completions | median | best |
+|---|---|---|---|---|---|
+| before 27,422,782 (death 5.0) | 2,428 | **4.577** | 2,100 | 199.15 s | 86.74 s |
+| after 27,422,782 (death 12.0) | 575 | **4.663** | 502 | 178.05 s | 77.09 s |
+
+Deaths per episode did not fall — it rose slightly, over ~1.8M steps. The completion median fell 185.5 →
+178.05 s, which is inside the swing the round already shows without any reward change (six equal step-buckets
+across the run: 226.67, 186.31, 192.90, 212.40, 185.53, 178.05 s). Pricing a death at 12.0 is therefore
+neither confirmed nor refuted; it stays in the shipped `speed.rewards.death` and the focus rung inherits it.
+The last status.json before the switch read rate **0.94** over 50 fresh, median **176.42 s** against the 120 s
+target, best **77.09 s**. 122 of the 3,003 rows (4.06%) had a negative total episode reward — the tail the
+`damage_share` clamp removes.
+
+**One cost of the ordering, recorded honestly:** the driver was restarted onto the new code ~1 minute before
+`END_STAGE`, and a trainer restart deliberately does not carry the fresh-episode windows, so the history row
+for that round has `fresh_completion_rate: null`, `fresh_window: 0`, `median_time: null`. The real numbers are
+the ones above, from the pre-restart status.json and from episodes.jsonl. Nothing reads those nulls — the row
+is `"unfinished"`, so `rung_met` ignores it and `refuse_promotion` had already declined. The alternative
+orderings were worse: ending the stage under the OLD driver would have started 0-3 complete under the old
+plan, and waiting ~40 minutes for the window to refill would have spent it on a round with no verdict either
+way.
+
+### What is live now
+
+`Level 0-1 (speed)` **round 3 = FOCUS rung 1 of 10**, run `spec_0-1_speed`, started 2026-09-20 11:21:44 and
+training since 11:23:22. Resumed from `models/spec_0-1_speed/latest.zip` at **28,393,030** steps (the driver
+picked it over the highest checkpoint, `ckpt_28362742_steps.zip`). `stale_below` = 28,393,030, so the rung
+cannot latch on the previous round's median. Generated config `configs/generated/spec_0-1_speed.yaml`:
+`speed_target_seconds: 120.0` (explicit, never scaled — `speed_target_scale` is still 1.0 and unused),
+`fresh_start_prob: 1.0`, `rewards.death: 12.0`, `rewards.time: 0.02`, `level_complete: 100`, difficulty 3
+(Violent — **the Brutal switch has NOT been made**), `timesteps: 37,393,030` (init + 8M cap + 1M slack).
+
+**The baseline this chase starts from**, all Violent: promoted median **147.16 s**, best single run **81.46 s**
+(`times.md` 0-1 01:21.464), fresh rate 0.92. The last 100 fresh episodes of round 2 (steps 28,141,426–
+28,392,274) were 93 completions, min 81.5 s, median **145.6 s**. The human INBOUNDS IL record is **19.798 s**
+(`configs/il_records.yaml`; the 4.915 s Any% leaves the level and is not the target). So the median is **7.4x**
+the record and the best is **4.1x** it. The ladder is 120, 100, 85, 72, 60, 50, 42, 35, 30, 25 — the last rung
+is 1.26x the record.
+
+### The restart itself
+
+The old driver (pid 11156), its `start_driver.cmd` wrapper, the `spec_0-2_speed` trainer and its 12 workers,
+and the five helpers — 33 processes — were stopped INDIVIDUALLY by pid after `DRIVER_PAUSE` was created; every
+`ULTRAKILL.exe` survived (12 alive after each batch, all 12 ports still listening). The pause was then removed
+and the driver started detached through `runs/start_driver.cmd`. It resumed 0-2 speed from
+`ckpt_29222494_steps.zip` (latest.zip was stale after the kill, exactly as the gotcha says) and was stepping
+before `END_STAGE` was written. At the stage boundary the driver found port 47805 not listening and relaunched
+all 12 games itself — so the instances are NOT the ones that survived the restart, and the memory leak is
+reset with them (system commit 79% → **66%**).
+
+### Verification at the switch
+
+`check_run.py`: **ALERTS none**; trainer running at 223 steps/s, 12/12 games listening, 17.7 GB total, fattest
+1.5 GB. Five helpers up, `keep_best.py --run spec_0-1_speed --metric time --min-rate 0.3`.
+`specialists_status.py` prints the focus first: the record 00:19.798, "rung 1 of 10: the median must reach
+02:00.000 (6.06x the record)", the ladder, and the one rung already done (target 02:30.000, median 02:27.159).
+
+### Not verified (this entry)
+
+- **No rung has been trained.** Every claim about what the 120 s rung does to the policy is still to come.
+- The first readings after the switch are noted, not judged: the stale guard means there is no rate and no
+  median until the new trainer has produced its own 50 fresh episodes.
+- The Brutal (difficulty 4) switch has not been made, and making it mid-ladder would invalidate the baseline
+  above. That is a lead decision, not an operator one.
+- The 0-2 death-weight experiment's 1.8M steps were NOT re-analysed per-leg; only the aggregate above.

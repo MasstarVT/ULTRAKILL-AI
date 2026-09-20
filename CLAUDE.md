@@ -166,18 +166,21 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   35, 30, 25]}` in `configs/specialists.yaml`. Each target is a RUNG: 0-1's speed stage with that exact
   median as `target_seconds` (never the S-rank time, never scaled), same run `spec_0-1_speed`, resumed from
   its own newest weights. A met rung promotes and the next starts; an `"unfinished"` round repeats the same
-  rung and promotes nothing. Which rung is current is DERIVED from the history, so the 2026-09-19 round (done
-  at 150 s, median 147.16) puts it on **120**. The last rung, 25 s, is 1.26x the record. Set `focus: null`
+  rung and promotes nothing. Which rung is current is DERIVED from the MEDIAN each done round actually
+  recorded (never the target it was aimed at), so the 2026-09-19 round (median 147.16) puts it on **120**,
+  and a round that latched once and drifted back repeats its rung. 25 s is 1.26x the record. Set `focus: null`
   to go back to the plan; the focus stops itself, loudly, when the ladder is done. **The plan is read once,
   at driver start** — a running driver must be restarted before any `focus:` edit means anything.
-- **Live: `Level 0-2` (SPEED) ROUND 2, run `spec_0-2_speed`** at ~23.31M steps, target median 120 s, 12 games
-  on ports 47800-47811 with `mem_guard.py` alongside — the stage the focus SUPERSEDES. End it with
-  `runs/specialists/END_STAGE` (never Ctrl+C) and the next stage is 0-1 speed at rung 120. Its own finding:
-  0-2 speed is a DEATH problem, not navigation (OLS
-  **+22.3 s/death**, intercept 121.1 s; route potential, ghost_max, path-distance and waypoints all
-  **refused on the data — do not re-propose**). 0-1 speed took two rounds (8M + 2.3M): median 500 -> 147 s
-  with NO reward change, after an `ent_coef_max` cap, a rollback and a `time` 0.02->0.05 raise were all
-  refused on a recorded per-leg budget (54% of the gap is one 25 m shaft climb). All in `docs/project-log.md`.
+- **Live: `Level 0-1` (SPEED) ROUND 3 = FOCUS RUNG 1 of 10, run `spec_0-1_speed`**, started 2026-09-20 11:21
+  from that run's own `latest.zip` at **28,393,030** steps, target median **120 s**, 12 games on 47800-47811.
+  The baseline to beat: median **147.16 s**, best **81.46 s**; the record is **19.798 s**.
+  0-2 speed round 2 was ENDED BY THE OPERATOR at 29.23M steps ("unfinished", nothing promoted): its death
+  5->12 experiment got only ~1.8M steps and has **NO VERDICT** (deaths/episode 4.58 -> 4.66). Its standing
+  finding holds: 0-2 speed is a DEATH problem, not navigation (OLS **+22.3 s/death**, intercept 121.1 s;
+  route potential, ghost_max, path-distance and waypoints all **refused on the data — do not re-propose**).
+  0-1 speed's first two rounds took 8M + 2.3M: median 500 -> 147 s with NO reward change, after an
+  `ent_coef_max` cap, a rollback and a `time` 0.02->0.05 raise were all refused on a recorded per-leg budget
+  (54% of the gap is one 25 m shaft climb). All in `docs/project-log.md`.
 - **Two shared-path reward bugs fixed 2026-09-20** (they change every stage; the focus's first rung is the new
   baseline): `damage_dealt` is bounded to [0, 1] per enemy — an overkilled enemy with no known health bar paid
   **-250 in one step**, 3.4% of 0-2 completions had a negative total — and `completion_bonus` now pays the
