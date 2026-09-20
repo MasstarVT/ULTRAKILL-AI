@@ -187,9 +187,13 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   FLOOR (25), not the full 100, when a speed stage's official time is missing. Neither is validated in game.
   Still open: guard T's mid-name-fork blind spot; a 0-3 mid-level wall probe; the memory work (another
   engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`).
+- **Branch `mod-0.8` (pushed, NOT merged, NOT installed)** — mod v0.8.0: the SSJ macro pair, a monotonic
+  input-event clock, three optional obs blocks, all defaulting to 0.7.2 behaviour; verified on a private game
+  on 47812 against an isolated `BepInEx-test` tree. Jump SSJ **25/25 bucket 1, +24.75 u/s median** vs 0/25
+  plain; wall SSJ 0/25, it needs an *airborne* slide. `docs/project-log.md` 2026-09-20.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
-  (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2** installed; **33 of 35**
-  levels ship; Violent, with all weapons unlocked in memory for AI runs only.
+  (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2** installed (v0.8.0 built
+  on `mod-0.8`); **33 of 35** levels ship; Violent, all weapons unlocked in memory for AI runs only.
 - Machines (backups and migration steps in `docs/machines.md`). This PC:
   `C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL`, Ryzen 9 3900X (12C/24T), 32 GB, RTX 2080 SUPER,
   **one display** — pass `--monitor 1` everywhere. Original PC:

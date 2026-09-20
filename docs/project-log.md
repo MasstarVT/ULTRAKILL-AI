@@ -3581,3 +3581,126 @@ bounded by geometry the way `gate_approach` is.
   further than the 195 m straight-line distance to the exit. **These techniques multiply speed along that path;
   they do not shorten it.** Rungs at 120 s and maybe 100 s are in reach; 60/42/30/25 s need a shorter route,
   which a memoryless 512x512 MLP cannot represent, and nothing here addresses that.
+
+## 2026-09-20 — mod v0.8.0 built and verified on a private game (S6/S7 mod half, branch `mod-0.8`)
+
+Built the mod half of `docs/superpowers/specs/2026-09-20-speedrun-tech.md` in worktree
+`F:\Github\ULTRAKILL-AI-mod8`, compiled with `-p:InstallPlugin=false` only (0 warnings), and verified it on
+**one** hand-started private game on 47812 while the 12-game fleet kept running the installed v0.7.2 DLL.
+**Nothing was installed and the live policy's behaviour was not touched.** The Python half (obs packing,
+`add_tech_heads.py`, the `tech` reward, the config flips) is not in this branch.
+
+**The isolated test tree.** `<game>\BepInEx-test\` — `core` and `config` **copied** (never moved) from
+`BepInEx\`, plus empty `plugins\` and `patchers\`; 1.7 MB. The installed `winhttp.dll` is Unity Doorstop
+**4.5.0** and its accepted arguments were read out of the DLL's UTF-16 strings: `--doorstop-enabled` and
+`--doorstop-target-assembly` (not Doorstop 3's `--doorstop-target`). The launch line mirrors `games.py`'s
+arguments plus `--doorstop-enabled true --doorstop-target-assembly "<game>\BepInEx-test\core\BepInEx.Preloader.dll"`.
+
+- **The path must be quoted as ONE argument.** PowerShell 5.1's `Start-Process -ArgumentList <array>` joins
+  without quoting, so `C:\Program Files (x86)\...` split into several arguments; the game started, loaded no
+  BepInEx at all, opened no port and exited by itself. Pass a single pre-quoted argument string instead. The
+  first attempt cost ~4 minutes and left the fleet untouched (12/12 games and 12/12 ports throughout).
+- **The gate that makes the test mean anything:** `hello` reported `mod_version 0.8.0` and BepInEx created
+  `BepInEx-test\cache\`, while `BepInEx\LogOutput.log` stayed at its 2026-09-17 mtime and
+  `BepInEx\plugins\UltrakillAIBridge\UltrakillAIBridge.dll` stayed at its 2026-09-18 one. Had the override
+  been ignored, 47812 would have loaded the **live** plugin and every number below would be a false negative.
+
+**The four questions the spec wrote this stage for, answered.**
+
+1. **Does an explicit `QueueStateEvent` timestamp reach `ctx.time` unchanged? YES, exactly.** A requested
+   12 ms slide-to-jump gap measured `dt` **11.999–12.000 ms** over 50 macro trials, and the `slide_timestamp`
+   the game recorded came back equal to the anchor the mod queued.
+2. **`InputSystem.settings.updateMode` is `ProcessEventsInDynamicUpdate`** — the default dynamic mode, in
+   which a future-dated event is processed in the current update. The macro design holds; had it been
+   `ProcessEventsInFixedUpdate` the whole thing would have needed redesigning.
+3. **The monotonic cursor is both necessary and sufficient.** Right after a macro, the mod's timestamp cursor
+   was **ahead of the live clock in 11 of 12 samples** — i.e. without the lift, the next frame's ordinary
+   event would have been older than the device's last update and silently dropped, costing a whole frame of
+   the agent's input in nearly every case. With the cursor, a dash issued on the step after a macro
+   registered **12 of 12**.
+4. **The serialized values, read at last:** `walkSpeed` **750**, `jumpPower` **90**, `wallJumpPower` **150**,
+   `ssjMaxFrames` **4**, `Time.fixedDeltaTime` **0.008**. These confirm every derived u/s figure in the spec
+   exactly: `0.5 x 750 x 2.75 x 3 x 0.008 = 24.75` u/s for a ground SSJ, `37.125` for a wall one.
+
+**Jump SSJ (M1): GO. 25 of 25 landed bucket 1; the control landed 0 of 25.**
+
+| | macro | control (plain slide jump) |
+|---|---|---|
+| trials | 25 | 25 |
+| buckets | `{1: 25}` | 19…522, i.e. all far past the accepted 1–3 |
+| landed | **25/25** | **0/25** |
+| `TrySSJ` h-gain | mean **+30.39** u/s, median **+24.75**, max +50.89 | **+0.00** u/s, every trial |
+| gap `dt` | 12.00 ms | mean 1966 ms |
+| whole-step dspeed | mean +7.51, median +4.73 | +0.00 |
+
+The control is measured by the **same instrument**, a prefix/postfix around `TrySSJ` itself, so its +0.00 is
+not noise: `TrySSJ` contributes *literally nothing* to an ordinary slide jump, because the slide is still
+held and `SlideCancelled` never fires. The median gain of exactly **24.75** is the pure bucket-1 bonus.
+**Caveat on the mean:** an SSJ from a standstill reads as +48.75 (`velocityAfterSlide` floors at 24, plus
+24.75), so trials that start slow flatter the macro. A first run without a turn-to-open-space step had
+`h_speed_before` median **0.0** and reported +45.6; adding the turn dropped it to +30.4 mean / +24.75 median.
+**Quote the median.**
+
+**Wall SSJ (M2): NO-GO as a demonstrated technique, and the test found a real defect.**
+
+- The **first** run reported 11 of 25 attempts as `ran` — and **not one reached `TrySSJ`**. Cause: the
+  implementation did not require an active slide. `WallJump` only reaches `TrySSJ` through
+  `sliding || currentTime - slideTimestamp < 0.032`, and `SlideCancelled` records `slideTimestamp`
+  **only `if (sliding)`**. Without a slide the macro fires an ordinary wall jump and reports a success it
+  does not have. Fixed: `not_sliding` is now a refusal, so the failure is legible instead of silent.
+- With the fix, **0 of 25 attempts ever reached a firing window** on 0-1's opening: only **3 steps** in the
+  whole run had the player simultaneously airborne and sliding. Holding `slide` in the air does **not** slide
+  — it calls `TryStartSlam` — so an airborne slide needs sliding off a ledge, and jumping out of a slide
+  cannot produce one because `Jump()`'s own `if (sliding)` branch calls `StopSlide`.
+- **This is a substantive correction to the spec's section 4.2.** M2's precondition is not "a wall plus a
+  jump"; it is "a wall plus an **airborne slide**", which is a much rarer state. M2 should be expected to
+  refuse most of the time, and gating the `tech` bonus on the reported bucket is what protects the reward
+  from paying for the ordinary wall jumps it would otherwise have bought. Whether M2 is worth its action row
+  at all is now an open question for the lead. Its row costs nothing if it stays refused.
+- Separately, the grace is load-dependent and untested under load: the release is queued at the end of frame
+  N and the jump is not read until frame N+2's `Update`, so the interval that must fit inside 32 ms is about
+  **two real frames**. On the idle private game that was 4.4–5.6 ms, so the adaptive lead computed 0.0 and
+  the grace was never the binding constraint. **On a loaded 12-game fleet a frame is tens of ms and it would
+  be.** `macro_wall_lead_frames` exists for that and is unexercised.
+
+**Time accounting: no hole.** Plain steps and macro steps both advanced `frame` by exactly **2** and
+`Time.time` by **0.066667 s** at `frameskip` 2 / `fixed_fps` 30. A macro step costs exactly what any other
+step costs, so `rewards.py`'s flat per-decision `time` charge and the decision-counted `stuck` / `max_steps`
+budgets need no correction. (Measured on `Time.time`, not `StatsManager.seconds`: the level timer is not
+running during 0-1's opening and a first attempt read a flat 0.0 that meant nothing.)
+
+**Backward compatibility: exact.** A second connection behaving as a 0.7.2 client — no `macro`, no `variant`,
+none of the `obs_*` flags — ran 60 steps and saw **zero unexpected top-level obs keys, zero unexpected
+`player` keys and zero missing `player` keys**; step latency median 7.2 ms, p90 10.9 ms. **This only holds on
+a game that has never been told about a 0.8 feature:** config is per game **process**, not per connection (as
+`frameskip` always has been), so a first run of this check — made *after* the main pass had switched the
+blocks on — inherited them and reported `move_tech`, `weapon_tech`, `projectiles` and `input` as unexpected.
+The compatibility check now runs first, on a clean game. Worth remembering before anyone concludes a live env
+is unaffected by a config that another client sent to the same game.
+
+**Observation blocks: partially verified. Do not read the gaps as working.**
+
+- **`projectiles` (block C) confirmed for coins.** Switching to the Marksman through the new `variant` action
+  (`result: ran`) and throwing one gave `{"kind":"coin","dist":6.96,"age":0.20,"rel":[-1.12,5.27,4.39]}` —
+  sensible relative coordinates in the player's yaw frame and a real age.
+- **`weapon_tech` (block B) reads.** `slot_counts [3,3,3,3,3,0]` (all five standard variants per slot, the
+  sixth empty), `variations_in_slot 3`, `gun_ready true`, `coin_charge 400`, `rai_charge 5`,
+  `hook_equipped true`, and `rocket_frozen` did go true when Freezeframe was triggered.
+- **NOT verified: rockets and grenades in block C.** No `rocket`, `grenade` or `cannonball` entry ever
+  appeared, across all five populated slots. Coins prove the list plumbing works, so this is specific to
+  `ObjectTracker.grenadeList` and is unexplained — most likely the probe never actually fired those weapons.
+- **NOT verified: the slam fields in block A.** `heavy_fall`, `slam_force`, `bounce_window` and
+  `pre_slide_speed` all stayed at their resting values because the probe never reached a qualifying fall:
+  `TryStartSlam` needs `fallTime > 0.5` **and** nothing within 3 m below **and** `slamCooldown == 0`, which a
+  jump on flat ground can never satisfy. The fields read plausibly at rest; nothing confirms they move.
+  **Whoever wires block A into `spaces.py` should re-run this against a real slam first** — the slam family
+  is, per the spec's section 8, one of the two cheapest real gains in the whole document.
+
+**What this branch leaves for the break.** Every default is the 0.7.2 behaviour: macros only run when an
+action asks for one, the three observation blocks are off, `variant` is refused (`variant_switching` false)
+and macro values 3–5 are refused as reserved. So S7 is a config flip plus the Python-side migration, exactly
+as the spec intends. `python/scripts/macro_check.py` is the test client (standalone, stdlib only, and it
+**refuses** to connect to 47800–47811). The test tree stays at
+`C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL\BepInEx-test\` for re-runs; it is outside the repo,
+is not committed, and does not travel between machines — recreate it with a copy of `BepInEx\core` and
+`BepInEx\config` on any machine that needs it.
