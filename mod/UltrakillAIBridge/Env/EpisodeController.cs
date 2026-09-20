@@ -362,6 +362,8 @@ namespace UltrakillAIBridge.Env
             // behaviour-preserving, and enabling them later a config flip rather than a second break.
             injector.MacrosEnabled = msg["macros"]?.Value<bool>() ?? injector.MacrosEnabled;
             injector.AllowReservedMacros = msg["allow_reserved_macros"]?.Value<bool>() ?? injector.AllowReservedMacros;
+            injector.AllowSsjWall = msg["macro_ssj_wall"]?.Value<bool>() ?? injector.AllowSsjWall;
+            injector.AllowUnsafeWallLead = msg["macro_wall_lead_unsafe"]?.Value<bool>() ?? injector.AllowUnsafeWallLead;
             injector.SsjGapSeconds = msg["ssj_gap_s"]?.Value<double>() ?? injector.SsjGapSeconds;
             injector.WallLeadSeconds = msg["macro_wall_lead_s"]?.Value<double>() ?? injector.WallLeadSeconds;
             injector.WallLeadFrames = msg["macro_wall_lead_frames"]?.Value<double>() ?? injector.WallLeadFrames;
@@ -703,6 +705,8 @@ namespace UltrakillAIBridge.Env
             var arr = new JArray();
             arr.Add(new JValue("monotonic_input_clock"));
             arr.Add(new JValue("macro.ssj"));
+            // Built and enforced, but reserved and refused unless `macro_ssj_wall` is set. Advertised so a
+            // client can tell "this DLL has it" from "this DLL is 0.7.x"; whether it will RUN is config.
             arr.Add(new JValue("macro.ssj_wall"));
             arr.Add(new JValue("obs.move_tech"));
             arr.Add(new JValue("obs.weapon_tech"));

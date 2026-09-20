@@ -3704,3 +3704,249 @@ as the spec intends. `python/scripts/macro_check.py` is the test client (standal
 `C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL\BepInEx-test\` for re-runs; it is outside the repo,
 is not committed, and does not travel between machines — recreate it with a copy of `BepInEx\core` and
 `BepInEx\config` on any machine that needs it.
+
+## 2026-09-20 — GO on the SSJ macro, with M2 cut to reserved: the mod-0.8 review, and the S7 install plan
+
+Review of branch `mod-0.8` at `15481e6` (built and privately verified earlier the same day, entry above),
+then the fixes, then the merge. **Source only: the installed DLL was not touched at any point.** The live
+plugin `BepInEx\plugins\UltrakillAIBridge\UltrakillAIBridge.dll` is still 73,728 bytes at 2026-09-18 01:34
+(v0.7.2); every build in this session used `-p:InstallPlugin=false`, and the csproj's copy target is
+`Condition="'$(InstallPlugin)' == 'true' AND Exists(...)"`, so the flag genuinely gates the install.
+The record chase on `Level 0-1` (`spec_0-1_speed`, rung 1, control arm) ran untouched throughout: no
+connection was ever made to 47800-47811, no `games.py launch` / `stop`, no `supervise.py`.
+
+### VERDICT: **GO** on the macro approach, with one scope cut
+
+**Ship M1 `ssj` at S7. Cut M2 `ssj_wall` to reserved-and-refused**, alongside macro values 3-5, until an
+airborne slide is demonstrated on a level that has one. The action row still exists, so enabling it later is
+a config flip and not a second break. Two independent reasons, one measured and one derived:
+
+- **It never fired.** 0 of 25 attempts on 0-1 reached a firing window. Only 3 steps in the whole run had the
+  player airborne *and* sliding at once — holding slide in the air calls `TryStartSlam`, not `StartSlide`,
+  and jumping out of a slide cannot leave one because `Jump()`'s `if (sliding)` branch calls `StopSlide`.
+- **Its lead mechanism perturbs the game outside the macro.** See finding 1 below.
+
+### The numbers the GO rests on
+
+Private game, port 47812, isolated `BepInEx-test` tree, `Level 0-1`, `frameskip 2` / `fixed_fps 30`.
+
+| measurement | macro | control |
+|---|---|---|
+| jump SSJ bucket 1 | **25 / 25** | **0 / 25** (buckets 19..522) |
+| `TrySSJ` horizontal gain, instantaneous | median **+24.75 u/s**, mean +30.39, max +50.89 | +0.00 on every trial |
+| whole-step `dspeed` | mean +7.51, **median +4.73 u/s** | +0.00 |
+| wall SSJ | **0 / 25** ever reached a firing window | — |
+| requested vs measured event gap | 12 ms requested, **11.999-12.000 ms** measured over 50 trials | — |
+| step length, plain vs macro | both advanced `frame` by exactly 2 and `Time.time` by 0.066667 s | — |
+| monotonic cursor | ahead of the live clock in **11 / 12** samples after a macro; dash on the next step registered **12 / 12** | — |
+| old-style client on the new DLL | 0 unexpected obs keys, 0 unexpected/missing player keys over 60 steps; step latency median 7.2 ms, p90 10.9 ms | — |
+
+Serialized values read from a live player at last (they cannot be read from decompiled C#): `walkSpeed` 750,
+`jumpPower` 90, `wallJumpPower` 150, `ssjMaxFrames` 4, `Time.fixedDeltaTime` 0.008,
+`InputSystem.settings.updateMode` `ProcessEventsInDynamicUpdate`. Those reproduce the spec's derived
+24.75 / 37.125 u/s exactly, which retires the spec's section 9 caveat that every u/s figure was derived.
+
+**Quote +4.73 u/s, not +24.75, against the speed ceiling.** The +24.75 is the instantaneous delta across the
+patched `TrySSJ` call; about five sixths of it does not survive the step. The spec's section 8 ceiling
+("~18 -> 25-30 u/s sustained, median ~159 s -> ~105-120 s") was written against the larger number and is
+**overstated**; it should be re-derived from the whole-step figure before any rung is judged on it.
+
+### Findings fixed
+
+1. **(major) The wall macro forward-dated `NewMovement.slideTimestamp` past the wall clock with no bound.**
+   Confirmed from the game: `SlideCancelled` writes `ctx.time` straight into the public field, so a
+   future-dated release event writes a future stamp, and **four** call sites read it — `WallJump`'s
+   `currentTime - slideTimestamp < ssjMaxFrames * 0.008` (trivially true while the difference is negative, so
+   every plain wall jump takes the SSJ / momentum-reflect branch), `HandleInputs`' enemy-step `windState`
+   test at 0.1 s, `Jump`'s dash-jump branch (`jumpTimestamp - slideTimestamp > 0.008 * ssjMaxFrames`, which a
+   negative difference fails), and `TrySSJ` itself, where an ordinary jump one or two decisions later lands in
+   bucket 1-3 and fires an **unrequested** SSJ that *overwrites* `rb.velocity` with a one-step-old slide
+   vector floored at 24 — a speed loss on a step the obs reports as `macro: none`.
+   The arithmetic is worse than the reviewer's sweep scenario, because it bites at the **default**: the lead
+   M2 needs is `~ 2 x frame_gap - 0.012` and the largest safe lead is `(step_frames + 1) x frame_gap - 0.032`.
+   They are compatible only inside a window one frame gap wide, and the default leaves it whenever
+   `frame_gap < 0.020` — at a 15 ms gap the needed lead is 18 ms against a 13 ms bound, and the next
+   decision's plain jump reads bucket 3. Measured on this box: **4.4-5.6 ms idle, ~30 ms under the 12-game
+   fleet**, so both sides of that boundary occur in practice.
+   **Fixed twice over.** `ssj_wall` is now reserved and refused by default (`macro_ssj_wall`, the scope cut),
+   *and* `WallLead()` computes the safe cap and `BeginMacro` **refuses** with `lead_unsafe` rather than
+   queueing an unsafe lead. A private test can override only through `macro_wall_lead_unsafe`. The bound is
+   conservative: it ignores Python think time, which only lengthens the real interval.
+
+2. **(major) `move_tech` mixed wall-clock seconds into an otherwise game-time observation.**
+   `slide_since` is `InputState.currentTime - nm.slideTimestamp` — real seconds, because the game's own grace
+   is measured on the Input System event clock — while every other quantity in the observation is game time,
+   which `Time.captureDeltaTime` pins per frame. The same game state would read `~0.08` on the loaded fleet
+   and `~0.01` on a single eval game: an order of magnitude of train/eval shift on the feature the spec
+   designates as the macro's precondition. `slide_timestamp` and `jump_timestamp` are worse — unbounded
+   process-uptime doubles, non-stationary as policy inputs and losing millisecond resolution in float32 after
+   a few hours of uptime.
+   **Fixed:** new `move_tech.slide_grace`, the fraction of the SSJ window still open (1.0 at release, 0.0 once
+   expired), bounded and normalised by the game's own window. That is the field to pack. The three raw fields
+   stay as diagnostics and `docs/protocol.md` now says in terms that they must never be packed.
+
+3. **(major) `macro.ssj_bucket` could report a landed SSJ for a REFUSED macro.**
+   `BuildMacroReport` read the instrument unconditionally, and `TrySSJ` runs at the end of **every** `Jump()`
+   (`decompiled/NewMovement.cs:1653`) and inside `WallJump`'s grace branch (1762). So a refused macro whose
+   plain action happened to contain a jump came back as `result:"refused"` beside `ssj_bucket:2,
+   ssj_landed:true`. The spec's S8 reward gates on the mod-reported bucket, so this would have **paid for the
+   refusal** — training the policy to request macros whose preconditions it cannot meet, the exact failure
+   section 4.5 exists to prevent.
+   **Fixed:** `ssj` / `ssj_bucket` / `ssj_landed` are populated only when `result == "ran"`. The unconditional
+   reading stays in `move_tech.ssj_last`, where it belongs, so a plain slide jump is still measured by the
+   same instrument. Documented in `docs/protocol.md`.
+
+4. **(minor) M1's precondition did not match the game's own jump gate; M2 ignored `fakeFallRequests`.**
+   `HandleInputs` computes `flag = !falling` and `flag2 = !gc.onGround && (gc.canJump ||
+   wcGroup.CheckForEnemyCols())` and calls `Jump()` iff `flag2 || flag` — not `onGround || canJump`, which is
+   what the macro tested. And `decompiled/NewMovement.cs:1040` gates the **whole** wall-jump block on
+   `!gc.onGround && fakeFallRequests <= 0`, which M2 never checked, so during a fake fall it would report
+   `"ran"` while `WallJump` never executed. Both are the class of false success the builder's own M2 fix
+   removed.
+   **Fixed:** M1 refuses with `no_jump_path` when neither branch would run, and reports `"note":"enemy_step"`
+   when the `flag2` branch will run — the macro does succeed there, but that branch also calls
+   `EnemyStepResets()`, zeroing the wall-jump and rocket-jump budgets as an unreported side effect of the
+   request. M2 refuses with `fake_fall`, on request and again on its second frame.
+
+5. **(minor) Block A allocated a fresh SSJ counters object and a full `ssj_last` object on every step.**
+   `BuildLast(-1)` can never return null once the instrument is available, because `Last.Frame` starts at 0
+   and `0 <= -1` is false. About 25 extra JTokens per step, ~4k short-lived objects per second at the fleet's
+   161 steps/s, on a box that is commit-bound beside games leaking ~790 MB/h. Not a leak; pure waste.
+   **Fixed:** both are emitted only when they changed, and are `null` in between. The counters are cumulative,
+   so nothing is lost.
+
+6. **(minor) Block C's `rel` is in a different frame from the `enemies` block's `rel`.**
+   `TechObserver` uses `nm.transform.InverseTransformPoint`, and `CameraController` sets the player
+   transform's rotation from `rotationY` alone, so that is a **yaw** frame; `ObservationBuilder.cs:283` builds
+   the enemy block's `rel` with `cam.InverseTransformPoint`, which **includes pitch**. Two frames now coexist
+   in one observation. Whoever packs block C at S10 by copying the enemy packer gets rocket and coin
+   directions wrong by exactly the current pitch — and the coin rocket jump is a look-up-then-detonate
+   technique. **Fixed in `docs/protocol.md`,** stated next to both blocks. No code change: the yaw frame is
+   the right one for block C.
+
+7. **(minor) A dead SSJ instrument would silently pay zero across the whole fleet.**
+   `Plugin.Awake` isolates `PatchAll(typeof(MovementPatches))` in its own try/catch, which is correct — a game
+   update renaming the private `TrySSJ` must cost the instrument and not the bridge. But `BuildLast` then
+   returns null forever, every macro reports `ssj_bucket: -1`, and an S8 reward keyed on the bucket turns off
+   across 12 games while training continues and the median quietly stops improving. **Fixed as a documented
+   client obligation:** `docs/protocol.md` now requires a client enabling such a reward to assert
+   `ssj_instrument` and `macro.ssj` are in `hello.features` at connect and fail the worker loudly. The Python
+   side of that assertion is S7/S8 work and is **not** on this branch.
+
+8. **(minor) The `identical_to_0_7_2` claim was weaker than its name.** It is a key-set comparison over 60
+   steady-state `step` replies against a hand-typed baseline: no value comparison, no run against an actual
+   0.7.2 DLL, and no coverage of reset, `get_obs`, episode end or a scene change. **Fixed in
+   `python/scripts/macro_check.py`:** renamed to `key_sets_identical_to_0_7_2`, now also checks for **missing**
+   required top-level obs keys and counts distinct key sets, and carries a comment naming what it does not
+   prove. The real check — a field-by-field diff of a fixed action script against the live 0.7.2 game and
+   against the test tree — is now step 4 of the install plan below.
+
+9. **(minor) The SSJ control arm measured a different input pattern from the one the policy produces.**
+   The control jumped while still **holding** slide, so `SlideCancelled` never fires. Today's policy instead
+   drops slide and adds jump in the *same* step, putting release and press in one `KeyboardState` event where
+   `TrySSJ` returns at `if (!(num > 0.0)) return;`. Both fail, so the GO survives, but the A/B measured was
+   "release slide + SSJ" versus "keep sliding + ordinary jump". **Fixed in `macro_check.py`:** three arms now
+   — `macro`, `hold` and `release` — with `release` as the honest baseline, and the whole-step median reported
+   beside the instantaneous delta. **The third arm has not been run in a game.**
+
+10. **(minor) The legacy path's cursor behaviour was reasoned about, not measured.** Traced and agreed: the
+    first event of each frame resets `lastQueuedTime` to `now`, so a lift is bounded at one 0.5 ms epsilon per
+    frame and cannot accumulate. **Added to `macro_check.py`** as an explicit assertion — N legacy steps with
+    `obs_input_clock` on, recording how often `cursor > now` and the maximum lift, expecting zero or
+    <= 0.0005. **Not yet run.**
+
+11. **(minor) `CLAUDE.md` spent its last headroom on per-branch history.** Collapsed the four-line `mod-0.8`
+    bullet to one line linking here. **217 lines** (main was 215, the branch had taken it to 219).
+
+### Findings flagged and NOT changed
+
+12. **The three pushed commits carry `Co-Authored-By: Claude Opus 5 (1M context)`, not the
+    `Claude Fable 5.1` the task specified.** Not rewritten: the branch is pushed, another engineer may have
+    fetched it, and a force-push to fix a trailer is not worth the hazard. The merge commit uses the same
+    trailer as the three it merges, so the history is at least internally consistent. **Lead decides** whether
+    the convention changes going forward.
+
+Also **not** changed: S4 (halving the route rewards) stays unapproved per the lead — an earlier measurement
+said cutting gate pay lowers the speed gradient, and it needs its own evidence after S1-S3. Nothing in this
+branch touches rewards.
+
+### Backward compatibility — why merging this cannot change the live policy
+
+The branch touches **no file under `python/ultrakill_ai/`**; the only Python file it adds is
+`python/scripts/macro_check.py`, a standalone test client that hard-refuses ports 47800-47811.
+`python/ultrakill_ai/spaces.py:44-57` emits only `move` / `buttons` / `slot` / `look`, and the strings
+`"macro"` and `"variant"` appear nowhere in the package — so on every live step `ParseMacro(null)` returns
+`None`, `ApplyVariant(null)` returns null, `BeginMacro` returns immediately, and `QueueAt(QueueOpts.None,
+-1.0)` reduces to the old `Queue()` plus a timestamp decision that takes the pre-0.8 `time = -1` call whenever
+the clock advanced. `BuildStepObs` adds `macro` only when one was requested, `variant` only when non-null,
+`input` only behind `obs_input_clock`, and `BuildTech` returns immediately when all three flags are false —
+all default false. **Merging the source cannot change behaviour. Only the S7 DLL install can.**
+
+Lockstep safety re-checked: no macro path blocks, sleeps or loops; macro state is cleared at the head of every
+`SetAction` and by `BeginReset`, so a macro cannot span two steps or survive a reset; `ReleaseControl ->
+Detach()` makes `ApplyFrame` a no-op and the next `Attach()` calls `Clear()`, so a client disconnecting
+mid-macro leaves nothing held.
+
+### The S7 full-pause install, step by step
+
+Downtime **15-25 minutes**, at a **rung boundary**, not mid-rung (lead-approved). The relaunch also resets the
+games' memory leak.
+
+1. `New-Item runs\specialists\DRIVER_PAUSE` **first**. A deliberate Ctrl+C is indistinguishable from a crash
+   and the driver will relaunch the games and the trainer underneath you.
+2. Write `END_STAGE` and let the round in flight record "unfinished — ended by operator", so no judged round
+   straddles the change (the 2026-09-20 lesson).
+3. Stop the driver, the trainer and the workers **by pid**; then `games.py stop` — safe only because no run is
+   live by this point. The live DLL is locked while games run.
+4. **Before installing anything**, settle finding 8: run one fixed action script against the live 0.7.2 game
+   on 47812 and the same script against the `BepInEx-test` 0.8.0 tree, and diff the two obs streams field by
+   field — including a `reset` and an episode end, not just steady-state steps. Exclude the known
+   non-deterministic fields. This is the only check that would catch a changed *value* or a changed
+   reset/settle cadence, which the key-set check cannot.
+5. `dotnet build -c Release` — this one installs. ~30 s.
+6. Run `add_tech_heads.py`; confirm the printed `mean_kl` is **0.0**, not merely small; read the measured
+   entropy total and write it into the config as the new `ent_floor`; quarantine the 479-wide checkpoints
+   under `pre_tech/` **and** add the `train.py` resume-path shape guard, because the driver's round init would
+   otherwise happily pick a 479-wide `ckpt_*_steps.zip` and re-exec `train.py` in a loop across 12 games.
+7. Edit `configs/specialists.yaml`: the new `ent_floor`, `obs_move_tech: true`, the `tech` block. Leave
+   `macro_ssj_wall`, `allow_reserved_macros`, `variant_switching`, `obs_weapon_tech` and `obs_projectiles`
+   **false** — that is what makes the migration behaviour-preserving.
+8. Remove `DRIVER_PAUSE`; start the driver through `runs\start_driver.cmd`.
+9. **Verify old-client behaviour on the fleet BEFORE any Python break lands**: `scripts/check_run.py`, expect
+   ALERTS none, 12/12 listening, five helpers up including `mem_guard.py`, and step latency in line with the
+   7.2 ms median / 10.9 ms p90 measured on the private game.
+
+### What is NOT verified
+
+- **Every in-game number above is the builder's, from the private 47812 game.** This review connected to no
+  bridge, ran no game and ran no Python test file; it verified that the instrument reporting those numbers
+  computes byte-for-byte what the game computes (`(int)((jumpTimestamp - slideTimestamp) / 0.00800000037997961)`
+  on the game's own two public doubles, one line before the game decides), and nothing more.
+- **None of this session's fixes has been run in a game.** They compile (`dotnet build -c Release
+  -p:InstallPlugin=false -t:Rebuild`, **0 warnings 0 errors**) and `macro_check.py` byte-compiles, but the new
+  refusal reasons (`no_jump_path`, `fake_fall`, `lead_unsafe`), the `note` field, `slide_grace`, the
+  change-only SSJ blocks and the three-arm control have **not** been exercised against a running game. The
+  next private-game run must re-measure the jump SSJ arm, because finding 4 changed M1's precondition and
+  could move the 25/25.
+- **The `lead_unsafe` bound is derived, never measured.** M2 is off by default, so it is untested code on a
+  path that cannot run.
+- **The macros have never been run under fleet load.** Every measurement is from one game on an idle-ish box
+  at a 4.4-5.6 ms frame gap; the fleet's is ~30 ms.
+- Not verified independently: `InputSystem.settings.updateMode`, `walkSpeed` 750, `fixedDeltaTime` 0.008, the
+  11/12 cursor result, the time-accounting result, `key_sets_identical_to_0_7_2`, and the contents of
+  `BepInEx-test\core`.
+- **Not on this branch and not written:** the S7 checkpoint quarantine, the `train.py` shape guard, the
+  `probe_rollout.py` absolute-index fix (its `TARGET_SLICE` uses negative indices from the end and will
+  quietly read the wrong slots after any append) and `add_tech_heads.py`.
+- **Block C rockets/grenades and block A's slam fields remain unconfirmed**, per the previous entry.
+
+### Where the test tree lives
+
+`C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL\BepInEx-test\` — `core` and `config` copied from
+`BepInEx\`, empty `plugins\` and `patchers\`, ~1.7 MB, left in place. It is a **sibling** of `BepInEx\`, not
+inside it, so neither the live chainloader nor a live launch can reach the test DLL; `doorstop_config.ini` is
+untouched (mtime 2026-02-08 01:50, `target_assembly=BepInEx\core\BepInEx.Preloader.dll`). `winhttp.dll` is
+Unity Doorstop 4.5.0 and the override argument is `--doorstop-target-assembly`. The tree is outside the repo,
+is not committed and does not travel between machines — recreate it by copying `BepInEx\core` and
+`BepInEx\config` on any machine that needs it. The 0.8.0 build currently there is 93,696 bytes, 2026-09-20,
+and is now **stale** relative to this session's fixes: re-copy before the next private run.

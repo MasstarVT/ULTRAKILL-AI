@@ -48,6 +48,13 @@ BASE_OBS_KEYS = {
     "type", "step", "frame", "time", "scene", "ready", "player", "enemies", "rays", "ground_rays",
     "ground_ray_center", "stats", "event", "campaign", "cybergrind", "mem",
 }
+# The subset of BASE_OBS_KEYS that must be present on EVERY step. The rest are conditional: `campaign`
+# only in a campaign scene, `cybergrind` only in the Cyber Grind, `mem` only under report_memory, `event`
+# only on a reset. Checking only for EXTRA keys would miss a regression that dropped one.
+REQUIRED_OBS_KEYS = {
+    "type", "step", "frame", "time", "scene", "ready", "player", "enemies", "rays", "ground_rays",
+    "ground_ray_center", "stats",
+}
 BASE_PLAYER_KEYS = {
     "pos", "vel", "local_vel", "forward", "yaw", "pitch", "hp", "anti_hp", "stamina", "grounded",
     "sliding", "slow_mode", "heavy_fall", "crouching", "dead", "activated", "level_over",
@@ -213,10 +220,21 @@ def settle(b: Bridge, steps: int = 12) -> dict | None:
     return obs
 
 
-def jump_trials(b: Bridge, trials: int, frameskip: int, use_macro: bool) -> dict:
-    """`trials` attempts at a ground SSJ (macro) or a plain slide jump (control), same instrument."""
+def jump_trials(b: Bridge, trials: int, frameskip: int, arm: str) -> dict:
+    """`trials` attempts at a ground SSJ, measured by the same instrument on three input patterns.
+
+    - ``macro``   -- the mod times the release and the press 12 ms apart, inside one frame.
+    - ``hold``    -- jump while still HOLDING slide. SlideCancelled never fires, slideTimestamp stays
+                     stale, and TrySSJ rejects the gap as far too large.
+    - ``release`` -- **the pattern today's policy actually produces**: drop slide and add jump in the SAME
+                     step, so both land in one KeyboardState event, `jumpTimestamp == slideTimestamp`,
+                     and TrySSJ returns at its `if (!(num > 0.0)) return;`.
+
+    ``release`` is the honest control for the macro: ``hold`` is a different action, and quoting the macro
+    against it alone measures "release slide + SSJ" versus "keep sliding + ordinary jump".
+    """
     out = {
-        "attempted": 0, "macro_result": Counter(), "macro_reason": Counter(),
+        "attempted": 0, "macro_result": Counter(), "macro_reason": Counter(), "macro_note": Counter(),
         "buckets": Counter(), "landed": 0, "gains": [], "h_gains": [],
         "h_before": [], "h_after": [], "dt_ms": [], "no_event": 0,
         "obs_delta": [],
@@ -229,16 +247,20 @@ def jump_trials(b: Bridge, trials: int, frameskip: int, use_macro: bool) -> dict
             continue
         before_obs = hspeed(start)
         out["attempted"] += 1
-        if use_macro:
+        if arm == "macro":
             obs = b.step(move=(0.0, 1.0), buttons=["slide"], macro=1)
             m = obs.get("macro") or {}
             out["macro_result"][m.get("result", "missing")] += 1
             if m.get("reason"):
                 out["macro_reason"][m["reason"]] += 1
-        else:
-            # The control: jump while still HOLDING slide, so SlideCancelled never fires and
-            # slideTimestamp stays stale -- an ordinary slide jump, and TrySSJ rejects it.
+            if m.get("note"):
+                out["macro_note"][m["note"]] += 1
+        elif arm == "hold":
             obs = b.step(move=(0.0, 1.0), buttons=["slide", "jump"])
+        elif arm == "release":
+            obs = b.step(move=(0.0, 1.0), buttons=["jump"])
+        else:
+            raise ValueError(f"unknown arm {arm!r}")
         ev = ssj_this_step(obs, frameskip)
         if ev is None:
             out["no_event"] += 1
@@ -556,13 +578,35 @@ def legacy_check(port: int, level: str, steps: int, frameskip: int, fixed_fps: f
         extra_obs: set[str] = set()
         extra_player: set[str] = set()
         missing_player: set[str] = set()
+        missing_required: set[str] = set()
+        key_sets: set[frozenset] = set()
         for i in range(steps):
             obs = b.legacy_step(move=(0.0, 1.0), buttons=["slide"] if i % 3 == 0 else [])
-            extra_obs |= set(obs) - BASE_OBS_KEYS
+            keys = set(obs)
+            extra_obs |= keys - BASE_OBS_KEYS
+            missing_required |= REQUIRED_OBS_KEYS - keys
+            key_sets.add(frozenset(keys))
             p = obs.get("player") or {}
             extra_player |= set(p) - BASE_PLAYER_KEYS
             missing_player |= BASE_PLAYER_KEYS - set(p)
         times = sorted(b.step_times[2:])
+
+        # The monotonic cursor on the LEGACY path. Every legacy event asks for no timestamp, so the cursor
+        # should only ever lift one when the native clock did not tick between two events of the same frame
+        # -- and then by exactly one TimeEpsilon (0.5 ms), which the next frame resets. Expect zero lifts, or
+        # lifts bounded at 0.0005. Anything larger means the cursor is running ahead of the clock on a path
+        # that has no macro in it, which is the one way this change could degrade a 0.7.2 client.
+        b.config(obs_input_clock=True)
+        lifts, max_lift = 0, 0.0
+        for i in range(steps):
+            obs = b.legacy_step(move=(0.0, 1.0), buttons=["slide"] if i % 3 == 0 else [])
+            clock = obs.get("input") or {}
+            lift = float(clock.get("cursor", 0.0)) - float(clock.get("now", 0.0))
+            if lift > 0.0:
+                lifts += 1
+                max_lift = max(max_lift, lift)
+        b.config(obs_input_clock=False)
+
         return {
             "mod_version": hello.get("mod_version"),
             "protocol": hello.get("protocol"),
@@ -570,9 +614,20 @@ def legacy_check(port: int, level: str, steps: int, frameskip: int, fixed_fps: f
             "unexpected_obs_keys": sorted(extra_obs),
             "unexpected_player_keys": sorted(extra_player),
             "missing_player_keys": sorted(missing_player),
+            "missing_required_obs_keys": sorted(missing_required),
+            "distinct_obs_key_sets": len(key_sets),
             "step_ms_median": round(1000 * statistics.median(times), 3) if times else None,
             "step_ms_p90": round(1000 * times[int(0.9 * (len(times) - 1))], 3) if times else None,
-            "identical_to_0_7_2": not extra_obs and not extra_player and not missing_player,
+            "cursor_lift_steps": lifts,
+            "cursor_max_lift_s": round(max_lift, 6),
+            "cursor_bounded": max_lift <= 0.0005 + 1e-9,
+            # NOTE the limits of this claim. It is a KEY-SET comparison over steady-state `step` replies
+            # against a hand-typed 0.7.2 baseline. It does not compare VALUES, does not run against an actual
+            # 0.7.2 DLL, and does not cover reset, get_obs, episode end or a scene change. Before installing
+            # 0.8.0 on the fleet, run a fixed action script against the live 0.7.2 game and against the test
+            # tree and diff the two obs streams field by field, including a reset and an episode end.
+            "key_sets_identical_to_0_7_2": (not extra_obs and not extra_player and not missing_player
+                                            and not missing_required),
         }
     finally:
         b.close()
@@ -587,6 +642,8 @@ def summarise(name: str, t: dict) -> str:
         lines.append(f"    result      {dict(t['macro_result'])}")
     if t.get("macro_reason"):
         lines.append(f"    reason      {dict(t['macro_reason'])}")
+    if t.get("macro_note"):
+        lines.append(f"    note        {dict(t['macro_note'])}  (ran, but with a side effect)")
     lines.append(f"    buckets     {dict(sorted(t['buckets'].items()))}  (valid = 1,2,3)")
     total = sum(t["buckets"].values())
     lines.append(f"    landed      {t['landed']}/{total} {pct(t['landed'], total)}")
@@ -665,16 +722,28 @@ def main() -> int:
         print(f"diag in level: {json.dumps(report['diag_in_level'], sort_keys=True)}\n")
 
         print("== jump SSJ ==")
-        macro_t = jump_trials(b, args.trials, args.frameskip, use_macro=True)
-        control_t = jump_trials(b, args.trials, args.frameskip, use_macro=False)
+        macro_t = jump_trials(b, args.trials, args.frameskip, arm="macro")
+        hold_t = jump_trials(b, args.trials, args.frameskip, arm="hold")
+        release_t = jump_trials(b, args.trials, args.frameskip, arm="release")
         report["jump_macro"] = {k: (dict(v) if isinstance(v, Counter) else v) for k, v in macro_t.items()}
-        report["jump_control"] = {k: (dict(v) if isinstance(v, Counter) else v) for k, v in control_t.items()}
-        print(summarise("macro  ", macro_t))
-        print(summarise("control", control_t))
-        if macro_t["h_gains"] and control_t["h_gains"]:
-            delta = statistics.mean(macro_t["h_gains"]) - statistics.mean(control_t["h_gains"])
+        report["jump_control_hold"] = {k: (dict(v) if isinstance(v, Counter) else v) for k, v in hold_t.items()}
+        report["jump_control_release"] = {k: (dict(v) if isinstance(v, Counter) else v)
+                                          for k, v in release_t.items()}
+        print(summarise("macro          ", macro_t))
+        print(summarise("control hold   ", hold_t))
+        print(summarise("control release", release_t))
+        # `release` is the honest baseline: it is what the live policy produces today.
+        if macro_t["h_gains"] and release_t["h_gains"]:
+            delta = statistics.mean(macro_t["h_gains"]) - statistics.mean(release_t["h_gains"])
             report["jump_speed_advantage_u_s"] = delta
-            print(f"  macro advantage over a plain slide jump: {delta:+.2f} u/s (horizontal, mean)")
+            print(f"  macro advantage over the policy's own release-and-jump: {delta:+.2f} u/s "
+                  f"(instantaneous TrySSJ delta, horizontal, mean)")
+        # The number that survives the whole step, which is the one a route time actually sees. It is
+        # several times smaller than the instantaneous TrySSJ delta; quote THIS against a speed ceiling.
+        if macro_t["obs_delta"] and release_t["obs_delta"]:
+            step_delta = statistics.median(macro_t["obs_delta"]) - statistics.median(release_t["obs_delta"])
+            report["jump_step_advantage_u_s_median"] = step_delta
+            print(f"  whole-step advantage (median dspeed over the step): {step_delta:+.2f} u/s")
 
         if not args.skip_wall:
             print("\n== wall SSJ ==")

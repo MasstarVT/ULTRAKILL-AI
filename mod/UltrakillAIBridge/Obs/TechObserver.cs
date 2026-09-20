@@ -76,18 +76,64 @@ namespace UltrakillAIBridge.Obs
                 ["jump_cooldown"] = PlayerFields.JumpCooldown(nm),
                 ["jumping"] = nm.jumping,
                 ["falling"] = nm.falling,
-                // Real seconds since the last slide release, on the clock TrySSJ and WallJump compare against.
+                ["fake_fall"] = nm.fakeFallRequests > 0,
+
+                // **The packable slide-grace feature, and the only one of these four that may go in the
+                // policy's input vector.** It is the fraction of the SSJ grace still open: 1.0 the instant the
+                // slide was released, 0.0 once WallJump and TrySSJ would both reject it.
+                //
+                // The three raw fields below it are REAL wall-clock seconds, because `slideTimestamp` and
+                // `jumpTimestamp` are Input System event timestamps and the game's own grace is measured
+                // against the same clock -- while every other quantity in this observation is GAME time, which
+                // `Time.captureDeltaTime` pins at a fixed step per frame. Packing a raw one would make the same
+                // game state read differently on a loaded 12-game fleet (~30 ms real per frame, measured) and
+                // on a single eval game (4.4-5.6 ms, measured): an order-of-magnitude train/eval shift on the
+                // feature that is the macro's own precondition. The two absolute stamps are worse still --
+                // unbounded process-uptime doubles that lose millisecond resolution as float32 after a few
+                // hours of uptime. Diagnostics only; see docs/protocol.md.
+                ["slide_grace"] = SlideGrace(nm),
                 ["slide_since"] = InputState.currentTime - nm.slideTimestamp,
                 ["slide_timestamp"] = nm.slideTimestamp,
                 ["jump_timestamp"] = nm.jumpTimestamp,
+
                 ["velocity_after_slide"] = ObservationBuilder.Vec(afterSlide),
                 ["riding_rocket"] = RidingRocket(),
-                ["ssj"] = MovementPatches.BuildCounters(),
+                // Both SSJ blocks are emitted only when they CHANGED, so block A costs no allocation on the
+                // overwhelming majority of steps, where no jump happened. A key simply absent means "same as
+                // the last step that carried it" -- and the counters are cumulative, so nothing is lost.
+                // Matters because these two built ~25 extra JTokens every step on a box already commit-bound
+                // beside games that leak ~790 MB/h.
+                ["ssj"] = Changed(MovementPatches.Attempts, ref lastAttempts) ? MovementPatches.BuildCounters() : null,
                 // The last TrySSJ attempt whether or not a macro asked for it, so a PLAIN slide jump is
                 // measured by the same instrument as a macro one. Compare its `frame` against the obs `frame`
-                // to tell "this step" from "some earlier jump".
-                ["ssj_last"] = MovementPatches.BuildLast(-1),
+                // to tell "this step" from "some earlier jump". Unlike `macro.ssj`, this is deliberately NOT
+                // conditioned on a macro having run.
+                ["ssj_last"] = Changed(MovementPatches.Last.Frame, ref lastSsjFrame) ? MovementPatches.BuildLast(-1) : null,
             };
+        }
+
+        private int lastAttempts = -1;
+        private int lastSsjFrame = -1;
+
+        private static bool Changed(int current, ref int previous)
+        {
+            if (current == previous) return false;
+            previous = current;
+            return true;
+        }
+
+        /// <summary>
+        /// Fraction of the SSJ grace still open, 1.0 at the instant of release down to 0.0 once it has run out.
+        /// Bounded, dimensionless and normalised by the game's own window, so it carries the same meaning at
+        /// any frame rate -- which the raw `slide_since` does not.
+        /// </summary>
+        private static float SlideGrace(NewMovement nm)
+        {
+            double grace = PlayerFields.SsjMaxFrames(nm) * 0.008;
+            if (grace <= 0.0) return 0f;
+            double since = InputState.currentTime - nm.slideTimestamp;
+            double open = (grace - since) / grace;
+            return open <= 0.0 ? 0f : (open >= 1.0 ? 1f : (float)open);
         }
 
         private static bool RidingRocket()

@@ -95,6 +95,30 @@ namespace UltrakillAIBridge.Act
         internal bool AllowReservedMacros;
 
         /// <summary>
+        /// M2 `ssj_wall`. **Reserved and refused by default**, alongside macro values 3..5, so the S7 break
+        /// ships M1 alone.
+        ///
+        /// Two reasons, both measured or derived on 2026-09-20:
+        ///
+        /// 1. It never fired. 0 of 25 attempts on Level 0-1 reached a firing window, because M2 needs an
+        ///    AIRBORNE slide and only 3 steps in the whole run had the player airborne and sliding at once.
+        /// 2. Its lead mechanism perturbs the game outside the macro. Frame 1 dates the slide release into the
+        ///    FUTURE, and `SlideCancelled` writes that future value straight into the public
+        ///    `NewMovement.slideTimestamp`. Four call sites read that field, and while the stamp is ahead of
+        ///    the clock all four are perturbed for a step the obs reports as `macro: none`:
+        ///    `WallJump`'s `currentTime - slideTimestamp &lt; ssjMaxFrames * 0.008` (trivially true while the
+        ///    difference is negative, so every plain wall jump takes the SSJ / momentum-reflect branch),
+        ///    `HandleInputs`' enemy-step `windState` test at 0.1 s, `Jump`'s dash-jump branch
+        ///    (`jumpTimestamp - slideTimestamp > 0.008 * ssjMaxFrames`, which a negative difference fails), and
+        ///    `TrySSJ` itself -- where a LATER ordinary jump can land inside bucket 1..3 and fire an
+        ///    **unrequested** SSJ that OVERWRITES `rb.velocity` with a one-step-old slide vector.
+        ///
+        /// <see cref="WallLead"/> now bounds the lead so (2) cannot happen at the frame gap the step actually
+        /// ran at, but the bound was never exercised in a game, so the macro stays off until it is.
+        /// </summary>
+        internal bool AllowSsjWall;
+
+        /// <summary>
         /// Gap queued between the slide release and the jump press. TrySSJ buckets it as
         /// `(int)(gap / 0.008)` and accepts 1..3, so 0.012 is the middle of bucket 1 -- the bucket with the
         /// strongest multiplier for BOTH call sites (Jump's `1/2^(f-1)` and WallJump's `(4-f+1)/4` are each 1.0
@@ -117,6 +141,13 @@ namespace UltrakillAIBridge.Act
         /// <summary>Frames of lead the adaptive path assumes; see <see cref="WallLeadSeconds"/>. Sweepable by a test.</summary>
         internal double WallLeadFrames = 2.0;
 
+        /// <summary>
+        /// Lets a private test drive a lead past the safety bound in <see cref="WallLead"/>. Default false, and
+        /// it must stay false anywhere a policy is learning: past the bound, an ordinary jump one or two
+        /// decisions later silently becomes an SSJ. See <see cref="AllowSsjWall"/> for the four call sites.
+        /// </summary>
+        internal bool AllowUnsafeWallLead;
+
         /// <summary>Recent real seconds per game frame, measured by EpisodeController, used by the adaptive lead.</summary>
         internal double FrameGapEstimate;
 
@@ -128,6 +159,7 @@ namespace UltrakillAIBridge.Act
         private bool macroSuppressSlide;
         private string macroResult;           // ran | refused | degraded | disabled
         private string macroReason;
+        private string macroNote;             // a side effect worth reporting on a macro that still ran
         private double macroAnchor;           // the slide-release timestamp the jump is measured from
         private double macroLead;
         private int macroScriptFrames;
@@ -327,6 +359,7 @@ namespace UltrakillAIBridge.Act
             macroSuppressSlide = false;
             macroResult = null;
             macroReason = null;
+            macroNote = null;
             macroAnchor = 0.0;
             macroLead = 0.0;
             macroScriptFrames = 0;
@@ -353,6 +386,13 @@ namespace UltrakillAIBridge.Act
                 macroReason = AllowReservedMacros ? "not_implemented" : "reserved";
                 return;
             }
+            if (kind == MacroKind.SsjWall && !AllowSsjWall)
+            {
+                // The S7 scope cut: M1 ships, M2 stays reserved beside macro values 3..5. See AllowSsjWall.
+                macroResult = "disabled";
+                macroReason = "reserved";
+                return;
+            }
 
             var why = CheckPreconditions(kind, frames);
             if (why != null)
@@ -364,11 +404,48 @@ namespace UltrakillAIBridge.Act
                 return;
             }
 
+            if (kind == MacroKind.SsjWall)
+            {
+                // Computed here, not on frame 1, so an unsafe lead is a REFUSAL rather than a silently
+                // perturbed slideTimestamp. Refusing costs nothing; the plain action still runs.
+                macroLead = WallLead(out var leadCap);
+                if (!AllowUnsafeWallLead && macroLead > leadCap)
+                {
+                    macroLead = 0.0;
+                    macroResult = "refused";
+                    macroReason = "lead_unsafe";
+                    return;
+                }
+            }
+            else
+            {
+                macroNote = GroundJumpNote();
+            }
+
             macroKind = kind;
             macroRunning = true;
             macroSuppressSlide = true;
             macroResult = "ran";
             macroScriptFrames = kind == MacroKind.SsjWall ? 2 : 1;
+        }
+
+        /// <summary>
+        /// A side effect of M1 worth reporting even though the macro runs and the SSJ lands.
+        ///
+        /// `HandleInputs` picks between two jump branches. When the player is airborne with coyote time or an
+        /// enemy under the feet it takes the FIRST branch, which sets `enemyStepping` and calls
+        /// `EnemyStepResets()` -- zeroing the wall-jump and rocket-jump budgets. `Jump()` runs either way, so
+        /// `TrySSJ` is reached and the macro genuinely succeeded; what would otherwise go unreported is that
+        /// the agent spent an enemy step to get it.
+        /// </summary>
+        private static string GroundJumpNote()
+        {
+            var nm = MonoSingleton<NewMovement>.Instance;
+            if (nm == null || nm.gc == null) return null;
+            if (nm.gc.onGround) return null;
+            var wc = PlayerFields.WallChecks(nm);
+            if (nm.gc.canJump || (wc != null && wc.CheckForEnemyCols())) return "enemy_step";
+            return null;
         }
 
         /// <summary>
@@ -389,12 +466,26 @@ namespace UltrakillAIBridge.Act
                 // is what calls StopSlide() and so refreshes the velocityAfterSlide that TrySSJ overwrites
                 // velocity WITH. Without an active slide the macro would land on a stale vector.
                 if (!nm.sliding) return "not_sliding";
-                if (!(nm.gc.onGround || nm.gc.canJump)) return "airborne";
+                // Exactly HandleInputs' own gate, which is NOT `onGround || canJump`:
+                //   flag  = !falling
+                //   flag2 = !gc.onGround && (gc.canJump || wcGroup.CheckForEnemyCols())
+                //   Jump() runs iff flag2 || flag.
+                // Testing anything looser lets the macro report "ran" on a step where no jump path executes at
+                // all -- the same class of false success the wall macro's `not_sliding` test removed.
+                {
+                    var wcg = PlayerFields.WallChecks(nm);
+                    bool stepBranch = !nm.gc.onGround && (nm.gc.canJump || (wcg != null && wcg.CheckForEnemyCols()));
+                    if (!stepBranch && nm.falling) return "no_jump_path";
+                }
                 return null;
             }
 
             // MacroKind.SsjWall
             if (frames < 2) return "frameskip_lt_2";
+            // HandleInputs gates the ENTIRE wall-jump block on `!gc.onGround && fakeFallRequests <= 0`.
+            // During a fake fall WallJump is never reached, so without this the macro reports "ran" while
+            // firing nothing.
+            if (nm.fakeFallRequests > 0) return "fake_fall";
             // WallJump only reaches TrySSJ through `sliding || currentTime - slideTimestamp < 0.032`, and
             // SlideCancelled only records slideTimestamp `if (sliding)`. Without an active slide the macro
             // would fire an ORDINARY wall jump and report a success it did not have. Measured 2026-09-20:
@@ -429,6 +520,7 @@ namespace UltrakillAIBridge.Act
             if (InputState.currentTime - nm.slideTimestamp >= PlayerFields.SsjMaxFrames(nm) * 0.008f)
                 return "slide_grace_expired";
             if (nm.gc.onGround) return "grounded";
+            if (nm.fakeFallRequests > 0) return "fake_fall";
             if (PlayerFields.JumpCooldown(nm)) return "jump_cooldown";
             if (nm.currentWallJumps >= 3) return "wall_jumps_spent";
             var wc = PlayerFields.WallChecks(nm);
@@ -438,10 +530,37 @@ namespace UltrakillAIBridge.Act
             return null;
         }
 
-        private double WallLead()
+        /// <summary>
+        /// The lead M2 wants, and the largest lead that is safe at the frame gap this step is actually running
+        /// at. The caller refuses the macro when the first exceeds the second.
+        ///
+        /// **Why there is a bound at all.** The lead dates `NewMovement.slideTimestamp` into the future. An
+        /// ordinary jump `d` real seconds after the anchor computes `jumpTimestamp - slideTimestamp = d - lead`
+        /// in `TrySSJ`, and lands an **unrequested** SSJ whenever that falls in `[0.008, ssjMaxFrames * 0.008)`.
+        /// The earliest such jump is the NEXT step's first queued frame, read about `(stepFrames + 1)` frames
+        /// after the anchor, so the lead must satisfy
+        ///
+        ///     lead &lt;= (stepFrames + 1) * frameGap - ssjMaxFrames * 0.008
+        ///
+        /// while the lead M2 needs -- to keep `WallJump`'s own `currentTime - slideTimestamp &lt; grace` test true
+        /// at the frame that reads the jump -- is about `WallLeadFrames * frameGap - SsjGapSeconds`. The two
+        /// are compatible only inside a window one frame gap wide, and the default `2 * gap - 0.012` leaves it
+        /// whenever `gap &lt; 0.020`: at a 15 ms gap the needed lead is 18 ms against a 13 ms bound, and the next
+        /// decision's plain jump reads bucket 3. The measured idle gap on this box is 4.4-5.6 ms and the
+        /// measured loaded gap is ~30 ms, so both sides of that boundary occur in practice.
+        ///
+        /// The bound is conservative on purpose: it ignores Python's think time between steps, which only
+        /// makes the real interval to the next jump longer.
+        /// </summary>
+        private double WallLead(out double cap)
         {
-            if (WallLeadSeconds >= 0.0) return WallLeadSeconds;
+            var nm = MonoSingleton<NewMovement>.Instance;
+            double grace = (nm != null ? PlayerFields.SsjMaxFrames(nm) : 4f) * 0.008;
             double gap = FrameGapEstimate;
+            cap = gap > 0.0 && gap <= 0.25 ? (stepFrames + 1) * gap - grace : 0.0;
+            if (cap < 0.0) cap = 0.0;
+
+            if (WallLeadSeconds >= 0.0) return WallLeadSeconds;
             if (gap <= 0.0 || gap > 0.25) return 0.0;
             double lead = WallLeadFrames * gap - SsjGapSeconds;
             if (lead <= 0.0) return 0.0;
@@ -485,7 +604,8 @@ namespace UltrakillAIBridge.Act
                 // `velocityAfterSlide + direction * bonus`, and WallJump never calls StopSlide -- it reaches
                 // TrySSJ through the `sliding ||` disjunct. A one-frame wall SSJ would therefore land on the
                 // PREVIOUS slide's vector, in that old direction: a speed loss disguised as a technique.
-                macroLead = WallLead();
+                // macroLead was computed and bounds-checked in BeginMacro, so an unsafe lead never reaches a
+                // queued event -- it is a refusal there instead.
                 QueueAt(QueueOpts.SuppressSlide, InputState.currentTime + macroLead);
                 macroAnchor = lastQueuedTime;
                 ApplyLook();
@@ -680,9 +800,22 @@ namespace UltrakillAIBridge.Act
                 ["lead_s"] = macroLead,
                 ["anchor"] = macroAnchor,
                 ["frame_gap"] = FrameGapEstimate,
+                ["note"] = macroNote,
             };
-            var ssj = MovementPatches.BuildLast(stepStartFrame);
-            obj["ssj"] = ssj; // null when TrySSJ did not run during this step
+
+            // Only a macro that RAN may report an SSJ.
+            //
+            // `MovementPatches.BuildLast` returns the most recent TrySSJ call in the step whoever caused it,
+            // and TrySSJ runs at the end of EVERY Jump() and inside WallJump's grace branch. So a REFUSED
+            // macro whose plain action happens to contain a jump would otherwise come back as
+            // `result: "refused"` beside `ssj_bucket: 2, ssj_landed: true`. The spec's S8 reward gates on the
+            // mod-reported bucket; paying that would teach the policy to request macros whose preconditions it
+            // cannot meet, which is the exact failure section 4.5 exists to prevent.
+            //
+            // The unconditional reading is still available, and belongs, in `move_tech.ssj_last`, where a
+            // PLAIN slide jump is measured by the same instrument as a macro one.
+            var ssj = macroResult == "ran" ? MovementPatches.BuildLast(stepStartFrame) : null;
+            obj["ssj"] = ssj; // null unless this step's own macro ran and reached TrySSJ
             obj["ssj_bucket"] = ssj != null ? ssj["bucket"] : new JValue(-1);
             obj["ssj_landed"] = ssj != null && ssj["landed"].Value<bool>();
             return obj;
