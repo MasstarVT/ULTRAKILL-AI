@@ -3708,3 +3708,105 @@ stream byte for byte, and that no shipped config or generated stage turns it on.
   fake.
 - No measurement of what any of these levers is worth. S0 is the only one that produces a number, and it
   will produce its first one on whatever round starts after this branch merges.
+
+## 2026-09-20 — Review of the dormant levers: the sticky slot's cooldown, and two S5 preconditions
+
+Branch `dormant-levers`, commit `5501cf6`, against the reviewer's seven findings. Four fixed in code, one
+rejected with a test that pins why it is not a bug, two documentation. The live `spec_0-1_speed` control arm
+is untouched by all of it: every lever is still dormant and S0 is still pinned byte-identical.
+
+### The one that would have corrupted the S5 round (major, fixed)
+
+`_sticky_slot` charged its switch cooldown on the **request**, not on a switch the game could perform.
+`GunControl.SwitchWeapon` cannot move `currentSlotIndex` into a slot with no weapon in it, so a press of an
+empty slot draws nothing and suppresses nothing — but it still locked out real switching for
+`sticky_slot_switch_every` decisions. **On 0-1 that is most of the level**: the revolver is the first pickup
+and the other four slots fill one at a time, so a policy pressing 2..5 early would have spent its entire
+switch budget on switches that never happened. The lever would have cut real switching by up to 3× while
+`slot_blocked_frac` read as though the cooldown were doing its job, and the round's judged metrics
+(`kills_per_min`, `firing_on_target_frac`, the median) could not have separated "sticky slot did not help"
+from "the cooldown was spent on non-events".
+
+`player.slot_counts` was already on the wire (`ObservationBuilder.SlotCounts`, one count per `GunControl.slots`
+entry, slot 1 first) and read by nothing but `campaign_check.py`. A press of a **known-empty** slot is now
+passed through free. **Unknown is a third outcome, never "empty"**: an empty array — which is what the mod
+sends before `GunControl` starts — or a mod older than v0.5.0 falls through and is still charged, because
+guessing "empty" would disable the rule on an old mod rather than relax it.
+
+### Two S5 preconditions that did not exist (minor, fixed — both passive, both live now)
+
+- **`slot_unowned_frac`**: the share of decisions pressing a slot `slot_counts` reports empty. It is the
+  measurement behind the fix above — it says how much of the policy's slot channel is aimed at keys that do
+  nothing — and it is taken now, with the lever off, so the gate can be judged before it is needed.
+- **`variation0_frac`** (plus `variation_known_frac` in status/csv, `held_variation_frac` per episode). The
+  press S5 drops **is** the redraw, and the redraw is `WeaponRedrawBehaviour` 0 = cycle to the next variation
+  — the policy's only way to change variation at all until the `variant` dim lands at S9. So the sticky slot
+  **freezes the variation for the episode**, and variation 0 is Piercer / Core Eject / Electric Railcannon /
+  Freezeframe (§3.5), the set every technique in the spec is built on. A round frozen on the Marksman would
+  have shown a worse `kills_per_min` and `firing_on_target_frac`, fired the documented revert criterion, and
+  been recorded as "sticky slot is worse" when what was measured was "variation 1 is worse".
+  `weapon_variation` has been on the wire and thrown away since the mod first sent it.
+
+Both read off `prev` — the observation the decision was made on — like every other counter here, so they
+answer "what was the policy holding when it chose".
+
+### Rejected, and pinned (major, not a bug)
+
+Rule 1 cannot fire while slot index **5** is held: `slot == held + 1` would need key 6, and the action space
+stops at 5 (`NUM_WEAPON_CHOICES` 6 = keep plus keys 1..5, against `NUM_WEAPON_SLOTS` 6). That is correct
+rather than a gap — the policy has no way to press key 6, so it can never re-draw slot 5, and every key it
+*can* press while holding slot 6 names a genuinely different slot.
+`test_on_holding_slot_6_makes_every_press_a_switch_and_that_is_correct` states it so nobody re-files it.
+
+### The dry run that decides nothing (major, documented)
+
+`campaign_driver.py --dry-run` **while `DRIVER_PAUSE` exists** prints the banner, prints `PAUSED: ... doing
+nothing`, and exits 0: `Driver.tick()` returns `"paused"` as its first statement and `Driver.run()` returns
+after one tick under `--dry-run`. The documented activation procedure ran it there and told the operator to
+read what it says, so after a plan edit they would have believed they had previewed which rung starts, which
+checkpoint it resumes from and what config would be written. It does prove exactly one thing — `load_plan` is
+called in `main()` before the Driver is built, so a typo or a wrong type in `speed.train:` / `speed.env:` is a
+hard error caught right there — and `docs/commands.md` now says that is all it proves, with the real preview
+moved **after** `Remove-Item DRIVER_PAUSE`, driver still stopped. Verified by reading that `save_state`,
+`seed_archives`, `ensure_games`, `ensure_trainer`, `stop_stage` and the supervisor's own `restart` and
+`ensure_helpers` are all dry-run guarded, and that `StageSupervisor.tick()`'s remaining side effect is a log
+line. **`Driver.log` is not guarded**, so a dry run does append its banner to the live driver log; the doc
+says so rather than claiming otherwise.
+
+### The rest
+
+- **`_speed_env` now validates value TYPES**, not only key names, against each `EnvConfig` field's declared
+  annotation. `EnvConfig.from_dict` does not coerce, so the quoted `sticky_weapon_slot: "false"` that YAML
+  will hand you is a truthy string and would have turned the lever **on** while the plan file read off — the
+  exact silent-wrong-value failure `_speed_train`'s number check exists to prevent. A non-numeric
+  `sticky_slot_switch_every` was worse than that: it passed load and raised inside a SubprocVecEnv worker on
+  the first honoured switch, mid-episode, leaving the driver to restart the trainer into the same config.
+- **`END_STAGE` costs up to 50k steps**, now stated beside it in `docs/commands.md`. `end_stage_now` to
+  `finish_stage` to `stop_stage` kills the trainer by pid, so `latest.zip` is not written and `round_init`
+  falls back to the highest-step `ckpt_*_steps.zip`. Waiting for the round and ending it now are not equal
+  options and the number should be in view when choosing.
+- A code comment pointed at `tests/test_speed_train_override.py`, which does not exist. The pin is
+  `test_the_train_block_does_not_leak_between_stage_kinds_in_either_order` in `tests/test_speed_overrides.py`.
+
+### Attribution
+
+The three earlier commits on this branch (`2487e43`, `e4e7769`, `1c8f833`) carry
+`Co-Authored-By: Claude Fable 5.1`, which the builder took from its task text. This session's harness
+specifies `Claude Opus 5 (1M context)`. Correcting them would need a force-push of an already-pushed branch,
+which the operating rules discourage, so they are left as they are and the review commit and the merge commit
+carry the right trailer. **Nothing after the merge should rewrite them.**
+
+### Not verified (this entry)
+
+- **Still nothing in game for the levers themselves.** No lever was switched on; `sticky_weapon_slot` is
+  False everywhere, `speed.train:` and `speed.env:` are absent from the shipped plan.
+- **Whether `weapon_slot` lags one decision behind an honoured slot press in the real game.** The corridor
+  fake never moves its slot by itself. If it does lag, rule 1 could drop a legitimate switch-back one
+  decision after a switch. Unchanged by this review and still open.
+- **`slot_counts`'s refresh latency in the real game** — the same question for the ownership gate. The fix is
+  conservative in the direction that matters (a stale "empty" costs a cooldown charge, not a wrong action),
+  but it has only been tested against the fake.
+- **`sticky_slot_switch_every: 3` is still a starting value, not a measurement**, for the reason the previous
+  entry gives.
+- No measurement of what any lever is worth. S0 is the only one that produces numbers, and the first of them
+  come from the round that starts after this merges.
