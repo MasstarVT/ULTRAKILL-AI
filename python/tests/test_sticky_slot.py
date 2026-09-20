@@ -89,16 +89,39 @@ def test_off_is_the_action_stream_byte_for_byte():
 
 
 def test_on_a_press_of_the_held_slot_is_sent_as_keep():
-    """Rule 1. `weapon_slot` is 0-based, the action's `slot` is a slot KEY, so "held" is `slot == index + 1`."""
-    env, client = sticky_env()
+    """Rule 1. `weapon_slot` is the 1-BASED `GunControl.currentSlotIndex` and the action's `slot` is the same
+    KEY, so "held" is `slot == weapon_slot` -- no offset. Until 2026-09-20 this compared `weapon_slot + 1`,
+    and rule 1 therefore fired on a switch to the NEXT slot and never on a real redraw at all."""
+    for key in (1, 3, 5):
+        env, client = sticky_env()
+        try:
+            client.weapon_slot = key
+            env.reset()
+            env.step(slot_action(key))
+            assert slots_sent(client) == 0, f"the redraw press never reaches the game (slot {key})"
+            _, _, _, _, info = env.step(idle())
+            assert info["slot_dropped_frac"] == 1 / 2, key
+            assert info["slot_same_frac"] == 1 / 2, "the POLICY's intent is still measured, before the rewrite"
+        finally:
+            env.close()
+
+
+def test_on_a_switch_to_the_next_slot_up_is_a_switch_and_not_a_redraw():
+    """The exact shape of the 2026-09-20 off-by-one, pinned so it cannot come back.
+
+    `slot == weapon_slot + 1` is a press of the slot ONE ABOVE the one in hand -- a perfectly ordinary
+    switch. The broken rule dropped it as though it were the redraw, which both suppressed a real weapon
+    change and left the actual redraw (`slot == weapon_slot`) reaching the game on every press.
+    """
+    env, client = sticky_env(sticky_slot_switch_every=1)
     try:
-        client.weapon_slot = 2  # holding slot 3
+        client.weapon_slot = 2          # holding slot 2 ...
         env.reset()
-        env.step(slot_action(3))
-        assert slots_sent(client) == 0, "the redraw press never reaches the game"
+        env.step(slot_action(3))        # ... and pressing slot 3: a switch, and honoured
+        assert slots_sent(client) == 3, "a switch to the next slot up must reach the game"
         _, _, _, _, info = env.step(idle())
-        assert info["slot_dropped_frac"] == 1 / 2
-        assert info["slot_same_frac"] == 1 / 2, "the POLICY's intent is still measured, before the rewrite"
+        assert info["slot_dropped_frac"] == 0.0, "nothing here is a redraw"
+        assert info["slot_switch_frac"] == 1 / 2 and info["slot_same_frac"] == 0.0
     finally:
         env.close()
 
@@ -107,7 +130,7 @@ def test_on_a_switch_is_honoured_then_rate_limited():
     """Rule 2: at `sticky_slot_switch_every: 3`, one switch is honoured and the next two are not."""
     env, client = sticky_env(sticky_slot_switch_every=3)
     try:
-        client.weapon_slot = 0  # holding slot 1, and the corridor never changes it
+        client.weapon_slot = 1  # holding slot 1, and the corridor never changes it
         env.reset()
         sent = []
         for _ in range(7):
@@ -125,7 +148,7 @@ def test_on_a_cooldown_of_one_honours_every_switch():
     for every in (0, 1):
         env, client = sticky_env(sticky_slot_switch_every=every)
         try:
-            client.weapon_slot = 0
+            client.weapon_slot = 1
             env.reset()
             sent = []
             for _ in range(4):
@@ -177,7 +200,7 @@ def test_on_a_press_of_an_EMPTY_slot_costs_no_cooldown():
     """
     env, client = sticky_env(sticky_slot_switch_every=3)
     try:
-        client.weapon_slot = 0          # holding slot 1, the revolver
+        client.weapon_slot = 1          # holding slot 1, the revolver
         client.slot_counts = [1, 0, 0, 0, 0]  # ... and nothing else has been picked up yet
         env.reset()
         for _ in range(4):
@@ -196,16 +219,17 @@ def test_on_a_press_of_an_EMPTY_slot_costs_no_cooldown():
 
 
 def test_on_holding_slot_6_makes_every_press_a_switch_and_that_is_correct():
-    """Rule 1 cannot fire while slot index 5 is held, and must not: the policy cannot press key 6.
+    """Rule 1 cannot fire while slot KEY 6 is held, and must not: the policy cannot press key 6.
 
-    `NUM_WEAPON_CHOICES` is 6 -- keep plus keys 1..5 -- while `NUM_WEAPON_SLOTS` is 6, so `slot == held + 1`
-    is unreachable at `held == 5`. There is no redraw to drop there, because the policy has no way to ask for
-    one; every key it CAN press while holding slot 6 names a different slot, so treating it as a switch is the
-    right answer rather than a gap in the rule.
+    The game really has six slots -- `GunControl` binds `Slot1`..`Slot6` and compares `currentSlotIndex != 6`
+    -- but `NUM_WEAPON_CHOICES` is 6, keep plus keys 1..5, so `slot == key` is unreachable at `key == 6`.
+    There is no redraw to drop there, because the policy has no way to ask for one; every key it CAN press
+    while holding slot 6 names a different slot, so treating it as a switch is the right answer rather than a
+    gap in the rule. (Slot 6 also ships empty in this build, so nothing reaches it in game either.)
     """
     env, client = sticky_env(sticky_slot_switch_every=3)
     try:
-        client.weapon_slot = 5
+        client.weapon_slot = 6  # slot KEY 6: a real game slot no action can name
         client.slot_counts = [1, 1, 1, 1, 1, 1]
         env.reset()
         sent = [(env.step(slot_action(5)), slots_sent(client))[1] for _ in range(4)]
@@ -221,7 +245,7 @@ def test_on_an_unanswerable_slot_counts_is_still_charged():
     """Unknown is not "empty". An old mod sends no `slot_counts`, and guessing would disable the rule."""
     env, client = sticky_env(sticky_slot_switch_every=3)
     try:
-        client.weapon_slot = 0
+        client.weapon_slot = 1
         client.slot_counts = []  # what BuildPlayer sends before GunControl starts, and all a v0.4 mod sends
         env.reset()
         env.step(slot_action(3))
@@ -236,7 +260,7 @@ def test_on_the_cooldown_is_cleared_by_a_level_load():
     """A load re-draws the weapon anyway, so a rate limit carried across one would be measuring nothing."""
     env, client = sticky_env(sticky_slot_switch_every=10)
     try:
-        client.weapon_slot = 0
+        client.weapon_slot = 1
         env.reset()
         env.step(slot_action(4))
         assert slots_sent(client) == 4 and env._slot_cooldown == 9

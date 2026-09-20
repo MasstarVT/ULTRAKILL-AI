@@ -102,21 +102,70 @@ def test_the_counters_cannot_change_a_single_step_output():
 
 
 def test_a_press_of_the_held_slot_is_counted_as_the_redraw():
-    """`weapon_slot` is 0-based (`GunControl.currentSlotIndex`); the action's `slot` is 1..5, a slot KEY."""
+    """`weapon_slot` is the 1-BASED `GunControl.currentSlotIndex`; the action's `slot` is the same KEY.
+
+    Deliberately UNBALANCED -- two redraws and one switch -- because a one-of-each script cannot tell the
+    fixed code from the off-by-one that shipped on 2026-09-20: that version compared `slot == weapon_slot + 1`
+    and so labelled these exact presses 1 same / 2 switch, the mirror image of the truth.
+    """
     env, client = make_env()
     try:
-        client.weapon_slot = 0  # holding slot 1
+        client.weapon_slot = 3  # holding slot 3, as the mod sends it
         env.reset()
-        env.step(slot_action(1))  # the slot already held: the redraw press
-        env.step(slot_action(2))  # a different slot: a real switch
-        env.step(slot_action(0))  # keep: no press at all
+        env.step(slot_action(3))  # the slot already held: the redraw press
+        env.step(slot_action(3))  # ... and again
+        env.step(slot_action(4))  # a different slot: a real switch
+        for _ in range(4):
+            env.step(slot_action(0))  # keep: no press at all
         _, _, _, _, info = env.step(idle())
-        assert info["slot_press_frac"] == 2 / 4
-        assert info["slot_same_frac"] == 1 / 4
-        assert info["slot_switch_frac"] == 1 / 4
+        # Eight decisions, so the three shares are exact in binary and the sum below can be an equality.
+        assert info["slot_press_frac"] == 3 / 8
+        assert info["slot_same_frac"] == 2 / 8
+        assert info["slot_switch_frac"] == 1 / 8
         assert info["slot_known_frac"] == 1.0
         # `slot_same_frac` is denominated in DECISIONS, which is the denominator §3.4's 76% used.
         assert info["slot_same_frac"] + info["slot_switch_frac"] == info["slot_press_frac"]
+    finally:
+        env.close()
+
+
+def test_the_held_slot_is_read_as_the_1_based_key_the_mod_really_sends():
+    """THE REGRESSION TEST for the 2026-09-20 off-by-one, at every slot the policy can press.
+
+    `GunControl.currentSlotIndex` is 1-based -- seeded `PlayerPrefs.GetInt("CurSlo", 1)`, reset to 1 rather
+    than 0 when it runs past `slots.Count`, and indexed `slots[currentSlotIndex - 1]` throughout the game --
+    and `ObservationBuilder` sends it RAW. Pressing the key equal to it IS the redraw, at every one of them.
+    """
+    for key in (1, 2, 3, 4, 5):
+        env, client = make_env()
+        try:
+            client.weapon_slot = key
+            env.reset()
+            env.step(slot_action(key))                    # the redraw
+            env.step(slot_action(key % 5 + 1))            # any other key: a switch
+            _, _, _, _, info = env.step(idle())
+            assert info["slot_same_frac"] == 1 / 3, key
+            assert info["slot_switch_frac"] == 1 / 3, key
+            # ... and the time share lands on that key's own entry, which is KEY - 1.
+            assert info["slot_held_frac"][key - 1] == 1.0, key
+        finally:
+            env.close()
+
+
+def test_slot_0_is_unknown_because_the_game_never_reports_it():
+    """0 is not slot 1. The game's own out-of-range reset is `currentSlotIndex = 1`, never 0, so a 0 on the
+    wire would mean a build this code has never seen -- and the rule everywhere else here applies: never
+    guess a slot from a value that is not one."""
+    env, client = make_env()
+    try:
+        client.weapon_slot = 0
+        env.reset()
+        for _ in range(3):
+            env.step(slot_action(1))
+        _, _, _, _, info = env.step(idle())
+        assert info["slot_known_frac"] == 0.0
+        assert info["slot_same_frac"] == 0.0 and info["slot_switch_frac"] == 0.0
+        assert info["slot_held_frac"] == [0.0] * NUM_WEAPON_SLOTS
     finally:
         env.close()
 
@@ -131,7 +180,7 @@ def test_a_press_of_an_empty_slot_is_counted_as_unowned():
     """
     env, client = make_env()
     try:
-        client.weapon_slot = 0
+        client.weapon_slot = 1  # holding slot 1, the revolver
         client.slot_counts = [1, 0, 0, 0, 0]  # 0-1 after the revolver pickup and nothing else
         env.reset()
         env.step(slot_action(1))   # owned: the redraw
@@ -150,7 +199,7 @@ def test_an_unanswerable_slot_counts_is_not_counted_as_unowned():
     """Unknown is a third outcome, never "empty": an empty array is what the mod sends before GunControl."""
     env, client = make_env()
     try:
-        client.weapon_slot = 0
+        client.weapon_slot = 1
         client.slot_counts = []
         env.reset()
         for _ in range(3):
@@ -224,20 +273,38 @@ def test_an_unknown_held_slot_is_never_guessed():
 
 
 def test_the_time_share_per_held_slot_is_over_the_steps_the_slot_was_known():
+    """Entry i is slot KEY i + 1, so slot 3 lands at index 2. Before the 2026-09-20 fix the raw 1-based field
+    was used as the index directly and every share sat one place to the right of its own name."""
     env, client = make_env()
     try:
-        client.weapon_slot = 2
+        client.weapon_slot = 3  # slot KEY 3 -> entry 2
         env.reset()
         env.step(idle())
         env.step(idle())
-        client.weapon_slot = 4  # the obs THIS step produces carries slot 4 ...
+        client.weapon_slot = 5  # the obs THIS step produces carries slot 5 ...
         env.step(idle())
         _, _, _, _, info = env.step(idle())  # ... and this step is the first to act on it
         # The slot is read from the frame the policy ACTED ON, so a switch shows one step later.
         shares = info["slot_held_frac"]
         assert len(shares) == NUM_WEAPON_SLOTS and abs(sum(shares) - 1.0) < 1e-9
-        assert shares[2] == 3 / 4 and shares[4] == 1 / 4
+        assert shares[2] == 3 / 4 and shares[4] == 1 / 4, shares
         assert info["slot_held_top_frac"] == 3 / 4
+    finally:
+        env.close()
+
+
+def test_the_revolver_is_entry_0_of_the_per_slot_lists():
+    """The named case, because it is the one a human reads off episodes.jsonl: 0-1 opens on the revolver
+    (slot KEY 1), and its share and its kills belong in entry 0, not entry 1."""
+    env, client = make_env()
+    try:
+        client.weapon_slot = 1
+        env.reset()
+        client.kill_enemy_next = True
+        _, _, _, _, info = env.step(idle())
+        assert info["slot_held_frac"][0] == 1.0, info["slot_held_frac"]
+        assert info["slot_kills"][0] == 1, info["slot_kills"]
+        assert sum(info["slot_kills"]) == 1
     finally:
         env.close()
 
@@ -260,13 +327,13 @@ def test_the_button_press_rates_separate_fire1_from_fire2():
 def test_kills_are_credited_to_the_slot_that_was_held_when_the_shot_went_out():
     env, client = make_env()
     try:
-        client.weapon_slot = 1  # before reset: the slot read is the one on the frame the policy ACTED ON
+        client.weapon_slot = 2  # before reset: the slot read is the one on the frame the policy ACTED ON
         env.reset()
         client.kill_enemy_next = True
-        _, _, _, _, info = env.step(idle())  # the kill lands here; slot index 1 was held when it fired
+        _, _, _, _, info = env.step(idle())  # the kill lands here; slot KEY 2 was held when it fired
         kills = info["slot_kills"]
         assert len(kills) == NUM_WEAPON_SLOTS
-        assert kills[1] == 1 and sum(kills) == 1, kills
+        assert kills[1] == 1 and sum(kills) == 1, kills  # KEY 2 -> entry 1
     finally:
         env.close()
 
@@ -277,7 +344,7 @@ def test_a_kill_counter_rollback_never_produces_a_negative_credit():
     env, client = make_env()
     try:
         env.reset()
-        client.weapon_slot = 0
+        client.weapon_slot = 1  # the revolver: slot KEY 1 -> entry 0
         client.kills = 10
         _, _, _, _, info = env.step(idle())
         assert info["slot_kills"][0] == 10

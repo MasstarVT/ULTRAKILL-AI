@@ -229,6 +229,16 @@ def pack_observation(
     put([lv[0] / 30.0, lv[1] / 30.0, lv[2] / 30.0])
     put([p["hp"] / 100.0, p["anti_hp"] / 100.0, p["stamina"] / 300.0])
     put([float(p["grounded"]), float(p["sliding"]), p["pitch"] / 90.0])
+    # THE WEAPON-SLOT ONE-HOT IS INDEXED BY THE RAW FIELD, AND MUST STAY THAT WAY. `player.weapon_slot` is
+    # `GunControl.currentSlotIndex`, which is 1-BASED (see `env.held_slot_key`), so slot KEY k lights index k
+    # and index 0 is never set -- a permanently dead input, not an off-by-one. The mapping is still one-to-one
+    # over every value the policy can cause (keys 1..5, plus -1 "GunControl has not started" -> all zeros), so
+    # the packing loses nothing; the only collision is key 6, which reads as all-zeros, and nothing can select
+    # it (`NUM_WEAPON_CHOICES` stops the action at key 5 and slot 6 ships empty).
+    # Every policy ever trained learned THIS mapping. Re-basing it to `weapon_slot - 1` would move five input
+    # features under the live weights and silently break them, which is why the 2026-09-20 fix to the 1-based
+    # convention deliberately stopped at the env's bookkeeping and left these four lines alone.
+    # `tests/test_spaces.py::test_the_weapon_slot_one_hot_is_indexed_by_the_raw_1_based_field` pins it.
     slot = np.zeros(NUM_WEAPON_SLOTS, dtype=np.float32)
     if 0 <= p["weapon_slot"] < NUM_WEAPON_SLOTS:
         slot[p["weapon_slot"]] = 1.0

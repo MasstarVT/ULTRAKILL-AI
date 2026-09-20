@@ -125,7 +125,7 @@ A macro is a short input script the **mod** plays across the frames of one step,
   "player": {"pos": [x,y,z], "vel": [..], "local_vel": [..], "forward": [..], "yaw": 90.0, "pitch": -5.0,
              "hp": 100, "anti_hp": 0.0, "stamina": 300.0, "grounded": true, "sliding": false,
              "slow_mode": false, "heavy_fall": false, "crouching": false, "dead": false,
-             "activated": true, "level_over": false, "weapon_slot": 0, "weapon_variation": 1,
+             "activated": true, "level_over": false, "weapon_slot": 1, "weapon_variation": 1,
              "slot_counts": [3, 3, 3, 3, 3, 0]},
   "enemies": [{"id": 12345, "type": 3, "type_name": "Filth", "health": 0.5, "pos": [..],
                "rel": [x,y,z], "dist": 12.3, "visible": true}],
@@ -143,7 +143,9 @@ A macro is a short input script the **mod** plays across the frames of one step,
 - **`slow_mode`, `heavy_fall`, `crouching`:** `NewMovement.slowMode`, `NewMovement.gc.heavyFall` and the private `NewMovement.crouching`. `slow_mode` blocks dash and stamina regen and cuts walk speed to 1.25x `walkSpeed`; while **grounded** it is an ordinary crouch under a low ceiling. Airborne with `slow_mode` (and no movement) is the wedge the `unwedge` config setting breaks: a slide that ends in the air leaves the player in a state the ground check can never end by itself. `crouching` is `false` with one logged warning if a game update renames the private field.
 - **`cybergrind`:** only present in the Cyber Grind scene. `start_trigger` is the volume that starts wave 1 when entered, and is only present before waves start.
 - **`player`:** `null` when no player exists (e.g. the main menu).
-- **`player.slot_counts`:** weapons in each of the six slots, slot 1 first. Empty until `GunControl` has started; 0-1 has none until the revolver pickup.
+- **`player.weapon_slot`: `GunControl.currentSlotIndex`, sent RAW, and it is 1-BASED.** The only values on the wire are **1..6** — the slot KEY the player would press to select that weapon — and **-1**, "`GunControl` has not started" (0-1 has no weapon at all until the revolver pickup, so -1 is the normal state for the opening of that level, not an error). **There is no 0.** The game seeds the field `PlayerPrefs.GetInt("CurSlo", 1)`, resets it to `1` rather than 0 whenever it runs past `slots.Count`, indexes it everywhere as `slots[currentSlotIndex - 1]`, and compares it against the `Slot1`..`Slot6` bindings as `currentSlotIndex != 1` .. `!= 6`; the mod's own `TechObserver.VariationsInSlot` and `EpisodeController`'s variation macro both subtract 1 before indexing. Slot 6 exists in the game but ships empty, and the action space stops at key 5, so in practice only 1..5 and -1 are observed. **Python must interpret this field only through `ultrakill_ai.env.held_slot_key`** — reading it as a 0-based index is the 2026-09-20 bug (project log, that date). The one deliberate exception is the packed observation's weapon one-hot, which indexes by the raw value and is frozen that way because every trained policy learned it; `spaces.py` says so at the packing site.
+- **`weapon_tech.slot`** (mod 0.8.0's optional block) is the same field, sent raw by `TechObserver`, so the same convention applies.
+- **`player.slot_counts`:** weapons in each of the six slots, slot 1 first — so the count for slot KEY *k* is `slot_counts[k - 1]`. Empty until `GunControl` has started; 0-1 has none until the revolver pickup.
 
 ## Technique blocks (mod 0.8.0)
 

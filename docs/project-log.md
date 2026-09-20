@@ -4423,3 +4423,116 @@ confirm it costs a round of twelve games.
   `mem_guard.py`'s total-budget recycles, which were already running on a ~7-minute cadence before it
   started (13:27, 13:35, 13:42). No trainer restart or `GIVING UP` followed, and the driver logged
   `healthy` throughout.
+
+## 2026-09-20 — The `weapon_slot` off-by-one, fixed: one helper, and which live readings were mislabelled
+
+Fix for the bug the frozen-policy A/B found earlier the same day (entry above, commit `83a6dad`), which
+that session deliberately left in place because it was measurement-only. **Code, tests and docs only — no
+mod change, no config change, no reward or observation change.** The live `spec_0-1_speed` driver was not
+touched; the fix reaches the run at the next trainer restart, which someone else will do.
+
+### The convention, at each layer
+
+- **Game.** `GunControl.currentSlotIndex` is **1-based**: seeded `PlayerPrefs.GetInt("CurSlo", 1)`, reset
+  to `1` (never 0) when it runs past `slots.Count`, indexed `slots[currentSlotIndex - 1]` throughout, and
+  compared against the `Slot1`..`Slot6` bindings as `currentSlotIndex != 1` .. `!= 6`. The game really has
+  **six** slots; slot 6 ships empty.
+- **Mod.** `ObservationBuilder.cs:207` sends it **raw** as `player.weapon_slot`, and `TechObserver.cs:163`
+  sends the same raw value as `weapon_tech.slot`. Both of the mod's own consumers
+  (`TechObserver.VariationsInSlot`, `EpisodeController`'s variation macro) subtract 1 before indexing, which
+  is what makes the 1-based reading unambiguous. Values on the wire: **1..6, or -1** for "`GunControl` has
+  not started". **Never 0.**
+- **Protocol doc.** Said nothing, and its example showed `"weapon_slot": 0` — a value the game cannot
+  produce. Now states the convention explicitly and carries `1`.
+- **Observation packing — CORRECT, and deliberately unchanged.** `spaces.py` packs a `NUM_WEAPON_SLOTS`
+  (6) wide one-hot indexed by the **raw** value under the guard `0 <= v < 6`, so slot KEY *k* lights index
+  *k* and index 0 is a permanently dead input. Because the width is 6 rather than 5 this is **lossless and
+  one-to-one** over every value the policy can cause (keys 1..5, and -1 to all zeros); the only collision is
+  key 6, which reads as all-zeros and which nothing can select (the action space stops at key 5 and slot 6
+  is empty). **Every policy ever trained learned this mapping**, so re-basing it to `weapon_slot - 1` would
+  move five input features under the live weights and silently break them. Left byte-identical, with the
+  reasoning at the packing site and a new pin,
+  `tests/test_spaces.py::test_the_weapon_slot_one_hot_is_indexed_by_the_raw_1_based_field`.
+- **Env bookkeeping — WRONG, and what this entry fixes.** Three sites read the field as a 0-based index.
+
+### The fix
+
+One helper, `ultrakill_ai.env.held_slot_key(player)`, returns the **1..6 slot KEY** that re-selects the
+weapon in hand, or `None` when it is unknown (-1, missing, out of range, not a number — unknown stays a
+third outcome and is never guessed into a slot). It is now the only place in Python that interprets the
+field. The three callers:
+
+- **`_sticky_slot` (rule 1)** — was `slot == held + 1`, now `slot == key`. The dormant S5 lever therefore
+  dropped a press of the key **one above** the held slot (an ordinary switch) and **never fired on a real
+  redraw at all**; it now does. Still dormant: `sticky_weapon_slot` defaults False and no shipped config
+  sets it. The A/B's "activate neither" recommendation stands and is unaffected.
+- **`_note_behaviour`** — `slot_same` / `slot_switch` split on the same test, and `held_slot_<i>` indexed by
+  the raw value. Both corrected; the per-slot arrays are now indexed by **KEY - 1**, so **entry 0 is slot
+  key 1, the revolver**, and entry 5 is key 6.
+- **`_note_slot_kills`** — same indexing correction for `kills_slot_<i>`.
+
+The arrays keep their width of 6, so `episodes.jsonl` lines written before and after the fix are still the
+same shape; only which entry means which weapon changes. `_slot_owned` was **already correct**
+(`counts[slot - 1]` against a `SlotCounts` array that starts at slot 1) and was not touched.
+
+### Audit of every other `weapon_slot` reader in `python/`
+
+| Site | Verdict |
+| --- | --- |
+| `ultrakill_ai/env.py` `_sticky_slot`, `_note_behaviour`, `_note_slot_kills` | **Wrong — fixed** (now via `held_slot_key`) |
+| `ultrakill_ai/env.py` `_slot_owned` | Correct already (reads the action's KEY, not `weapon_slot`) |
+| `ultrakill_ai/spaces.py` `pack_observation` | Correct as packed; **frozen on purpose**, now pinned |
+| `scripts/probe_rollout.py:147` | Passes the raw value straight into a probe record — no arithmetic, so not wrong; a comment now says it is 1-based |
+| `scripts/macro_check.py:61` | Key-presence check only, no convention |
+| `ultrakill_ai/progress.py` | Carries `slot_held_frac` / `slot_kills` through as opaque lists; no indexing |
+| `scripts/poll_status.py` | Column names only; no indexing |
+
+### Which live readings are mislabelled
+
+The S0 counters went live the same day, so **every `slot_same_frac` / `slot_switch_frac` / `slot_held_frac`
+/ `slot_kills` written before the next trainer restart** means something other than its name:
+
+- **`slot_press_per_s` 10.83 is unaffected** — it counts presses and reads no slot.
+- **`slot_same_frac` 0.098 and `slot_switch_frac` 0.547 are not what their names say.** They split on
+  "pressed the key one above the held slot", and the two sets are disjoint from the real ones.
+- The A/B's own corrected numbers, measured directly off the recordings: **true redraw rate 0.175**, and
+  **7.75 executed switches per second** with sticky off.
+- **`slot_held_frac` and `slot_kills` sit one place to the right** of their documented meaning in every
+  pre-fix row: entry 0 is always 0 and the revolver's share is in entry 1. Post-fix, the revolver is
+  entry 0. Anything comparing the two eras must shift the old rows left by one.
+
+### Tests
+
+`tests/test_campaign_env.py`'s fake client defaulted to `weapon_slot = 0` — a value the mod cannot send —
+and the two slot test files stated the 0-based premise in their docstrings, which is why the suite passed
+against the bug. Fixtures now use only values the mod really sends (1..6, -1), and ten tests were added or
+rewritten so that each corrected site has one that fails against the old premise: same-slot detection at
+every key, switch detection, the "next slot up is a switch" case that is the exact shape of the bug,
+slot 0 treated as unknown, the held-slot share, the revolver as entry 0, kills per slot, the rollback case,
+sticky rule 1 firing on a true redraw at keys 1/3/5, and the slot-6 case.
+
+That "fails before the fix" claim was **verified by exact emulation rather than by reverting the tree**:
+patching `held_slot_key` to return `held + 1` over the old guard reproduces all three pre-fix behaviours
+identically (the known-condition, the array index, and the comparison), and under that patch all ten fail
+while four controls — the two byte-identity pins and the two "unknown is never guessed" tests — still pass.
+`env.py` was never written to disk in a broken state, because the driver could have restarted the trainer
+into it.
+
+Both byte-identity pins are kept and still pass: the counters cannot change a step's outputs
+(`test_the_counters_cannot_change_a_single_step_output`), and with sticky off the action stream is
+unchanged (`test_off_is_the_action_stream_byte_for_byte`).
+
+### Not verified (this entry)
+
+- **Nothing was run in game.** No bridge connection was made, no game was started or stopped, and the live
+  driver, trainer and its twelve games were not touched. The fix is unexercised against a real mod reply;
+  it takes effect at the next trainer restart.
+- **No claim that the corrected counters will read differently in the direction expected.** The A/B's 0.175
+  true redraw rate was measured on a frozen `ckpt_29717542_steps.zip`, not on the live policy, and a
+  replay proves a mechanism only for the policy that was recorded.
+- **The S5 lever's behaviour is now different from the one the A/B measured** — rule 1 fires on redraws
+  instead of on next-slot-up switches — so the A/B's arms B and C do **not** characterise the fixed lever.
+  They still settle the dominant half (rationing switching hurts this policy); section 3.4's
+  redraw-suppression premise remains unmeasured, and the "activate neither" recommendation stands.
+- **`weapon_tech.slot`** (mod 0.8.0's block) carries the same raw field, but that mod is not installed and
+  no Python consumer reads it yet; it was documented, not exercised.

@@ -243,6 +243,37 @@ def test_no_campaign_block_gives_36_zeros():
     assert out.shape == (479,) and not out[443:].any()
 
 
+def test_the_weapon_slot_one_hot_is_indexed_by_the_raw_1_based_field():
+    """THE PIN THAT THE PACKING MUST NOT MOVE. `weapon_slot` is `GunControl.currentSlotIndex`, 1-BASED.
+
+    `pack_observation` indexes the 6-wide one-hot with that RAW value, so slot KEY k lights index k and index
+    0 is never set. That is not an off-by-one to fix: the map is one-to-one over every value the policy can
+    cause (keys 1..5, and -1 "GunControl has not started" -> all zeros), so nothing is lost, and EVERY POLICY
+    EVER TRAINED learned this exact mapping. Re-basing it to `weapon_slot - 1` would move five input features
+    under the live weights and silently break them.
+
+    The env-side bookkeeping was corrected to the 1-based truth on 2026-09-20 (`env.held_slot_key`); these
+    nine floats were deliberately left alone, and this test is what says so.
+    """
+    base = 3 + 3 + 3  # local_vel, hp/anti_hp/stamina, grounded/sliding/pitch
+    for key in range(1, 6):
+        obs = snapshot()
+        obs["player"]["weapon_slot"] = key
+        one_hot = pack_observation(obs, ObsLayout(), {}, explore=EXPLORE)[base:base + 6]
+        assert list(one_hot) == [1.0 if i == key else 0.0 for i in range(6)], key
+
+    # -1 (before GunControl starts) is all zeros: "unknown" is never guessed into a slot.
+    obs = snapshot()
+    obs["player"]["weapon_slot"] = -1
+    assert not pack_observation(obs, ObsLayout(), {}, explore=EXPLORE)[base:base + 6].any()
+
+    # Index 0 is structurally dead, because the game never reports slot 0.
+    for key in (-1, 1, 2, 3, 4, 5):
+        obs = snapshot()
+        obs["player"]["weapon_slot"] = key
+        assert pack_observation(obs, ObsLayout(), {}, explore=EXPLORE)[base] == 0.0, key
+
+
 def test_cybergrind_action_space_is_unchanged():
     """Widening the module constant would make every Cyber Grind checkpoint unloadable against its own env."""
     assert len(ACTION_NVEC) == 11 and int(ACTION_NVEC.sum()) == 42

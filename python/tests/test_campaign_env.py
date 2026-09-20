@@ -139,11 +139,13 @@ class FakeLevel:
         self.exit_ground_pos: list[float] | None = None
         self.mod_ground_pos = True
         self.yaw = 0.0
-        # `GunControl.currentSlotIndex`, 0-based, and -1 before GunControl starts (0-1 has no weapon at all
-        # until the revolver pickup). A plain attribute, NOT driven by the action: the corridor models no
-        # weapons, and a slot that moved with the action would change the packed one-hot under every existing
-        # test. tests/test_slot_counters.py and tests/test_sticky_slot.py set it directly.
-        self.weapon_slot = 0
+        # `GunControl.currentSlotIndex`, 1-BASED (1..6, the game's own convention -- see `env.held_slot_key`)
+        # and -1 before GunControl starts (0-1 has no weapon at all until the revolver pickup). 1 is the
+        # revolver, the slot every level opens on. A plain attribute, NOT driven by the action: the corridor
+        # models no weapons, and a slot that moved with the action would change the packed one-hot under every
+        # existing test. tests/test_slot_counters.py and tests/test_sticky_slot.py set it directly, always to
+        # a value the mod could really send.
+        self.weapon_slot = 1
         # `GunControl.currentVariationIndex`, and `player.slot_counts` -- weapons per slot, slot 1 first, and
         # EMPTY until GunControl starts. Plain attributes for the same reason `weapon_slot` is one. The
         # default owns every slot the action space can press (keys 1..5), which is the mid-level state; a

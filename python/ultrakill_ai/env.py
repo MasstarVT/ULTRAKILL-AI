@@ -337,7 +337,8 @@ BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_vis
                   #   slot_same      ... and the key pressed was the slot already held: the redraw (§3.4)
                   #   slot_switch    ... and it was a different slot
                   #   slot_known     decisions whose held slot the mod actually reported (the denominator for
-                  #                  the per-slot shares; `weapon_slot` is -1 before `GunControl` starts)
+                  #                  the per-slot shares; `weapon_slot` is -1 before `GunControl` starts, and
+                  #                  is otherwise the 1-BASED slot KEY -- see `held_slot_key`)
                   #   slot_unowned   ... and the key pressed named a slot `player.slot_counts` says is EMPTY,
                   #                  so `SwitchWeapon` cannot move `currentSlotIndex` and no switch happens.
                   #                  0-1 acquires its weapons one pickup at a time, so this is most of the
@@ -357,6 +358,8 @@ BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_vis
                   # fire1-OR-fire2 and cannot separate them, and nothing counted `punch` at all even though
                   # `rewards.punch` charges for it.
                   "press_fire1", "press_fire2", "press_punch",
+                  # Both indexed by slot KEY - 1: entry 0 is key 1 (the revolver) and entry 5 is key 6, which
+                  # the game has but no action can select. NOT by `weapon_slot` raw, which is the key itself.
                   *("held_slot_%d" % i for i in range(NUM_WEAPON_SLOTS)),     # decisions each slot was held
                   *("kills_slot_%d" % i for i in range(NUM_WEAPON_SLOTS)))    # kills while each slot was held
 
@@ -379,6 +382,36 @@ def _slot_owned(player: dict[str, Any], slot: int) -> bool | None:
         return int(counts[slot - 1]) > 0
     except (TypeError, ValueError):
         return None
+
+
+def held_slot_key(player: dict[str, Any] | None) -> int | None:
+    """The slot KEY (1..`NUM_WEAPON_SLOTS`) that re-selects the weapon in hand, or None when unknown.
+
+    THE ONE PLACE `player.weapon_slot` IS INTERPRETED. It is `GunControl.currentSlotIndex` sent RAW by
+    `ObservationBuilder.BuildPlayer`, and the game keeps that field **1-BASED**: it is seeded
+    `PlayerPrefs.GetInt("CurSlo", 1)`, reset to `1` (never 0) whenever it runs past `slots.Count`, indexed
+    everywhere as `slots[currentSlotIndex - 1]`, and compared against the `Slot1`..`Slot6` bindings as
+    `currentSlotIndex != 1` .. `!= 6`. The mod's own `TechObserver.VariationsInSlot` and
+    `EpisodeController`'s variation macro both subtract 1 before indexing, for the same reason. The only
+    other value on the wire is **-1**, "GunControl has not started" -- on 0-1 there is no weapon at all
+    until the revolver pickup, so that is the normal state for the opening of the level, not an error.
+
+    So the key returned is the number the policy would press, and `weapon_slot` IS that number already: no
+    +1 anywhere. Until 2026-09-20 the callers below read it as 0-based and compared `slot == weapon_slot + 1`,
+    which made every counter name the wrong set -- see `docs/project-log.md` 2026-09-20.
+
+    Anything outside 1..`NUM_WEAPON_SLOTS` (-1, a missing key, a non-number from a future mod) is None:
+    unknown is a third outcome and callers must never guess a slot from it. Note that a key of 6 is a real
+    game slot the policy can never press -- `NUM_WEAPON_CHOICES` stops the action at key 5 -- so it is
+    reported honestly here and the callers handle it as "held, but no press can name it".
+    """
+    if not player:
+        return None
+    try:
+        held = int(player.get("weapon_slot", -1))
+    except (TypeError, ValueError):
+        return None
+    return held if 1 <= held <= NUM_WEAPON_SLOTS else None
 
 
 _NO_SLOT = "<none>"  # the sentinel for "nothing to serialize against", never a real path
@@ -1601,20 +1634,21 @@ class UltrakillEnv(gym.Env):
              is EMPTY is not a switch at all -- the game cannot honour it -- so it is passed through and
              costs nothing; see the `_slot_owned` branch below.
 
-        Rule 1 cannot fire while slot index 5 is held, because the action space stops at slot KEY 5
-        (`NUM_WEAPON_CHOICES` 6 = keep plus keys 1..5) while `NUM_WEAPON_SLOTS` is 6. That is correct rather
-        than a gap: the policy has no way to press key 6, so it can never re-draw slot 5, and every key it
-        CAN press while holding slot 5 is a genuine switch to a different slot.
+        Rule 1 cannot fire while slot KEY 6 is held, because the action space stops at slot KEY 5
+        (`NUM_WEAPON_CHOICES` 6 = keep plus keys 1..5) while the game has six slots. That is correct rather
+        than a gap: the policy has no way to press key 6, so it can never re-draw slot 6, and every key it
+        CAN press while holding slot 6 is a genuine switch to a different slot.
 
         The action that was refused is NOT replaced by anything: the step goes out with `slot: 0`, which is the
         action the policy could already have chosen, so the wire message stays inside the existing protocol and
         the mod needs no change. Nothing here is charged or paid for -- the same rule the macro design states
         for a refusal (§4.2): charging teaches the policy to avoid the channel rather than to use it well.
 
-        The held slot is `GunControl.currentSlotIndex`, 0-based; the action's `slot` is 0 for keep and 1..5 for
-        a slot KEY, so "the slot already held" is `slot == weapon_slot + 1`. With no player, or a
-        `weapon_slot` of -1 (before `GunControl` has started -- 0-1 has no weapon at all until the revolver
-        pickup), nothing is known about what is held and the action is passed through untouched.
+        The held slot comes from `held_slot_key`, which is already the KEY that re-selects it (1-based, like
+        `GunControl.currentSlotIndex` itself), and the action's `slot` is 0 for keep and 1..5 for a slot KEY,
+        so "the slot already held" is simply `slot == key`. With no player, or a `weapon_slot` of -1 (before
+        `GunControl` has started -- 0-1 has no weapon at all until the revolver pickup), nothing is known
+        about what is held and the action is passed through untouched.
         """
         if not self.cfg.sticky_weapon_slot:
             return
@@ -1628,10 +1662,10 @@ class UltrakillEnv(gym.Env):
         slot = int(command.get("slot", 0))
         if not slot:
             return
-        held = (prev.get("player") or {}).get("weapon_slot", -1)
-        if not 0 <= held < NUM_WEAPON_SLOTS:
+        key = held_slot_key(prev.get("player"))
+        if key is None:
             return  # nothing known about what is held: never guess, pass the press through
-        if slot == held + 1:
+        if slot == key:
             command["slot"] = 0
             self._behaviour["slot_dropped"] += 1
         elif was_cooling:
@@ -1661,13 +1695,16 @@ class UltrakillEnv(gym.Env):
         `compute_reward` uses is used here -- a rollback contributes nothing rather than a negative count. The
         slot read is the PREVIOUS frame's, because that is the weapon that fired; a kill landing on the frame
         of a switch is credited to the weapon that fired it, not to the one being drawn.
+
+        `kills_slot_<i>` is indexed by KEY - 1, so entry 0 is slot key 1 (the revolver) and entry 5 is key 6:
+        see `held_slot_key` for why the raw field is not the index.
         """
         new_kills = max(0, cur.get("stats", {}).get("kills", 0) - prev.get("stats", {}).get("kills", 0))
         if not new_kills:
             return
-        held = (prev.get("player") or {}).get("weapon_slot", -1)
-        if 0 <= held < NUM_WEAPON_SLOTS:
-            self._behaviour["kills_slot_%d" % held] += new_kills
+        key = held_slot_key(prev.get("player"))
+        if key is not None:
+            self._behaviour["kills_slot_%d" % (key - 1)] += new_kills
 
     def _note_behaviour(self, raw: dict[str, Any], command: dict[str, Any], raw_pitch_cmd: float, applied_mode: int = 0) -> None:
         """Per-episode diagnostics: is the agent shooting, is it shooting at anything, and does it turn toward enemies?
@@ -1693,14 +1730,16 @@ class UltrakillEnv(gym.Env):
         player = raw.get("player")
         if not player:
             return
-        held = player.get("weapon_slot", -1)
-        if 0 <= held < NUM_WEAPON_SLOTS:
-            # `weapon_slot` is `GunControl.currentSlotIndex` (0-based) and is -1 until `GunControl` starts, so
-            # `slot_known` is the honest denominator for every per-slot share below.
+        key = held_slot_key(player)
+        if key is not None:
+            # `held_slot_key` returns the 1-based slot KEY (`GunControl.currentSlotIndex` is 1-based) or None
+            # before `GunControl` starts, so `slot_known` is the honest denominator for every per-slot share
+            # below, and `held_slot_<i>` is indexed by KEY - 1: entry 0 is slot key 1, entry 5 is key 6.
             self._behaviour["slot_known"] += 1
-            self._behaviour["held_slot_%d" % held] += 1
+            self._behaviour["held_slot_%d" % (key - 1)] += 1
             if slot:
-                self._behaviour["slot_same" if slot == held + 1 else "slot_switch"] += 1
+                # The action's `slot` is already a KEY, so the redraw press is `slot == key` -- no offset.
+                self._behaviour["slot_same" if slot == key else "slot_switch"] += 1
         if slot and _slot_owned(player, slot) is False:
             # A press the game CANNOT honour. Counted here, passively and whether or not the sticky lever is
             # on, because it is the measurement that decides whether the lever's ownership gate matters: it is
@@ -2312,6 +2351,8 @@ class UltrakillEnv(gym.Env):
         # Time share per held slot, and kills per held slot. LISTS, so they travel to episodes.jsonl through
         # EPISODE_LOG_RAW rather than through `_num` -- six columns each in status.json would be six columns
         # nobody reads, while the single scalar below (how concentrated the held weapon was) is chartable.
+        # ENTRY i IS SLOT KEY i + 1: entry 0 is the revolver. Readings taken before 2026-09-20 are shifted one
+        # place right of this (entry 1 was the revolver) -- see `held_slot_key` and the project log.
         known = max(1, b["slot_known"])
         held_slots = [b["held_slot_%d" % i] for i in range(NUM_WEAPON_SLOTS)]
         info["slot_held_frac"] = [n / known for n in held_slots]

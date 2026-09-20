@@ -144,6 +144,9 @@ def world_state(raw: dict, pos) -> dict:
         "level_over": camp.get("level_over"),
         "dead": p_dead(raw),
         "anti_hp": (raw.get("player") or {}).get("anti_hp"),
+        # Recorded RAW, which is the 1-BASED slot KEY (1..6, or -1 before GunControl starts) -- see
+        # docs/protocol.md and `env.held_slot_key`. Anything reading this column back must not treat it
+        # as a 0-based index: that was the 2026-09-20 bug.
         "weapon_slot": (raw.get("player") or {}).get("weapon_slot"),
         "n_enemies": len(enemies),
         "n_visible": len(visible),
