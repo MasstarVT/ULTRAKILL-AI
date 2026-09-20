@@ -1957,8 +1957,8 @@ def test_the_focus_starts_below_the_target_already_passed_and_skips_rungs_the_me
         # 147.16 is not at or under 120, so 120 is where the focus starts.
         assert h.driver.focus_rung() == cd.Rung(0, 120.0, 10)
         assert h.driver.focus_rung().number == 1
-        # A ladder that starts ABOVE what has been achieved skips straight past those rungs: 150 (met by the
-        # recorded target), 200 and 160 (met the same way), 148 (met by the recorded median 147.16).
+        # A ladder that starts ABOVE what has been achieved skips straight past those rungs: 200, 160, 150 and
+        # 148 are all at or above the median 147.16 that round actually measured.
         wide = focus_harness(tmp + "2", targets=[200, 160, 150, 148, 120, 100])
         try:
             assert wide.driver.focus_rung() == cd.Rung(4, 120.0, 6)
@@ -1967,17 +1967,32 @@ def test_the_focus_starts_below_the_target_already_passed_and_skips_rungs_the_me
             _shutil.rmtree(tmp + "2", ignore_errors=True)
 
 
-def test_a_rung_that_is_met_marks_every_easier_rung_met_too():
-    """The pure rule, stated on its own: `rung_met` is monotone, so the ladder only ever walks forwards."""
+def test_a_rung_is_met_only_by_a_MEASURED_median_and_marks_every_easier_rung_met_too():
+    """The pure rule, stated on its own: `rung_met` is monotone, so the ladder only ever walks forwards.
+
+    THE EVIDENCE IS THE MEASURED MEDIAN, never the target the round was aimed at (2026-09-20 review).
+    `stage_verdict` LATCHES on the first 50-episode window whose rate and median clear the bar and never
+    un-latches, so a round is recorded `"done"` on ONE window and then settles for 300k steps -- during which
+    the median can drift straight back above the target. 0-1's completion times run from 81 s to well past its
+    147 s median, so a transient dip is not exotic. Counting the round's own target as proof would advance the
+    whole ladder on that single window, ask the next rung of a policy that never reached this one, and (with
+    `max_rounds: 0` and nobody monitoring) repeat 8M-step rounds of an unreachable rung for good. Reading the
+    median RECORDED AT THE END of the round makes a second, independent window agree 300k steps later before
+    the ladder moves; a round that drifted back simply runs its rung again, which is the whole correction.
+    """
     done_120 = [{"status": "done", "kind": "speed", "target_seconds": 120.0, "median_time": 118.4}]
     assert cd.rung_met(done_120, 150.0) and cd.rung_met(done_120, 120.0)
     assert not cd.rung_met(done_120, 100.0), "a harder rung is not met by an easier one that was"
+    # THE DRIFT: aimed at 120 and latched on some window under it, but typically 136 s by the time it ended.
+    drifted = [{"status": "done", "kind": "speed", "target_seconds": 120.0, "median_time": 136.0}]
+    assert not cd.rung_met(drifted, 120.0), "the round's own target is not evidence; the median it left is"
+    assert cd.rung_met(drifted, 150.0), "what it did measure still counts, against an easier rung"
     # An UNFINISHED round proves nothing, however good its median looked at the cap.
     unfinished = [{"status": "unfinished", "kind": "speed", "target_seconds": 120.0, "median_time": 60.0}]
     assert not cd.rung_met(unfinished, 120.0) and not cd.rung_met(unfinished, 60.0)
-    # A round with no clock recorded at all cannot meet anything by its median, only by its own target.
+    # A round with no clock recorded at all MEASURED nothing, so it meets nothing -- not even its own target.
     no_clock = [{"status": "done", "kind": "speed", "target_seconds": 150.0, "median_time": None}]
-    assert cd.rung_met(no_clock, 150.0) and not cd.rung_met(no_clock, 120.0)
+    assert not cd.rung_met(no_clock, 150.0) and not cd.rung_met(no_clock, 120.0)
     # ... and an impossible "time" never counts: the same predicate the leaderboard uses rejects it.
     zero = [{"status": "done", "kind": "speed", "target_seconds": None, "median_time": 0.0}]
     assert not cd.rung_met(zero, 25.0)
@@ -2128,9 +2143,67 @@ def test_a_focus_on_a_level_with_no_specialist_stops_the_driver_rather_than_trai
         assert pick is None and [s.key for s in waiting] == [("Level 0-1", cd.SPEED)]
         assert blocked == "FOCUS Level 0-1 (speed): no specialist file for the level yet"
         assert h.driver.tick() == "held", "it stops; it does not quietly start Level 0-2"
-        # The same refusal before the level's complete stage has ever finished.
-        h.driver.state.history = []
-        assert h.driver.choose_stage()[2] == "FOCUS Level 0-1 (speed): its complete stage is not done yet"
+        # ... and it says the FOCUS is what stopped it. The hold line is not the reason and naming it first
+        # sends an operator to the wrong file (2026-09-20 review).
+        log = h.driver.log_path.read_text(encoding="utf-8").splitlines()[-1]
+        assert "FOCUS on Level 0-1 and its speed stage cannot start" in log, log
+        assert "no specialist file for the level yet" in log and "HELD before" not in log
+        assert "the games are STILL RUNNING" in log, "they are not children of this process"
+        # The level's complete stage IS done here, so there is nothing else to run: a missing specialist file
+        # is a broken tree, not a plan the driver can carry out, and a human has to look.
+
+
+def test_a_focus_on_a_level_that_is_not_FINISHED_yet_runs_its_complete_stage_first():
+    """"Focus on Level X" means get X done and then chase its clock -- not exit with 12 games idle.
+
+    2026-09-20 review. `focus.level` is one line of the plan and the user's own direction invites changing it;
+    naming a level whose complete stage is not `"done"` used to load cleanly and then return `(None, [spec])`
+    from `choose_stage`, which `tick` reports as `"held"` and `run()` turns into exit code 1. The games are
+    not children of the tick loop, so 12 instances would keep burning a commit-bound box with no trainer until
+    a human noticed -- the outcome `max_rounds: 0` exists to prevent. A focus now falls back to the one stage
+    that can unblock it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = focus_harness(tmp, state={"version": 1, "current": None, "history": [
+            {"level": "Level 0-3", "kind": "complete", "status": "unfinished", "round": 1,
+             "end_steps": 24_757_714}]})
+        h.driver.plan = dataclasses.replace(h.plan, focus=cd.FocusPlan("Level 0-3", (120.0, 100.0), 19.798))
+        pick, waiting, blocked = h.driver.choose_stage()
+        assert (pick.key, waiting, blocked) == (("Level 0-3", cd.COMPLETE), [], ""), \
+            "the focus level's own complete stage, not a held exit and not another level"
+        assert h.driver.rung_for(pick) is None, "a complete stage is never a rung of the ladder"
+        log = h.driver.log_path.read_text(encoding="utf-8")
+        assert "FOCUS on Level 0-3: its speed stage cannot start yet" in log
+        assert "running its COMPLETE stage first" in log
+        # Once that stage is done the focus goes back to the ladder it was set for.
+        h.driver.state.history.append({"level": "Level 0-3", "kind": "complete", "status": "done", "round": 2})
+        assert h.driver.choose_stage()[0].key == ("Level 0-3", cd.SPEED)
+        assert h.driver.rung_for(cd.StageSpec("Level 0-3", cd.SPEED)) == cd.Rung(0, 120.0, 2)
+
+
+def test_a_stage_STARTED_BY_HAND_gets_the_focus_rung_it_would_have_got_automatically():
+    """`--start-at` bypasses `choose_stage`, where the focus lives, so `begin_stage` resolves the rung itself.
+
+    2026-09-20 review. `start_at_objection` deliberately lets the focus level's OWN speed stage through, so
+    after any exit that leaves `current` null an operator restarting it by hand was the one path that began a
+    focus level's speed stage with no rung at all: `target_seconds` fell back to the plan (0-1 has no
+    `speed.targets:` override), the env reported the level's S-rank 150 s live, and the tick clause accepted
+    that number because `stage.rung` was None. The stage would then have latched and promoted on a bar the
+    level already passed on 2026-09-19 -- 300k+ steps of 12 games and a false `"done"` row, for nothing. The
+    rung is a property of WHICH STAGE is being started, not of which code path started it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = focus_harness(tmp)
+        h.driver.state.current = None
+        init = cd.specialist_path(h.tmp / "models", "Level 0-1")
+        stage = h.driver.begin_stage("Level 0-1", init, cd.SPEED)  # exactly the call `main()` makes
+        assert (stage.rung, stage.target_seconds) == (0, 120.0)
+        env = yaml.safe_load((h.tmp / "configs" / "generated" / "spec_0-1_speed.yaml")
+                             .read_text(encoding="utf-8"))["env"]
+        assert env["speed_target_seconds"] == 120.0, "the rung's target, not the level's S-rank time"
+        # Nothing else picks up a rung: not the same level's complete stage, and not another level.
+        assert h.driver.begin_stage("Level 0-1", init, cd.COMPLETE).rung is None
+        assert h.driver.begin_stage("Level 0-3", init, cd.SPEED).rung is None
 
 
 def test_start_at_cannot_change_the_subject_while_a_focus_is_set():
@@ -2140,6 +2213,13 @@ def test_start_at_cannot_change_the_subject_while_a_focus_is_set():
         assert "FOCUS on Level 0-1" in objection and "cannot be started by hand" in objection
         assert cd.start_at_objection(h.plan, h.driver, "Level 0-1", cd.SPEED, plan_path="the plan",
                                      rerun_stage=True) == ""
+        # The focus level's COMPLETE stage is the other thing the focus itself can choose to run, so a hand
+        # start of it is allowed for the same reason (2026-09-20).
+        h.driver.plan = dataclasses.replace(h.plan, focus=cd.FocusPlan("Level 0-3", (120.0,), None))
+        assert cd.start_at_objection(h.driver.plan, h.driver, "Level 0-3", cd.COMPLETE, plan_path="the plan",
+                                     rerun_stage=True) == ""
+        assert "cannot be started by hand" in cd.start_at_objection(h.driver.plan, h.driver, "Level 0-2",
+                                                                    cd.COMPLETE, plan_path="the plan")
 
 
 def test_a_rounds_cap_counts_the_rounds_of_THIS_rung_only():

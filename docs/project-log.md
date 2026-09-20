@@ -3277,3 +3277,64 @@ changed nothing, and named the focus and its rung. Quoted in the pull request; n
 - **`keep_best`'s carried `best.json`** across rungs is argued, not observed: the metric and `penalty_name`
   are unchanged so it will not refuse to start, and a carried `best_at` can only lengthen a settle. No rung
   boundary has actually happened yet.
+
+## 2026-09-20 — FOCUS review: four defects fixed before the branch went anywhere near the live box
+
+A review of the focus branch (b0a5721) found no blocker and six findings. Four were real and are fixed here,
+each with a test confirmed to FAIL against the pre-fix code and pass after. All 31 no-game test files pass one
+at a time with `PYTHONPATH` on the worktree; `tests/test_campaign_driver.py` 83 → **85**.
+
+1. **The ladder advanced on the round's own target, not on what it measured.** `stage_verdict` latches on the
+   FIRST 50-episode window whose rate and median clear the bar and never un-latches, so `"done"` can be
+   written on one window and the 300k-step settle can end with the median drifted straight back above the
+   target. `rung_met` accepted that entry's `target_seconds` as proof, so the whole ladder would advance on a
+   single lucky window — while keep_best (which ranks a 9-sample smoothed median over the append-only
+   `metrics_log.csv`) never moved `best.zip`, `promote` re-copied the identical file, and the next rung asked
+   100 s of a policy typically at 136 s. With `max_rounds: 0` and no monitors that rung then repeats 8M-step
+   rounds for good. 0-1's completions span 81 s to well past its 147 s median, so a transient dip is not
+   exotic. **`rung_met` now reads the recorded `median_time` and nothing else**: a second, independent window
+   has to agree 300k steps later before the ladder moves, and a round that drifted back simply runs its rung
+   again. A `"done"` round with no median recorded meets nothing and repeats — conservative, in the safe
+   direction. The reviewer's alternative (require `best_at > start_steps`, i.e. that keep_best moved the file
+   during the rung) was **rejected**: a rung whose target the policy already meets would never move `best.zip`
+   at all and would then never be recordable as done — a worse deadlock than the bug.
+2. **`--start-at` began a focus rung with no rung.** `main()` called `begin_stage` without `rung=`, and
+   `start_at_objection` deliberately permits the focus level's own speed stage, so an operator restarting by
+   hand after a `held`/`no_checkpoint` exit got `target_seconds = None` → the env reported 0-1's S-rank 150 s
+   live → the tick clause accepted it because `stage.rung` was None → the stage would latch (the run's measured
+   state is rate 0.92, median 147.16) and promote on a bar the level passed on 2026-09-19. Fixed at the source
+   rather than at the call site: **`begin_stage(rung=...)` defaults to `AUTO_RUNG` and asks `rung_for`**, so
+   every path that begins a stage gets the same answer and a future call site cannot forget. Explicit
+   `rung=None` still means "not a rung".
+3. **A focus on an unfinished level exited with 12 games idle.** `focus.level` naming a level whose complete
+   stage is not `"done"` loaded cleanly and then returned `(None, [spec])` from `choose_stage` → `"held"` →
+   exit 1. The games are children of `mem_guard`, not of the tick loop, so twelve instances would keep burning
+   a commit-bound box with no trainer until a human noticed — the one outcome `max_rounds: 0` exists to
+   prevent — and `focus.level` is a single plan line the user's own direction invites changing. **The focus
+   now runs that level's COMPLETE stage first** (never as a rung) and starts the ladder when it is done; both
+   of the focus level's stages are allowed through `start_at_objection` for the same reason. A missing
+   specialist FILE still stops the driver — that is a broken tree, not a plan — and the stopping line now
+   leads with the focus instead of the irrelevant hold line and says out loud that the games are still running.
+4. **The shipped `focus:` block carried no `record_seconds`**, so both driver log sites fell silent and the
+   sample in `docs/commands.md` described a line the config could not produce. Added `record_seconds: 19.798`
+   and pinned it in `tests/test_specialists_config.py`.
+
+Two findings were accepted as constraints rather than code changes, and are now written down beside the focus
+recipe in `docs/commands.md`:
+
+- **A shared-path reward change must not straddle a round that will be judged.** The live trainer holds the
+  old `rewards.py` in memory, but the driver re-execs `train.py` on a hang or a crash, so merging mid-round
+  silently mixes two reward functions with nothing recording which. The reviewer's suggested order (END_STAGE,
+  then merge) is wrong in this particular case: the OLD driver would pick the next stage from the old plan and
+  start 0-3 complete. The correct order when the plan itself is changing is end the stage under the NEW driver
+  — which is what was done here, on a round that was being cut short anyway and therefore has no verdict.
+- **`speed.max_rounds` stays 0 while a focus is set.** A positive cap turns a stalled rung into the same held
+  exit: driver gone, games running, nobody watching.
+
+### Not verified (this entry)
+
+- Still nothing in game. No rung has been trained and no reward change has been measured live, so every claim
+  about what a rung does in practice — including how often a latched window drifts back — remains offline
+  reasoning.
+- The `test_speed_death_weight.py` farmability table (6.17 per respawn) was measured under the OLD damage
+  clamp and was not recomputed; the file still passes.

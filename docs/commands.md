@@ -152,8 +152,10 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
     round until it is `"done"`, and the plan's stages are level-major, so the machine finishes Level 0-1
     (complete, then speed) before any Level 0-2 stage starts. `round_robin` is the other value and the code's
     default. A HELD exit therefore means something the driver
-    cannot train its way out of — a speed stage whose complete stage is not `"done"`, or no specialist file —
-    and the log line names the stage and the reason. Do not restart the driver into it; fix the reason, or
+    cannot train its way out of — a speed stage whose complete stage is not `"done"` (unless a FOCUS is set,
+    which runs that complete stage instead), or no specialist file —
+    and the log line names the stage and the reason, leading with the focus when the focus is the cause, and
+    says out loud that the games are still running. Do not restart the driver into it; fix the reason, or
     retune `speed.target_scale` / add a per-level `speed.targets` override in `configs/specialists.yaml`.
     Every round's weights are still in `models/spec_<level>_speed/`.
   - **FOCUS one level on the record** (2026-09-20, spec §11). The user: *"can we focuse on one level tell we
@@ -169,20 +171,36 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
     focus:
       level: "Level 0-1"
       targets: [120, 100, 85, 72, 60, 50, 42, 35, 30, 25]   # median OFFICIAL seconds, hardest last
+      record_seconds: 19.798                                # display only, for the "x the record" log line
     ```
+    **Keep `speed.max_rounds` at 0 while a focus is set.** A positive cap turns a rung that will not come down
+    into a `held` exit — the driver gone, the 12 games still running on a commit-bound box, and nobody
+    watching. Retune the ladder instead.
     **To clear it**: delete the block, or set `focus: null`. The driver then behaves exactly as it did
     before it existed, from the same state file — nothing to migrate, nothing to undo.
     **To change the subject**: edit `level:`, then end the current stage (`END_STAGE`) so the next stage is
     chosen under the new block. `--start-at` is REFUSED for any other stage while a focus with rungs left is
-    set, on purpose: that flag bypasses `choose_stage`, which is where the focus lives.
+    set, on purpose: that flag bypasses `choose_stage`, which is where the focus lives; either of the FOCUS
+    LEVEL's own stages is allowed. If the level you name has not finished its complete stage yet, the focus
+    runs that COMPLETE stage first and starts the ladder when it is done — it does not stop.
+    **Landing a change to the shared reward path at the same time** (`ultrakill_ai/rewards.py`, and anything
+    else `train.py` imports): the running trainer holds the old module in memory, but the driver re-execs
+    `train.py` whenever it hangs or dies, so a merge silently swaps the reward function mid-round and the
+    round's numbers become a mixture of two of them with nothing recording which. Order it so the change never
+    straddles a round that will be JUDGED: end the current stage (`END_STAGE`, and let the driver record it),
+    then merge, then restart the driver, so the next round starts under the new rewards from step one. If the
+    stage that is running will be cut short anyway, say so in `docs/project-log.md` — that round has no
+    verdict either way.
     **How a rung shows up.** Each `targets` entry is a RUNG: an ordinary speed stage of that level, same run
     (`spec_0-1_speed`), same model directory, resumed from that run's own newest weights, but with
     `speed_target_seconds` written into `configs/generated/spec_0-1_speed.yaml` as that exact number (never
     the S-rank time, never scaled). It promotes on the usual speed rule — fresh rate ≥ 0.4 **and**
     `median_time_50` ≤ the rung — and then the next rung starts. A rung that runs out of steps repeats
     itself and does **not** overwrite `models/specialists/<level>.zip`. Which rung is current is derived from
-    the history, so a rung already met by an earlier round (by its own target or by its recorded median) is
-    skipped rather than re-proved. In the log:
+    the history, so a rung already met by an earlier round is skipped rather than re-proved — met meaning the
+    MEDIAN that round actually recorded when it ended, never the target it was aimed at. A round that latched
+    on one good window and then drifted back above its target is not proof, and simply runs its rung again.
+    In the log:
     ```
     FOCUS on Level 0-1: rung 1 of 10, median must reach 120.00 s (6.06x the 19.798 s record)
     FOCUS rung 1 of 10 for Level 0-1: target 120.00 s; ignoring spec_0-1_speed's status.json until ...

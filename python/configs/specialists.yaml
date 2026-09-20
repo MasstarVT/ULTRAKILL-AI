@@ -186,6 +186,11 @@ speed:
 focus:
   level: "Level 0-1"
   targets: [120, 100, 85, 72, 60, 50, 42, 35, 30, 25]
+  # The number the ladder is chasing, carried so the driver's own log can say what each rung is a multiple of
+  # ("rung 1 of 10, median must reach 120.00 s (6.06x the 19.798 s record)"). NOTHING in the rule reads it:
+  # it is the human INBOUNDS IL record from configs/il_records.yaml, copied here for the log line, and the
+  # driver behaves identically without it.
+  record_seconds: 19.798
 # THE HOLD LINE (spec §8a). No stage at or after this level starts until EVERY stage before it is "done".
 # The lead, 2026-09-18: "dont have it promote to 0-4 untell it gets better times on these levels". Without this
 # key a speed stage that burns its 8M-step cap is recorded "unfinished" and the ladder walks on to 0-4 carrying

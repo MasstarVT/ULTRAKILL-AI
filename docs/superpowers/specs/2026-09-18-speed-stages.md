@@ -459,6 +459,36 @@ round proves nothing however good its median looked, and an impossible time is r
   today, and the SAME rung runs again from the stage's own newest weights -- unbounded, because
   `speed.max_rounds` is 0. A round cap, if one is ever turned back on, counts the rounds of THIS rung
   (`DriverState.rung_rounds`), or the tenth rung would start already out of rounds.
+- **THE LADDER ADVANCES ON THE MEASURED MEDIAN, NEVER ON THE ROUND'S OWN TARGET** (2026-09-20 review).
+  `rung_met` reads `median_time` out of the `"done"` entry and nothing else. `stage_verdict` latches on the
+  FIRST 50-episode window whose rate and median clear the bar and never un-latches, so `"done"` can be written
+  on one lucky window and the 300k-step settle can end with the median drifted back above the target -- with
+  keep_best never moving `best.zip`, `promote` re-copying the identical file, and the ladder nevertheless
+  walking on to a rung the policy has never been near, then repeating 8M-step rounds of it for good.
+  0-1's completion times run from 81 s to well past its 147 s median, so a transient dip is not exotic.
+  Reading the recorded median makes a second, independent window agree 300k steps later before the ladder
+  moves; a round whose median drifted back simply runs the same rung again, which is the whole correction.
+  The cost is that a `"done"` round with no median recorded at all (a filtered final sample) meets nothing and
+  repeats its rung -- conservative, and safe in the direction that matters.
+- **The rung is a property of the stage, not of the code path that started it.** `begin_stage(rung=...)`
+  defaults to `AUTO_RUNG` and asks `rung_for`, so `tick`, `finish_stage` and `main()`'s `--start-at` all get
+  the same answer. Before that, `--start-at` was the one caller that forgot: `start_at_objection` deliberately
+  permits the focus level's own speed stage, so an operator restarting it by hand after a `held` or
+  `no_checkpoint` exit began it with no rung at all -- `target_seconds` fell back to the plan (0-1 has no
+  `speed.targets:` override), the env reported the level's S-rank 150 s live, the tick clause accepted that
+  number because `stage.rung` was None, and the stage would latch and promote on a bar the level passed on
+  2026-09-19. Passing `rung=None` explicitly still means "not a rung".
+- **A focus finishes its level first.** If the focus level's speed stage is blocked because its complete stage
+  is not `"done"`, `choose_stage` returns that COMPLETE stage (never a rung) and says so, instead of returning
+  nothing. "Focus on Level X" means get X done and then chase its clock. The old behaviour was a `"held"` exit,
+  and the 12 games are not children of the driver: they would have kept burning a commit-bound box with no
+  trainer until a human noticed -- the one outcome `max_rounds: 0` exists to avoid -- and `focus.level` is a
+  single line of the plan that the user's own direction invites changing. Both of the focus level's stages are
+  therefore also allowed through `start_at_objection`. A focus still stops when its level's specialist FILE is
+  missing (a broken tree, not a plan), and the stopping line now leads with the focus rather than with the
+  hold line, and says out loud that the games are still running.
+- **`speed.max_rounds` must stay 0 while a focus is set.** A positive cap turns a stalled rung into exactly the
+  held exit above -- driver gone, 12 games running, nobody watching. Retune the ladder instead.
 - `Stage.stale_below` is what stops a new rung latching on the previous rung's `status.json`: a rung boundary
   IS a stage boundary, so `begin_stage` sets it from whatever the file says at that instant and
   `current_sample` returns `EMPTY_SAMPLE` until the new trainer passes it. Without it the 100 rung would
@@ -489,12 +519,16 @@ with a line saying the focus overrides it.
 
 `tests/test_campaign_driver.py`: the block loaded, defaulted and refused ten ways; `focus_rung` starting at
 120 from a literal copy of the live state and skipping rungs a wider ladder has already met; `rung_met`'s
-monotonicity, its refusal of an unfinished round and of an impossible time; the generated config carrying the
-exact target and nothing else changed; the focus overriding the depth-first rule that would have gone to 0-2;
+monotonicity, its refusal of an unfinished round, of an impossible time, of a round with no clock, and of a
+round that latched at 120 but ended with its median drifted to 136; the generated config carrying the exact
+target and nothing else changed; the focus overriding the depth-first rule that would have gone to 0-2;
 a met rung promoting with `rung` in the sidecar and the next rung starting from the stage's own weights with
 the stale guard set; an unfinished rung repeating itself without touching the specialist; the focus stopping
-when the ladder is done; a blocked focus stopping the driver rather than training something else;
-`--start-at` refused; a round cap counted per rung; and **the literal-state test** -- the live file of
+when the ladder is done; a focus whose level is not finished running that level's COMPLETE stage first and
+then returning to the ladder; a stage started BY HAND getting the same rung `choose_stage` would have given
+it, and no rung for any other stage; a focus with no specialist file stopping the driver rather than training
+something else, with the stopping line naming the focus; `--start-at` refused for another level and allowed
+for either of the focus level's own stages; a round cap counted per rung; and **the literal-state test** -- the live file of
 2026-09-20 keeps 0-2 speed round 2 running on `tick()`, and once it is ended the next stage is 0-1 speed at
 rung 120 resumed from `models/spec_0-1_speed`'s own newest checkpoint. `tests/test_specialists_config.py`
 pins the shipped block. `tests/test_campaign_rewards.py` covers the two reward fixes that landed with it.

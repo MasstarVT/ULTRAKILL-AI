@@ -258,6 +258,10 @@ def test_the_shipped_focus_is_level_0_1_on_a_ladder_down_to_the_record():
     record = records["levels"]["Level 0-1"]["inbounds"]["seconds"]
     assert record == 19.798
     assert focus.targets[-1] > record and focus.targets[-1] / record < 1.3
+    # The block carries the record itself, so the DRIVER's log can print "x the record" too. Without it both
+    # log sites fall silent and the sample in docs/commands.md describes a line the shipped config cannot
+    # produce (2026-09-20 review). Nothing in the rule reads it, so it only ever has to match the record file.
+    assert focus.record_seconds == record
 
 
 def test_a_focus_rung_generates_the_speed_config_with_an_explicit_target():
