@@ -51,6 +51,15 @@ FIELDS = [
     # `part_gate_approach` against `part_level_complete` on any window where this is above 1 -- the route
     # spec's §12.6 tripwire is 6x, and the lever is the route file, never the weight.
     "route_source",
+    # Stage S0 of docs/superpowers/specs/2026-09-20-speedrun-tech.md, added 2026-09-20: the weapon channel,
+    # which this file has never carried. `slot_same_frac` is the one to read first -- it is §3.4's 76% figure
+    # re-taken on the live policy, and the whole case for the sticky-slot lever (S5) rests on it. All eleven
+    # are PASSIVE counters: nothing in the run reads them back. `slot_dropped_frac` and `slot_blocked_frac`
+    # are 0 until `env.sticky_weapon_slot` is turned on, so they are also how "is the lever live" is read.
+    # NEW COLUMNS, so an existing metrics_log.csv must be moved aside to get them (see the module docstring).
+    "slot_press_frac", "slot_same_frac", "slot_switch_frac", "slot_press_per_s",
+    "fire1_frac", "fire2_frac", "punch_frac",
+    "slot_held_top_frac", "slot_known_frac", "slot_dropped_frac", "slot_blocked_frac",
 ]
 # The same means over fresh-start episodes only (status["mean_fresh_100"]): a respawn episode inherits
 # gates_reached and checkpoints_level from its level load, so only these two say how a whole run goes.

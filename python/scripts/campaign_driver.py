@@ -200,6 +200,20 @@ END_STAGE_REASON = "ended by operator"
 # A speed stage's target is this times the level's own S-rank threshold (§8b). Duplicated as `EnvConfig`'s
 # default so a stage config that predates the key still means the same thing; the env is where it is APPLIED.
 DEFAULT_TARGET_SCALE = 0.75
+# A SPEED STAGE'S OWN PPO HYPERPARAMETERS (`speed.train:` in the plan file, 2026-09-20). The allowlist is
+# PPO's own numeric constructor arguments, which is exactly what `training.main` forwards into `PPO(...)` /
+# `PPO.load(...)`; anything else is refused at load time rather than silently ignored, for the same reason
+# `speed.rewards:` is validated against `RewardConfig`. Stages S1 and S2 of
+# docs/superpowers/specs/2026-09-20-speedrun-tech.md are `gamma` 0.998 -> 0.999 -> 0.9995 with
+# `gae_lambda` 0.98, and they must apply to the SPEED stage only: a complete stage's generated config has to
+# stay byte-identical to what `configs/campaign_gates_full.yaml` pins.
+SPEED_TRAIN_KEYS = ("learning_rate", "n_steps", "batch_size", "n_epochs", "gamma", "gae_lambda",
+                    "clip_range", "ent_coef", "vf_coef", "max_grad_norm", "target_kl")
+# Env settings a `speed.env:` block may NOT carry, because `stage_config` decides them itself and a plan that
+# asked for one would be silently overruled: the level, the multi-level keys a stage must never see, the four
+# the speed rule sets, and `rewards`, which has its own `speed.rewards:` block.
+SPEED_ENV_REFUSED = ("level", "rewards", "speed_bonus", "speed_target_scale", "speed_target_seconds",
+                     "fresh_start_prob", *MULTI_LEVEL_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +370,13 @@ class Plan:
     # Empty by default, so a plan written before this key -- and every test that loads one -- generates
     # exactly the config it always did, for both kinds.
     speed_rewards: dict[str, float] = field(default_factory=dict)
+    # A SPEED STAGE'S OWN PPO HYPERPARAMETERS, merged over `train.hyperparams` for that kind and no other
+    # (2026-09-20, stages S1/S2). Empty by default, and empty means the generated `train:` block of BOTH kinds
+    # is exactly what it was before this key existed -- which is what `tests/test_specialists_config.py` pins.
+    speed_train: dict = field(default_factory=dict)
+    # ... and a speed stage's own ENV settings, same rule, same default, for a lever that is not a reward
+    # weight (stage S5's `sticky_weapon_slot`). `SPEED_ENV_REFUSED` lists what it may not contain.
+    speed_env: dict = field(default_factory=dict)
     # THE HOLD LINE (§8a): the level at which the ladder stops until everything before it is "done". `None`
     # lifts it. The lead's instruction on 2026-09-18 was "dont have it promote to 0-4 untell it gets better
     # times on these levels", and a stage that hits its step cap is recorded "unfinished" and walked past --
@@ -451,6 +472,8 @@ def load_plan(path: str | Path) -> Plan:
     unknown_weights = sorted(set(speed_rewards) - {f.name for f in dataclasses.fields(RewardConfig)})
     if unknown_weights:
         raise ValueError("%s: unknown speed reward weights %s" % (path, unknown_weights))
+    speed_train = _speed_train(path, speed.pop("train", None))
+    speed_env = _speed_env(path, speed.pop("env", None))
     for name, block in (("stage", dict(data.get("stage", {}) or {})), ("speed", speed)):
         unexpected = sorted(set(block) - known)
         if unexpected:  # a misspelt knob would silently use its default, exactly as EnvConfig.from_dict would
@@ -468,10 +491,62 @@ def load_plan(path: str | Path) -> Plan:
     if order_rule not in HOLD_ORDERS:
         raise ValueError("%s: unknown hold_order %r (expected %s)" % (path, order_rule, list(HOLD_ORDERS)))
     plan = Plan(stages=stages, rule=StageRule(**dict(data.get("stage", {}) or {})), speed=speed, targets=targets,
-                target_scale=scale, speed_rewards=speed_rewards, hold_before=hold, hold_order=order_rule,
+                target_scale=scale, speed_rewards=speed_rewards, speed_train=speed_train, speed_env=speed_env,
+                hold_before=hold, hold_order=order_rule,
                 focus=_focus_plan(path, data.get("focus"), stages),
                 env=dict(data.get("env", {}) or {}), train=dict(data.get("train", {}) or {}))
     return plan
+
+
+def _speed_train(path, block) -> dict:
+    """The `speed.train:` block: PPO hyperparameters for a SPEED stage only. Absent is today's config exactly.
+
+    Every check is a hard error, never a default, for the reason the rest of this loader is: a plan that
+    silently trains at the old gamma while the file says 0.999 costs a round of twelve games and reads as
+    "the gamma stage did nothing" -- which is the single most expensive wrong conclusion available here.
+    """
+    if not block:
+        return {}
+    if not isinstance(block, dict):
+        raise ValueError("%s: `speed.train:` must be a block of PPO hyperparameters, not %r" % (path, block))
+    unexpected = sorted(set(map(str, block)) - set(SPEED_TRAIN_KEYS))
+    if unexpected:
+        raise ValueError("%s: unknown speed.train settings %s (expected %s)"
+                         % (path, unexpected, list(SPEED_TRAIN_KEYS)))
+    out: dict = {}
+    for key, value in block.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            # A bool is an int in Python and every key on the allowlist is a number, so `gamma: true` would
+            # otherwise reach PPO as 1.0 -- an infinite horizon, and a silent one.
+            raise ValueError("%s: speed.train.%s must be a number, not %r" % (path, key, value))
+        out[str(key)] = value  # NOT coerced to float: `n_steps`, `batch_size` and `n_epochs` are ints
+    return out
+
+
+def _speed_env(path, block) -> dict:
+    """The `speed.env:` block: env settings for a SPEED stage only. Absent is today's config exactly.
+
+    Validated against `EnvConfig`'s own field names, because `EnvConfig.from_dict` DROPS a key it does not
+    know and a misspelt lever would train at the default while the plan file said otherwise. The import is
+    deliberately LAZY and inside this branch: `ultrakill_ai.env` pulls in numpy, gymnasium and the protocol
+    client, and the driver polls beside twelve games and a trainer on a commit-bound box, so a plan with no
+    `speed.env:` block -- which is every plan today -- must not pay for it.
+    """
+    if not block:
+        return {}
+    if not isinstance(block, dict):
+        raise ValueError("%s: `speed.env:` must be a block of env settings, not %r" % (path, block))
+    from ultrakill_ai.env import EnvConfig  # noqa: PLC0415 - see the docstring
+
+    names = {f.name for f in dataclasses.fields(EnvConfig)}
+    unexpected = sorted(set(map(str, block)) - names)
+    if unexpected:
+        raise ValueError("%s: unknown speed.env settings %s" % (path, unexpected))
+    refused = sorted(set(map(str, block)) & set(SPEED_ENV_REFUSED))
+    if refused:
+        raise ValueError("%s: speed.env may not set %s -- stage_config decides those (use `speed.rewards:` for "
+                         "reward weights)" % (path, refused))
+    return {str(k): v for k, v in block.items()}
 
 
 FOCUS_KEYS = ("level", "targets", "record_seconds")
@@ -545,10 +620,15 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
     no readable step count in the init file it falls back to the plan's own `timesteps`, or to the cap plus
     slack, either of which only has to exceed what the stage rule will allow.
 
-    A SPEED stage is the same config with `speed_bonus` on, plus whatever the plan's `speed.rewards:` block
-    overrides (2026-09-20: `death: 12.0`). No observation or action changes, and a reward weight is not a
-    policy parameter, so the level's own specialist still loads into it unchanged. The override is REBOUND,
-    never mutated in place -- see the comment at the merge. `speed_target_seconds` is set only when the
+    A SPEED stage is the same config with `speed_bonus` on, plus whatever the plan's three speed-only override
+    blocks say: `speed.rewards:` (2026-09-20: `death: 12.0`) over `env.rewards`, `speed.env:` over `env`, and
+    `speed.train:` over `train.hyperparams`. All three are EMPTY unless the plan sets them, and empty means the
+    generated config of both kinds is byte for byte what it was before they existed. `speed.rewards` and
+    `speed.env` change nothing a checkpoint carries -- a reward weight and an env setting are read at env
+    construction -- so the level's own specialist still loads unchanged; `speed.train` changes PPO's own
+    hyperparameters, which a resumed model also takes from the config
+    (`ultrakill_ai.training.apply_resume_hyperparams`) and which likewise leave the weights' shape alone. Every
+    override is REBOUND, never mutated in place -- see the comments at the merges. `speed_target_seconds` is set only when the
     plan overrides it for this level; 0 tells the env to read the level's own S-rank time live and scale it by
     `speed_target_scale`. The scale is written into every speed stage's config even when it is the default, so
     a generated file says what the run was actually measured against.
@@ -557,6 +637,10 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
     env = {key: value for key, value in plan.env.items() if key not in MULTI_LEVEL_KEYS}
     env["level"] = level
     if kind == SPEED:
+        # A speed stage's own ENV settings first, so the four keys the speed rule owns below cannot be
+        # overruled by the plan. `SPEED_ENV_REFUSED` already refuses them at load time, so this ordering is a
+        # second lock on the same door rather than a silent override.
+        env.update(plan.speed_env)
         env["speed_bonus"] = True
         env["speed_target_scale"] = float(plan.target_scale)
         # EVERY EPISODE IS A FRESH LEVEL LOAD on a speed stage (2026-09-18 review). The bonus is scaled only on
@@ -578,7 +662,9 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
             # stage's weights are `campaign_gates_full.yaml`'s would not catch it, because both dicts would
             # be the one mutated object and would still compare equal. Pinned by the order-independence test
             # in tests/test_speed_death_weight.py.
-            env["rewards"] = {**env["rewards"], **plan.speed_rewards}
+            # `.get`, not `[...]`: a plan that names `speed.rewards:` and no shared `env.rewards:` block is a
+            # legitimate file, and it used to raise KeyError here rather than generate a config.
+            env["rewards"] = {**(env.get("rewards") or {}), **plan.speed_rewards}
         # A FOCUS RUNG's target wins over the plan's per-level override, which wins over reading the level's
         # own S-rank time live (§11). All three arrive at the env down the ONE path, `speed_target_seconds`,
         # which the env reports back as `info["target_seconds"]` -- so the reward and the promotion rule are
@@ -587,6 +673,12 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
         if target:
             env["speed_target_seconds"] = float(target)
     train = dict(plan.train)
+    if kind == SPEED and plan.speed_train:
+        # REBIND, NEVER MUTATE, exactly as `rewards` above: `train` is a SHALLOW copy of `plan.train`, so
+        # `train["hyperparams"]` IS the plan's own dict and an in-place update would leak this stage's gamma
+        # into every complete stage generated afterwards from the same Plan object. Pinned by the
+        # order-independence test in tests/test_speed_train_override.py.
+        train["hyperparams"] = {**(train.get("hyperparams") or {}), **plan.speed_train}
     train["run_name"] = stage_run_name(level, kind)
     budget = rule.max_steps_per_stage + TIMESTEPS_SLACK
     train["timesteps"] = int(init_steps) + budget if init_steps is not None else int(train.get("timesteps", budget))

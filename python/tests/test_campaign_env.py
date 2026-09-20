@@ -139,6 +139,11 @@ class FakeLevel:
         self.exit_ground_pos: list[float] | None = None
         self.mod_ground_pos = True
         self.yaw = 0.0
+        # `GunControl.currentSlotIndex`, 0-based, and -1 before GunControl starts (0-1 has no weapon at all
+        # until the revolver pickup). A plain attribute, NOT driven by the action: the corridor models no
+        # weapons, and a slot that moved with the action would change the packed one-hot under every existing
+        # test. tests/test_slot_counters.py and tests/test_sticky_slot.py set it directly.
+        self.weapon_slot = 0
         self.enemy_rel = [0.0, 0.0, 5.0]
         self.last_action: dict | None = None  # the command dict the env last sent
         self.skulls = False
@@ -376,7 +381,7 @@ class FakeLevel:
             "pos": [0.0, self.y, self.z], "vel": [0.0, -20.0 if self.falling else 0.0, 0.0], "local_vel": [0.0, 0.0, 0.0],
             "forward": [0.0, 0.0, 1.0], "yaw": self.yaw, "pitch": 0.0, "hp": 0 if self.dead else 100,
             "anti_hp": 0.0, "stamina": 300.0, "grounded": not airborne, "sliding": False, "dead": self.dead,
-            "activated": True, "level_over": over, "weapon_slot": 0, "weapon_variation": 0,
+            "activated": True, "level_over": over, "weapon_slot": self.weapon_slot, "weapon_variation": 0,
             "soft_deaths": 0, "soft_death_instakill": False, "slot_counts": [1, 0, 0, 0, 0],
         }
         if self.mod_flags:  # mod 0.6.0 and later

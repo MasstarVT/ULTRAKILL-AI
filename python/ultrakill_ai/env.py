@@ -53,7 +53,16 @@ from ultrakill_ai.procmem import GB as PROC_GB
 from ultrakill_ai.procmem import MB as PROC_MB
 from ultrakill_ai.procmem import derive_game_limit, private_bytes
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
-from ultrakill_ai.spaces import PITCH_BINS, YAW_BINS, ObsLayout, action_space, decode_action, pack_observation, yaw_frame
+from ultrakill_ai.spaces import (
+    NUM_WEAPON_SLOTS,
+    PITCH_BINS,
+    YAW_BINS,
+    ObsLayout,
+    action_space,
+    decode_action,
+    pack_observation,
+    yaw_frame,
+)
 from ultrakill_ai.times import valid_official_seconds
 
 CYBERGRIND_SCENE = "Endless"
@@ -203,6 +212,28 @@ class EnvConfig:
     wedge_seconds: float = 3.0  # game seconds wedged before the episode ends (0 = no end, the steps are still counted)
     wedge_creep_mps: float = 1.5  # movement below this counts as not moving, in the wedge test only
     slide_min_hold: int = 0  # decisions slide stays held once pressed (0 = off; an experiment, see the design spec)
+    # THE STICKY WEAPON SLOT -- stage S5 of docs/superpowers/specs/2026-09-20-speedrun-tech.md, and DORMANT:
+    # False is today's action stream byte for byte, and nothing below is read while it is False.
+    #
+    # WHY IT EXISTS. `GunControl.SwitchWeapon` with `targetSlotIndex == currentSlotIndex` reads
+    # `PrefsManager`'s `WeaponRedrawBehaviour`, whose default is 0 = cycle to the next variation, so pressing
+    # the slot already held RE-DRAWS the weapon: `Revolver.OnEnable` sets `gunReady = false` and only the
+    # `ReadyGun()` animation event clears it, while `Revolver.Update` gates firing on `gunReady`. A probe of
+    # the PROMOTED `Level_0-1.zip` measured that press on 76.0% of steps (39,371 of 51,772), which would mean
+    # the agent keeps its weapon permanently in the draw animation and suppresses its own primary fire. That
+    # 76% is from a DIFFERENT CHECKPOINT and is being re-measured on the live policy by the S0 counters below
+    # (`slot_same_frac`); this switch must not be turned on before that number exists.
+    sticky_weapon_slot: bool = False
+    # ... and, while it is on, how many decisions a switch to a DIFFERENT slot must wait for. A switch also
+    # plays a draw animation, so honouring one every decision reproduces the same defect with two slots instead
+    # of one. THE SPEC NAMES NO NUMBER FOR THIS and the draw animation's real length is NOT MEASURED -- the
+    # game's animation clips are serialized and cannot be read from the decompiled C#. 3 is the decisions
+    # covered by the nearest documented window in the spec's own table (the 200 ms `JumpReady` cooldown) at
+    # `fixed_fps: 30` / `frameskip: 2`, i.e. 66.7 ms of game time per decision. It is a starting value to be
+    # replaced by a measurement, not a finding. 0 or 1 honours every switch, which is the drop rule alone.
+    # NOTE THE TENSION the spec records: "swap cancel" (§2) is a technique that WANTS rapid switching, so a
+    # large number here trades one gain for another. Judge them together.
+    sticky_slot_switch_every: int = 3
     archive_save_steps: int = 20000  # env lifetime steps between exploration-archive saves
     archive_save_seconds: float = 600.0  # ... or this much wall time, whichever comes first
 
@@ -296,7 +327,25 @@ class EnvConfig:
 BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "yaw_err_sum", "dist_sum", "yaw_sum",
                   "pitch_steps", "pitch_sum", "pitch_signed_sum", "look_up_sum", "elev_steps", "elev_sum", "elev_abs_sum", "elev_over15", "pitch_err_sum",
                   "yaw_track", "yaw_track_n", "pitch_track", "pitch_track_n",
-                  "look_free", "look_enemy", "look_gate", "slide_forced")
+                  "look_free", "look_enemy", "look_gate", "slide_forced",
+                  # STAGE S0 of docs/superpowers/specs/2026-09-20-speedrun-tech.md: the weapon channel, which
+                  # `status.json` has never carried. PURE BOOKKEEPING -- nothing here is read by a reward, an
+                  # observation or an action, and `tests/test_slot_counters.py` pins that the step outputs are
+                  # byte for byte what they are with the counters removed.
+                  #   slot_press     decisions that pressed ANY slot key (the action's `slot` is not 0)
+                  #   slot_same      ... and the key pressed was the slot already held: the redraw (§3.4)
+                  #   slot_switch    ... and it was a different slot
+                  #   slot_known     decisions whose held slot the mod actually reported (the denominator for
+                  #                  the per-slot shares; `weapon_slot` is -1 before `GunControl` starts)
+                  "slot_press", "slot_same", "slot_switch", "slot_known",
+                  # What the STICKY SLOT lever suppressed, both 0 while `sticky_weapon_slot` is False.
+                  "slot_dropped", "slot_blocked",
+                  # Press counts for the three buttons the technique work cares about. `firing` above is
+                  # fire1-OR-fire2 and cannot separate them, and nothing counted `punch` at all even though
+                  # `rewards.punch` charges for it.
+                  "press_fire1", "press_fire2", "press_punch",
+                  *("held_slot_%d" % i for i in range(NUM_WEAPON_SLOTS)),     # decisions each slot was held
+                  *("kills_slot_%d" % i for i in range(NUM_WEAPON_SLOTS)))    # kills while each slot was held
 
 
 _NO_SLOT = "<none>"  # the sentinel for "nothing to serialize against", never a real path
@@ -499,6 +548,9 @@ class UltrakillEnv(gym.Env):
         self._wedge_run = 0  # consecutive wedged decisions right now
         self._wedged_steps = 0  # steps inside runs that reached the hold, credited retroactively
         self._slide_latch = 0  # decisions slide is still held for (slide_min_hold)
+        # Decisions still to wait before the sticky-slot lever honours another switch. Always 0 while
+        # `sticky_weapon_slot` is False, because nothing ever writes it: see `_sticky_slot`.
+        self._slot_cooldown = 0
         # Lifetime steps never reset, so the archive schedule does not depend on episode boundaries: the whole
         # ground run saved nothing because episodes are ~3900 decisions and no worker reached 20 of them.
         self._lifetime_steps = 0
@@ -609,6 +661,7 @@ class UltrakillEnv(gym.Env):
         self._wedge_run = 0
         self._wedged_steps = 0
         self._slide_latch = 0
+        self._slot_cooldown = 0
 
         if self.cfg.mode == "campaign":
             self.archive.start_episode()
@@ -691,7 +744,13 @@ class UltrakillEnv(gym.Env):
         elif self.cfg.pitch_limit_deg and prev.get("player"):
             command["look"][1] = clamp_pitch_command(prev["player"]["pitch"], command["look"][1], self.cfg.pitch_limit_deg)
         self._hold_slide(prev, command)
+        # THE S0 COUNTERS READ THE POLICY'S OWN SLOT INTENT, so they are taken BEFORE `_sticky_slot` rewrites
+        # it. That ordering is the point: `slot_same_frac` is a fact about the POLICY (§3.4's 76% re-measured
+        # on the live one), and it has to stay comparable before and after the sticky lever is switched on --
+        # measured after the rewrite it would read ~0 by construction and say nothing. What the lever
+        # suppressed is counted separately, inside `_sticky_slot`, as `slot_dropped` / `slot_blocked`.
         self._note_behaviour(prev, command, raw_pitch_cmd, applied_mode)
+        self._sticky_slot(prev, command)
         campaign = self.cfg.mode == "campaign"
         cur = self.client.step(command)
         if campaign:
@@ -702,6 +761,7 @@ class UltrakillEnv(gym.Env):
         if self._lifetime_steps % ARCHIVE_CHECK_EVERY == 0:
             self._save_archive_on_schedule()
         self._track_enemies(cur)
+        self._note_slot_kills(prev, cur)
 
         player = cur.get("player")
         prev_player = prev.get("player") or {}
@@ -792,6 +852,10 @@ class UltrakillEnv(gym.Env):
                     seconds = camp_seconds - self._episode_start_seconds
             info["episode_seconds"] = seconds
             info["kills_per_min"] = info["kills"] / seconds * 60.0 if seconds > 0 else 0.0
+            # STAGE S0: slot presses per GAME second, which is what the stage asks for and what is comparable
+            # between runs at different `fixed_fps`/`frameskip`. Set beside `kills_per_min` because this is the
+            # only place the episode's game-clock duration exists.
+            info["slot_press_per_s"] = self._behaviour["slot_press"] / seconds if seconds > 0 else 0.0
             if campaign:
                 self._end_campaign_episode(cur, reason, info)
         return self._pack(cur), float(reward.total), terminated, truncated, info
@@ -1219,6 +1283,7 @@ class UltrakillEnv(gym.Env):
         self._steps_since_progress = 0
         self._wedge_run = 0
         self._slide_latch = 0
+        self._slot_cooldown = 0
 
     def _end_on_bridge_reset(self, raw: dict[str, Any]):
         """Truncates the episode the bridge failure destroyed, and hands back the fresh level load.
@@ -1239,6 +1304,7 @@ class UltrakillEnv(gym.Env):
         seconds = self._steps * self.cfg.frameskip / self.cfg.fixed_fps
         info["episode_seconds"] = seconds
         info["kills_per_min"] = info["kills"] / seconds * 60.0 if seconds > 0 else 0.0
+        info["slot_press_per_s"] = self._behaviour["slot_press"] / seconds if seconds > 0 else 0.0
         self._last_end_reason = "bridge_reset"
         if self.cfg.mode == "campaign":
             self._end_campaign_episode(last_good, "bridge_reset", info)
@@ -1487,6 +1553,69 @@ class UltrakillEnv(gym.Env):
             self._slide_latch -= 1
             self._behaviour["slide_forced"] += 1
 
+    def _sticky_slot(self, prev: dict[str, Any], command: dict[str, Any]) -> None:
+        """STAGE S5, and DORMANT: `sticky_weapon_slot` is False, so this returns before reading anything else.
+
+        Two rules, both of which only ever turn a slot press into "keep" -- this can add no press and can never
+        change which slot is selected, only whether a selection happens at all:
+
+          1. A press of the slot ALREADY HELD becomes `slot: 0` (keep). In game that press re-draws the weapon
+             (`WeaponRedrawBehaviour` 0 = cycle variation), which sets `gunReady = false` until the `ReadyGun()`
+             animation event, so a policy that presses it constantly suppresses its own primary fire (§3.4).
+          2. A switch to a DIFFERENT slot is honoured at most once per `sticky_slot_switch_every` decisions,
+             because a switch draws too. The counter runs over DECISIONS, not game seconds, and is reset by a
+             level load and by a respawn along with `_slide_latch`.
+
+        The action that was refused is NOT replaced by anything: the step goes out with `slot: 0`, which is the
+        action the policy could already have chosen, so the wire message stays inside the existing protocol and
+        the mod needs no change. Nothing here is charged or paid for -- the same rule the macro design states
+        for a refusal (§4.2): charging teaches the policy to avoid the channel rather than to use it well.
+
+        The held slot is `GunControl.currentSlotIndex`, 0-based; the action's `slot` is 0 for keep and 1..5 for
+        a slot KEY, so "the slot already held" is `slot == weapon_slot + 1`. With no player, or a
+        `weapon_slot` of -1 (before `GunControl` has started -- 0-1 has no weapon at all until the revolver
+        pickup), nothing is known about what is held and the action is passed through untouched.
+        """
+        if not self.cfg.sticky_weapon_slot:
+            return
+        # The cooldown is read as it stood at the START of this decision and spent at the end of it, so
+        # `sticky_slot_switch_every: 3` means "honour, refuse, refuse, honour" -- three decisions between two
+        # honoured switches. Decrementing before the test would spend this decision's own tick on itself and
+        # give every OTHER decision a switch at any setting, which is what the first draft of this did.
+        was_cooling = self._slot_cooldown > 0
+        if was_cooling:
+            self._slot_cooldown -= 1
+        slot = int(command.get("slot", 0))
+        if not slot:
+            return
+        held = (prev.get("player") or {}).get("weapon_slot", -1)
+        if not 0 <= held < NUM_WEAPON_SLOTS:
+            return  # nothing known about what is held: never guess, pass the press through
+        if slot == held + 1:
+            command["slot"] = 0
+            self._behaviour["slot_dropped"] += 1
+        elif was_cooling:
+            command["slot"] = 0
+            self._behaviour["slot_blocked"] += 1
+        else:
+            self._slot_cooldown = max(0, int(self.cfg.sticky_slot_switch_every) - 1)
+
+    def _note_slot_kills(self, prev: dict[str, Any], cur: dict[str, Any]) -> None:
+        """STAGE S0: kills attributed to the weapon slot that was held when the shot went out.
+
+        Bookkeeping only. `kills` is the game's own cumulative counter, which ROLLS BACK on a checkpoint
+        respawn (measured: 133 rollbacks over 126 deaths in runs/probe_0-2_speed), so the same `max(0, delta)`
+        `compute_reward` uses is used here -- a rollback contributes nothing rather than a negative count. The
+        slot read is the PREVIOUS frame's, because that is the weapon that fired; a kill landing on the frame
+        of a switch is credited to the weapon that fired it, not to the one being drawn.
+        """
+        new_kills = max(0, cur.get("stats", {}).get("kills", 0) - prev.get("stats", {}).get("kills", 0))
+        if not new_kills:
+            return
+        held = (prev.get("player") or {}).get("weapon_slot", -1)
+        if 0 <= held < NUM_WEAPON_SLOTS:
+            self._behaviour["kills_slot_%d" % held] += new_kills
+
     def _note_behaviour(self, raw: dict[str, Any], command: dict[str, Any], raw_pitch_cmd: float, applied_mode: int = 0) -> None:
         """Per-episode diagnostics: is the agent shooting, is it shooting at anything, and does it turn toward enemies?
 
@@ -1498,9 +1627,27 @@ class UltrakillEnv(gym.Env):
         firing = "fire1" in command["buttons"] or "fire2" in command["buttons"]
         self._behaviour["firing"] += firing
         self._behaviour["yaw_sum"] += abs(command["look"][0])
+        # STAGE S0. Separate press counts for the three buttons the technique work reads (`firing` above is the
+        # OR of the two fire buttons and cannot tell them apart), and the slot channel §3.4 says is probably
+        # suppressing the agent's own fire. Counting only; nothing below is read by a reward or an observation.
+        buttons = command["buttons"]
+        for name in ("fire1", "fire2", "punch"):
+            if name in buttons:
+                self._behaviour["press_" + name] += 1
+        slot = int(command.get("slot", 0))
+        if slot:
+            self._behaviour["slot_press"] += 1
         player = raw.get("player")
         if not player:
             return
+        held = player.get("weapon_slot", -1)
+        if 0 <= held < NUM_WEAPON_SLOTS:
+            # `weapon_slot` is `GunControl.currentSlotIndex` (0-based) and is -1 until `GunControl` starts, so
+            # `slot_known` is the honest denominator for every per-slot share below.
+            self._behaviour["slot_known"] += 1
+            self._behaviour["held_slot_%d" % held] += 1
+            if slot:
+                self._behaviour["slot_same" if slot == held + 1 else "slot_switch"] += 1
         self._behaviour["pitch_steps"] += 1
         self._behaviour["pitch_sum"] += abs(player["pitch"])
         self._behaviour["pitch_signed_sum"] += player["pitch"]
@@ -1774,6 +1921,7 @@ class UltrakillEnv(gym.Env):
         self._steps_since_progress = 0
         self._wedge_run = 0
         self._slide_latch = 0
+        self._slot_cooldown = 0
         self._track_enemies(raw)
         if player and reloaded:
             # No checkpoint yet, so StatsManager.Restart reloaded the level and its counters started again. Keep
@@ -2081,6 +2229,29 @@ class UltrakillEnv(gym.Env):
         info["enemy_dist_mean"] = b["dist_sum"] / seen
         info["enemy_close_frac"] = b["close"] / steps  # nearest visible enemy within 5 m
         info["yaw_per_step_mean"] = b["yaw_sum"] / steps  # degrees turned per decision
+        # STAGE S0, the weapon channel (docs/superpowers/specs/2026-09-20-speedrun-tech.md §3.4 and stage S0).
+        # BOOKKEEPING ONLY, and in BOTH modes: a weapon slot is not a campaign idea. The denominator for the
+        # first three is every decision of the episode, which is the denominator §3.4's 76% was measured with
+        # (39,371 of 51,772 steps), so `slot_same_frac` is directly comparable to it.
+        info["slot_press_frac"] = b["slot_press"] / steps   # pressed any slot key
+        info["slot_same_frac"] = b["slot_same"] / steps     # ... the slot ALREADY HELD: the redraw
+        info["slot_switch_frac"] = b["slot_switch"] / steps  # ... a different slot
+        info["fire1_frac"] = b["press_fire1"] / steps
+        info["fire2_frac"] = b["press_fire2"] / steps
+        info["punch_frac"] = b["press_punch"] / steps
+        # What the sticky-slot lever suppressed. Both 0.0 on every run with `sticky_weapon_slot` False, which
+        # is every run today, so these two columns are how "the lever is live" is read off status.json.
+        info["slot_dropped_frac"] = b["slot_dropped"] / steps
+        info["slot_blocked_frac"] = b["slot_blocked"] / steps
+        # Time share per held slot, and kills per held slot. LISTS, so they travel to episodes.jsonl through
+        # EPISODE_LOG_RAW rather than through `_num` -- six columns each in status.json would be six columns
+        # nobody reads, while the single scalar below (how concentrated the held weapon was) is chartable.
+        known = max(1, b["slot_known"])
+        held_slots = [b["held_slot_%d" % i] for i in range(NUM_WEAPON_SLOTS)]
+        info["slot_held_frac"] = [n / known for n in held_slots]
+        info["slot_held_top_frac"] = max(held_slots) / known
+        info["slot_kills"] = [b["kills_slot_%d" % i] for i in range(NUM_WEAPON_SLOTS)]
+        info["slot_known_frac"] = b["slot_known"] / steps  # ... and how much of the episode had a known slot
         if self.cfg.mode == "campaign":
             # The level this episode RAN on: `info` is built in step() before SubprocVecEnv calls reset(), so a
             # switch episode's row still carries the level it played. Deliberately not in CAMPAIGN_INFO_KEYS,
