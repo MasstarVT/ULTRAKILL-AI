@@ -40,6 +40,17 @@ class TimeEntry:
     notes: str = ""
 
 
+def actions_note(deterministic: bool) -> str:
+    """How a recorded run chose its actions, for the notes cell. THE wording, so every writer agrees.
+
+    A row has to say this: the two modes are not the same policy. The action heads are deliberately held near
+    7 nats of entropy, so argmax is a policy nobody trained -- measured 2026-09-20 on the promoted 0-1
+    specialist, sampling completed 19 of 20 fresh runs and argmax 0 of 5. `post_times.py`'s own rows say
+    "training episode (sampled actions)" for the same reason.
+    """
+    return "deterministic (argmax) actions" if deterministic else "sampled actions"
+
+
 def valid_official_seconds(seconds) -> float | None:
     """THE predicate for "did the game really report an official time?": the time, or None.
 

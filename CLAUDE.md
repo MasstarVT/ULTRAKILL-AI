@@ -37,7 +37,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   rewrites `python/models/` continuously.
 - **Times**: `python scripts/post_times.py --run <run>` posts a level to `times.md` only when it beats the row
   already there (no game, idempotent); `--watch 600 --push` is the token-free watcher, which commits
-  `times.md` alone. `eval.py --record-times` is the deterministic counterpart. Instructions for the file's own
+  `times.md` alone. `eval.py --record-times` is the on-demand counterpart. Instructions for the file's own
   format are in an HTML comment at the bottom of `times.md`.
 
 ## Layout — one line each; file-by-file detail in `docs/layout.md`
@@ -53,7 +53,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - `python/scripts/` — `train.py`, `eval.py`, `games.py`, `campaign_driver.py` (the specialist driver),
   `supervise.py`, `mem_guard.py`, `full_run.py`, `specialists_status.py`, `poll_status.py`, `keep_best.py`,
   `post_times.py`, `dashboard.py`, `build_routes.py`, `campaign_check.py`, `skull_check.py`, `bridge_test.py`.
-- `python/tests/` — 30 no-game test files, ~774 named tests, about 3 minutes for the lot.
+- `python/tests/` — 32 no-game test files, ~823 named tests, about 3 minutes for the lot.
 - `python/configs/` — `specialists.yaml` (the specialist plan; **not** a training config),
   `campaign_gates_full.yaml` (the shared-run config it is pinned against), `campaign_0-1.yaml`,
   `cybergrind.yaml`, `il_records.yaml`, and the earlier campaign configs kept as rollbacks.
@@ -86,7 +86,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - Chain the promoted specialists over one game (never a trainer's port):
   `games.py launch --count 1 --monitor 1`, `python scripts/full_run.py --record-times`, `games.py stop`.
 - Eval one policy: `python scripts/eval.py models/specialists/Level_0-1.zip --level "Level 0-1" --episodes 10`
-  (`--record-times` to post the fastest completion).
+  (`--record-times` posts the fastest; campaign eval and `full_run.py` SAMPLE actions, `--deterministic` = argmax).
 - In-game checks on one private game: `python scripts/campaign_check.py --level "Level 0-1"` (check 5, the
   exit, is a known standing FAIL — exit code 1 is expected) and `python scripts/skull_check.py --port 47812 …`.
 - Route data, no game and safe beside a live run: `python scripts/build_routes.py --validate`, then

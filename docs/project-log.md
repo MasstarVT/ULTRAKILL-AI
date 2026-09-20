@@ -3420,3 +3420,46 @@ reset with them (system commit 79% → **66%**).
 - The Brutal (difficulty 4) switch has not been made, and making it mid-ladder would invalidate the baseline
   above. That is a lead decision, not an operator one.
 - The 0-2 death-weight experiment's 1.8M steps were NOT re-analysed per-leg; only the aggregate above.
+
+## 2026-09-20 -- Campaign evaluation samples its actions: argmax was scoring 0/5 on the promoted 0-1
+
+**The bug.** `scripts/eval.py` and `scripts/full_run.py` both defaulted to `deterministic=True` -- argmax --
+in their `model.predict` calls. Campaign policies are trained, promoted and timed on SAMPLED actions (every
+`times.md` row says `training episode (sampled actions)`) and their action heads are deliberately held near
+**7 nats** of entropy, so the most likely action is a policy nobody has ever measured.
+
+**Measured 2026-09-20 on a private game** (recordings in `python/runs/probe_0-1_record/`): the promoted
+`models/specialists/Level_0-1.zip` completed **19 of 20** sampled episodes and **0 of 5** deterministic ones.
+All five argmax episodes ended `stuck`, **two never left the spawn**, argmax picked **look mode 2 on 96%** of
+its decisions and hit **0.1% on target**. So every `full_run.py` chain and every `eval.py --record-times` of a
+campaign specialist was failing at the spawn, and had been since those scripts were written.
+
+**The fix** (scripts + tests + docs only; the live driver was not touched). One rule, `resolve_deterministic`
+in `scripts/eval.py`, imported by `full_run.py`: campaign mode samples unless `--deterministic` is given,
+**Cyber Grind keeps its old argmax default** because nothing was measured to say otherwise, and `--stochastic`
+still parses -- a no-op in campaign mode, still the way to sample in Cyber Grind -- so documented commands
+keep running. Both flags in one command is an argparse error rather than a silent winner. `full_run.play_level`
+now defaults to `deterministic=False`, and both scripts print the mode they are about to run in.
+
+**The row has to say which mode produced the time.** `ultrakill_ai.times.actions_note` is the single wording
+(`sampled actions` / `deterministic (argmax) actions`); `eval.py`'s note is now
+`N/M eval runs completed (sampled actions)` and `full_run.py`'s `full run, one specialist per level (sampled
+actions)`. A sampled time and an argmax time are not comparable, and a leaderboard row that does not name its
+mode cannot be read later.
+
+**Tests.** New `python/tests/test_eval.py` (7 tests: the `resolve_deterministic` table, the flags, that
+`rollout` hands the chosen mode to every `predict` call, and the recorded note) plus four more in
+`test_full_run.py` (`play_level`'s default, the flags, the posted note). They fail on the previous commit --
+`resolve_deterministic`, `build_parser`, `rollout` and `actions_note` did not exist, and `play_level` defaulted
+to True. Whole no-game suite, one file at a time from `python/`: **32 files, 823 named tests, all green**
+(commit charge 70% throughout; `mem_guard.py --dry-run` checked before starting).
+
+### Not verified (this entry)
+
+- **No real eval was run**: all twelve games belong to the live driver, so the fix is proven against a stub
+  env, `FakeLevel` and a temp copy of `times.md`, never against the game. The 19/20 vs 0/5 numbers above are
+  the earlier probe's, not a re-measurement.
+- The next chained `full_run.py` on a private game is what confirms the specialists actually complete their
+  levels end to end; nothing here proves the chain's total.
+- Cyber Grind's argmax default is untouched and unmeasured -- it may well be wrong there too, for the same
+  reason, but no one has recorded it.

@@ -7,9 +7,15 @@ plus the total. A level with no specialist yet is SKIPPED and reported -- the ru
 a hole in it, and the table says exactly where.
 
     python scripts/games.py launch --count 1 --monitor 1
-    python scripts/full_run.py                       # deterministic actions, the whole order
-    python scripts/full_run.py --levels "Level 0-1" "Level 0-2" --stochastic --episodes 2
+    python scripts/full_run.py                       # sampled actions, the whole order
+    python scripts/full_run.py --levels "Level 0-1" "Level 0-2" --episodes 2
     python scripts/games.py stop
+
+**Actions are SAMPLED, not argmax** (since 2026-09-20, `eval.resolve_deterministic` has the measurement):
+every specialist here is a campaign policy, trained and promoted on sampled actions with its action heads
+near 7 nats of entropy, so argmax is a policy nobody measured -- 0-1's promoted specialist completed 0 of 5
+argmax episodes against 19 of 20 sampled. `--deterministic` opts back in; `--stochastic` is kept as a no-op
+alias so documented commands still run.
 
 **One game, one port.** Never run this against a port a trainer is using: the bridge drops its current client
 when a new one connects, so connecting would kill that worker's run.
@@ -45,9 +51,10 @@ import yaml  # noqa: E402
 
 from campaign_driver import (  # noqa: E402
     COMPLETE, load_plan, specialist_path, stage_config_path, stage_run_name)
+from eval import resolve_deterministic  # noqa: E402  -- one rule for what `predict` gets, shared with eval.py
 from ultrakill_ai.campaign import ExplorationArchive, safe_name  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
-from ultrakill_ai.times import TimeEntry, format_time, record_file  # noqa: E402
+from ultrakill_ai.times import TimeEntry, actions_note, format_time, record_file  # noqa: E402
 
 TIMES_MD = ROOT.parent / "times.md"
 
@@ -147,11 +154,13 @@ def generation(date: str | None = None) -> str:
 
 
 def post_results(times_md: Path, results: list[LevelResult], *, gen: str | None = None,
-                 record=record_file) -> list[str]:
+                 deterministic: bool = False, record=record_file) -> list[str]:
     """Posts every completed level's official time through `ultrakill_ai.times`. Returns one line per post.
 
     The helper itself decides whether the leaderboard row moves (only a faster time replaces one); the
     generation history takes every row either way, which is the point of recording a whole chained run.
+    `deterministic` is what the chain actually played with, and the note says so -- the two action modes are
+    not the same policy, so a row that did not name its mode would not be comparable with the one above it.
     """
     gen = gen or generation()
     posted = []
@@ -161,7 +170,7 @@ def post_results(times_md: Path, results: list[LevelResult], *, gen: str | None 
         record(times_md, TimeEntry(
             level=r.level, seconds=r.seconds, rank=r.rank or "", generation=gen,
             difficulty=r.difficulty, date=time.strftime("%Y-%m-%d"), kills=r.kills, deaths=r.deaths,
-            notes="full run, one specialist per level"))
+            notes="full run, one specialist per level (%s)" % actions_note(deterministic)))
         posted.append("%s %s rank %s" % (r.level, format_time(r.seconds), r.rank or "-"))
     return posted
 
@@ -218,9 +227,12 @@ def load_archive(env: UltrakillEnv, level: str, cwd: Path, port: int, mode: str 
     return len(env.archive.counts)
 
 
-def play_level(level: str, env, model, *, deterministic: bool = True, max_steps: int = 200_000) -> LevelResult:
+def play_level(level: str, env, model, *, deterministic: bool = False, max_steps: int = 200_000) -> LevelResult:
     """One episode of one level with one specialist. The env and the model are passed in, so the offline test
-    drives this same function against a fake level and a stub policy."""
+    drives this same function against a fake level and a stub policy.
+
+    `deterministic` defaults to False -- SAMPLED actions, the way every specialist was trained and promoted.
+    See the module docstring and `eval.resolve_deterministic` for what argmax measured instead."""
     obs, _ = env.reset()
     state, start = None, np.ones((1,), dtype=bool)
     info: dict = {}
@@ -251,21 +263,34 @@ def best_of(results: list[LevelResult]) -> LevelResult | None:
     return min(completed, key=lambda r: r.seconds) if completed else None
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--plan", default="configs/specialists.yaml")
     ap.add_argument("--models-dir", default="models")
     ap.add_argument("--levels", nargs="+", help="only these levels, in this order (default: the plan's order)")
     ap.add_argument("--port", type=int, default=47800, help="the ONE game's bridge port; never a trainer's")
-    ap.add_argument("--stochastic", action="store_true", help="sample actions instead of taking the most likely")
+    actions = ap.add_mutually_exclusive_group()
+    actions.add_argument("--deterministic", action="store_true",
+                         help="take the most likely action (argmax) instead of sampling; NOT how these "
+                              "specialists were trained or promoted (0-1: 0/5 against 19/20, 2026-09-20)")
+    actions.add_argument("--stochastic", action="store_true",
+                         help="no-op alias: sampling is the default here (kept so older commands still run)")
     ap.add_argument("--episodes", type=int, default=1, help="attempts per level; the fastest completion is kept")
     ap.add_argument("--record-times", action="store_true", help="post each completed level to times.md")
     ap.add_argument("--times", default=str(TIMES_MD))
     ap.add_argument("--json", help="write the results to this file as JSON")
+    return ap
+
+
+def main() -> None:
+    ap = build_parser()
     a = ap.parse_args()
 
     from stable_baselines3 import PPO
 
+    # Everything chained here is a campaign specialist, so this is "sample" unless --deterministic says argmax.
+    deterministic = resolve_deterministic("campaign", deterministic=a.deterministic, stochastic=a.stochastic)
+    print("actions: %s" % actions_note(deterministic))
     cwd = Path.cwd()
     plan = load_plan(a.plan)
     levels = a.levels or plan.order
@@ -284,7 +309,7 @@ def main() -> None:
             print("%s: %s (%s stage, %d exploration cells)"
                   % (level, model_path.name, mode, cells), flush=True)
             for _ in range(max(1, a.episodes)):
-                result = play_level(level, env, model, deterministic=not a.stochastic)
+                result = play_level(level, env, model, deterministic=deterministic)
                 print("  %s time=%s kills=%d deaths=%d end=%s"
                       % ("completed" if result.completed else "did not finish",
                          format_time(result.seconds) if result.seconds is not None else "-",
@@ -300,7 +325,7 @@ def main() -> None:
     if a.json:
         Path(a.json).write_text(json.dumps([dataclasses.asdict(r) for r in results], indent=2), encoding="utf-8")
     if a.record_times:
-        posted = post_results(Path(a.times), results)
+        posted = post_results(Path(a.times), results, deterministic=deterministic)
         for line in posted:
             print("posted", line)
         if not posted:

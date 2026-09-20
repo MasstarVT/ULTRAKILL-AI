@@ -553,6 +553,8 @@ and check `docs/project-log.md` for anything later.
   `--record-times` posts each completed level through `ultrakill_ai.times` under the generation
   `specialists@<date>`; the leaderboard row only moves when the time is faster, which is that helper's own rule.
   One game, one port, and **never a port a trainer is using** — the bridge drops its current client.
+  Actions are **sampled**, the way every specialist was trained and promoted (`eval.resolve_deterministic`,
+  2026-09-20); `--deterministic` opts in to argmax, `--stochastic` is a no-op alias, and the note says which ran.
 - `python/scripts/specialists_status.py`: the driver's state in one screen (stage, steps into it, fresh rate and
   window, best time, how much settle is left, the promoted specialists table, what is left). Read-only: it opens
   files, never a port, so it is safe beside the driver and beside a trainer.
@@ -566,7 +568,12 @@ and check `docs/project-log.md` for anything later.
   port is missing, and **another run's trainer never matched or killed** (no game, no real process, no real clock).
 - `python/tests/test_full_run.py`: the chaining logic against an injected `play` (order, skips, the total, the
   table, the times.md posting) and `play_level` itself against `test_campaign_env.FakeLevel` — a completed level
-  reports an official time, a truncated one reports none and invents nothing (no game needed).
+  reports an official time, a truncated one reports none and invents nothing, and **every decision is sampled
+  unless `--deterministic` says otherwise**, with the posted note naming the mode (no game needed).
+- `python/tests/test_eval.py` (2026-09-20): `eval.py`'s action mode — `resolve_deterministic`'s whole table
+  (campaign samples, Cyber Grind keeps argmax, `--deterministic` wins, both flags at once is refused), that
+  `rollout` hands that mode to every `predict` call, and that the `--record-times` note names it. Runs against
+  a stub env, a recording policy and a temp copy of `times.md` (no game, no policy, no port).
 - `python/tests/test_specialists_config.py`: pins `configs/specialists.yaml` equal to `campaign_gates_full.yaml`
   — the order is that config's levels list, every env setting that is not a curriculum key is identical, every
   reward weight is identical, the train section is identical bar `run_name`/`timesteps`, every key is a real

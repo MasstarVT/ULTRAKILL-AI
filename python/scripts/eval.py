@@ -3,10 +3,12 @@
     python scripts/eval.py models/cybergrind_ppo/latest.zip --episodes 3 --realtime
     python scripts/eval.py models/campaign_ppo/best.zip --level "Level 0-1" --episodes 10 --record-times
 
-Campaign evaluation always starts from a fresh level load with real deaths. It reads the first training game's
-exploration counts (the policy was trained with them as inputs) but never writes them back, and never writes the
-training runs' best-run files. `--record-times` adds the fastest completion to the repo-root times.md
-(generation history, plus the leaderboard when it is a record).
+Campaign evaluation always starts from a fresh level load with real deaths, and **samples its actions**, which
+is how these policies are trained, promoted and timed (`--deterministic` is the opt-in to argmax; see
+`resolve_deterministic`). It reads the first training game's exploration counts (the policy was trained with
+them as inputs) but never writes them back, and never writes the training runs' best-run files.
+`--record-times` adds the fastest completion to the repo-root times.md (generation history, plus the
+leaderboard when it is a record), with a note saying which action mode produced it.
 
 Point it at the run whose action space the model has: a campaign checkpoint from before the look modes has 11
 action dimensions, and its actions still decode (look mode 0, free look), but scripts/add_look_mode.py is what
@@ -31,12 +33,53 @@ import yaml  # noqa: E402
 
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS, ExplorationArchive, safe_name  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
-from ultrakill_ai.times import TimeEntry, format_time, record_file  # noqa: E402
+from ultrakill_ai.times import TimeEntry, actions_note, format_time, record_file  # noqa: E402
 
 TIMES_MD = Path(__file__).resolve().parents[2] / "times.md"
 
 
-def report_campaign(args: argparse.Namespace, level: str, model, results: list[tuple[float, dict]]) -> None:
+def resolve_deterministic(mode: str, *, deterministic: bool = False, stochastic: bool = False) -> bool:
+    """The `deterministic=` that `model.predict` gets: True takes the most likely action, False SAMPLES one.
+
+    **Campaign evaluation samples by default** (since 2026-09-20). These policies are trained and promoted on
+    sampled actions -- every `times.md` row says "sampled actions" -- and their action heads are deliberately
+    held near 7 nats of entropy, so argmax is not the policy that was measured. On a private game on
+    2026-09-20 the promoted `Level_0-1.zip` completed 19 of 20 sampled episodes and 0 of 5 deterministic ones:
+    all five ended "stuck", two never left the spawn, argmax picked look mode 2 on 96% of its decisions and
+    hit 0.1% on target (`runs/probe_0-1_record/`). So a `full_run.py` chain or `eval.py --record-times` of a
+    campaign specialist used to fail at the spawn.
+
+    Cyber Grind keeps its old default -- argmax, with `--stochastic` opting in to sampling -- because nothing
+    was measured to say otherwise. `--deterministic` is the explicit opt-in either way and wins.
+    """
+    if deterministic:
+        return True
+    if stochastic:
+        return False
+    return mode != "campaign"
+
+
+def rollout(env, model, *, deterministic: bool) -> tuple[float, int, dict]:
+    """One episode. Returns (total reward, decisions, the final info).
+
+    Extracted so a no-game test can check that the chosen action mode is what `predict` actually receives.
+    """
+    obs, _ = env.reset()
+    state, start = None, np.ones((1,), dtype=bool)
+    total, steps = 0.0, 0
+    while True:
+        action, state = model.predict(obs, state=state, episode_start=start, deterministic=deterministic)
+        start = np.zeros((1,), dtype=bool)
+        obs, reward, terminated, truncated, info = env.step(action)
+        total += reward
+        steps += 1
+        if terminated or truncated:
+            break
+    return total, steps, info
+
+
+def report_campaign(args: argparse.Namespace, level: str, model, results: list[tuple[float, dict]], *,
+                    deterministic: bool = False, times_md: Path = TIMES_MD, record=record_file) -> None:
     """Completion summary for a campaign eval, and the times.md entry for its fastest completion.
 
     `level` is read from the env, never from the config: `--record-times` writes a row only a FASTER time can
@@ -63,21 +106,33 @@ def report_campaign(args: argparse.Namespace, level: str, model, results: list[t
         date=time.strftime("%Y-%m-%d"),
         kills=best["kills"],
         deaths=best["deaths"],
-        notes=f"{completions}/{len(results)} eval runs completed",
+        # The action mode belongs in the row: a sampled time and an argmax time are two different policies.
+        notes=f"{completions}/{len(results)} eval runs completed ({actions_note(deterministic)})",
     )
-    record_file(TIMES_MD, entry)
-    print(f"recorded {format_time(entry.seconds)} ({entry.generation}) in {TIMES_MD}")
+    record(times_md, entry)
+    print(f"recorded {format_time(entry.seconds)} ({entry.generation}) in {times_md}")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("model", help="path to a saved .zip")
     parser.add_argument("--algo", choices=["ppo", "rppo"], default="ppo")
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--realtime", action="store_true", help="normal speed with sound")
-    parser.add_argument("--stochastic", action="store_true", help="sample actions instead of taking the most likely")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--deterministic", action="store_true",
+                         help="take the most likely action (argmax) instead of sampling; NOT how a campaign "
+                              "policy was trained or timed (0/5 completions against 19/20 sampled, 2026-09-20)")
+    actions.add_argument("--stochastic", action="store_true",
+                         help="sample actions: the campaign default since 2026-09-20, so there it changes "
+                              "nothing; still the opt-in for Cyber Grind, whose default stays argmax")
     parser.add_argument("--level", help='campaign scene, e.g. "Level 0-1" (default: the level in env_config.yaml next to the model)')
     parser.add_argument("--record-times", action="store_true", help="campaign: add the fastest completion to times.md")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     cfg_path = Path(args.model).parent / "env_config.yaml"
@@ -119,6 +174,8 @@ def main() -> None:
         from stable_baselines3 import PPO as cls
     model = cls.load(args.model, device="cpu")
 
+    deterministic = resolve_deterministic(cfg.mode, deterministic=args.deterministic, stochastic=args.stochastic)
+    print(f"actions: {actions_note(deterministic)}")
     env = UltrakillEnv(cfg)
     if cfg.mode == "campaign":
         # The last 9 campaign inputs are the game's visit counts, which in training come from thousands of earlier
@@ -131,17 +188,7 @@ def main() -> None:
     results = []
     try:
         for ep in range(args.episodes):
-            obs, info = env.reset()
-            state, start = None, np.ones((1,), dtype=bool)
-            total, steps = 0.0, 0
-            while True:
-                action, state = model.predict(obs, state=state, episode_start=start, deterministic=not args.stochastic)
-                start = np.zeros((1,), dtype=bool)
-                obs, reward, terminated, truncated, info = env.step(action)
-                total += reward
-                steps += 1
-                if terminated or truncated:
-                    break
+            total, steps, info = rollout(env, model, deterministic=deterministic)
             if cfg.mode == "campaign":
                 # The difficulty the game actually read this run: the campaign block reports the override, if any.
                 info = dict(info, difficulty=(env._raw.get("campaign") or {}).get("difficulty", cfg.difficulty))
@@ -160,7 +207,7 @@ def main() -> None:
 
     print(f"mean reward {np.mean([r for r, _ in results]):.1f} over {len(results)} episodes")
     if cfg.mode == "campaign":
-        report_campaign(args, env.level, model, results)
+        report_campaign(args, env.level, model, results, deterministic=deterministic)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ the campaign env tests use. Nothing here opens a port or writes into the repo.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import shutil
 import sys
@@ -173,13 +175,17 @@ def test_a_speed_stage_specialist_is_played_with_its_own_runs_settings():
 
 
 class WalkForward:
-    """A policy that always walks forward, with `PPO.predict`'s signature."""
+    """A policy that always walks forward, with `PPO.predict`'s signature.
+
+    It also records the action mode it was asked for, which is what pins the 2026-09-20 fix in place."""
 
     def __init__(self):
         self.calls = 0
+        self.modes: list[bool] = []
 
     def predict(self, obs, state=None, episode_start=None, deterministic=True):
         self.calls += 1
+        self.modes.append(deterministic)
         return forward(), None
 
 
@@ -214,6 +220,57 @@ def test_play_level_reports_a_level_that_did_not_finish_without_inventing_a_time
             env.close()
         assert not result.completed and result.seconds is None
         assert result.end_reason == "max_steps"
+
+
+def test_play_level_samples_actions_the_way_the_specialists_were_trained():
+    """Measured 2026-09-20: 0-1's promoted specialist completes 19/20 sampled and 0/5 with argmax, because it
+    is trained and promoted on sampled actions with ~7 nats of entropy in its heads. So the chain samples."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for asked, expected in ((None, False), (False, False), (True, True)):
+            env = fake_env(Path(tmp))
+            policy = WalkForward()
+            try:
+                kwargs = {} if asked is None else {"deterministic": asked}
+                full_run.play_level(LEVEL, env, policy, **kwargs)
+            finally:
+                env.close()
+            assert policy.modes and set(policy.modes) == {expected}, \
+                "every decision of the episode is made in the mode the chain chose"
+
+
+def test_the_action_flags_parse_and_cannot_both_be_given():
+    parser = full_run.build_parser()
+    a = parser.parse_args([])
+    assert a.deterministic is False and a.stochastic is False
+    assert full_run.resolve_deterministic("campaign", deterministic=a.deterministic,
+                                          stochastic=a.stochastic) is False, "sampling is the default"
+    opted_in = parser.parse_args(["--deterministic"])
+    assert full_run.resolve_deterministic("campaign", deterministic=opted_in.deterministic,
+                                          stochastic=opted_in.stochastic) is True
+    # --stochastic is kept as a no-op alias so the documented command still runs.
+    alias = parser.parse_args(["--levels", "Level 0-1", "--stochastic", "--episodes", "2"])
+    assert full_run.resolve_deterministic("campaign", deterministic=alias.deterministic,
+                                          stochastic=alias.stochastic) is False
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            parser.parse_args(["--deterministic", "--stochastic"])
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("asking for both modes at once must be refused, not silently resolved")
+
+
+def test_the_posted_row_says_which_action_mode_played_the_chain():
+    with tempfile.TemporaryDirectory() as tmp:
+        times = Path(tmp) / "times.md"
+        shutil.copy2(TIMES_MD, times)
+        results = [LevelResult(level="Level 0-1", completed=True, seconds=1.25, rank="P", kills=40, deaths=0)]
+        assert full_run.post_results(times, results, gen="specialists@2026-09-20") == \
+            ["Level 0-1 00:01.250 rank P"]
+        assert "one specialist per level (sampled actions)" in times.read_text(encoding="utf-8")
+        full_run.post_results(times, [LevelResult(level="Level 0-1", completed=True, seconds=1.2, rank="P")],
+                              gen="specialists@2026-09-20", deterministic=True)
+        assert "one specialist per level (deterministic (argmax) actions)" in times.read_text(encoding="utf-8")
 
 
 def test_the_chain_end_to_end_over_the_fake_level():
