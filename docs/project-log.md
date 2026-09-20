@@ -3463,3 +3463,121 @@ to True. Whole no-game suite, one file at a time from `python/`: **32 files, 823
   levels end to end; nothing here proves the chain's total.
 - Cyber Grind's argmax default is untouched and unmeasured -- it may well be wrong there too, for the same
   reason, but no one has recorded it.
+
+## 2026-09-20 — Speedrun technique as capability: the spec, and the three code facts that reshaped it
+
+**The instruction**, verbatim: *"make sure the bot knows about the coin rocket jumping and all the other ways
+people speedrun these games to make the time go by faster"*. Interpretation agreed by the lead and written
+into the spec: **still no recorded human routes and no demonstrations**, but human **knowledge of techniques**
+imported as **capability** — actions, observations, and a safe way to make discovery likely.
+
+Spec: `docs/superpowers/specs/2026-09-20-speedrun-tech.md`. **Docs only — nothing live was touched**: no
+socket to 47800-47811, no game or driver started or stopped, no mod build, nothing written to `python/models`
+or `python/runs`. Research ran against `decompiled/`, the installed `Unity.InputSystem.dll` and
+`BepInEx.Preloader.dll` (via the repo's own `.tools/ilspycmd`), and a streamed read of the live
+`status.json` / `episodes.jsonl`.
+
+**Three findings reshaped the design after a skeptic pass, and all three were re-verified against the code
+before being written down.**
+
+1. **`TrySSJ` OVERWRITES velocity, it does not add** — `rb.velocity = velocityAfterSlide + direction * num5`,
+   and `velocityAfterSlide` is written only by `StopSlide`. `Jump()` calls `StopSlide()` *before* `TrySSJ`, so
+   the jump variant is safe. **`WallJump` never calls `StopSlide`** and reaches `TrySSJ` through the
+   `sliding ||` disjunct — so a one-frame wall-SSJ macro lands on a **stale** `velocityAfterSlide` from the
+   previous slide, in that old direction: a wall SSJ at 80 u/s can come out at ~61 u/s pointing elsewhere.
+   **A speed loss disguised as a technique.** The wall macro must be two frames, releasing slide on the first.
+2. **The SSJ window is real wall-clock time, not game time.** `jumpTimestamp`/`slideTimestamp` come from
+   `ctx.time`, which `InputRuntime` sources from the native clock; `Time.captureDeltaTime` does not touch it.
+   This **kills the "run at `fixed_fps` 60 / `frameskip` 4 and land bucket 2 for free" fallback** — raising the
+   capture rate changes game time per frame, not the real interval between two queued events. Explicit
+   timestamps are the only route.
+3. **The Input System silently DROPS a state event whose timestamp precedes the device's last**, and
+   `Keyboard` has no state callbacks so the drop is unconditional. Queue a jump at `now + 0.012` and the *next*
+   frame's ordinary event can carry a lower timestamp and vanish — **eating a whole frame of the agent's
+   input**, fleet-wide, looking exactly like a policy regression. `ActionInjector` needs a monotonic timestamp
+   cursor. This was missing from the first draft entirely.
+
+**The break got about four times smaller.** Only SSJ and wall-SSJ have windows shorter than one decision;
+`core_nuke`, `rocket_down` and `coin_rocket` are ordinary multi-decision sequences (five, three, ~seven) whose
+real blockers are variant selection and projectile observations. Both surviving macros fit inside the existing
+2-frame step, which deletes the whole frame-scripting apparatus — `obs["frames"]`, `env._frames`, a
+`time_scale` in `compute_reward`, frame-denominated `stuck`/`max_steps` — and its test. The principle written
+into the spec: **macro what is unreachable TIMING; never macro what is unreachable AIM**, because a mod that
+steers the crosshair onto a moving core is auto-aim, not technique knowledge. (The game's own `autoAim` and
+`majorAssist` prefs default false and the mod does not patch `GetBool`; that line has been kept cleanly so far.)
+
+**Two corrections to the folklore, from the code.** A plain rocket jump is **damage-free and does not decay** —
+`harmlessExplosion` has damage 0, so `rocketExplosion` is never set and the `100/((rocketJumps+3)/3)` ladder is
+**dead code for player rockets**; it falls through to a flat 200 launch. And **dash i-frames do protect against
+explosion self-damage** — `GetHurt` returns immediately when `invincible && layer == 15`, and `Dodge()` sets
+layer 15 while `boostLeft > 0`. "Dash, then detonate" is damage-free by construction.
+
+**The measurement that reordered the plan.** Live at 29.01M steps: median 158.6 s, best 81.5 s, `completed`
+0.89, `gates_reached` 9.36/10, `wedged_steps` 0, episode 2,720 decisions. Undiscounted, the clock-sensitive
+share of gross positive reward is `(72.68 + 54.41) / 473.39` = **26.8 %**. **Discounted at episode start it is
+about 6 %**: at `gamma` 0.998 the horizon is 500 decisions (33 s) against a 2,720-decision episode, so
+`0.998^2720 = 0.0043` and a 72.68 completion bonus is worth **0.31** at t=0. At 0.999 it is 4.78; at 0.9995,
+18.64. **The agent is not ignoring the clock because the weights are wrong — the finish line is four horizons
+away.** Gamma goes first, and in **two steps** rather than one, because `approx_kl` 0.0251 is already close to
+`target_kl` 0.03 with `explained_variance` 0.57.
+
+**The entropy alarm in the first draft was backwards.** `EntropyFloorCallback` is one-directional above its
+band: over `floor + 1.0` it only decays `ent_coef` back towards `base`, **never below**, and `ent_coef_live` is
+already at `base`. Not re-basing `ent_floor` would not "loosen every head" — decaying `ent_coef` makes a policy
+*sharper*. It is hygiene, and the number must be **measured** on the migrated model, not guessed. The nats were
+also wrong: the widening adds **1.3986**, not 1.502.
+
+**The reward gate was perversely signed** and is now gated on the mod-reported SSJ bucket instead. Because
+`TrySSJ` overwrites with `velocityAfterSlide + bonus` and `velocityAfterSlide` floors at 24, a
+"speed rose by >= 12" gate **pays from a standstill (24 -> 48.75) and stops paying at 90 u/s** (clamped to
+100, under a 102 bar) — it would have rewarded stopping and re-accelerating.
+
+**Also recorded**, each verified: the mod already binds `hook` and `change_fist` and Python never sends them;
+`heavy_fall`, `weapon_variation` and `slot_counts` are already on the wire and `pack_observation` throws all
+three away; `Punch.BlastCheck()` requires `heldAction.IsPressed()` and `punch` is a TapButton, so **the
+Knuckleblaster blast wave can never fire today**; `Railcannon` fires on `WasPerformedThisFrame` while `fire1`
+is a HoldButton, so holding it across steps fires once; `add_look_mode.carry_optimizer` pads only along axis 0
+and the new first layer grows along axis 1 (it **fails closed** into a silent fresh optimizer, so the caller
+must log loudly); `probe_rollout.py`'s `TARGET_SLICE` uses negative indices and will read the wrong slots after
+any append; and there is **no `VecNormalize`** in the project's own code, so the usual observation-widening
+killer does not exist here.
+
+**Stage list** (S0 measure, S1 gamma 0.999, S2 gamma 0.9995, S3 `level_complete` 300, S4 halve the milestone
+pile, S5 sticky slot, S6 private-game verification, **S7 the one break**, S8 tech bonus, S9 variant, S10 own
+projectiles + hook, S11 hazard rays, S12 Brutal). S1-S5 need no pause, no DLL and no migration. S4 moved ahead
+of the mobility work because more mobility raises the *rate* at which `novelty` pays, and novelty is not
+bounded by geometry the way `gate_approach` is.
+
+### Open, needing the lead or the user
+
+1. Two-step gamma ladder instead of the planned single move to 0.9995?
+2. Is S4 (halving `gate`, `gate_approach`, `checkpoint`, `door_unlock`, `novelty`) approved as its own round?
+   It is the biggest lever on the reward mix and weakens the ladder that reached 0.89 completion.
+3. Is the private-game test (S6) approved beside the live fleet — one extra ~1.2 GB game on 47812 via an
+   isolated `BepInEx-test` tree, under 30 minutes?
+4. Is "macro timing, never macro aim" the right line? It defers `core_nuke` and `coin_rocket` from S7 to S10.
+5. Is the ~15-25 minute full pause at S7 acceptable, and wanted at a rung boundary?
+6. **`coin_rocket` — the technique the user named — is scheduled last and is honestly low value on 0-1** (little
+   verticality; a one-weapon rocket jump does the same job). Kept for the vertical 4-x/5-x levels. Confirm that
+   answers the instruction, or say it should be pulled forward.
+
+### Not verified (this entry)
+
+- **Nothing in this design has run in game.** No macro, no observation, no migration has been executed.
+- `walkSpeed` and `Time.fixedDeltaTime` are **serialized**, so every u/s figure in the spec is derived
+  (750 x 0.008 reproduces the wiki's 16.5 / 49.5 / 24.75 exactly, and the probe's max horizontal speed 99.64
+  confirms the 100 clamp), never read.
+- Whether an explicit `QueueStateEvent` timestamp reaches `ctx.time` unchanged on Unity 2022.3.29 Mono, and
+  what `InputSystem.settings.updateMode` is. S6 exists to settle both; `TrySSJ`'s own `ssjIndicator` pref
+  prints the bucket and the exact `+Nu/s`, which turns the question into a readout.
+- **The 76 % equipped-slot press rate is from a probe of the PROMOTED `Level_0-1.zip`, not the live policy**,
+  and `status.json` carries no slot histogram to corroborate it. S0 exists to re-measure it; the size of S5's
+  claimed gain rests on that number.
+- The self-damage of a plain (non-`ultrabooster`) beam detonating a core, and whether `SelectVariant1/2/3` have
+  default keybindings (fallback: `GunControl.SwitchWeapon` is public).
+- **No public text describes the 19.798 s inbounds 0-1 route** — all top-12 run comments are one word or
+  moderator notes, and no route was imported from any of them. speedrun.com's prose pages are Cloudflare-403.
+- The honest ceiling, stated in the spec rather than buried: the agent travels roughly an order of magnitude
+  further than the 195 m straight-line distance to the exit. **These techniques multiply speed along that path;
+  they do not shorten it.** Rungs at 120 s and maybe 100 s are in reach; 60/42/30/25 s need a shorter route,
+  which a memoryless 512x512 MLP cannot represent, and nothing here addresses that.

@@ -210,6 +210,6 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - `docs/il-records.md` — human individual-level speedrun records, the speed targets (`configs/il_records.yaml`
   is the machine-readable copy).
 - `docs/notes/2026-09-18-memory.md` — the memory investigation (owned by another engineer).
-- `docs/superpowers/specs/` — approved design specs (campaign foundation, gates/un-wedge/look modes,
-  multi-level and skull gates, ladder patience and exit guard, route fallback and boss levels).
-  `docs/superpowers/plans/` — the implementation plans and integration checklists.
+- `docs/superpowers/specs/` — approved design specs (campaign foundation, gates/un-wedge/look modes, ladder
+  patience, route fallback and boss levels, speed stages, and **`2026-09-20-speedrun-tech.md`** — human
+  speedrun technique as capability). `docs/superpowers/plans/` — implementation plans and checklists.
