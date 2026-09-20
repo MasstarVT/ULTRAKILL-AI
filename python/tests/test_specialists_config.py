@@ -89,6 +89,8 @@ def test_every_plan_setting_is_a_real_field():
     assert not sorted(set(p.env) - names), sorted(set(p.env) - names)
     reward_names = {f.name for f in dataclasses.fields(RewardConfig)}
     assert not sorted(set(p.env["rewards"]) - reward_names)
+    # ... including a SPEED stage's own weights, which are merged over those and go down the same from_dict.
+    assert not sorted(set(p.speed_rewards) - reward_names)
     # And the stage knobs: load_plan refuses one it does not know rather than defaulting it.
     text = PLAN.read_text(encoding="utf-8")
     assert "target_rate" in text and "settle_steps" in text and "max_steps_per_stage" in text
@@ -161,8 +163,14 @@ def test_the_hold_line_sits_in_front_of_every_stage_past_0_3():
     assert all(s.level not in ("Level 0-1", "Level 0-2", "Level 0-3") for s in p.stages[hold:])
 
 
-def test_a_speed_stage_only_adds_the_bonus_switch_to_the_env():
-    """No observation, action or reward-weight change, so the level's own specialist loads into it unchanged."""
+def test_a_speed_stage_only_adds_the_bonus_switch_and_the_death_weight():
+    """No observation or action change, so the level's own specialist loads into it unchanged.
+
+    ONE reward weight moves, and only for this kind: `death` 5.0 -> 12.0 (2026-09-20). A reward weight is not
+    a policy parameter -- it is a scalar read into `RewardConfig` at env construction -- so every existing
+    checkpoint still loads. The derivation is in configs/specialists.yaml beside the key and in
+    docs/project-log.md; the farm bounds are pinned in tests/test_speed_death_weight.py.
+    """
     p = plan()
     complete = campaign_driver.stage_config(p, "Level 0-2")["env"]
     speed = campaign_driver.stage_config(p, "Level 0-2", kind=campaign_driver.SPEED)["env"]
@@ -173,15 +181,22 @@ def test_a_speed_stage_only_adds_the_bonus_switch_to_the_env():
     # complete stage's 0.2 a checkpoint respawn would pay the full unscaled weight for the outcome the stage
     # does not measure -- an unobservable 4x split in the terminal reward.
     changed = {k for k in set(speed) & set(complete) if speed[k] != complete[k]}
-    assert changed == {"fresh_start_prob"}
+    assert changed == {"fresh_start_prob", "rewards"}
     assert speed["fresh_start_prob"] == 1.0 and complete["fresh_start_prob"] == 0.2
+    # ... and inside `rewards`, exactly one weight, by the plan's `speed.rewards:` block and nothing else.
+    assert set(speed["rewards"]) == set(complete["rewards"]), "no weight appears or disappears"
+    moved = {k for k in speed["rewards"] if speed["rewards"][k] != complete["rewards"][k]}
+    assert moved == {"death"} == set(p.speed_rewards)
+    assert (speed["rewards"]["death"], complete["rewards"]["death"]) == (12.0, 5.0)
     assert {k: v for k, v in speed.items() if k not in added | changed} == \
         {k: v for k, v in complete.items() if k not in changed}
     cfg = EnvConfig.from_dict(speed)
     assert cfg.speed_bonus is True and cfg.speed_target_seconds == 0.0, "0 = read the level's own S-rank time"
     assert cfg.fresh_start_prob == 1.0
     assert cfg.speed_target_scale == 1.0, "the plan's target_scale (§8b), applied in the env and nowhere else"
-    assert cfg.rewards == EnvConfig.from_dict(complete).rewards, "every reward weight is the complete stage's"
+    base = EnvConfig.from_dict(complete).rewards
+    assert dataclasses.replace(cfg.rewards, death=base.death) == base, \
+        "every reward weight but `death` is the complete stage's"
     env = UltrakillEnv(cfg)
     try:
         assert env.observation_space.shape == (479,), "the same policy shape: an existing checkpoint loads"

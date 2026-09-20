@@ -132,6 +132,33 @@ speed:
   # Applied in exactly ONE place -- the env -- so the reward and the promotion rule cannot drift apart; a
   # `targets:` override above is a decision already made and is NOT scaled.
   target_scale: 1.0
+  # A SPEED STAGE'S OWN REWARD WEIGHTS (2026-09-20). Merged over the shared `env.rewards:` block above for a
+  # speed stage and for nothing else, so a complete stage's generated config is byte-identical to what it was
+  # and configs/campaign_gates_full.yaml stays the pin for it. Full derivation, the measurements and the
+  # revert trigger: docs/project-log.md, 2026-09-20.
+  #
+  # WHY `death` MOVES. On 0-2's speed stage the clock is deaths and nothing else: over 2,067 live fresh
+  # completions `seconds = 121.33 + 22.32 * deaths` (r +0.86) and a completed run averages 4.75 of them. The
+  # objective cost of one death is 14.27 -- 6.99 of `time` over the 349.6 extra decisions it adds, plus 7.28
+  # of `level_complete` the slower clock gives up. The policy does not feel that. At the death decision it is
+  # paid `death` 5.0 + `damage_taken` 1.0, the time stream discounts to 5.02 at gamma 0.998, the completion
+  # bonus arrives ~1,484 decisions later at 0.998^1484 = 0.051 of face value (0.37), and -- measured over the
+  # 126 recorded deaths in runs/probe_0-2_speed -- a respawn RE-PAYS +6.17 of combat reward, because the
+  # game's kill counter rolls back to the checkpoint value, the arena resurrects and `new_kills` pays for
+  # every re-kill again (133 rollbacks; 2,434 paid kill events against 1,126 final kills). Net felt cost of a
+  # death: about -6.5 against an objective -14.27. Setting the felt cost equal to the objective one gives
+  # 12.7; pricing the MARGINAL death (18.52) would give 17.0. 12.0 is the conservative end of that range and
+  # buys most of the effect for half the added return variance.
+  #
+  # THE LEVER IS CROSSINGS, NOT CAUTION. >= 96% of deaths are full-hp instant kills by crusher pistons whose
+  # DeathZones are triggers -- every observation ray passes QueryTriggerInteraction.Ignore, there is no hazard
+  # channel in the 479 floats and no frame stack, so a timed dodge is not learnable at ANY weight. What is
+  # learnable is fewer passes: expected deaths = 0.115 x crusher-footprint crossings, and the 86.74 s best run
+  # makes 19 crossings where the median run makes 46, at an identical exposure FRACTION. Waiting cannot lower
+  # p(death | crossing) and costs 0.313 per official second, so the gradient this buys points at "go through
+  # once", not at "stand still". Pinned by tests/test_speed_death_weight.py.
+  rewards:
+    death: 12.0
 # THE HOLD LINE (spec §8a). No stage at or after this level starts until EVERY stage before it is "done".
 # The lead, 2026-09-18: "dont have it promote to 0-4 untell it gets better times on these levels". Without this
 # key a speed stage that burns its 8M-step cap is recorded "unfinished" and the ladder walks on to 0-4 carrying

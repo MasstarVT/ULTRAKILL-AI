@@ -2970,3 +2970,190 @@ signalled, no port 47800-47811 touched. All analysis streamed one 29 KB JSON, on
 jsonl in short-lived numpy processes (no torch). `mem_guard.py --dry-run` at the start: 12 games, 24.0 GB
 total, fattest 2.3 GB against a 2.6 GB limit, system commit 72%. Scratch scripts stayed in the session
 scratchpad; the only repo change is this entry.
+
+## 2026-09-20 — 0-2 speed: the deaths are crusher pistons, and a speed stage now prices a death at 12.0
+
+The follow-up to 2026-09-20's "the plateau is deaths, and only deaths". Three questions were open: what kills
+the policy, whether it could do anything about it, and what to change. Answered, then ONE change landed.
+
+### 1. What kills it: crusher pistons, and they are pure instant-kill triggers
+
+From `decompiled/Piston.cs` + `decompiled/DeathZone.cs`, read offline, and the 126 deaths recorded in
+`python/runs/probe_0-2_speed/` (24 episodes on the spec_0-2_speed checkpoint; analysis in that run's
+`analysis/hazards/`):
+
+- 0-2 ships **44 `DeathZone`** objects (the offline parse reproduces `docs/level-survey.md`'s 44 exactly), one
+  off-route `HurtZone` and 5 off-route `MovingPlatform`. **16 of the 44** are the head/base plates of 16
+  `Crusher Symmetrical` prefabs driven by a `Piston`, all with `notInstakill == false`, so `DeathZone.GotHit`
+  calls `pm.GetHurt(999999, …, instablack: true)` — **a kill from any HP**; the `damage = 50` field is dead
+  code on these.
+- `Piston.Update` runs `timer -= Time.deltaTime * 2`, so `attackTime: 4` / `returnTime: 1` is a **2.5 s cycle**,
+  and travel is `MoveTowards(…, dt * 75f)` — 5–8 m in **0.067–0.107 s**. The head's DeathZone is enabled only
+  during the outward slam, so the lethal duty cycle is **2.7–4.3%**. There is essentially no solid collider in
+  the shaft: what kills is a trigger volume sweeping it in two or three frames.
+- **>= 96% of the deaths are instant kills.** 123/126 lost ZERO hp in the preceding second; 117/126 were at
+  hp >= 70 with no hp loss in three seconds; 84/126 were at exactly hp 100 on the last live decision. Exactly
+  **1/126** is classifiable as accumulated damage.
+- **100/126 (79%) died inside a piston's swept head volume** padded by 1 m, 119/126 (94%) within 3 m. Every
+  cluster with >= 3 deaths sits on a `Crusher Symmetrical`. Rate check: 126 deaths over 479 s spent inside a
+  padded footprint = **0.263 deaths/s**, against the **0.40 slams/s** ceiling a 2.5 s cycle allows. The
+  observed rate inside a crusher footprint IS the crusher's own firing rate; nothing else need be invoked.
+- The clusters: 34% on the opposed horizontal pair in `9 - Crushers Arena` (the exit leg), 21% on the vertical
+  crusher in `6 - Crusher Arena`, 17% on `5 - Crusher Tutorial` (whose piston ships `off: true` but is armed
+  25 m earlier by a `ScriptActivator` trigger, so it is live on every pass), 17% on room 9's two verticals,
+  6% on `7 - Crusher Hallway`, and 5% on the room-7 wall `Fan` (an inference, see "not verified" below).
+
+### 2. Why the policy cannot dodge, and what it CAN do
+
+Every DeathZone on 0-2 is a trigger. `BuildHorizontalRays`, `BuildGroundRays` and `GroundRayCenter`
+(`mod/UltrakillAIBridge/Obs/ObservationBuilder.cs`) all pass `QueryTriggerInteraction.Ignore`, there is no
+hazard channel anywhere in the 479 floats, the bridge reports no piston position, phase or hurt-cause, and the
+policy is PPO + `MlpPolicy` [512,512] with **no frame stack and no recurrence**. It could not tell a rising
+crusher from a falling one if the crusher were visible. **A timed dodge is not learnable at any reward
+weight.** What is learnable is fewer passes: expected deaths = **0.115 × crusher-footprint crossings**
+(126 deaths / 1,095 crossings; predicted 4.1 for the median episode's 46 crossings, measured 4.6 in the probe
+and 4.75 live). The **86.74 s best run** does not route around the crushers — it crosses the same footprints
+**19 times for 8.26 s** where the median run crosses **46 times for 17.5 s**, at an *identical* exposure
+fraction (8.9% vs 8.1% of play time). The lever is crossing count, and the way to cut it is to go through
+once. Waiting cannot help: p(death | crossing) is memoryless w.r.t. anything the policy observes.
+
+### 3. The defect in the reward, including one the design missed
+
+Re-derived from `runs/spec_0-2_speed/episodes.jsonl` (2,392 fresh episodes, 2,068 completions, 18.78M–27.31M):
+`seconds = 121.33 + 22.32 × deaths` (r +0.864), `length = 1959.0 + 349.6 × deaths`, 15.63 decisions per
+official second, mean **4.75** deaths per completed run, zero-death median 123.2 s, best 86.74 s. Milestones
+are NOT re-paid on a respawn — `gates_reached = 8.00 + 0.0000 × deaths`, `checkpoints_level = 2.00 + 0.0001 ×
+deaths` — so `mark_paid` / `new_level_load(keep_paid=True)` hold.
+
+**Objective cost of one death: 14.27** (6.99 of `time` over the 349.6 extra decisions, plus 7.28 of
+`level_complete` given up by the slower clock; the MARGINAL first death costs 18.52, the fifth 10.37, because
+the bonus is hyperbolic). **What the policy felt: about −6.8.** `death` 5.0 and `damage_taken` 1.0 land at the
+decision; the time stream discounts to 5.04 at gamma 0.998; the completion bonus arrives ~1,484 decisions
+later at **0.998^1484 = 5.1% of face value** (0.37) — the only channel that encodes "this is a speedrun".
+
+**And a death RE-PAYS combat reward.** Streaming all 24 probe rollouts and summing per-step `reward_parts`:
+`kill = 28.77 + 4.178 × deaths` (r +0.854), `damage_dealt = 30.25 + 1.994 × deaths` — **+6.17 per death**.
+Mechanism, seen directly in `rollout_3.jsonl`: at each restart the game's kill counter rolls back to the
+checkpoint value (24→16 at i=777, 18→16 at i=806, 24→16 at i=967), the arena resurrects, and
+`new_kills = max(0, cs - ps)` reads 0 on the rollback step and then **pays again for every re-kill** — 133
+rollbacks, **2,434 paid kill events against 1,126 final kills** (2.16x). This closes the ledger: −5.0 −1.0
+−6.99 −7.28 **+6.17** = −14.10 against the measured episode slope of **−13.72**. At the old weight the
+immediate channels of a death (5.0 + 1.0) were *smaller than the re-pay*: **a death paid for itself on
+everything the policy feels promptly.** The live log contains the consequence — the three `max_steps`
+episodes averaged **24.33 deaths** and a return of **295.4**, MORE than the 140 `stuck` episodes' **200.0**.
+
+### 4. The change
+
+**`speed.rewards.death: 5.0 → 12.0`, speed stages only.** Nothing else moves: no observation, no action space,
+no other weight, no mod, no `env.py`, no `rewards.py`.
+
+- `configs/specialists.yaml` gains a `rewards:` block under `speed:`; `campaign_driver.load_plan` pops and
+  validates it against `RewardConfig` (a misspelt weight is refused, not defaulted); `stage_config` merges it
+  over `env["rewards"]` **inside `if kind == SPEED` only**, by REBINDING — `env` there is a shallow copy, so
+  `.update()` would leak the weight into every complete stage generated afterwards from the same `Plan`, and
+  comparing the two generated configs would not catch it because both would be the one mutated object.
+- **Complete stages are byte-identical**: `Plan.rule_for(COMPLETE)` is untouched and the COMPLETE branch never
+  reads `speed_rewards`, so the `campaign_gates_full.yaml` pin still holds unchanged.
+- **Sizing.** Felt cost at w: `−(w + 1.0 + 5.04 + 0.37 − 4.64)`. Setting that equal to the average objective
+  cost (14.27) gives **12.7**; equal to the marginal (18.52) gives 17.0. **12.0** is the conservative end —
+  it prices the death the policy HAS and under-prices the one it will have when it is fast — and buys most of
+  the effect for half the added return variance (sd of completion reward 158.7 → ~170 at 12, ~181 at 17).
+- **Farm bounds, all pinned in `python/tests/test_speed_death_weight.py` (15 tests, 7 of which fail at 5.0).**
+  Never-moving is capped by the stuck rule at 675 decisions = **−13.5** with no other income, at any weight.
+  Dying cannot end an episode (`env.py` respawns unconditionally in campaign mode; **0 of 2,392** episodes
+  ended `end_reason: "death"`). Camping costs 0.313 per official second and cannot lower p(death | crossing).
+  A suicide shortcut never advances the player and the clock runs through it. Faster always beats slower (the
+  bonus is strictly decreasing, floor approached never reached). And the per-death slope is negative **even at
+  w = 0** once the re-pay is counted in dying's favour. Re-scored at 12.0: mean completion **411.1** vs mean
+  non-completion **212.3**; the death loop goes **295.4 → 125.1**, below `stuck`'s **177.2** — the ordering
+  inverts at w ≈ 9.5, which is the thing this change actually buys.
+- NOT claimed: improved credit assignment. p(death | crossing) = 0.115 means signal 0.115·C and noise
+  0.319·√C — **SNR is unchanged at every weight**. This works by making the death channel large relative to
+  the arena income that keeps the policy in the shafts, not by making the hazard easier to learn.
+- It applies to **every** speed stage, not just 0-2 (`speed:` is per-kind). 0-1's is already done; 0-3's picks
+  it up when it first starts. 12.0 was derived at 0-2's constants (T = 120 s, 22.32 s/death, t0 = 121.33 s)
+  and the re-pay is level-specific too — it scales with enemies-killed-since-checkpoint.
+- Three statements from the design were **corrected before landing** and must not be re-quoted: "dying buys
+  almost no combat income (+0.067)" (it buys **+6.17**; the design tested the reported unique-kill field, not
+  the `kill` reward); "w=12 is strictly decreasing in k, w=5 is not" (**neither is**, on 2,068 completions —
+  both break at k=10→11 on small n; use the structural slope instead); and the 12.25 derivation, which omitted
+  the re-pay.
+
+### 5. Baseline, horizon and revert trigger
+
+**Baseline, taken immediately before the switch** — last six FULL 500k buckets, 24.0M–26.5M, fresh episodes,
+`level_seconds` filtered through `times.valid_official_seconds`, partial bucket excluded:
+
+| bucket | 24.0M | 24.5M | 25.0M | 25.5M | 26.0M | 26.5M | six-bucket median |
+|---|---|---|---|---|---|---|---|
+| median official time (s) | 225.9 | 200.1 | 207.3 | 220.5 | 163.4 | 200.5 | **203.9** |
+| deaths per completed run | 5.05 | 4.81 | 5.44 | 5.19 | 3.90 | 4.69 | **4.93** |
+| fresh completion rate | 0.868 | 0.899 | 0.801 | 0.887 | 0.863 | 0.879 | min **0.801** |
+
+`level_started` 1.0000 and **zero-kill share 0.0000 in all six** (the whole-stage 0.0004 is one early bucket).
+
+**PRIMARY signal** the six-bucket median of official time; **MECHANISM signal** mean deaths per completed run
+per bucket — if deaths do not move, the change did nothing and comes out even if time looks flat.
+**HORIZON >= 3M steps** (six full buckets) after the contaminated one, ~6 h at 137 steps/s.
+
+**The noise figure in the earlier plan was the wrong one.** Individual bucket medians have sd **29.9 s**, but
+the judging statistic — the median of six — has a measured sd of **10.7 s** over 12 rolling windows, and it
+**drifts with nothing changed**: 225, 214, 198, 191, 191, 191, 191, 196, 204, 207, 207, 204. A bare "worse
+than 203.9" would revert on that drift alone. Restated on 10.7 s: deaths 4.93 → 3.0 predicts −43 s (4.0 sd,
+clear); → 3.9 predicts −23 s (2.1 sd, visible); **below ~16 s treat as a null.**
+
+**REVERT TRIGGERS — any one fires:**
+1. fresh completion rate **< 0.40** (the stage's own `target_rate`) for two consecutive full 500k buckets;
+2. `level_started` share **< 0.85** in any full bucket;
+3. zero-kill share **> 0.15** in any full bucket — the "stopped fighting, doors never open" farm;
+4. the six-bucket median is **worse than the switch-time baseline by more than 15 s (~1.4 sd)** at two
+   consecutive checks;
+5. **mechanism null**: after 3M steps, mean deaths per completed run is not below 4.93 AND time has not
+   improved — revert rather than leave an inert change in the config.
+
+Watch without a hard trigger: `reward_parts_mean_100/death` should read about −12 × deaths/ep (the one-line
+confirmation the weight reached the env), and **`reward_parts_mean_100/kill`** — 43.06 today against 46.81
+reported kills, the 2.16x re-pay signature. If the change works by cutting crossings, `kill` should FALL
+toward ~27; if deaths fall but `kill` does not, the policy cut deaths by fighting less, which is the timid
+failure — watch `arena_clear` (47.0) and `door_unlock` (141.3) with it.
+
+**TO REVERT:** delete the `rewards:` block under `speed:` in `configs/specialists.yaml`; the next round
+regenerates `configs/generated/spec_0-2_speed.yaml` without it. No weights are lost.
+
+### 6. A SEPARATE, LARGER defect found in passing — NOT bundled, and next in line
+
+`python/ultrakill_ai/rewards.py`, the `vanished` branch (the "killed in one hit" credit), adds
+`e["health"] / max(enemy_max_health.get(e["id"], e["health"]), 1e-3)` with **no clamp on a negative health**,
+while the other branch is guarded by `before > e["health"]`. When an overkilled enemy reports negative health
+AND its id is missing from `enemy_max_health`, the fallback divisor is that same negative number, `max(...)`
+returns **1e-3**, and the term becomes health × 1000. Measured: one step in
+`runs/probe_0-2_speed/rollout_11.jsonl` (i=2053) paid `damage_dealt = −250.0` in a single decision, and
+**71 of 2,068 completions (3.43%) have a negative TOTAL episode reward, worst −1,119.5**. That is 4–20x the
+whole death channel, it is unbounded, and it fires during exactly the arena fighting 0-2 requires. The fix is
+a one-line clamp (`max(0.0, e["health"])`) but it is on the SHARED reward path — it changes complete stages
+and every level — so it needs its own six-bucket baseline and must not run concurrently with this change, or
+neither is interpretable. **Land it next, alone.** Related and much smaller: `completion_bonus` returns the
+full unscaled `level_complete` when the official time is missing, so a completion whose timer was lost pays
+more than any genuine completion slower than target (one such episode in the live log) — the reward path does
+not use `times.valid_official_seconds` the way the leaderboard does.
+
+### 7. Not verified
+
+- **The piston's runtime phase at each death.** The recordings carry no piston state, so "the head was
+  mid-slam" is inferred from geometry, the decompiled code and the rate match (0.263 deaths/s inside against
+  a 0.40 slams/s ceiling) — never observed. A live probe logging `Piston.transform.localPosition` would
+  settle it. No in-game probe was run for any of this work; no socket was opened.
+- **Cluster 5** (6 deaths, 5%) attributed to the room-7 wall `Fan` DeathZone at 2.21 m. Nearest hazard
+  offline and the kinematics fit (52 m/s, airborne, 148° off heading), but it is an inference.
+- **Whether the mod's `pos` is the capsule centre or the feet** — `ground_ray_center` was calibrated at
+  ~1.50 m on grounded decisions, but `NewMovement`'s collider offset was not read, so the "inside the swept
+  volume" distances carry up to ~1.75 m of vertical uncertainty. Volumes were padded 1 m in every axis; the
+  79%/94% figures move if that pad is wrong.
+- **`notInstakill == false` is read from the serialized scene only.** `ScriptActivator`, `ObjectActivator`,
+  `PlayerActivator`, `Door`, `CheckPoint`, `ActivateArena` and `ActivateNextWave` were checked for writers;
+  all ~1,200 game classes were not.
+- **Everything behavioural is measured on the probe checkpoint** (recorded 04:27–05:16), not on the live
+  weights at 27.3M steps. Live `mean_100` deaths 4.49 and level_seconds 244.6 against the probe's 4.6 and
+  190–226 s says it is representative; deaths-per-crossing on the current weights is not directly measured.
+- **The effect on the value function's fit is not bounded offline.** 12.0 widens the death term's spread from
+  0…−120 to 0…−288 over the observed 0–24 death range. That is what the judging plan has to catch.
