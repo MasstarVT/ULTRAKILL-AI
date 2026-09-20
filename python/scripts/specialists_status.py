@@ -22,8 +22,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from campaign_driver import (  # noqa: E402
-    COMPLETE, DRIVER_RUN, SPECIALIST_DIR, SPEED, DriverState, load_plan, read_sample, specialist_path,
-    stage_run_name, stage_verdict)
+    COMPLETE, DRIVER_RUN, SPECIALIST_DIR, SPEED, DriverState, StageSpec, load_plan, order_rule_text, read_sample,
+    specialist_path, stage_blocked, stage_run_name, stage_verdict)
 from ultrakill_ai.times import format_time  # noqa: E402
 
 
@@ -46,12 +46,20 @@ def collect(cwd: Path, plan_path: str, runs_dir: str, models_dir: str) -> dict:
     # `rounds` counts ENDED rounds, so the stage that is running right now reads 0/"not started" unless it is
     # named: `current` says which of the waiting stages is the one on screen above.
     running = state.current.key if state.current is not None else None
+    # `blocked` is the DRIVER's own rule (`campaign_driver.stage_blocked`), not a copy of it: under
+    # `sequential` a blocked stage is passed over and a LATER level takes the machine for a whole round, so
+    # the daily read-only check has to be able to see why (2026-09-19 review).
     out["held_by"] = ([{"level": s.level, "kind": s.kind, "rounds": state.rounds(s.key),
                         "status": state.stage_status(s.key),
                         "current": s.key == running,
+                        "blocked": stage_blocked(plan, state, StageSpec(s.level, s.kind), cwd / models_dir),
                         "max_rounds": plan.rule_for(s.kind).max_rounds}
                        for s in plan.stages[:hold]
                        if state.stage_status(s.key) not in ("done", "skipped")] if hold is not None else [])
+    # WHICH of those runs next (§10). `held_by` above is already in plan order, and under `sequential` the
+    # plan order IS the order they will be trained in -- the first one runs until it is done.
+    out["hold_order"] = plan.hold_order
+    out["order_rule"] = order_rule_text(plan.hold_order, [h["level"] for h in out["held_by"]])
     out["target_scale"] = plan.target_scale
     stage = state.current
     if stage is not None:
@@ -147,8 +155,19 @@ def render(data: dict) -> str:
                                          "RUNNING NOW" if h.get("current") else
                                          (h["status"] or "not started"))
                                       for h in held)))
-            lines.append("  no stage at or after %s starts until every one of those is done; they are trained "
-                         "in round robin, fewest rounds first" % data["hold_before"])
+            # The waiting list above is in the order they will be TRAINED in, which under `sequential` means
+            # the first one keeps the machine until it is done -- so say the rule out loud beside the list.
+            lines.append("  no stage at or after %s starts until every one of those is done; order rule -- %s"
+                         % (data["hold_before"],
+                            data.get("order_rule") or "round robin: fewest rounds first, ties in plan order"))
+            # A waiting stage that CANNOT start is the one way the order above is not the order it will run
+            # in: the rule passes over it and the next runnable stage -- a later level -- takes the machine.
+            stuck = [h for h in held if h.get("blocked") and not h.get("current")
+                     and not (h.get("max_rounds", 0) > 0 and h["rounds"] >= h["max_rounds"])]
+            if stuck:
+                lines.append("  BLOCKED (the order passes over it): %s"
+                             % ", ".join("%s (%s) -- %s" % (h["level"], h["kind"], h["blocked"])
+                                         for h in stuck))
             caps = [h for h in held if h.get("max_rounds", 0) > 0 and h["rounds"] >= h["max_rounds"]]
             if caps:
                 lines.append("  OUT OF ROUNDS (the driver stops rather than looping): %s -- retune "

@@ -2666,3 +2666,97 @@ for best/median and healing a poisoned `status.json`, `times.record` refusing it
 median. Two fixtures reported times no real level could produce and were corrected to the range a real run
 lives in (`test_progress`'s fake campaign env, `test_campaign_check`'s fake game clock). Whole no-game suite,
 one file at a time: 30 files, 0 failures.
+
+## 2026-09-19 — Depth-first stage order (`hold_order: sequential`) and the `END_STAGE` control file
+
+**The user, on the round robin:** *"shouldnt we just work on 0-1 untell its finished before working on the
+other levels in that case?"* The hold line's §8a round robin was handing every not-done stage in front of
+`hold_before: "Level 0-4"` a fresh 8M-step budget before any of them got a second, so twelve games were being
+spread over 0-1 speed, 0-2 speed, 0-3 complete and 0-3 speed in turn — the `campaign_gates` thrash moved from
+inside one policy to the schedule. Built on branch `hold-order` (worktree, live run untouched); design in
+`docs/superpowers/specs/2026-09-18-speed-stages.md` §10.
+
+**What changed.**
+- `hold_order` in `configs/specialists.yaml`, two values. `round_robin` is §8a unchanged and is still the
+  CODE default, so every plan and test written before the key means what it meant. `sequential` makes
+  `Driver.choose_stage` return the first not-done stage in plan order that can start, round after round,
+  until its own rule records it `"done"`. `load_plan` refuses an unknown value (a silent fallback to round
+  robin is exactly the failure the key exists to stop). A stage that cannot start at all (`stage_blocked`) is
+  passed over only when nothing in front of it can run, and the log names it and the reason.
+- **The shipped plan is now level-major**: 0-1 complete, 0-1 speed, 0-2 complete, 0-2 speed, 0-3 complete,
+  0-3 speed, then 0-4 and the rest — so "first in plan order" is "the earliest unfinished level".
+  `Plan.order` (the distinct levels `full_run.py` plays) and the hold index (6) are unchanged. History is
+  matched by `(level, kind)`, so `reconcile` renumbers the indices of the live state file's four entries
+  (0-1 complete 0, 0-2 complete 2, 0-3 complete 4, 0-1 speed 1) and the running 0-2 speed stage (index 3)
+  without losing, duplicating or renaming anything.
+- **`runs/specialists/END_STAGE`**, a control file beside `DRIVER_PAUSE`: on the next poll the driver ends the
+  CURRENT stage through `finish_stage` with status `"unfinished"` and `"reason": "ended by operator"`, so
+  `refuse_promotion` still refuses to put a speed round's weights over the level's promoted specialist and
+  nothing in `models/` is deleted; the file is deleted BEFORE the stage ends (one file, at most one stage) and
+  a file that cannot be deleted ends nothing. Its text may name the stage (`Level 0-2 speed`); a name that
+  does not match the running stage is refused, logged and deleted. `DRIVER_PAUSE` is checked first.
+- `specialists_status.py` prints the order rule beside the waiting list
+  (`order rule -- depth-first: finishing Level 0-1 before Level 0-2`), and the waiting list is already in the
+  order the stages will be trained in.
+
+**What the order does to the live run.** State at the time: 0-1 complete done, 0-2 complete done, 0-3 complete
+unfinished (round 1, 0 completions), 0-1 speed unfinished (round 1: median 500 → 212 s, best 117.5 s, target
+150 s), 0-2 speed running (round 1, ~3.9M of 8M, median 306 → ~190 s, target 120 s). Ending 0-2 speed with
+`END_STAGE` loses nothing — its weights and optimiser state stay in `models/spec_0-2_speed/` and its next
+round resumes from them — and the depth-first rule then runs **0-1 speed round 2** from
+`models/spec_0-1_speed/`'s own newest checkpoint until 0-1 is done, then 0-2 speed, then 0-3 complete, then
+0-3 speed, and only then 0-4.
+
+**One real bug, found by the scratch dry-run** (the whole reason for running one): PowerShell's
+`Set-Content -Encoding utf8` writes a **BOM**, so `END_STAGE` holding exactly what `docs/commands.md`
+recommends parsed as the level `"﻿Level 0-2"` and the driver refused a request that was right —
+`END_STAGE REFUSED: it names '﻿Level 0-2' and the running stage is Level 0-2 (speed)`. Control files are
+now decoded by `decode_control_file` (`utf-8-sig`, then `utf-16` for PowerShell 5.1's `>`/`Out-File`, then
+`latin-1`), and the parser strips a stray BOM and NULs. Two tests cover it, one of them end to end.
+
+**Tests.** `tests/test_campaign_driver.py` +11 (the key loaded/defaulted/refused; sequential holding one stage
+across rounds where round robin moves on; a blocked stage passed over with the reason logged; today's state
+reconciled onto the reordered plan and the whole order walked; seven `END_STAGE` cases). Whole no-game suite
+run one file at a time with `PYTHONPATH` on the worktree: **30 files, 0 failures**. Also dry-run from an
+isolated scratch directory holding only copies of the plan, the real `driver_state.json` and
+`runs/spec_0-2_speed/status.json` — it reported `HOLD LINE before Level 0-4 (depth-first: finishing Level 0-1
+before Level 0-2) ... waiting on Level 0-1 (speed), Level 0-2 (speed), Level 0-3 (complete), Level 0-3
+(speed)` and left the running stage alone (`Level 0-2 (speed): ok, 4,285,128 steps into the stage, rate 0.900
+over 50 fresh, median 199.62 (best 97.65) vs target 120.00`).
+
+### 2026-09-19 — review of the depth-first branch: one real bug, two log fixes, three doc corrections
+
+An adversarial review of `hold-order` (branch at 98ab1a8) could not reproduce any of the four hazards it was
+pointed at — index collisions, a history entry matched to the wrong stage, rounds counted wrong, or the ladder
+passing the hold line — but found five other things. Fixed before the merge:
+
+- **The real one (major).** `end_stage_now` read `status.json` with `read_sample` directly and never applied
+  the `stale_below` filter `tick` applies, so a stage ended by hand in the first minutes of a round >= 2
+  recorded the PREVIOUS round's rate, median and best as its own. The window is not the step gap alone:
+  `runs/<run>/status.json` keeps the old round's contents until the new trainer's first write, and
+  `start_grace_seconds` is 900, so it is ~15 minutes wide at every round boundary. On a COMPLETE stage
+  `promote` wrote those numbers into the committed `models/specialists/<level>.json`. Nothing decides on them
+  (the hold line reads `status`, `round_init` reads files), so no weights could move and no stage could be
+  mis-chosen — the damage was a false record in git. Both readers now go through one `Driver.current_sample`,
+  and a filtered sample prints "an unknown number of steps into the stage" instead of the run's whole step
+  count as a negative.
+- **`log_once` had one key for the whole driver**, so two messages written in the same tick alternated and
+  both were re-logged every poll: an `END_STAGE` file the driver cannot unlink (an editor holding it, an ACL)
+  meant two lines a minute forever and the "this is stuck" signal lost in them. It takes a `slot` now — one
+  per concern, and the running commentary keeps the default.
+- **A blocked leading stage was announced once per driver process.** Under `sequential` a stage that cannot
+  start is passed over and a LATER level takes the machine for a whole 8M-step round, which is the one thing
+  the user's instruction forbids; it now says so for every round the later level takes, and
+  `specialists_status.py` prints `BLOCKED (the order passes over it): ...` beside the order rule from the
+  driver's own `stage_blocked`, which moved to module level so the report cannot drift from it.
+- **Three doc corrections**, all behaviour that was right and described wrongly: a COMPLETE stage ended by
+  `END_STAGE` DOES promote its `best.zip` (`refuse_promotion` declines only for a speed stage); under
+  `sequential`, ending the stage that is already first in the order starts the next ROUND of that same stage,
+  not another level; and "the games are not touched" is too strong — the next stage's `ensure_games` relaunches
+  all twelve if a port is not listening, which is why the recipe now says to check `games.py status` first.
+
+**Tests.** +3 in `tests/test_campaign_driver.py` (an `END_STAGE` inside a round-2 stale window records `None`s
+and its complete-stage sidecar does too; a control file the driver cannot unlink says so once across three
+polls while the stage line is still logged once; a blocked leading stage is named every round and shown by
+`specialists_status`). All three were run against the pre-fix code first and failed there. `test_campaign_driver.py`
+69 passed, `test_specialists_config.py` 12 passed, then the whole suite one file at a time.

@@ -107,12 +107,31 @@ def test_the_three_speed_stages_sit_before_any_0_4_stage():
     """The lead's 2026-09-18 instruction, pinned: nothing promotes to 0-4 until 0-1..0-3 have better times."""
     p = plan()
     keys = [s.key for s in p.stages]
-    assert keys[:6] == [("Level 0-1", "complete"), ("Level 0-2", "complete"), ("Level 0-3", "complete"),
-                        ("Level 0-1", "speed"), ("Level 0-2", "speed"), ("Level 0-3", "speed")]
     speed_at = [i for i, key in enumerate(keys) if key[1] == "speed"]
     later = [i for i, key in enumerate(keys) if key[0] not in ("Level 0-1", "Level 0-2", "Level 0-3")]
     assert max(speed_at) < min(later), "every speed stage runs before the first level past 0-3"
     assert len(keys) == 33 and len(set(keys)) == 33, "30 complete stages plus the three speed ones"
+
+
+def test_the_plan_is_depth_first_by_level():
+    """2026-09-19, the user: "shouldnt we just work on 0-1 untell its finished before working on the other
+    levels". `hold_order: sequential` walks the `order:` list in order, so the LIST is the instruction: each
+    level's speed stage sits directly after its own complete stage, and the machine finishes one level
+    (complete, then speed) before the next level's first stage can start."""
+    p = plan()
+    keys = [s.key for s in p.stages]
+    assert p.hold_order == campaign_driver.SEQUENTIAL, "depth-first, not the 2026-09-18 round robin"
+    assert keys[:6] == [("Level 0-1", "complete"), ("Level 0-1", "speed"),
+                        ("Level 0-2", "complete"), ("Level 0-2", "speed"),
+                        ("Level 0-3", "complete"), ("Level 0-3", "speed")]
+    # Level-major: every stage of a level is contiguous, so "the first not-done stage in plan order" is
+    # always a stage of the earliest unfinished level.
+    firsts = {}
+    for i, (level, _) in enumerate(keys):
+        firsts.setdefault(level, i)
+    assert [level for level, _ in keys] == sorted((level for level, _ in keys), key=lambda l: firsts[l])
+    # ... and the distinct levels full_run.py plays are untouched by the reordering.
+    assert p.order[:4] == ["Level 0-1", "Level 0-2", "Level 0-3", "Level 0-4"]
 
 
 def test_the_speed_rule_is_the_stage_rule_with_the_clock_added():

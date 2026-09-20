@@ -302,3 +302,94 @@ can no longer be measured from an origin the trainer never visits.
   The unbounded-loop half of the same finding is fixed by 9e.
 - *"Clear `campaign.best_time` per round."* Not needed once the gate is the median (9a); `best_time` is a
   reported headline and a cumulative record of the run, which is what `times.md` wants it to be.
+
+## 10. Depth-first by level, and ending a stage on purpose (2026-09-19)
+
+The user, reading the round robin back: *"shouldnt we just work on 0-1 untell its finished before working on
+the other levels in that case?"* §8a's round robin spread twelve games over three levels at once -- a fresh
+budget for every not-done stage before any of them got a second -- which is the shared-run failure mode
+(`campaign_gates`' thrash) moved from inside one policy to the schedule. Two changes, both in the driver and
+its plan; no env, reward, observation or action semantics move.
+
+### 10a. `hold_order`
+
+A plan key beside `hold_before`, with two values:
+
+- **`round_robin`** -- §8a exactly as it shipped, and still the CODE default, so every plan and test written
+  before this key means what it meant.
+- **`sequential`** -- what `configs/specialists.yaml` now sets. While the line is up, `Driver.choose_stage`
+  returns the **first not-done stage in plan order that can start**, and returns it again round after round
+  (each round a fresh step budget, resumed through `round_init` from that stage's own newest weights, exactly
+  as before) until its own rule records it `"done"`. Only then does the next stage start.
+
+`load_plan` refuses an unknown value rather than defaulting it: `hold_order: sequental` would quietly go back
+to the round robin. A stage that cannot start at all (`stage_blocked` -- a speed stage whose complete stage is
+not `"done"`, or with no specialist file) is passed over only because nothing in front of it can run, and the
+driver logs which stage and why. Nothing else changes: the line itself, eligibility, `max_rounds: 0`, the
+`"held"` exit when NOTHING is runnable, and `--start-at`'s two objections are all §8a's.
+
+**The plan is reordered level-major** so that "first in plan order" IS "the earliest unfinished level":
+0-1 complete, 0-1 speed, 0-2 complete, 0-2 speed, 0-3 complete, 0-3 speed, then 0-4 and the rest of the
+ladder. `Plan.order` -- the DISTINCT levels, which is what `full_run.py` plays -- is unchanged, and so is the
+hold index (6). History is matched by `(level, kind)`, so `DriverState.reconcile` renumbers every entry's
+`index` onto the new positions and loses, duplicates and renames nothing;
+`tests/test_campaign_driver.py::test_todays_state_reconciles_onto_the_depth_first_plan_and_finishes_0_1_first`
+pins that against a literal copy of the live state file's shape and then walks the whole depth-first order.
+
+### 10b. `END_STAGE`
+
+Switching the order is worth nothing while a stage that the new order would not have chosen is holding the
+machine. A second control file beside `DRIVER_PAUSE`, `runs/specialists/END_STAGE`, ends the CURRENT stage on
+the driver's next poll through `finish_stage` -- the ordinary stage-end path:
+
+- status `"unfinished"` with `"reason": "ended by operator"` in the history entry, so every other rule reads
+  it exactly as it reads a stage that ran out of steps;
+- `refuse_promotion` therefore applies unchanged: a SPEED stage's weights do NOT replace the level's promoted
+  specialist, and nothing in `models/` is deleted -- the round's weights stay in `models/<run>/`, which is
+  where its next round resumes from. A **COMPLETE** stage is the other case and DOES promote its `best.zip`
+  to `models/specialists/<level>.zip` with a fresh sidecar, exactly as it does at the step cap; the source is
+  `keep_best`'s lifetime peak for that model directory, so the weights cannot regress, but a committed file
+  does change (2026-09-19 review);
+- the sample is read through `Driver.current_sample`, the same reader (and the same `stale_below` filter)
+  `tick` uses: an operator picks the moment, and a moment inside the first `start_grace_seconds` of a round
+  >= 2 would otherwise record the PREVIOUS round's rate, median and best as this round's, and write them into
+  that committed sidecar (2026-09-19 review);
+- the trainer and its helpers are stopped exactly as at any stage end, and the games are not deliberately
+  restarted -- but, as at ANY stage change, `ensure_games` relaunches all twelve if a port is not listening
+  when the next stage starts, so check `games.py status` before writing the file;
+- the file is deleted BEFORE the stage ends, so one file can only ever end one stage, and a file that cannot
+  be deleted ends nothing at all (it says so once, in its own log slot);
+- then the plan's own rule chooses and starts the next stage. Under `sequential` that is the first not-done
+  stage in plan order -- which, when the stage just ended IS that stage, is the **next round of the same
+  stage** with a fresh budget. `END_STAGE` moves the machine to another level only when the one it ended was
+  not the leading one; to stop working on a level, change `hold_order`, set a positive `max_rounds`, or
+  retune its target.
+
+The file's text may name the stage it means (`Level 0-2 speed`, `Level 0-2/speed`, `Level 0-2`, or empty for
+"whatever is running"). A name that does not match the running stage is refused, logged and deleted: a stale
+file may not end the wrong stage. `DRIVER_PAUSE` is checked first, so a paused driver does nothing at all,
+including deleting the file; `--dry-run` only reports what it would do.
+
+The text is decoded by `decode_control_file`, not by `read_text("utf-8")`. The scratch dry-run against a copy
+of the live state caught the reason: `Set-Content -Encoding utf8` writes a **byte order mark**, so the file
+the recipe in `docs/commands.md` tells an operator to write parsed as the level `"﻿Level 0-2"` and was
+REFUSED. PowerShell 5.1's `>` and `Out-File` can write UTF-16, which is not valid UTF-8 at all and raised
+where the caller expects "no text". `utf-8-sig`, then `utf-16`, then `latin-1`, and the parser strips a stray
+BOM and NULs as well.
+
+### 10c. Tests (all no-game)
+
+`tests/test_campaign_driver.py`: `hold_order` loaded, defaulted and refused; sequential runs one stage round
+after round and only then the next, where round robin would have moved on; a blocked stage passed over with
+the reason logged; today's state reconciled onto the reordered plan and the whole order walked (0-2 speed
+keeps running, then 0-1 speed round 2 from its own weights, 0-2 speed round 2, 0-3 complete, 0-3 speed only
+after it, 0-4 last); `END_STAGE` ends the right stage once, removes the file, records the reason, leaves the
+specialist and the model files alone, is refused when stale or mismatched, loses to `DRIVER_PAUSE` and only
+reports under `--dry-run`. `tests/test_specialists_config.py`: the shipped plan is `sequential` and
+level-major, and `Plan.order` is untouched.
+
+The 2026-09-19 review added three more: an `END_STAGE` inside a round-2 stale window records `None` for the
+rate, median, best and step count rather than the previous round's numbers (and the complete-stage sidecar it
+promotes carries the same `None`s); a control file the driver cannot unlink says so ONCE across three polls
+instead of alternating with the running-stage line every poll; and a blocked leading stage is named again for
+every round a later level takes, and is printed by `specialists_status.py` beside the order rule.

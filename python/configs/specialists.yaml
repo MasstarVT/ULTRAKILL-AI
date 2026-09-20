@@ -34,12 +34,17 @@
 # until the level is finished FAST. The lead's instruction on 2026-09-18: nothing promotes to 0-4 until 0-1,
 # 0-2 and 0-3 have better times, because they can be done much faster than they are being done.
 order:  # the 30 levels of configs/campaign_gates_full.yaml, mission order (read that file's header for why
-        # exactly these), with the three speed stages inserted after 0-3 and before any 0-4 stage.
+        # exactly these), with each of the first three levels' SPEED stage directly after its own complete
+        # stage. LEVEL-MAJOR, 2026-09-19, on the user's instruction -- "shouldnt we just work on 0-1 untell
+        # its finished before working on the other levels" -- because `hold_order: sequential` below walks
+        # this list in order, so the list IS the depth-first order: 0-1 finished (complete, then speed)
+        # before anything of 0-2 starts. `Plan.order` -- the distinct levels, which is what full_run.py
+        # plays -- is unchanged by the reordering.
   - "Level 0-1"
-  - "Level 0-2"
-  - "Level 0-3"
   - {level: "Level 0-1", kind: speed}
+  - "Level 0-2"
   - {level: "Level 0-2", kind: speed}
+  - "Level 0-3"
   - {level: "Level 0-3", kind: speed}
   - "Level 0-4"
   - "Level 0-5"
@@ -106,8 +111,9 @@ speed:
   # 2026-09-18: NEVER IDLE THE MACHINE. A cap makes the driver exit "HELD" (code 1) once every stage in front
   # of the line has spent its rounds, and nobody watches this run -- there are no LLM monitors, by the user's
   # own instruction -- so that exit is hours or days of twelve idle games, which is strictly worse than
-  # carrying on training the held stages. The round robin therefore runs until the targets are met or a human
-  # lifts the hold line. To stop instead of continuing, set a positive number here.
+  # carrying on training the held stages. The held stages therefore keep getting fresh budgets (in the
+  # `hold_order` below) until the targets are met or a human lifts the hold line. To stop instead of
+  # continuing, set a positive number here.
   # If a target turns out to be unreachable, retune `target_scale` or add a per-level `targets:` override
   # above, or lift `hold_before`; every round's weights stay in models/spec_<level>_speed/.
   max_rounds: 0
@@ -130,9 +136,19 @@ speed:
 # The lead, 2026-09-18: "dont have it promote to 0-4 untell it gets better times on these levels". Without this
 # key a speed stage that burns its 8M-step cap is recorded "unfinished" and the ladder walks on to 0-4 carrying
 # exactly the slow policies the instruction forbids. While the line is up the driver keeps training the stages
-# in front of it in ROUND ROBIN -- fewest rounds first, ties in plan order -- each round a fresh step budget
-# resumed from that stage's own newest weights. Set it to null (or delete it) to let the ladder walk on.
+# in front of it, each round a fresh step budget resumed from that stage's own newest weights. Set it to null
+# (or delete it) to let the ladder walk on.
 hold_before: "Level 0-4"
+# WHICH held stage runs next (spec §10). The user, 2026-09-19: "shouldnt we just work on 0-1 untell its
+# finished before working on the other levels". `sequential` is that, exactly: the FIRST not-done stage of the
+# `order:` list above that can start runs, round after round, until its own rule says "done"; only then does
+# the next one start. With the level-major order above that means 0-1 complete -> 0-1 speed -> 0-2 complete ->
+# 0-2 speed -> 0-3 complete -> 0-3 speed, and then the line opens and 0-4 begins. The alternative,
+# `round_robin` (the rule the hold line shipped with on 2026-09-18, and still the code's default so that
+# nothing written before this key changes meaning), gave every not-done stage a fresh budget before any of
+# them got a second -- which spread the machine across three levels at once. A stage that cannot start at all
+# (a speed stage whose complete stage is not done) is passed over, with the reason logged.
+hold_order: sequential
 env:
   mode: campaign
   level: "Level 0-1"   # the driver overwrites this per stage; `levels` is deliberately absent

@@ -140,12 +140,17 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - A **speed stage** (`{level, kind: speed}`) adds the clock: its `median_time_50` — never `best_time`, a
   lifetime minimum one lucky load sets for good — must also reach the level's own S-rank time (`target_scale:
   1.0`, since the gate is a median), at rate 0.4, cap 8M. It does NOT overwrite the level's specialist unless
-  it ends `"done"`. The **hold line** `hold_before: "Level 0-4"` stops the ladder there and round-robins
+  it ends `"done"`. The **hold line** `hold_before: "Level 0-4"` stops the ladder there and keeps training
   0-1..0-3 for as long as it takes (`max_rounds: 0`): a `HELD` exit would idle twelve games nobody watches.
-  Spec and the review that shaped it: `docs/superpowers/specs/2026-09-18-speed-stages.md`.
-- **The 0-3 stage ended at its 6M cap** (24,757,714 steps, recorded `"unfinished"`, 0 fresh completions); the
-  driver is now on the **`Level 0-1` speed** stage, 12 games on ports 47800-47811, `mem_guard.py` alongside.
-  Round-robin order means the next 0-3 window is **round 2**, after the 0-1 and 0-2 speed stages.
+  Since 2026-09-19 `hold_order: sequential` makes that **depth-first by level** — the first not-done stage in
+  plan order runs round after round until it is `"done"`, and the plan is level-major (0-1 complete, 0-1
+  speed, 0-2 complete, ...), so Level 0-1 is finished before any 0-2 stage starts (the user: "shouldnt we
+  just work on 0-1 untell its finished"). `runs/specialists/END_STAGE` ends the running stage early through
+  the normal path (never Ctrl+C). Spec: `docs/superpowers/specs/2026-09-18-speed-stages.md` §8a, §10.
+- **The 0-3 stage ended at its 6M cap** (24,757,714 steps, recorded `"unfinished"`, 0 fresh completions), and
+  0-1's first speed round ended at its own cap; 12 games on ports 47800-47811, `mem_guard.py` alongside.
+  Under the depth-first order the next windows are 0-1 speed (round 2) until 0-1 is done, then 0-2 speed,
+  then 0-3 complete — 0-3's speed stage cannot start until its complete stage is `"done"`.
 - **Parking is off on a collapsed-ladder trunk load** (2026-09-18, `patience_active` + `_prefers_route`): on
   0-3 a park aimed the agent 27.3 m back DOWN off Floor 2 and `gate_approach` paid +3.87 for descents over 13
   recorded rollouts. The proposed waypoint move was REFUSED — it fails the generator's own `SEP`/`co_credit`
