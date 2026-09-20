@@ -2787,3 +2787,186 @@ Round 2 verified over the following ten minutes: `spec_0-1_speed` stepping from 
 helpers up with `keep_best --metric time --min-rate 0.3`, 12/12 ports listening, system commit 77-82%,
 `check_run.py` `ALERTS none`, no traceback in the driver log.
 69 passed, `test_specialists_config.py` 12 passed, then the whole suite one file at a time.
+
+## 2026-09-20 -- 0-2 speed: the route-potential lever REFUSED, and the plateau is deaths, not navigation
+
+**Outcome: nothing was changed on the live box.** No reward term, no config, no weight, no mod rebuild, no
+trainer bounce. The run `spec_0-2_speed` (stage `Level 0-2` speed, round 2) was left stepping untouched on
+ports 47800-47811 throughout. This entry is the measurement, and it redirects the stage.
+
+### 1. The time budget of 0-2 (probe, 24 recorded episodes at checkpoint 25,959,958)
+
+Recorded by `scripts/probe_rollout.py` on a private game (port 47812) in an earlier session; raw data in
+`runs/probe_0-2_speed/`. 22 completions, official seconds p10 123.8 / median 214.0 / p90 345.0, min 117.0,
+max 438.6 -- inside the +-45 s noise band of the live trailing-50 at the same moment, so the probe reproduces
+the live run. Ladder: 8 rungs, hops 7..0, then the exit; all 22 completions monotone (9 target transitions, 0
+parks), so "leg h = decisions aiming at rung h" is exact. Reference: the run's own best, 86.74 s
+(`runs/spec_0-2_speed/best_runs/Level_0-2.json`, 1389 samples, 2915 m raw).
+
+Per-leg mean seconds vs the best run's own leg, with the mean split into fight / hunt / post-clear / nav:
+
+| leg | mean s | best s | gap | fight | hunt | post-clear | nav | deaths/run |
+|----|----|----|----|----|----|----|----|----|
+| 7 | 2.5 | 4.0 | -1.5 | 0 | 0 | 0 | 5.7 | 0 |
+| 6 | 3.1 | 1.5 | +1.6 | 0 | 0 | 0 | 3.8 | 0 |
+| 5 | 12.1 | 10.9 | +1.2 | 0 | 0 | 0 | 15.2 | 0 |
+| 4 | 29.5 | 15.9 | +13.6 | 20.3 | 0.3 | 9.0 | 5.0 | 0 |
+| 3 | 3.6 | 5.6 | -2.0 | 0 | 0 | 0 | 3.5 | 0.36 |
+| 2 | 4.0 | 2.4 | +1.6 | 0.4 | 0 | 0.1 | 3.5 | 0.32 |
+| 1 | 42.4 | 14.7 | +27.7 | 19.3 | 0.7 | 24.2 | 0.1 | 1.82 |
+| 0 | 7.5 | 6.4 | +1.1 | 3.6 | 0.3 | 0.1 | 3.8 | 0 |
+| exit | 120.5 | 25.4 | +95.0 | 63.8 | 17.5 | 42.8 | 0.0 | 2.55 |
+
+The exit leg + leg 1 + leg 4 are 136.3 s of the 138.3 s mean gap (98.5%). The six pure-navigation legs
+(7/6/5/3/2/0) total 32.8 s against the best run's 30.8 s -- **parity**. Raw movement speed is identical
+between the fastest and slowest thirds (16.7 vs 16.5 m/s median; under 2 m/s on 16.6% vs 18.9% of decisions);
+the path is 2.7x longer. Same work done either way: kills 51.1 vs 49.6, arena clears 5.0/5.0, doors 11.0/11.0.
+**0-2 is not the 0-1 shaft problem.** On 0-1, 54% of the gap sat in one navigation leg where `gate_approach`
+was flat; on 0-2 no such leg exists.
+
+### 2. Signal tests, all offline on the 22 completions -- four candidates, all rejected
+
+- **(a) ghost_max** (new maximum of arc along the policy's own best trace): discrimination 2.37 against
+  `gate_approach`'s 3.02 -- worse. It is a high-water-mark term, so like `gate_approach` it is silent exactly
+  where the dawdle happens, after the maximum is set (pays on 1% of dark decisions at 1.89 m/s).
+- **(b) path-distance** instead of straight-line to the rung: median |r| against the ground truth 0.67 vs the
+  straight line's 0.68 across the nine legs. No improvement, even though the straight line disagrees in SIGN
+  with true route progress on 40% of the exit leg's decisions.
+- **(c) inserted waypoints** on the exit leg: would repair the direction signal on the 33-40% of decisions
+  where the straight line disagrees -- a navigation problem worth **0.0 s** of that leg's 120.5 s mean, which
+  is 63.8 fight + 17.5 hunt + 42.8 post-clear. Also a per-level hand-placed patch.
+- **(d) per-leg time budget** (truncate at k x the policy's own best leg time): no k below **15.5** spares the
+  completions. k=3 cuts 94% of recorded time and kills 22/22. It breaks "finishing must always beat not
+  finishing" outright.
+
+### 3. Route potential ("ghost potential") -- designed, independently re-derived, and REFUSED
+
+The one candidate that lit up offline: a per-decision `B * (u_t - u_{t-1})` on the arc fraction `u` of the
+policy's own fastest recorded run, `B = SPEED_BONUS_MIN * level_complete = 25.0`, telescoping so a loop nets
+zero. It pays on 74-78% of the decisions where `gate_approach` is dark (73% of all decisions, 3901 s of the
+4877 s of recorded completion time) and it is the only tested term with any gradient in the cleared-room time.
+
+**Its safety holds.** Re-derived here from the raw recordings (reference rebuilt from `best_runs`, tracker
+re-implemented from the spec, run over all 88,799 decisions): episode total on every completion **24.984 to
+24.998**, max running total at any point in any episode **24.9977**, truncated episodes -0.005. No loop,
+oscillation, respawn or stall can exceed `B` -- the bound is structural, not empirical. Forward motion pays
+`B/L` = 0.0098 reward/m against a time cost of 0.0182 reward/m at the policy's own 19.6 m/s, so no detour
+along the reference pays for itself. A death's potential drop is charged and refunded only by re-walking, so
+the die-and-re-earn inversion is closed. Finishing beats walking-the-route-and-stalling by ~294.
+
+**Its mechanism does not.** Measured here on the same 88,799 decisions, at the design's own constants
+(W = 40 m, D_max = 20 m, jump 15 m, loop 8 m):
+
+- **12.26% of decisions move the arc faster than the player physically moved** (|d arc| > 2*step + 2 m), and
+  those decisions carry **82.0% of gross |payment| and 80.8% of net**. On the exit leg -- 51.2% of all
+  decisions, 69% of the mean time gap -- it is 86.8% of gross and 84.9% of net.
+- **corr(d arc, the player's actual displacement along the route tangent) = 0.222** overall, **0.210** on the
+  exit leg.
+- **Only 50.3% of the positive payment lands on a decision that actually moved forward** along the route by
+  more than 0.5 m. Half the reward pays for the projection switching folds, not for motion.
+- The sign is right 90.6% of the time, but the 9.4% of wrong-signed decisions carry **35.2% of gross
+  payment** (39.0% on the exit leg): the errors are ~5x larger than the average payment.
+- Mean |payment| per decision is **0.0515 -- 2.6x the per-decision `time` cost of 0.020** -- while the net
+  contribution is 0.0062. The term pushes **207.7 of gross reward through an episode to deliver 25 net**
+  (churn 8.3x).
+- The stated per-decision bound in the design (`B*W/L = 0.391`) is **wrong**: windowed decisions reach 0.425
+  (the window is on segment-midpoint arc, so the reachable arc runs to W plus half a segment), and the 0.42%
+  of decisions that fall back to a global re-sync pay up to **+8.09 / -20.09** -- a third of the whole episode
+  budget on one decision, against gate 15 and door_unlock 15 as the largest existing single-step rewards.
+
+**Root cause, geometric and not tunable:** 0-2's reference has **48,174 vertex pairs within 20 m of each other
+but more than 40 m apart along the route**, maximum arc separation **847 m**. The exit chain is 904 m of arc
+for 109 m of net displacement (path/net 8.3), a U-turn chain that passes within metres of itself. A 1-D arc
+coordinate is genuinely ill-defined there; no window width fixes it.
+
+**The obvious repair fails.** Clamping the arc update to the player's own displacement + 2 m removes every
+impossible move and caps |payment| at 3.45, but sign accuracy *falls* to 72.6%, wrong-signed decisions still
+carry 35.6% of gross, positive payment landing on forward motion stays at 49.1%, and `u_end` drops to a median
+0.943 (completions pay 20.9-25.0 instead of a constant 25). It trades spikes for drag and buys no correlation.
+
+**Refused**, therefore: a reward whose per-decision magnitude is 2.6x the clock, whose correlation with the
+quantity it claims to measure is 0.22, and 80% of whose payment lands on projection artifacts, on 100% of
+decisions -- on a run whose trailing-50 median swung 160 -> 175 -> 236 s inside one session with nothing
+changed. It is safe. It is not judgeable, and it is more likely to add gradient variance than direction.
+Reference length is also under-specified by the design's own prose: three implementations of "the LAST earlier
+vertex within 8 m" gave 2514, 2539.2 and 2550.6 m.
+
+### 4. What the plateau actually is: deaths, and only deaths
+
+Live `episodes.jsonl`, streamed, **1,960 fresh completions** over 18.78M-26.93M steps -- not the 22-episode
+probe:
+
+| deaths in the episode | n | share | median s | p10 s |
+|----|----|----|----|----|
+| 0 | 163 | 8.3% | **123.6** | 105.3 |
+| 1-2 | 503 | 25.7% | 149.7 | 118.5 |
+| 3-4 | 453 | 23.1% | 192.2 | 148.5 |
+| 5-8 | 517 | 26.4% | 253.3 | 181.7 |
+| >= 9 | 324 | 16.5% | 378.3 | 265.9 |
+
+`corr(deaths, level_seconds) = +0.863` per episode; OLS **+22.3 s per death with an intercept of 121.1 s**
+against an S-rank target of **120 s**. Across the 17 x 500k buckets, `corr(mean deaths, median time) = +0.778`
+and +28.6 s per +1 mean death. **The policy already finishes 0-2 at a 123.6 s median when it does not die**,
+on 8.3% of its fresh completions. The remaining ~80-110 s of median time is deaths.
+
+**The causation was separated, offline, and it runs death -> time, not slow -> death.** Two independent tests
+on the probe recordings:
+
+1. *Pre-treatment pace.* Legs 7/6/5/4 carry **zero deaths in all 22 completions**, and include a full gated
+   arena fight, so the time an episode takes over that opening (median 43.2 s, 22% of the median run) is
+   measured before any death. `corr(opening seconds, final seconds) = -0.109`; `corr(opening seconds, eventual
+   death count) = -0.155`; `partial corr(deaths, total | opening) = +0.862`, unchanged from +0.863. Slow
+   episodes are **not** slow before they die. The slowest opening (72.8 s) finished in 147.7 s with 0 deaths;
+   a median opening (43.0 s) finished in 387.2 s with 16 deaths.
+2. *Removing the recovery.* Taking the UNION of the intervals from each death until the episode regains the
+   closest approach to the exit it held before dying: time **inside** recovery is a median 88.0 s (38% of the
+   median run); time **outside** recovery is a median **127.3 s** (p10 101.4, p90 153.4) and
+   `corr(outside-recovery time, total) = +0.189` -- flat across the entire 117-439 s range. Episode 0 (387.2 s,
+   16 deaths) spends only 97.9 s outside recovery, *less* than episode 19 (147.7 s, 0 deaths). 18.6 s of
+   recovery per death on the union basis; 85 m of net respawn-to-high-water displacement per death but 1234 m
+   actually walked, because deaths cluster and the walk-back is itself a wander.
+
+This **reinterprets the profile's own headline.** "76.0 s per run of post-clear wandering plus 18.5 s of
+hunting" was classified by room state, which cannot tell aimless wandering in a cleared room apart from
+walking back through a cleared room to where you died. On the two legs holding 86% of the deaths, they are the
+same seconds.
+
+**The deaths are three places, not a difficulty.** 111 deaths fall into 7 greedy 15 m clusters; the top three
+hold 75%: **39 (35%) at [-135.6, -21.5, 278.6]** on the exit leg at the bottom of the descent, **23 (21%) at
+[16.9, -5.7, 245.0]** and **21 (19%) at [16.5, -3.5, 217.5]** on legs 1-3. 93% of deaths occur at hp >= 70 and
+**none at all below hp 20** -- the median hp on the last sample before the restart marker is **100**. That is
+not combat attrition; it is consistent with instant kills (0-2 ships 44 `DeathZone`s and 5 moving platforms per
+`docs/level-survey.md`) or with the damage never being sampled. Deaths y: p10 -24.5, median -10.1 -- both
+clusters sit at the bottom of a drop.
+
+### 5. What to do next, in order
+
+1. **Classify the deaths before choosing any lever.** The probe does not sample `player.dead` at frameskip 2
+   and reads deaths as `restarts` increments, so cause is unknown. A probe (or a mod field) that records the
+   last pre-death hp trajectory and whether a `DeathZone` was the killer decides between two very different
+   fixes: a fall/hazard problem at three coordinates, or a combat problem. **Do not pick a lever before this.**
+2. **Do not raise the `death` weight blind.** The current marginal price of a death is already ~14 reward
+   (5.0 `death` + ~5.6 of `time` over the 18.6 s of recovery + ~3.4 of lost completion bonus). Note the one
+   thing the new data does change about the old objection: a death costs mostly *clock*, and standing still
+   costs the same clock, so timidity is not free -- but this still needs its own farmability pass, and if the
+   deaths are falls then a blanket death penalty teaches caution in fights that are not killing the policy.
+3. **Judging, when a lever is finally chosen.** Use the **median of six consecutive 500k-step bucket medians**
+   over the 3M steps after activation, against a baseline taken the same way from full buckets only. Measured
+   here: the 17 bucket medians have mean 206.8 and **sd 28.6**, while the pooled sigma of completion times is
+   ~88 s, so a ~120-completion bucket median has only ~10 s of sampling noise -- policy drift dominates, and
+   more completions per window will not help, only longer windows. Never read a partial bucket and never read
+   the trailing-50 point median: it read 160.4, 175.5 and 239.1 within one session with nothing changed. The
+   3.0M pooled median is 186 s at 24.0M and 203 s at 27.0M; the 5.5M trend is 217 -> 203 s. That is the
+   plateau, against a 120 s target.
+4. Useful baselines recorded today at 26,864,698 steps, for whoever activates next: fresh completion rate 0.87
+   over the last 200 fresh episodes, `level_started` 1.000, **zero-kill share 0.000 across all 17 buckets**
+   (0.006 in one), `mean_100` level_seconds 228.6 / deaths 4.56 / kills 48.85, reward parts door_unlock 140.3,
+   gate 116.1, gate_approach 75.1, time -68.5, level_complete 62.9, kill 46.8, arena_clear 46.6, death -22.8.
+
+### Live-box safety of this session
+
+Read-only throughout. No socket was opened, no game started or stopped, no trainer or driver process
+signalled, no port 47800-47811 touched. All analysis streamed one 29 KB JSON, one 2.6 MB npz and one 1.1 MB
+jsonl in short-lived numpy processes (no torch). `mem_guard.py --dry-run` at the start: 12 games, 24.0 GB
+total, fattest 2.3 GB against a 2.6 GB limit, system commit 72%. Scratch scripts stayed in the session
+scratchpad; the only repo change is this entry.

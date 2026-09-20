@@ -180,6 +180,11 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   `docs/project-log.md`, 2026-09-19. Also: guard T's mid-name-fork blind spot still
   unfixed campaign-wide; a **0-3 mid-level wall probe** still to run; and the memory work above — another
   engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`.
+- **0-2 speed is a DEATH problem, not navigation** (2026-09-20, no change landed): live over 1,960 fresh
+  completions, zero-death episodes finish at a **123.6 s** median against the 120 s target while >=9-death
+  ones take 378 s; OLS **+22.3 s/death, intercept 121.1 s**. Route potential, ghost_max, path-distance,
+  waypoints and per-leg time budgets were all **refused on the data — do not re-propose**. Classify the deaths
+  (93% at hp >= 70, three 15 m clusters) before picking a lever: `docs/project-log.md`, 2026-09-20.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
   (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2** installed; **33 of 35**
   levels ship; Violent, with all weapons unlocked in memory for AI runs only.
