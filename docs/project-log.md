@@ -2759,4 +2759,31 @@ passing the hold line — but found five other things. Fixed before the merge:
 and its complete-stage sidecar does too; a control file the driver cannot unlink says so once across three
 polls while the stage line is still logged once; a blocked leading stage is named every round and shown by
 `specialists_status`). All three were run against the pre-fix code first and failed there. `test_campaign_driver.py`
+69 passed, `test_specialists_config.py` 12 passed, whole suite one file at a time: 30 files, 0 failures.
+
+**Activated on the live box, 2026-09-19 19:33-19:36.** Merged as 225a7e8 (`--no-ff`, branch commits 4cbf2e9,
+e959f40, 98ab1a8, 1f3936b). `campaign_driver.py --dry-run` first reported the new plan against the live state
+(33 stages, hold index 6, `unplanned == []`, `HOLD LINE before Level 0-4 (depth-first: finishing Level 0-1
+before Level 0-2)`, current `Level 0-2 (speed)` / `spec_0-2_speed`). Then `DRIVER_PAUSE`; the old driver, its
+`start_driver.cmd`, the `spec_0-2_speed` trainer, its twelve workers and the five helpers were stopped one pid
+at a time, each re-verified by its command line first (no tree kill; all twelve `ULTRAKILL.exe` survived and
+all twelve ports stayed listening); pause removed; `start_driver.cmd` restarted detached. It resumed the SAME
+stage from `models/spec_0-2_speed/latest.zip` at 23,292,490 steps, exactly as `tick`'s short circuit on a
+non-None `current` promises.
+
+`Set-Content runs\specialists\END_STAGE "Level 0-2 speed"` at 19:34:38; the driver's 19:35:32 poll logged, in
+order: `END_STAGE: ending Level 0-2 (speed, round 1) now, at the operator's request` → `STAGE END Level 0-2
+(speed): unfinished -- ended by operator (rate 0.000 over 1 fresh, median -, best 97.65, target 120.00,
+4,558,092 steps into the stage)` → `NOT promoting Level 0-2 (speed)` → `holding before Level 0-4 (depth-first:
+finishing Level 0-1 before Level 0-2)` → `STAGE 2/33 Level 0-1 (speed, round 2): resuming from
+models/spec_0-1_speed/latest.zip` at **26,063,110** steps, and the control file was gone. `Level_0-2.zip` is
+byte-identical across the switch (SHA-256 `F3C3A29A…`) and `models/spec_0-2_speed/` still holds all 106 files.
+**The rate 0.000 over 1 fresh in that history entry is the post-restart window, not round 1's 0.94 / 205.8 s**:
+restarting a trainer resets `fresh_window`, and `END_STAGE` fired a minute later. Nothing reads those numbers
+(the hold line reads `status`), but the round's real headline lives only here and in `times.md`.
+
+Round 2 verified over the following ten minutes: `spec_0-1_speed` stepping from 26,063,110 (26,070,106 at
+19:36:37, 217 steps/s), `stale_below` 26,063,110 so the new fix is doing real work at this very boundary,
+helpers up with `keep_best --metric time --min-rate 0.3`, 12/12 ports listening, system commit 77-82%,
+`check_run.py` `ALERTS none`, no traceback in the driver log.
 69 passed, `test_specialists_config.py` 12 passed, then the whole suite one file at a time.

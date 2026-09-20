@@ -170,10 +170,11 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   against a completion's 100. Trimmed to the 4 rungs every recorded completion used (2026-09-18, `route-0-3`);
   `rung_overrides.json` now carries `drop` entries; trainer bounced onto it at **21,701,566** steps. Judge at
   +400k on wing endings and `exit_ground_dist_min` (131.8 m at the bounce), never on `gates_reached` — see the log.
-- **Live: stage 4, `Level 0-1` (SPEED), run `spec_0-1_speed`**, resumed from `Level_0-1.zip` at 18.05M, target
-  median 150.00 s. It dipped hard (rate 0.68 -> 0.28, zero-kill wanders 0.05 -> 0.46), **recovered on its
-  own**, and at **22.36M** stands at the stage's best yet: rate **0.82**, `median_time_50` **289.1 s** (from
-  500), best **156.98 s**. The clock is still falling unaided, so an `ent_coef_max` cap, a rollback AND a
+- **Live: stage 2, `Level 0-1` (SPEED) ROUND 2, run `spec_0-1_speed`**, resumed 2026-09-19 19:35 from the
+  stage's own `latest.zip` at **26,063,110** steps, target median 150.00 s. Round 1 ended at its 8M cap
+  `"unfinished"` (rate 0.70, `median_time_50` **177.37 s** from 500, best **117.46 s**); 0-2's speed round 1
+  was ended with `END_STAGE` at 23,310,130 steps and its weights stay in `models/spec_0-2_speed/` for its next
+  round. In round 1 an `ent_coef_max` cap, a rollback AND a
   `time` 0.02->0.05 raise were all **refused** on the data — a recorded per-leg time budget (54% of the gap is
   one 25 m shaft climb where `gate_approach` is flat), the corrected numbers and the revert triggers are in
   `docs/project-log.md`, 2026-09-19. Also: guard T's mid-name-fork blind spot still
