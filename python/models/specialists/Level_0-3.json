@@ -1,0 +1,20 @@
+{
+  "level": "Level 0-3",
+  "run": "spec_0-3",
+  "mode": "complete",
+  "target_seconds": null,
+  "s_rank_seconds": null,
+  "round": 1,
+  "status": "unfinished",
+  "fresh_completion_rate": 0.0,
+  "fresh_window": 50,
+  "best_time": null,
+  "median_time": null,
+  "timesteps": 24757714.0,
+  "stage_steps": 6005676.0,
+  "source_checkpoint": "best.zip",
+  "source_kind": "best",
+  "difficulty": 3,
+  "env_config": "F:/Github/ULTRAKILL-AI/python/models/spec_0-3/env_config.yaml",
+  "saved_at": "2026-09-18 23:29:23"
+}
