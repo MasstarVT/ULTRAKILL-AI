@@ -230,10 +230,10 @@ def test_the_plain_bonus_is_byte_identical_when_no_target_is_set():
     cfg = RewardConfig(level_complete=100.0)
     assert completion_bonus(cfg) == cfg.level_complete
     assert completion_bonus(cfg, None, 131.25) == cfg.level_complete
-    assert completion_bonus(cfg, 95.0, None) == cfg.level_complete, "a target with no official time pays plain"
     assert completion_bonus(cfg, 0.0, 131.25) == cfg.level_complete
-    assert completion_bonus(cfg, 95.0, 0.0) == cfg.level_complete, "a completion frame with no clock pays plain"
     assert compute_reward(cfg, snapshot(), snapshot(level_complete=True), {}).parts["level_complete"] == 100.0
+    # A TARGET WITH NO CLOCK is the speed stage's own case and is NOT this one: see
+    # test_a_timerless_completion_can_never_out_earn_a_genuine_one (2026-09-20).
 
 
 def test_the_bonus_scales_with_the_target_over_the_official_time():
@@ -252,7 +252,10 @@ def test_the_bonus_is_bounded_so_finishing_always_beats_not_finishing():
     cfg = RewardConfig(level_complete=100.0)
     assert completion_bonus(cfg, 95.0, 95.0 * 40) > 25.0, "a crawl bottoms out ABOVE 0.25, never at or below"
     assert completion_bonus(cfg, 95.0, 95.0 * 1e6) > 25.0, "however slow, the floor is never actually reached"
-    assert completion_bonus(cfg, 95.0, 1e-3) == 200.0, "and a bogus near-zero time cannot pay unbounded"
+    assert completion_bonus(cfg, 95.0, 1.5) == 200.0, "a genuinely fast time still cannot pay unbounded"
+    # A time at or under `times.MIN_OFFICIAL_SECONDS` is not a time at all (the fastest human IL in the whole
+    # first act is 6.6 s), so since 2026-09-20 it reads as MISSING and pays the floor rather than the ceiling.
+    assert completion_bonus(cfg, 95.0, 1e-3) == 25.0
     assert (SPEED_BONUS_MIN, SPEED_BONUS_MAX) == (0.25, 2.0)
 
 
@@ -289,6 +292,104 @@ def test_compute_reward_pays_the_scaled_bonus_on_the_completion_edge():
     cur.pop("player")
     assert compute_reward(cfg, snapshot(), cur, {}, target_seconds=95.0,
                           official_seconds=190.0).parts["level_complete"] == 62.5
+
+
+# ---------------------------------------------------------------------------
+# The two reward defects found on 2026-09-20 (docs/project-log.md, 2026-09-20 §6)
+# ---------------------------------------------------------------------------
+
+
+def test_a_timerless_completion_can_never_out_earn_a_genuine_one():
+    """FIX (b). `completion_bonus` used to pay the FULL 100 when the official time was missing.
+
+    That made the best-paying completion available to the policy one with no clock at all: a completion whose
+    timer the game never reported paid 100 while every genuine completion slower than the target paid 39-99.
+    Such frames are real -- the 2026-09-19 incident behind `times.valid_official_seconds` was a completion
+    frame that arrived after the game's own level stats had reset and reported 0.0 s. It now pays the FLOOR.
+    """
+    cfg = RewardConfig(level_complete=100.0)
+    floor = SPEED_BONUS_MIN * cfg.level_complete
+    for missing in (None, 0.0, -1.0, 0.5, float("nan"), float("inf"), "", "n/a"):
+        assert completion_bonus(cfg, 150.0, missing) == floor, missing
+    # ... and the floor is strictly below every genuine completion, however slow. This is the whole property:
+    # a lost timer must never be the most valuable way to finish a level.
+    for genuine in (150.0, 300.0, 600.0, 1500.0, 15000.0, 1.5e6):
+        assert completion_bonus(cfg, 150.0, genuine) > floor, genuine
+    # It still beats not finishing by a mile, which is the OTHER safety property (the void-farming post-mortem).
+    assert floor == 25.0
+    # A run that is not a speed stage has no target and is untouched: it pays the plain weight either way.
+    assert completion_bonus(cfg, None, None) == 100.0
+    # End to end, on the completion edge, with the frame that has no player -- which is how a real one arrives.
+    cur = dict(snapshot(level_complete=True))
+    cur.pop("player")
+    assert compute_reward(cfg, snapshot(), cur, {}, target_seconds=150.0,
+                          official_seconds=0.0).parts["level_complete"] == 25.0
+
+
+def test_an_overkilled_enemy_with_no_known_health_bar_cannot_pay_minus_250():
+    """FIX (a), reproducing the measured step: `runs/probe_0-2_speed/rollout_11.jsonl` i=2053.
+
+    A one-shot kill credits the vanished enemy's remaining health. An OVERKILLED enemy reports NEGATIVE
+    health, and when its id was also missing from `enemy_max_health` the divisor fell back to that same
+    negative number, `max(negative, 1e-3)` returned 1e-3, and the term became health x 1000. At the live
+    `damage_dealt: 0.5` a health of -0.5 paid exactly -250.0 in one decision; 71 of 2,068 live completions
+    (3.43%) ended with a negative TOTAL episode reward, worst -1,119.5.
+    """
+    cfg = RewardConfig(**GATES_WEIGHTS)
+    assert cfg.damage_dealt == 0.5 and cfg.kill == 0.5
+    prev = {"player": {"pos": [0.0, 0.0, 0.0], "hp": 100, "dead": False},
+            "enemies": [{"id": 77, "health": -0.5, "visible": True, "rel": [0.0, 0.0, 5.0]}],
+            "stats": {"kills": 3, "style": 0, "level_complete": False}}
+    cur = {"player": {"pos": [0.0, 0.0, 0.0], "hp": 100, "dead": False},
+           "enemies": [],  # it vanished: one-shot killed, and the kill counter went up
+           "stats": {"kills": 4, "style": 0, "level_complete": False}}
+    parts = compute_reward(cfg, prev, cur, {}).parts  # {} -- the id was never in enemy_max_health
+    # The old arithmetic: -0.5 / max(-0.5, 1e-3) = -500.0, x 0.5 = -250.0.
+    assert (-0.5 / max(-0.5, 1e-3)) * cfg.damage_dealt == -250.0, "the defect, stated as arithmetic"
+    assert "damage_dealt" not in parts, "an overkilled enemy now credits nothing, never a negative"
+    assert parts["kill"] == 0.5, "the kill itself is still paid, exactly as before"
+
+
+def test_one_enemy_can_never_credit_more_or_less_than_its_own_health_bar():
+    """The bound itself: every per-enemy contribution lands in [0, 1] x `damage_dealt`, in both credit paths."""
+    cfg = RewardConfig(damage_dealt=1.0, kill=0.0)
+
+    def dealt(prev_enemies, cur_enemies, max_health, kills=0):
+        prev = {"player": {"pos": [0.0, 0.0, 0.0], "hp": 100, "dead": False}, "enemies": prev_enemies,
+                "stats": {"kills": 0, "style": 0, "level_complete": False}}
+        cur = {"player": {"pos": [0.0, 0.0, 0.0], "hp": 100, "dead": False}, "enemies": cur_enemies,
+               "stats": {"kills": kills, "style": 0, "level_complete": False}}
+        return compute_reward(cfg, prev, cur, max_health).parts.get("damage_dealt", 0.0)
+
+    hurt = [{"id": 1, "health": 100.0, "visible": False, "rel": [0.0, 0.0, 1.0]}]
+    # The ordinary case is arithmetically what it always was: a known bar, a partial hit.
+    assert abs(dealt(hurt, [{"id": 1, "health": 75.0, "visible": False, "rel": [0, 0, 1]}], {1: 100.0}) - 0.25) < 1e-9
+    # An overkill through the HEALTH-DROP path (before 100, now -50) is a whole bar and not 1.5 of one.
+    assert dealt(hurt, [{"id": 1, "health": -50.0, "visible": False, "rel": [0, 0, 1]}], {1: 100.0}) == 1.0
+    # A bar the env recorded as 0 or negative is unusable: it falls back to the previous health, never to 1e-3.
+    assert abs(dealt(hurt, [{"id": 1, "health": 50.0, "visible": False, "rel": [0, 0, 1]}], {1: 0.0}) - 0.5) < 1e-9
+    assert abs(dealt(hurt, [{"id": 1, "health": 50.0, "visible": False, "rel": [0, 0, 1]}], {1: -7.0}) - 0.5) < 1e-9
+    # And through the VANISHED path: a full bar when the enemy died at full health, nothing when overkilled.
+    assert dealt(hurt, [], {1: 100.0}, kills=1) == 1.0
+    assert dealt([{"id": 1, "health": -3.0, "visible": False, "rel": [0, 0, 1]}], [], {}, kills=1) == 0.0
+    # Two enemies still sum: the clamp is per enemy, not per step.
+    both = [{"id": 1, "health": 100.0, "visible": False, "rel": [0, 0, 1]},
+            {"id": 2, "health": 100.0, "visible": False, "rel": [0, 0, 1]}]
+    assert dealt(both, [], {1: 100.0, 2: 100.0}, kills=2) == 2.0
+
+
+def test_damage_share_is_the_bound_stated_directly():
+    from ultrakill_ai.rewards import damage_share  # noqa: PLC0415 - the helper the two paths share
+
+    assert damage_share(25.0, 100.0, 100.0) == 0.25
+    assert damage_share(250.0, 100.0, 100.0) == 1.0, "clamped at one whole bar"
+    assert damage_share(-0.5, None, -0.5) == 0.0, "the -250 step: negative health credits nothing"
+    assert damage_share(0.0, 100.0, 100.0) == 0.0
+    assert damage_share(10.0, None, None) == 1.0, "damage happened but no bar is known: one bar, bounded"
+    assert damage_share(10.0, None, 40.0) == 0.25, "the fallback is the caller's old divisor"
+    assert damage_share(float("nan"), 100.0, 100.0) == 0.0
+    assert damage_share(10.0, float("nan"), 40.0) == 0.25
+    assert damage_share(10.0, float("inf"), 40.0) == 0.25
 
 
 if __name__ == "__main__":

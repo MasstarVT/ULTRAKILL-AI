@@ -7,6 +7,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from ultrakill_ai.times import valid_official_seconds
+
 
 @dataclass
 class RewardConfig:
@@ -67,9 +69,19 @@ def completion_bonus(cfg: "RewardConfig", target_seconds: float | None = None,
                      official_seconds: float | None = None) -> float:
     """What one level completion pays: the plain weight, or it scaled by the clock.
 
-    With either argument missing or non-positive this is `cfg.level_complete` and nothing else, so every run
-    that is not a speed stage -- and every completion inside one that has no official time (a frame that
-    arrived after the campaign block was gone) -- is unchanged.
+    With NO TARGET -- every run that is not a speed stage -- this is `cfg.level_complete` and nothing else.
+
+    WITH A TARGET AND NO USABLE OFFICIAL TIME it is the FLOOR, `SPEED_BONUS_MIN * cfg.level_complete`
+    (2026-09-20). It used to be the full unscaled weight, and that was a hole in the whole mechanism: a
+    completion whose timer the game never reported paid 100 while a genuine completion slower than the target
+    paid 39-99, so the best-paying completion available to the policy was one with no clock at all. Such
+    frames are real and not rare enough to ignore -- the 2026-09-19 incident that produced
+    `times.valid_official_seconds` was a 4,120-decision episode whose completion frame arrived after the
+    game's level stats had reset -- and nothing about them says the level was played fast. The floor is what
+    the slowest conceivable genuine completion approaches, so a timer-less one can never out-earn a genuine
+    one, and it still pays far more than not finishing, which is the safety property below. Both arguments go
+    through `times.valid_official_seconds`, the same predicate the leaderboard and the driver's rule use, so a
+    0.0 or a NaN cannot slip past as a "time".
 
     THE FLOOR IS APPROACHED, NEVER REACHED (2026-09-18 review). A hard `max(target/official, 0.25)` clip is
     flat wherever the policy is more than 4x its target, and that is exactly where every policy starts: over
@@ -87,11 +99,50 @@ def completion_bonus(cfg: "RewardConfig", target_seconds: float | None = None,
     a faster one. At `level_complete: 100` and a 90 s target: 482 s pays 39.0, 243 s pays 52.8, 150 s pays
     70.0, 90 s pays 100.0. NOT VALIDATED IN GAME: no speed stage has been trained with this.
     """
-    if not target_seconds or not official_seconds or target_seconds <= 0.0 or official_seconds <= 0.0:
-        return cfg.level_complete
-    ratio = target_seconds / official_seconds
+    target = valid_official_seconds(target_seconds)
+    if target is None:
+        return cfg.level_complete  # not a speed stage: nothing about this call has changed
+    official = valid_official_seconds(official_seconds)
+    if official is None:
+        return cfg.level_complete * SPEED_BONUS_MIN
+    ratio = target / official
     scale = min(ratio, SPEED_BONUS_MAX) if ratio >= 1.0 else SPEED_BONUS_MIN + (1.0 - SPEED_BONUS_MIN) * ratio
     return cfg.level_complete * scale
+
+
+def damage_share(removed: float, max_health: float | None, fallback: float | None) -> float:
+    """One enemy's contribution to `damage_dealt` this step: the fraction of its health bar removed, in [0, 1].
+
+    THE CLAMP IS THE POINT (2026-09-20). Both credit paths used to divide by
+    `max(enemy_max_health.get(id, <a health value>), 1e-3)`, and when the id was missing from
+    `enemy_max_health` AND the health value was NEGATIVE -- an overkilled enemy, which the game does report --
+    `max()` returned the 1e-3 rather than the negative number and the term became health x 1000. Measured on
+    the live 0-2 speed stage: one decision in `runs/probe_0-2_speed/rollout_11.jsonl` paid
+    `damage_dealt = -250.0` (health -0.5, weight 0.5), and 71 of 2,068 completions (3.43%) had a NEGATIVE total
+    episode reward, worst -1,119.5 -- 4-20x the whole death channel, unbounded, and firing during exactly the
+    arena fighting a gated level forces. A per-enemy share can only ever be "none of its bar" to "all of its
+    bar", so that is what this returns.
+
+    `max_health` is the enemy's own bar when the env has seen one. `fallback` is what each caller used before
+    this function existed -- the previous frame's health, or the vanished enemy's last health -- and it is used
+    only when the bar is unknown, so the ordinary case is arithmetically identical to what it always was. With
+    neither usable and real damage observed, the share is a whole bar: bounded, and never a credit for damage
+    that did not happen (`removed <= 0` pays nothing).
+    """
+    try:
+        taken = float(removed)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(taken) or taken <= 0.0:
+        return 0.0
+    for denominator in (max_health, fallback):
+        try:
+            bar = float(denominator)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(bar) and bar > 0.0:
+            return min(1.0, taken / bar)
+    return 1.0
 
 
 @dataclass
@@ -227,15 +278,16 @@ def compute_reward(
     for e in cur.get("enemies", []):
         before = prev_hp.get(e["id"])
         if before is not None and before > e["health"]:
-            dealt += (before - e["health"]) / max(enemy_max_health.get(e["id"], before), 1e-3)
+            dealt += damage_share(before - e["health"], enemy_max_health.get(e["id"]), before)
 
     new_kills = max(0, cs.get("kills", 0) - ps.get("kills", 0))
     if new_kills:
         # Enemies killed in one hit vanish before a health drop is ever observed. Credit the health they
-        # had left, nearest first, for as many enemies as the kill counter went up.
+        # had left, nearest first, for as many enemies as the kill counter went up. An OVERKILLED enemy
+        # reports negative health here, which is the -250 defect `damage_share` exists to bound.
         vanished = [e for e in prev.get("enemies", []) if e["id"] not in cur_ids]
         for e in vanished[:new_kills]:
-            dealt += e["health"] / max(enemy_max_health.get(e["id"], e["health"]), 1e-3)
+            dealt += damage_share(e["health"], enemy_max_health.get(e["id"]), e["health"])
     r.add("damage_dealt", cfg.damage_dealt * dealt)
     r.add("kill", cfg.kill * new_kills)
     r.add("style", cfg.style * max(0, cs.get("style", 0) - ps.get("style", 0)))
