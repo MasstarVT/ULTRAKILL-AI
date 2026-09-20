@@ -151,12 +151,16 @@ def test_a_speed_stage_cannot_latch_on_a_clock_the_game_never_reported():
 # ---------------------------------------------------------------------------
 
 
-def write_plan(tmp: Path, *, order=LEVELS, speed: dict | None = None, hold_before=None) -> Path:
+def write_plan(tmp: Path, *, order=LEVELS, speed: dict | None = None, hold_before=None,
+               hold_order=None) -> Path:
     path = tmp / "configs" / "specialists.yaml"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump({
         "order": list(order),
         "hold_before": hold_before,
+        # Absent by default, on purpose: every test written before `hold_order` existed must keep meaning
+        # what it meant, which is `round_robin`.
+        **({"hold_order": hold_order} if hold_order else {}),
         "speed": speed if speed is not None else {"target_rate": 0.4, "max_steps_per_stage": 8_000_000,
                                                   "targets": {}},
         "stage": {"target_rate": 0.5, "min_fresh_window": 30, "settle_steps": 300_000,
@@ -1350,6 +1354,391 @@ def test_the_real_live_state_file_loads_into_the_new_plan_and_keeps_stage_three_
         # And the copy on disk still describes the same stage after a save.
         saved = json.loads(state_path.read_text(encoding="utf-8"))
         assert saved["current"]["level"] == "Level 0-3" and saved["current"]["start_steps"] == 18_752_038.0
+
+
+# ---------------------------------------------------------------------------
+# hold_order: sequential -- depth-first by level (spec §10, 2026-09-19)
+# ---------------------------------------------------------------------------
+
+
+# The plan shape the user asked for on 2026-09-19 -- "shouldnt we just work on 0-1 untell its finished before
+# working on the other levels" -- in miniature: each level's speed stage directly after its own complete stage.
+DEPTH_FIRST_ORDER = ["Level 0-1", {"level": "Level 0-1", "kind": "speed"},
+                     "Level 0-2", {"level": "Level 0-2", "kind": "speed"},
+                     "Level 0-3", {"level": "Level 0-3", "kind": "speed"},
+                     "Level 0-4", "Level 0-5"]
+
+# `runs/specialists/driver_state.json` as it stood on 2026-09-19, in shape: 0-1 and 0-2 complete done, 0-3
+# complete ended at its cap, 0-1's first speed round ended at its cap, and 0-2's speed stage running. A
+# literal, never a read of the live file, for the reason PRE_KINDS_STATE gives: the live file moves on.
+TODAYS_STATE = {
+    "version": 1,
+    "current": {"level": "Level 0-2", "run": "spec_0-2_speed", "index": 4,
+                "init": "F:/Github/ULTRAKILL-AI/python/models/specialists/Level_0-2.zip",
+                "start_steps": 18752038.0, "started_at": 1789832690.7030592, "target_reached_at": None,
+                "kind": "speed", "target_seconds": 120.0, "s_rank_seconds": 120.0, "round": 1,
+                "stale_below": None},
+    "history": [
+        {"level": "Level 0-1", "kind": "complete", "run": "spec_0-1", "status": "done", "index": 0,
+         "round": 1, "start_steps": 17002318.0, "end_steps": 18362686.0, "fresh_completion_rate": 0.48,
+         "fresh_window": 50, "best_time": 243.441513,
+         "specialist": "F:/Github/ULTRAKILL-AI/python/models/specialists/Level_0-1.zip"},
+        {"level": "Level 0-2", "kind": "complete", "run": "spec_0-2", "status": "done", "index": 1,
+         "round": 1, "start_steps": 18052150.0, "end_steps": 19089202.0, "fresh_completion_rate": 0.72,
+         "fresh_window": 50, "best_time": 139.530548,
+         "specialist": "F:/Github/ULTRAKILL-AI/python/models/specialists/Level_0-2.zip"},
+        {"level": "Level 0-3", "kind": "complete", "run": "spec_0-3", "status": "unfinished", "index": 2,
+         "round": 1, "start_steps": 18752038.0, "end_steps": 24757714.0, "fresh_completion_rate": 0.0,
+         "fresh_window": 50, "best_time": None, "median_time": None, "promoted": True,
+         "specialist": "F:/Github/ULTRAKILL-AI/python/models/specialists/Level_0-3.zip"},
+        {"level": "Level 0-1", "kind": "speed", "run": "spec_0-1_speed", "status": "unfinished", "index": 3,
+         "round": 1, "start_steps": 18052150.0, "end_steps": 26062882.0, "fresh_completion_rate": 0.7,
+         "fresh_window": 50, "best_time": 117.463913, "median_time": 177.3729, "target_seconds": 150.0,
+         "s_rank_seconds": 150.0, "promoted": False, "specialist": None,
+         "not_promoted_because": "it ended 'unfinished' and Level_0-1.zip already holds a promoted specialist"},
+    ],
+}
+
+
+def depth_first_harness(tmp, *, state: dict | None = None, **kwargs) -> Harness:
+    """The depth-first plan, today's state on disk, and the model files that state implies."""
+    h = harness(tmp, **kwargs)
+    h.plan = cd.load_plan(write_plan(Path(tmp), order=DEPTH_FIRST_ORDER, hold_before="Level 0-4",
+                                     hold_order="sequential"))
+    # The shipped plan's `max_rounds: 0` under both kinds: never idle the machine, so a stage that is not
+    # done yet keeps getting fresh budgets. With `StageRule`'s default of 3 the depth-first rule would move
+    # off Level 0-1 after three rounds, which is not what "until it is finished" means.
+    h.plan.rule.max_rounds = 0
+    h.plan.speed["max_rounds"] = 0
+    for level in ("Level 0-1", "Level 0-2", "Level 0-3"):
+        path = cd.specialist_path(h.tmp / "models", level)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"promoted-%s" % level.encode())
+        h.zip_steps[path.as_posix()] = 19_000_000
+    # What each stage that has already run left behind in its own model directory.
+    for run, steps in (("spec_0-1_speed", 26_062_882), ("spec_0-2_speed", 22_600_000)):
+        model_dir = h.tmp / "models" / run
+        model_dir.mkdir(parents=True, exist_ok=True)
+        ckpt = model_dir / ("ckpt_%d_steps.zip" % steps)
+        ckpt.write_bytes(b"%s own weights" % run.encode())
+        h.zip_steps[ckpt.as_posix()] = steps
+    state_path = h.tmp / "runs" / "specialists" / "driver_state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state if state is not None else TODAYS_STATE), encoding="utf-8")
+    h.driver = cd.Driver(
+        cd.DriverConfig(plan_path=str(h.tmp / "configs" / "specialists.yaml"), cwd=h.tmp, python="PY.EXE",
+                        start_grace_seconds=0.0, **kwargs),
+        h.plan,
+        processes=lambda: list(h.procs), now=lambda: h.time, sleep=h.slept.append,
+        probe=lambda path, now: h.status, kill=h.killed.append, spawn=h._spawn,
+        stop_games=h._stop, launch_games=h._launch,
+        zip_steps=lambda path: h.zip_steps.get(Path(path).as_posix()),
+        working_sets=lambda: dict(h.sets), port_pids=lambda: dict(h.ports),
+        relaunch_one=lambda port: True, established=lambda ports: {p: 1 for p in ports},
+        cpu=lambda: {}, copy=h._copy, pid=SELF_PID)
+    return h
+
+
+def end_round(h, key, status="done"):
+    """Records the running (or named) stage as ended, so the test can walk the plan without training it."""
+    h.driver.state.current = None
+    h.driver.state.history.append({"level": key[0], "kind": key[1], "status": status,
+                                   "round": h.driver.state.rounds(key) + 1})
+
+
+def test_the_plan_carries_a_hold_order_and_refuses_one_it_does_not_know():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        assert cd.load_plan(write_plan(root, order=SPEED_ORDER)).hold_order == cd.ROUND_ROBIN, \
+            "a plan written before the key means what it always meant"
+        assert cd.load_plan(write_plan(root, order=SPEED_ORDER, hold_order="sequential")).hold_order == \
+            cd.SEQUENTIAL
+        bad = root / "bad.yaml"
+        bad.write_text(yaml.safe_dump({"order": LEVELS, "hold_order": "sequental"}), encoding="utf-8")
+        try:
+            cd.load_plan(bad)
+            raise AssertionError("an unknown hold_order must be refused, not silently defaulted")
+        except ValueError as exc:
+            assert "sequental" in str(exc) and "round_robin" in str(exc)
+
+
+def test_sequential_runs_one_stage_round_after_round_until_it_is_done():
+    """The whole instruction: finish Level 0-1 before anything of Level 0-2 starts."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp, state={"version": 1, "current": None, "history": []})
+        picks = []
+        for _ in range(4):  # four rounds of 0-1 complete: nothing else may be chosen while it is not done
+            pick, waiting, blocked = h.driver.choose_stage()
+            assert blocked == "" and waiting, "the hold line is up the whole time"
+            picks.append((pick.level, pick.kind, h.driver.state.rounds(pick.key) + 1))
+            end_round(h, pick.key, "unfinished")
+        assert picks == [("Level 0-1", "complete", 1), ("Level 0-1", "complete", 2),
+                         ("Level 0-1", "complete", 3), ("Level 0-1", "complete", 4)]
+        # Once it is done, its OWN speed stage is next -- not the next level.
+        end_round(h, ("Level 0-1", cd.COMPLETE), "done")
+        pick, _, _ = h.driver.choose_stage()
+        assert pick.key == ("Level 0-1", cd.SPEED)
+        end_round(h, ("Level 0-1", cd.SPEED), "unfinished")
+        pick, _, _ = h.driver.choose_stage()
+        assert pick.key == ("Level 0-1", cd.SPEED), "round 2 of the same stage, not 0-2"
+        end_round(h, ("Level 0-1", cd.SPEED), "done")
+        # ... and only now does Level 0-2 begin.
+        pick, _, _ = h.driver.choose_stage()
+        assert pick.key == ("Level 0-2", cd.COMPLETE)
+        assert h.driver.order_rule_text() == "depth-first: finishing Level 0-2 before Level 0-3"
+        # Round robin on the same state would have spread the machine over every not-done stage instead.
+        h.driver.plan.hold_order = cd.ROUND_ROBIN
+        assert h.driver.choose_stage()[0].key == ("Level 0-2", cd.COMPLETE)
+        end_round(h, ("Level 0-2", cd.COMPLETE), "unfinished")
+        assert h.driver.choose_stage()[0].key == ("Level 0-3", cd.COMPLETE), "round robin moves on; depth-first does not"
+        h.driver.plan.hold_order = cd.SEQUENTIAL
+        assert h.driver.choose_stage()[0].key == ("Level 0-2", cd.COMPLETE)
+
+
+def test_sequential_passes_over_a_blocked_stage_only_when_nothing_earlier_can_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp, state={"version": 1, "current": None, "history": [
+            {"level": "Level 0-1", "kind": "complete", "status": "unfinished", "round": 1}]})
+        # 0-1's speed stage cannot start (its complete stage is not done), but 0-1 complete CAN, so the
+        # depth-first order takes that and nothing is passed over.
+        assert h.driver.stage_blocked(cd.StageSpec("Level 0-1", cd.SPEED)) == "its complete stage is not done yet"
+        assert h.driver.choose_stage()[0].key == ("Level 0-1", cd.COMPLETE)
+        # Now 0-1 complete is out of the way ("skipped" satisfies the line) and only the blocked speed stage
+        # is in front: the first stage that CAN run is 0-2's complete stage, and the log says why.
+        h.driver.state.history = [{"level": "Level 0-1", "kind": "complete", "status": "skipped", "round": 1}]
+        pick, waiting, blocked = h.driver.choose_stage()
+        assert blocked == "" and pick.key == ("Level 0-2", cd.COMPLETE)
+        assert [s.key for s in waiting][:2] == [("Level 0-1", cd.SPEED), ("Level 0-2", cd.COMPLETE)]
+        log = h.driver.log_path.read_text(encoding="utf-8")
+        assert "depth-first order: Level 0-1 (speed) -- its complete stage is not done yet" in log
+        assert "the first stage that can is Level 0-2 (complete)" in log
+
+
+def test_todays_state_reconciles_onto_the_depth_first_plan_and_finishes_0_1_first():
+    """THE MIGRATION, pinned against a literal copy of the live state file's shape (2026-09-19).
+
+    History is matched by `(level, kind)`, so reordering the plan renumbers indices and nothing else: no entry
+    may be lost, duplicated or renamed, and the stage that is RUNNING keeps running. Then the depth-first rule
+    takes over: 0-1's speed stage (round 2, from its own weights), then 0-2's, then 0-3.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp)
+        driver = h.driver
+        assert driver.unplanned == [], "every (level, kind) in the live file is still in the plan"
+        stage = driver.state.current
+        assert (stage.level, stage.kind, stage.run) == ("Level 0-2", "speed", "spec_0-2_speed")
+        assert stage.index == 3, "0-2's speed stage is the fourth stage of the level-major plan"
+        assert stage.start_steps == 18_752_038.0 and stage.round == 1 and stage.target_seconds == 120.0
+        # Every history entry is still there, exactly once, renumbered onto the new plan.
+        assert [(e["level"], e["kind"], e["index"], e["round"], e["status"]) for e in driver.state.history] == [
+            ("Level 0-1", "complete", 0, 1, "done"), ("Level 0-2", "complete", 2, 1, "done"),
+            ("Level 0-3", "complete", 4, 1, "unfinished"), ("Level 0-1", "speed", 1, 1, "unfinished")]
+        assert len(driver.state.history) == 4
+        assert driver.plan.order == ["Level 0-1", "Level 0-2", "Level 0-3", "Level 0-4", "Level 0-5"], \
+            "the DISTINCT levels full_run.py plays are untouched by the reordering"
+        assert [s.key for s in driver.held_by()] == [
+            ("Level 0-1", "speed"), ("Level 0-2", "speed"), ("Level 0-3", "complete"), ("Level 0-3", "speed")]
+
+        # The running stage just keeps running: `tick` never consults `choose_stage` while one is current.
+        h.trainer_up("spec_0-2_speed")
+        h.write_status("spec_0-2_speed", 22_700_000, 0.3, 50, best_time=150.0, median_time=190.0,
+                       target_seconds=120.0)
+        assert driver.tick() == "ok"
+        assert driver.state.current.key == ("Level 0-2", "speed")
+        assert h.trainer_commands == [] and h.killed == [] and h.stopped == 0
+
+        # Once it ends, the depth-first rule sends the machine back to Level 0-1's speed stage, round 2,
+        # resumed from THAT stage's own newest weights -- not from the promoted specialist, not 0-2's.
+        end_round(h, ("Level 0-2", cd.SPEED), "unfinished")
+        pick, waiting, blocked = driver.choose_stage()
+        assert blocked == "" and pick.key == ("Level 0-1", "speed")
+        assert driver.state.rounds(pick.key) + 1 == 2
+        init = driver.round_init(pick)
+        assert init == h.tmp / "models" / "spec_0-1_speed" / "ckpt_26062882_steps.zip"
+        assert init != cd.specialist_path(h.tmp / "models", "Level 0-1")
+
+        # 0-1 speed done -> 0-2 speed, round 2, from its own weights.
+        end_round(h, ("Level 0-1", cd.SPEED), "done")
+        pick, _, _ = driver.choose_stage()
+        assert pick.key == ("Level 0-2", "speed") and driver.state.rounds(pick.key) + 1 == 2
+        assert driver.round_init(pick) == h.tmp / "models" / "spec_0-2_speed" / "ckpt_22600000_steps.zip"
+
+        # 0-2 speed done -> 0-3's COMPLETE stage, and its speed stage stays blocked until that is done.
+        end_round(h, ("Level 0-2", cd.SPEED), "done")
+        assert driver.stage_blocked(cd.StageSpec("Level 0-3", cd.SPEED)) == "its complete stage is not done yet"
+        pick, _, _ = driver.choose_stage()
+        assert pick.key == ("Level 0-3", "complete") and driver.state.rounds(pick.key) + 1 == 2
+        end_round(h, ("Level 0-3", cd.COMPLETE), "unfinished")
+        assert driver.choose_stage()[0].key == ("Level 0-3", "complete"), "round 3 of it, never its speed stage"
+        end_round(h, ("Level 0-3", cd.COMPLETE), "done")
+        pick, waiting, _ = driver.choose_stage()
+        assert pick.key == ("Level 0-3", "speed") and waiting
+        # Nothing at or after the line ran at any point along the way, and only now does 0-4 become the answer.
+        assert all(p.level != "Level 0-4" for p in [pick])
+        end_round(h, ("Level 0-3", cd.SPEED), "done")
+        pick, waiting, _ = driver.choose_stage()
+        assert waiting == [] and pick.key == ("Level 0-4", "complete")
+
+
+def test_specialists_status_reports_the_depth_first_rule_and_the_waiting_order():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp)
+        import specialists_status  # noqa: PLC0415 - a script, imported only where it is tested
+
+        data = specialists_status.collect(h.tmp, "configs/specialists.yaml", "runs", "models")
+        assert data["hold_order"] == "sequential"
+        assert data["order_rule"] == "depth-first: finishing Level 0-1 before Level 0-2"
+        assert [(x["level"], x["kind"]) for x in data["held_by"]] == [
+            ("Level 0-1", "speed"), ("Level 0-2", "speed"), ("Level 0-3", "complete"), ("Level 0-3", "speed")]
+        text = specialists_status.render(data)
+        assert "order rule -- depth-first: finishing Level 0-1 before Level 0-2" in text
+        assert "round robin" not in text
+        assert "waiting on Level 0-1 (speed, round 1, unfinished), Level 0-2 (speed, round 0, RUNNING NOW)" in text
+
+
+# ---------------------------------------------------------------------------
+# The END_STAGE control file (2026-09-19)
+# ---------------------------------------------------------------------------
+
+
+def test_end_stage_reads_the_stage_a_control_file_names():
+    stage = cd.Stage(level="Level 0-2", run="spec_0-2_speed", index=3, init="x", kind=cd.SPEED)
+    assert cd.end_stage_request("") == (None, None), "an empty file means whatever is running"
+    assert cd.end_stage_request("   \n") == (None, None)
+    assert cd.end_stage_request("Level 0-2 speed") == ("Level 0-2", "speed")
+    assert cd.end_stage_request("Level 0-2/speed\n") == ("Level 0-2", "speed")
+    assert cd.end_stage_request("# why\nLevel 0-2, complete") == ("Level 0-2", "complete")
+    assert cd.end_stage_request("Level 0-2") == ("Level 0-2", None)
+    assert cd.end_stage_request("speed") == (None, "speed")
+    assert cd.end_stage_objection(stage, "") == ""
+    assert cd.end_stage_objection(stage, "Level 0-2 speed") == ""
+    assert cd.end_stage_objection(stage, "Level 0-2") == ""
+    assert "Level 0-1" in cd.end_stage_objection(stage, "Level 0-1 speed")
+    assert "complete" in cd.end_stage_objection(stage, "Level 0-2 complete")
+
+
+def test_a_control_file_powershell_wrote_is_read_whatever_encoding_it_chose():
+    """FOUND BY THE 2026-09-19 SCRATCH DRY-RUN, against the very command `docs/commands.md` recommends.
+
+    `Set-Content -Encoding utf8` writes a BYTE ORDER MARK and `read_text("utf-8")` keeps it, so a file holding
+    "Level 0-2 speed" parsed as the level "\\ufeffLevel 0-2" and the driver REFUSED a request that was right.
+    Windows PowerShell 5.1's `>` and `Out-File` can write UTF-16, which is not valid UTF-8 at all.
+    """
+    stage = cd.Stage(level="Level 0-2", run="spec_0-2_speed", index=3, init="x", kind=cd.SPEED)
+    for raw in ("Level 0-2 speed".encode("utf-8-sig"),          # Set-Content -Encoding utf8
+                "Level 0-2 speed\r\n".encode("utf-16"),          # Out-File / > on PowerShell 5.1
+                b"Level 0-2 speed\r\n",                          # a plain ASCII file
+                "Level 0-2 speed\n".encode("utf-8")):
+        text = cd.decode_control_file(raw)
+        assert cd.end_stage_request(text) == ("Level 0-2", "speed"), raw
+        assert cd.end_stage_objection(stage, text) == "", raw
+    assert cd.decode_control_file(b"") == ""
+    assert cd.end_stage_request(cd.decode_control_file("﻿\r\n".encode("utf-8"))) == (None, None)
+
+
+def test_a_bom_written_control_file_ends_the_stage_end_to_end():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp)
+        h.trainer_up("spec_0-2_speed")
+        h.write_status("spec_0-2_speed", 22_700_000, 0.3, 50, best_time=150.0, median_time=190.0,
+                       target_seconds=120.0)
+        h.write_best("spec_0-2_speed", 22_650_000)
+        h.driver.end_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        h.driver.end_stage_path.write_bytes("Level 0-2 speed\r\n".encode("utf-8-sig"))
+        assert h.driver.tick() == "advanced", "the BOM PowerShell wrote may not refuse a good request"
+        assert h.driver.state.history[-1]["reason"] == "ended by operator"
+
+
+def test_the_end_stage_file_ends_the_running_stage_once_without_promoting_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp)
+        driver, specialist = h.driver, cd.specialist_path(h.tmp / "models", "Level 0-2")
+        h.trainer_up("spec_0-2_speed")
+        h.write_status("spec_0-2_speed", 22_700_000, 0.3, 50, best_time=150.0, median_time=190.0,
+                       target_seconds=120.0)
+        h.write_best("spec_0-2_speed", 22_650_000)  # keep_best's peak: something IS promotable
+        driver.end_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        driver.end_stage_path.write_text("Level 0-2 speed\n", encoding="utf-8")
+
+        assert driver.tick() == "advanced"
+        assert not driver.end_stage_path.exists(), "the file is removed, so it can only ever end one stage"
+        entry = driver.state.history[-1]
+        assert (entry["level"], entry["kind"], entry["status"], entry["round"]) == \
+            ("Level 0-2", "speed", "unfinished", 1)
+        assert entry["reason"] == "ended by operator" and entry["promoted"] is False
+        assert entry["end_steps"] == 22_700_000 and entry["median_time"] == 190.0
+        # A speed round that never beat the clock may not replace the level's promoted specialist, and
+        # nothing in models/ was deleted: the round's own weights are still there for the next round.
+        assert specialist.read_bytes() == b"promoted-Level 0-2"
+        assert (h.tmp / "models" / "spec_0-2_speed" / "best.zip").exists()
+        assert (h.tmp / "models" / "spec_0-2_speed" / "ckpt_22600000_steps.zip").exists()
+        assert sorted(h.killed) == [3000, 3001, 4000, 4001, 4002], "the trainer, its workers and its helpers"
+        assert h.stopped == 0, "the games are never stopped"
+        # ... and the plan's own rule chose what came next: depth-first, back to 0-1's speed stage, round 2.
+        nxt = driver.state.current
+        assert (nxt.level, nxt.kind, nxt.round) == ("Level 0-1", "speed", 2)
+        assert nxt.init.endswith("models/spec_0-1_speed/ckpt_26062882_steps.zip")
+        # The next tick is an ordinary one: the file is gone, so nothing else ends.
+        h.trainer_up("spec_0-1_speed")
+        h.write_status("spec_0-1_speed", 26_100_000, 0.5, 50, best_time=150.0, target_seconds=150.0)
+        assert driver.tick() == "ok"
+        assert len(driver.state.history) == 5
+
+
+def test_a_stale_end_stage_file_ends_nothing_and_is_removed():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp)
+        driver = h.driver
+        h.trainer_up("spec_0-2_speed")
+        h.write_status("spec_0-2_speed", 22_700_000, 0.3, 50)
+        driver.end_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        # Written for the stage BEFORE this one and forgotten: it must not end the stage that is running now.
+        driver.end_stage_path.write_text("Level 0-1 speed", encoding="utf-8")
+        assert driver.tick() == "ok", "the running stage is driven as usual"
+        assert not driver.end_stage_path.exists()
+        assert len(driver.state.history) == 4, "nothing was ended: the history is still today's four entries"
+        assert driver.state.current.key == ("Level 0-2", "speed") and h.killed == []
+        assert "END_STAGE REFUSED" in driver.log_path.read_text(encoding="utf-8")
+        # The same for a file naming the right level but the wrong KIND.
+        driver.end_stage_path.write_text("Level 0-2 complete", encoding="utf-8")
+        assert driver.tick() == "ok"
+        assert not driver.end_stage_path.exists() and driver.state.current.key == ("Level 0-2", "speed")
+        assert h.killed == []
+
+
+def test_the_pause_file_wins_over_end_stage_and_a_dry_run_only_reports_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp)
+        driver = h.driver
+        h.trainer_up("spec_0-2_speed")
+        driver.end_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        driver.end_stage_path.write_text("", encoding="utf-8")
+        driver.pause_path.write_text("", encoding="utf-8")
+        assert driver.tick() == "paused"
+        assert driver.end_stage_path.exists(), "a paused driver does nothing at all, including deleting it"
+        assert (h.spawned, h.killed, h.stopped) == ([], [], 0)
+        assert driver.state.current.key == ("Level 0-2", "speed")
+        driver.pause_path.unlink()
+
+        # --dry-run reports the decision and changes nothing, exactly as it does for the stage rule.
+        dry = depth_first_harness(tmp, dry_run=True)
+        dry.procs = list(h.procs)
+        dry.driver.end_stage_path.write_text("", encoding="utf-8")
+        assert dry.driver.tick() == "would_end_stage"
+        assert dry.driver.end_stage_path.exists() and dry.driver.state.current.key == ("Level 0-2", "speed")
+        assert (dry.killed, dry.spawned, dry.stopped) == ([], [], 0)
+        assert len(dry.driver.state.history) == 4, "nothing was recorded either"
+
+
+def test_an_end_stage_file_with_no_stage_running_is_just_removed():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = depth_first_harness(tmp, state={"version": 1, "current": None, "history": [
+            {"level": "Level 0-1", "kind": "complete", "status": "done", "round": 1}]})
+        h.driver.end_stage_path.parent.mkdir(parents=True, exist_ok=True)
+        h.driver.end_stage_path.write_text("", encoding="utf-8")
+        assert h.driver.tick() == "started", "it starts the stage the plan chose, as it would have anyway"
+        assert not h.driver.end_stage_path.exists()
+        assert h.driver.state.current.key == ("Level 0-1", "speed") and h.killed == []
 
 
 if __name__ == "__main__":

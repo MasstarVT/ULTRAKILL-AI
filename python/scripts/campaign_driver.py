@@ -23,6 +23,20 @@ crash recovery, its boot gate and its resume-file rule verbatim -- see `StageSup
     New-Item runs/specialists/DRIVER_PAUSE            # PowerShell, from python/
     Remove-Item runs/specialists/DRIVER_PAUSE         # when the pause is over
 
+**Ending the current stage on purpose** (`END_STAGE`, 2026-09-19). A second control file, read only when the
+driver is NOT paused:
+
+    New-Item runs/specialists/END_STAGE                             # end whatever is running
+    Set-Content runs/specialists/END_STAGE "Level 0-2 speed"        # ... only if THAT is what is running
+
+On its next poll the driver ends the current stage through the ordinary stage-end path -- status
+`"unfinished"`, reason `"ended by operator"`, the trainer and helpers stopped exactly as at any stage end, a
+speed stage's weights NOT promoted over the level's specialist (`refuse_promotion`), nothing in `models/`
+deleted -- deletes the file, and starts whatever the plan's rule chooses next. The round's weights stay in
+`models/<run>/`, which is where `round_init` resumes its next round from, so nothing is lost. A file whose
+text names a stage that is not the one running is refused, logged and deleted: a stale file may not end the
+wrong stage.
+
 **Stage kinds** (2026-09-18, `docs/superpowers/specs/2026-09-18-speed-stages.md`). A plan entry is a
 `(level, kind)` pair. `"complete"` is the rule below, unchanged. `"speed"` is the same stage run again on a
 level that is already being finished, with `level_complete` scaled by `target_seconds / official_seconds` and a
@@ -59,10 +73,19 @@ the other 29.
 the lead's instruction -- "dont have it promote to 0-4 untell it gets better times on these levels" -- is
 precisely a refusal to walk past an unfinished stage. `hold_before: "Level 0-4"` means no stage at or after 0-4
 starts while any stage before it is not `"done"`. While the line is up the driver keeps training the stages in
-front of it in ROUND ROBIN (`choose_stage`): fewest rounds first, ties in plan order, each round a fresh step
-budget resumed from that stage's OWN newest weights (`round_init`), never from scratch and never from another
-level. Every round is one history entry carrying its `round` number, so `specialists_status.py` can report
-"holding before Level 0-4: waiting on ..., round N". Setting `hold_before: null` lifts the line.
+front of it, each round a fresh step budget resumed from that stage's OWN newest weights (`round_init`), never
+from scratch and never from another level. Every round is one history entry carrying its `round` number, so
+`specialists_status.py` can report "holding before Level 0-4: waiting on ..., round N". Setting
+`hold_before: null` lifts the line.
+
+`hold_order` decides WHICH held stage runs next (§10, 2026-09-19). `"round_robin"` is the rule the line
+shipped with and is still the code default -- fewest ended rounds first, ties in plan order.
+`"sequential"`, which `configs/specialists.yaml` now sets, is DEPTH-FIRST: the first not-done stage in plan
+order runs round after round until it is `"done"`, and only then does the next one start. The user's
+instruction on 2026-09-19 was "shouldnt we just work on 0-1 untell its finished before working on the other
+levels", and the plan's stages are ordered level-major (0-1 complete, 0-1 speed, 0-2 complete, ...) so that
+depth-first over the plan IS depth-first over the levels. A stage that cannot start at all (`stage_blocked`)
+is passed over, and the log says which and why.
 
 **Per stage**: run name `spec_<short level>` (e.g. `spec_0-1`), `models/spec_0-1/`, `runs/spec_0-1/`, the
 generated config at `configs/generated/spec_0-1.yaml`, and the shared run's `explore_<level>_*.npz` copied in
@@ -144,6 +167,14 @@ TIMESTEPS_SLACK = 1_000_000
 COMPLETE = "complete"  # the stage kind that has always existed: promote on the fresh completion RATE
 SPEED = "speed"        # ... and the one that promotes on the CLOCK as well (2026-09-18-speed-stages.md)
 STAGE_KINDS = (COMPLETE, SPEED)
+# HOW THE HOLD LINE SPENDS ITS ROUNDS (`hold_order` in the plan file, §10 of the spec).
+ROUND_ROBIN = "round_robin"  # the original rule: fewest ended rounds first, ties in plan order
+SEQUENTIAL = "sequential"    # depth-first: the FIRST not-done stage in plan order, round after round
+HOLD_ORDERS = (ROUND_ROBIN, SEQUENTIAL)
+# The operator's control file, beside DRIVER_PAUSE: end the CURRENT stage now, through the normal stage-end
+# path. Its text may name the stage it means, and then it only ends THAT stage (see `end_stage_request`).
+END_STAGE_FILE = "END_STAGE"
+END_STAGE_REASON = "ended by operator"
 # A speed stage's target is this times the level's own S-rank threshold (§8b). Duplicated as `EnvConfig`'s
 # default so a stage config that predates the key still means the same thing; the env is where it is APPLIED.
 DEFAULT_TARGET_SCALE = 0.75
@@ -225,6 +256,12 @@ class Plan:
     # times on these levels", and a stage that hits its step cap is recorded "unfinished" and walked past --
     # so without this key the ladder reaches 0-4 with exactly the slow policies the instruction forbids.
     hold_before: str | None = None
+    # HOW THE HELD STAGES TAKE THEIR TURNS (§10). `round_robin` is the rule the line shipped with and stays
+    # the code default, so a plan written before this key -- and every test that loads one -- means exactly
+    # what it meant. `sequential` is DEPTH-FIRST: the first not-done stage in plan order runs round after
+    # round until it is "done", and only then does the next one start. The user, 2026-09-19: "shouldnt we
+    # just work on 0-1 untell its finished before working on the other levels".
+    hold_order: str = ROUND_ROBIN
 
     def hold_index(self) -> int | None:
         """The plan position the hold line sits in front of, or None when there is no line.
@@ -303,10 +340,32 @@ def load_plan(path: str | Path) -> Plan:
         # A typo here would silently lift the hold line and let the ladder walk to 0-4 on slow policies, which
         # is the one thing this key exists to prevent. It is a hard error, not a warning.
         raise ValueError("%s: hold_before %r is not a level in the plan" % (path, hold))
+    # An unknown `hold_order` is refused rather than defaulted, for the same reason a misspelt stage knob is:
+    # `hold_order: sequental` would silently go back to round robin and quietly spread the machine across
+    # three levels again, which is precisely what the key exists to stop.
+    order_rule = str(data.get("hold_order") or ROUND_ROBIN)
+    if order_rule not in HOLD_ORDERS:
+        raise ValueError("%s: unknown hold_order %r (expected %s)" % (path, order_rule, list(HOLD_ORDERS)))
     plan = Plan(stages=stages, rule=StageRule(**dict(data.get("stage", {}) or {})), speed=speed, targets=targets,
-                target_scale=scale, hold_before=hold,
+                target_scale=scale, hold_before=hold, hold_order=order_rule,
                 env=dict(data.get("env", {}) or {}), train=dict(data.get("train", {}) or {}))
     return plan
+
+
+def order_rule_text(hold_order: str, levels: Iterable[str]) -> str:
+    """One phrase for HOW the held stages take their turns. Shared with `specialists_status.py` verbatim.
+
+    `levels` is the distinct levels still waiting, in plan order, so the depth-first phrase names the two the
+    operator actually cares about: "depth-first: finishing Level 0-1 before Level 0-2".
+    """
+    names = list(dict.fromkeys(levels))
+    if hold_order != SEQUENTIAL:
+        return "round robin: fewest rounds first, ties in plan order"
+    if len(names) >= 2:
+        return "depth-first: finishing %s before %s" % (names[0], names[1])
+    if names:
+        return "depth-first: finishing %s" % names[0]
+    return "depth-first: one stage at a time, in plan order"
 
 
 def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind: str = COMPLETE) -> dict:
@@ -555,6 +614,65 @@ def promote(model_dir: Path, models_dir: Path, level: str, *, sample: StageSampl
 
 
 # ---------------------------------------------------------------------------
+# The END_STAGE control file (pure)
+# ---------------------------------------------------------------------------
+
+
+def decode_control_file(raw: bytes) -> str:
+    """The text of a control file PowerShell wrote, whatever encoding it chose. Never raises.
+
+    THIS IS NOT PEDANTRY (found by the 2026-09-19 scratch dry-run). `Set-Content -Encoding utf8` writes a
+    BYTE ORDER MARK, and `read_text("utf-8")` keeps it, so `END_STAGE` holding "Level 0-2 speed" parsed as the
+    level `"\\ufeffLevel 0-2"` and a perfectly good request was refused. Windows PowerShell 5.1's `>` and
+    `Out-File` can write UTF-16 as well, which is not valid UTF-8 at all and would raise where the caller
+    expects "no text".
+    """
+    for encoding in ("utf-8-sig", "utf-16", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, ValueError):
+            continue
+    return ""
+
+
+def end_stage_request(text: str) -> tuple[str | None, str | None]:
+    """What `runs/specialists/END_STAGE`'s text names: `(level, kind)`, either `None` for "do not care".
+
+    An empty file means "the stage that is running, whatever it is" -- the common case, and the one the
+    command in `docs/commands.md` writes. Naming the stage is the safe form:
+
+        Level 0-2 speed        Level 0-2/speed        Level 0-2, speed        Level 0-2        speed
+
+    Anything after the first non-comment line is ignored, so a file may carry a note about why it was made.
+    """
+    clean = text.replace("﻿", "").replace("\x00", "")  # a BOM decoded by hand, and UTF-16 read as bytes
+    line = next((raw.strip() for raw in clean.splitlines()
+                 if raw.strip() and not raw.strip().startswith("#")), "")
+    tokens = line.replace("/", " ").replace(",", " ").split()
+    kind = None
+    if tokens and tokens[-1].lower() in STAGE_KINDS:
+        kind = tokens.pop().lower()
+    level = " ".join(tokens) or None
+    return level, kind
+
+
+def end_stage_objection(stage: Stage, text: str) -> str:
+    """Why this END_STAGE file must NOT end `stage`, or `""` when it may.
+
+    A file left behind from an earlier stage -- written, forgotten, or dropped while the driver was between
+    stages -- would otherwise end whatever happens to be running when the driver next polls, which is exactly
+    the accident the naming form exists to prevent.
+    """
+    level, kind = end_stage_request(text)
+    if level is not None and level != stage.level:
+        return ("it names %r and the running stage is %s (%s)" % (level, stage.level, stage.kind))
+    if kind is not None and kind != stage.kind:
+        return ("it names the %s stage of %s and the running stage is the %s one"
+                % (kind, stage.level, stage.kind))
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Driver state
 # ---------------------------------------------------------------------------
 
@@ -776,6 +894,9 @@ class Driver:
         self.run_dir = cfg.cwd / cfg.runs_dir / DRIVER_RUN
         self.state_path = self.run_dir / "driver_state.json"
         self.pause_path = self.run_dir / "DRIVER_PAUSE"
+        # The operator's "end this stage now" file. DRIVER_PAUSE is checked FIRST in `tick`, so a paused
+        # driver does nothing at all with this one -- including deleting it.
+        self.end_stage_path = self.run_dir / END_STAGE_FILE
         self.log_path = cfg.cwd / cfg.runs_dir / "specialists_driver.log"
         self.state = DriverState.load(self.state_path)
         # The plan is re-read on every start, so stages can be inserted into it; the state is matched to the
@@ -873,13 +994,23 @@ class Driver:
         return [s for s in self.plan.stages[:hold]
                 if self.state.stage_status(s.key) not in ("done", "skipped")]
 
+    def order_rule_text(self) -> str:
+        """How this driver's hold line spends its rounds, in one phrase, naming the levels it is on."""
+        return order_rule_text(self.plan.hold_order, [s.level for s in self.held_by()])
+
     def choose_stage(self) -> tuple[StageSpec | None, list[StageSpec], str]:
         """`(the stage to start, the stages the hold line is waiting on, why nothing can start)`.
 
         With the line open (or absent) this is the ladder's own order, skipping a speed stage whose level is
-        not ready for one. With the line up it is a ROUND ROBIN over the stages still in front of it: fewest
-        rounds first, ties in plan order, so every not-done stage gets a fresh step budget before any of them
-        gets a second. A stage picked for another round resumes from its OWN newest weights (`round_init`).
+        not ready for one. With the line up, `plan.hold_order` decides between the stages still in front of it:
+
+          * `round_robin` (the default, and what the line shipped with): fewest ended rounds first, ties in
+            plan order, so every not-done stage gets a fresh step budget before any of them gets a second.
+          * `sequential` (§10, the user's 2026-09-19 instruction): DEPTH-FIRST -- the FIRST not-done stage in
+            plan order that can run, and the same one again next time, until it is `"done"`. A blocked stage
+            is passed over only because nothing in front of it can run; the reason is logged.
+
+        Either way a stage picked for another round resumes from its OWN newest weights (`round_init`).
         """
         waiting = self.held_by()
         if waiting:
@@ -889,6 +1020,17 @@ class Driver:
                 # cannot resolve itself, so say which and let the driver stop rather than spin.
                 return None, waiting, "; ".join("%s (%s): %s" % (s.level, s.kind, self.stage_blocked(s))
                                                 for s in waiting)
+            if self.plan.hold_order == SEQUENTIAL:
+                pick = eligible[0]  # `waiting` is in plan order, so this is the first runnable stage
+                passed = waiting[:waiting.index(pick)]
+                if passed:
+                    # Say why the depth-first order is NOT taking the stage that comes first: the only reason
+                    # is that it cannot start at all, and a silent skip here reads as the rule being ignored.
+                    self.log_once("sequential-skip:" + ";".join("%s/%s" % s.key for s in passed),
+                                  "depth-first order: %s cannot start, so the first stage that can is %s (%s)"
+                                  % ("; ".join("%s (%s) -- %s" % (s.level, s.kind, self.stage_blocked(s))
+                                               for s in passed), pick.level, pick.kind))
+                return pick, waiting, ""
             pick = min(eligible, key=lambda s: (self.state.rounds(s.key), self.plan.index_of(s.level, s.kind)))
             return pick, waiting, ""
         done = self.state.finished_stages()
@@ -1084,10 +1226,18 @@ class Driver:
         return killed
 
     def finish_stage(self, stage: Stage, status: str, sample: StageSample,
-                     procs: list[supervise.Proc], sup: StageSupervisor) -> str:
-        self.log("STAGE END %s (%s): %s (rate %s over %d fresh, median %s, best %s, target %s, %s steps into "
+                     procs: list[supervise.Proc], sup: StageSupervisor, *, reason: str | None = None) -> str:
+        """Ends the current stage: stop its processes, promote (or refuse to), record it, start the next one.
+
+        `reason` is recorded in the history entry and says WHY a stage ended other than by its own rule --
+        today only `END_STAGE_REASON`, the operator's control file. The status is still the ordinary one, so
+        every other rule (`refuse_promotion`, the hold line, `round_init`) reads the entry exactly as it reads
+        a stage that ran out of steps.
+        """
+        self.log("STAGE END %s (%s): %s%s (rate %s over %d fresh, median %s, best %s, target %s, %s steps into "
                  "the stage)"
-                 % (stage.level, stage.kind, status, _fmt(sample.fresh_rate, 3), sample.fresh_window,
+                 % (stage.level, stage.kind, status, (" -- %s" % reason) if reason else "",
+                    _fmt(sample.fresh_rate, 3), sample.fresh_window,
                     _fmt(sample.median_time, 2), _fmt(sample.best_time, 2), _fmt(stage.target_seconds, 2),
                     "{:,.0f}".format((sample.timesteps or 0) - stage.start_steps)))
         self.stop_stage(stage, procs, sup)
@@ -1117,6 +1267,8 @@ class Driver:
             self.log("promoted %s -> %s" % (sidecar.get("source_checkpoint", "?"), destination))
         entry = {"level": stage.level, "kind": stage.kind, "run": stage.run, "status": status,
                  "index": stage.index, "round": stage.round,
+                 # Why it ended, when that was not its own rule. None for every stage the rule ended.
+                 "reason": reason,
                  "start_steps": stage.start_steps, "end_steps": sample.timesteps,
                  "fresh_completion_rate": sample.fresh_rate, "fresh_window": sample.fresh_window,
                  "best_time": sample.best_time, "median_time": sample.median_time,
@@ -1143,8 +1295,9 @@ class Driver:
                      % (self.plan.hold_before, blocked))
             return "held"
         if waiting:
-            self.log("holding before %s: waiting on %s"
-                     % (self.plan.hold_before, ", ".join("%s (%s)" % (s.level, s.kind) for s in waiting)))
+            self.log("holding before %s (%s): waiting on %s"
+                     % (self.plan.hold_before, self.order_rule_text(),
+                        ", ".join("%s (%s)" % (s.level, s.kind) for s in waiting)))
         # A speed stage starts from ITS OWN level's specialist and a repeat round from its own newest weights,
         # neither of which is the file this stage just promoted: that one belongs to the level that ended.
         # The freshly promoted checkpoint stays the fallback for the ordinary "next level up" case.
@@ -1153,13 +1306,82 @@ class Driver:
         self.ensure_trainer(started, self.supervisor_for(started), self.processes())
         return "advanced"
 
+    # -- ending a stage on purpose (the END_STAGE control file) -------------------------------------
+
+    def clear_end_stage(self) -> bool:
+        """Removes the control file. False means it is still there, and then NOTHING may be ended.
+
+        A file that cannot be deleted would end the current stage, then the stage after it, then the stage
+        after that, one per poll, for as long as it stays on disk. Refusing to act on it is the safe failure.
+        """
+        try:
+            self.end_stage_path.unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            self.log_once("end_stage_stuck",
+                          "END_STAGE: could not remove %s (%s: %s), so NO stage is being ended -- a file that "
+                          "cannot be removed would end every stage in turn. Delete it by hand."
+                          % (self.end_stage_path, type(exc).__name__, exc))
+            return False
+
+    def end_stage_now(self) -> str | None:
+        """Handles `runs/specialists/END_STAGE`. A string ends the tick; None means "carry on as usual".
+
+        The stage ends through `finish_stage`, the ordinary stage-end path, with status `"unfinished"` and the
+        reason recorded -- so a SPEED stage's weights are NOT promoted over the level's specialist
+        (`refuse_promotion`), nothing in `models/` is deleted, the round counts, and the next stage is chosen
+        by the plan's own rule. The round's weights stay in the stage's own model directory, which is where
+        `round_init` resumes its next round from.
+        """
+        try:
+            text = decode_control_file(self.end_stage_path.read_bytes())
+        except OSError:
+            text = ""  # unreadable is not a reason to refuse: an empty file means "whatever is running"
+        stage = self.state.current
+        if stage is None:
+            self.log("END_STAGE: no stage is running, so there is nothing to end; removing the file")
+            self.clear_end_stage()
+            return None
+        objection = end_stage_objection(stage, text)
+        if objection:
+            self.log_once("end_stage_refused:%s/%s" % stage.key,
+                          "END_STAGE REFUSED: %s. Nothing was ended; removing the file and leaving %s (%s) "
+                          "running." % (objection, stage.level, stage.kind))
+            self.clear_end_stage()
+            return None
+        if self.cfg.dry_run:
+            self.log("[dry-run] END_STAGE: would end %s (%s, round %d) now as 'unfinished' (%s), leave "
+                     "models/specialists alone and choose the next stage; changing nothing"
+                     % (stage.level, stage.kind, stage.round, END_STAGE_REASON))
+            return "would_end_stage"
+        # Removed BEFORE the stage ends: if anything below raises, the tick loop carries on and the file is
+        # already gone, so at most one stage is ever ended per file.
+        if not self.clear_end_stage():
+            return None
+        sup = self.supervisor_for(stage)
+        procs = self.processes()
+        sample = read_sample(self.stage_run_dir(stage.level, stage.kind) / "status.json",
+                             self.model_dir(stage.level, stage.kind) / "best.json")
+        self.log("END_STAGE: ending %s (%s, round %d) now, at the operator's request"
+                 % (stage.level, stage.kind, stage.round))
+        return self.finish_stage(stage, "unfinished", sample, procs, sup, reason=END_STAGE_REASON)
+
     # -- one poll -----------------------------------------------------------------------------------
 
     def tick(self) -> str:
         if self.pause_path.exists():
+            # FIRST, and before END_STAGE is even read: a paused driver does nothing at all, which is the
+            # whole promise of the pause file. An END_STAGE left beside it is handled when the pause lifts.
             self.log_once("paused", "PAUSED: %s exists, doing nothing (delete it to resume the ladder)"
                           % self.pause_path)
             return "paused"
+
+        if self.end_stage_path.exists():
+            action = self.end_stage_now()
+            if action is not None:
+                return action
 
         stage = self.state.current
         if stage is None:
@@ -1173,8 +1395,8 @@ class Driver:
                 return "held"
             if waiting:
                 self.log_once("holding:%s" % spec.key[0] + spec.key[1],
-                              "holding before %s: waiting on %s"
-                              % (self.plan.hold_before,
+                              "holding before %s (%s): waiting on %s"
+                              % (self.plan.hold_before, self.order_rule_text(),
                                  ", ".join("%s (%s)" % (s.level, s.kind) for s in waiting)))
             init = self.round_init(spec)
             if init is None:
@@ -1288,13 +1510,17 @@ class Driver:
                         else "no round cap"))
         if self.plan.hold_before:
             waiting = self.held_by()
-            self.log("HOLD LINE before %s: no stage at or after it starts until every stage before it is "
-                     "done%s" % (self.plan.hold_before,
+            self.log("HOLD LINE before %s (%s): no stage at or after it starts until every stage before it is "
+                     "done%s" % (self.plan.hold_before, self.order_rule_text(),
                                  "; waiting on " + ", ".join("%s (%s)" % (s.level, s.kind) for s in waiting)
                                  if waiting else " -- the line is open"))
         if self.unplanned:
             self.log("state entries the plan no longer lists (kept, not reordered): %s" % ", ".join(self.unplanned))
         self.log("pause with: New-Item %s" % self.pause_path)
+        self.log("end the current stage early with: New-Item %s (its text may name the stage, e.g. \"%s\")"
+                 % (self.end_stage_path,
+                    "%s %s" % (self.state.current.level, self.state.current.kind) if self.state.current
+                    else "Level 0-1 speed"))
         self.log("DO NOT run supervise.py at the same time: the driver supervises each stage itself")
         ticks = 0
         while max_ticks is None or ticks < max_ticks:
