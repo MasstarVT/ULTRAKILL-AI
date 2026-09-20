@@ -15,7 +15,7 @@ namespace UltrakillAIBridge
     {
         public const string Guid = "masstarvt.ultrakill.aibridge";
         public const string Name = "ULTRAKILL AI Bridge";
-        public const string Version = "0.7.2";
+        public const string Version = "0.8.0";
         public const int ProtocolVersion = 1;
 
         internal static ManualLogSource Log;
@@ -82,6 +82,18 @@ namespace UltrakillAIBridge
             }
             try
             {
+                // Binds the private NewMovement.TrySSJ to read which 8 ms bucket a jump landed in, and
+                // PrefsManager.GetBool to switch the game's own SSJ indicator on for a test instance. Read-only.
+                // Isolated because TrySSJ is private: losing it must cost the SSJ readout, not the bridge.
+                harmony.PatchAll(typeof(MovementPatches));
+                MovementPatches.InstrumentAvailable = true;
+            }
+            catch (System.Exception e)
+            {
+                Log.LogError($"SSJ instrument failed to apply, macro.ssj_bucket will be unavailable: {e}");
+            }
+            try
+            {
                 // CampaignPatches binds a private method (ActivateNextWave.EndWaves) among its five targets;
                 // a game update renaming or restructuring any of them would throw here. Isolate that failure
                 // so campaign support degrades instead of taking the whole bridge down with it.
@@ -101,6 +113,8 @@ namespace UltrakillAIBridge
                 CampaignPatches.OnSceneLoaded();
                 // The cameras of the scene that just went away are destroyed; drop their wrappers.
                 TrainingSpeed.OnSceneLoaded();
+                // SSJ counters are per level load, like the arena and door keys above.
+                MovementPatches.ResetCounters();
             };
 
             // ULTRAKILL destroys BepInEx's manager GameObject during startup, which would take this

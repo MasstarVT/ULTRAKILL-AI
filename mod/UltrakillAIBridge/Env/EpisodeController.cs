@@ -6,6 +6,7 @@ using UltrakillAIBridge.Net;
 using UltrakillAIBridge.Obs;
 using UnityEngine;
 using UnityEngine.AddressableAssets;
+using UnityEngine.InputSystem.LowLevel;
 
 namespace UltrakillAIBridge.Env
 {
@@ -40,6 +41,23 @@ namespace UltrakillAIBridge.Env
         private int replyClient = -1; // connection the next reply belongs to
         private int step;
         private int framesRemaining;
+
+        // mod 0.8.0. The frame the current step began on, so an SSJ can be attributed to the step that asked
+        // for it rather than to a jump the policy happened to make earlier.
+        private int stepStartFrame;
+        private JObject variantReport;
+
+        // A rolling estimate of real seconds per game frame, on the same clock NewMovement's SSJ windows use.
+        // Measured only between frames INSIDE a step, so Python's think time is never counted: the wall macro
+        // needs to predict how much real time passes between queueing an event and the frame that reads it.
+        private double lastFrameTime = -1.0;
+        private double frameGap;
+
+        /// <summary>Whether the `variant` action may switch the held weapon's variation. Refused by default.</summary>
+        private bool variantSwitching;
+
+        /// <summary>Adds the `input` block (timestamp cursor vs the live clock) to a step reply. Diagnostic.</summary>
+        private bool reportInputClock;
 
         // Config
         private int frameskip = 4;
@@ -93,6 +111,15 @@ namespace UltrakillAIBridge.Env
 
         public void EndOfFrame()
         {
+            if (lastFrameTime > 0.0 && state == State.Stepping)
+            {
+                double delta = InputState.currentTime - lastFrameTime;
+                if (delta > 0.0 && delta < 0.5)
+                {
+                    frameGap = frameGap <= 0.0 ? delta : frameGap * 0.9 + delta * 0.1;
+                    injector.FrameGapEstimate = frameGap;
+                }
+            }
             try
             {
                 if (HasControl) ApplyCursorAndAudio();
@@ -116,7 +143,7 @@ namespace UltrakillAIBridge.Env
                             injector.ApplyFrame();
                             break;
                         }
-                        Send(observer.Build(++step));
+                        Send(BuildStepObs());
                         state = State.AwaitCommand;
                         BlockForCommand();
                         break;
@@ -142,6 +169,35 @@ namespace UltrakillAIBridge.Env
                     state = State.AwaitCommand;
                 }
             }
+            finally
+            {
+                // Recorded AFTER any BlockForCommand above, so the next frame's delta is pure frame time.
+                lastFrameTime = InputState.currentTime;
+            }
+        }
+
+        /// <summary>
+        /// The step reply: the ordinary observation, plus the `macro` and `variant` blocks when the client
+        /// asked for either. A client that sends neither gets exactly the 0.7.2 message.
+        /// </summary>
+        private JObject BuildStepObs()
+        {
+            var obs = observer.Build(++step);
+            var macro = injector.BuildMacroReport(stepStartFrame);
+            if (macro != null) obs["macro"] = macro;
+            if (variantReport != null) obs["variant"] = variantReport;
+            if (reportInputClock)
+            {
+                // `cursor` ahead of `now` is the monotonic cursor holding a lifted timestamp: exactly the
+                // case in which an un-lifted event would have been silently dropped by InputManager.OnUpdate.
+                obs["input"] = new JObject
+                {
+                    ["cursor"] = injector.LastQueuedTime,
+                    ["now"] = InputState.currentTime,
+                    ["frame_gap"] = frameGap,
+                };
+            }
+            return obs;
         }
 
         private void DrainNonBlocking()
@@ -213,6 +269,13 @@ namespace UltrakillAIBridge.Env
                         // Steam already initialised leaves this false, which is the only in-band way to tell.
                         ["steam_hidden"] = SteamPatches.Hidden,
                         ["scene"] = SceneHelper.CurrentScene,
+                        // Capability discovery. The protocol number stays 1 because every 0.8 addition is
+                        // optional on both sides; this array is how a client tells a 0.8 DLL from a 0.7 one
+                        // WITHOUT parsing the version string, and it is the check the S6 test gates on: if the
+                        // Doorstop override were ignored, the private game would load the LIVE plugin and
+                        // every result would be a false negative.
+                        ["features"] = Features(),
+                        ["diag"] = Diag(),
                     });
                     break;
 
@@ -233,7 +296,10 @@ namespace UltrakillAIBridge.Env
                 case "step":
                     TakeControl(incoming.ClientId);
                     ApplyTimeSettings(); // Scene loads and menus can re-enable vsync or a frame cap.
-                    injector.SetAction(msg["action"] as JObject, frameskip);
+                    stepStartFrame = Time.frameCount;
+                    var action = msg["action"] as JObject;
+                    variantReport = ApplyVariant(action?["variant"]);
+                    injector.SetAction(action, frameskip);
                     injector.ApplyFrame();
                     framesRemaining = frameskip;
                     state = State.Stepping;
@@ -289,9 +355,86 @@ namespace UltrakillAIBridge.Env
             }
             windowWidth = Mathf.Max(160, msg["window_width"]?.Value<int>() ?? windowWidth);
             windowHeight = Mathf.Max(90, msg["window_height"]?.Value<int>() ?? windowHeight);
+
+            // mod 0.8.0. Macros are available but a client only gets one by asking for it in an action, so
+            // these defaults leave a 0.7.x client's behaviour untouched. `variant` and the reserved macro
+            // values 3..5 are refused by default: that is what makes widening the action head at S7 exactly
+            // behaviour-preserving, and enabling them later a config flip rather than a second break.
+            injector.MacrosEnabled = msg["macros"]?.Value<bool>() ?? injector.MacrosEnabled;
+            injector.AllowReservedMacros = msg["allow_reserved_macros"]?.Value<bool>() ?? injector.AllowReservedMacros;
+            injector.SsjGapSeconds = msg["ssj_gap_s"]?.Value<double>() ?? injector.SsjGapSeconds;
+            injector.WallLeadSeconds = msg["macro_wall_lead_s"]?.Value<double>() ?? injector.WallLeadSeconds;
+            injector.WallLeadFrames = msg["macro_wall_lead_frames"]?.Value<double>() ?? injector.WallLeadFrames;
+            variantSwitching = msg["variant_switching"]?.Value<bool>() ?? variantSwitching;
+            reportInputClock = msg["obs_input_clock"]?.Value<bool>() ?? reportInputClock;
+            MovementPatches.SsjIndicator = msg["ssj_indicator"]?.Value<bool>() ?? MovementPatches.SsjIndicator;
+
             observer.Configure(msg);
 
             if (HasControl) ApplyTimeSettings();
+        }
+
+        /// <summary>
+        /// The optional `variant` action field: 0/absent keeps the held variation, 1..3 select variation 0..2
+        /// of the CURRENT slot.
+        ///
+        /// This is the one place the mod may legitimately bypass the virtual-device pipeline. Weapon
+        /// selection has no Harmony-inlining hazard -- the reason input goes through virtual devices at all is
+        /// that Mono may inline `InputActionState`'s getters, which does not apply to a public method called
+        /// directly -- and `SelectVariant1/2/3` are not reliably bound to a key, so there may be no key to
+        /// press. `GunControl.SwitchWeapon(slot, variation)` is public and is exactly what the game's own
+        /// key handler calls.
+        ///
+        /// Refused by default (`variant_switching` false). The variants worth holding on 0-1 are all
+        /// variation 0, so refusing costs nothing and keeps the S7 migration behaviour-preserving: a live
+        /// `variant` head at P(!= keep) = 0.15 would otherwise change the held weapon on 15 % of steps from
+        /// the first rollout, an environment change the offline migration test cannot see.
+        /// </summary>
+        private JObject ApplyVariant(JToken token)
+        {
+            if (token == null || token.Type == JTokenType.Null) return null;
+            int requested = token.Type == JTokenType.Integer ? token.Value<int>() : 0;
+            if (requested <= 0) return null;
+
+            var report = new JObject { ["requested"] = requested };
+            if (!variantSwitching)
+            {
+                report["result"] = "disabled";
+                report["reason"] = "reserved";
+                return report;
+            }
+
+            var gun = MonoSingleton<GunControl>.Instance;
+            if (gun == null || gun.slots == null || gun.slots.Count == 0)
+            {
+                report["result"] = "refused";
+                report["reason"] = "no_gun_control";
+                return report;
+            }
+
+            int slotIndex = gun.currentSlotIndex;
+            int i = slotIndex - 1;
+            int available = i >= 0 && i < gun.slots.Count && gun.slots[i] != null ? gun.slots[i].Count : 0;
+            int target = requested - 1;
+            report["variations"] = available;
+            if (target >= available)
+            {
+                report["result"] = "refused";
+                report["reason"] = "no_such_variation";
+                return report;
+            }
+            if (target == gun.currentVariationIndex)
+            {
+                // Switching to the variation already held would re-draw the weapon and clear Revolver.gunReady.
+                report["result"] = "refused";
+                report["reason"] = "already_held";
+                return report;
+            }
+
+            gun.SwitchWeapon(slotIndex, target);
+            report["result"] = "ran";
+            report["variation"] = gun.currentVariationIndex;
+            return report;
         }
 
         private void TakeControl(int clientId)
@@ -367,6 +510,7 @@ namespace UltrakillAIBridge.Env
         private void BeginReset(JObject msg)
         {
             injector.Clear();
+            variantReport = null;
             var scene = (string)msg["scene"];
             bool checkpoint = msg["checkpoint"]?.Value<bool>() ?? false;
 
@@ -518,5 +662,54 @@ namespace UltrakillAIBridge.Env
         private void Send(JObject obj) => server.Send(obj, replyClient);
 
         private static JObject Error(string message) => new JObject { ["type"] = "error", ["message"] = message };
+
+        /// <summary>
+        /// The handful of values the macro design was derived from but could not be READ from the decompiled
+        /// C#, because they are serialized in the scene rather than assigned in code: `walkSpeed` and
+        /// `fixedDeltaTime` set every u/s figure in the design, and `updateMode` decides whether a
+        /// future-dated input event is processed in the current update or time-sliced into a later one.
+        /// Reported once, on hello, so a test never has to assume them.
+        /// </summary>
+        private static JObject Diag()
+        {
+            var nm = MonoSingleton<NewMovement>.Instance;
+            var obj = new JObject
+            {
+                ["update_mode"] = UnityEngine.InputSystem.InputSystem.settings != null
+                    ? UnityEngine.InputSystem.InputSystem.settings.updateMode.ToString()
+                    : null,
+                ["fixed_delta_time"] = Time.fixedDeltaTime,
+                ["capture_delta_time"] = Time.captureDeltaTime,
+                ["input_now"] = InputState.currentTime,
+                ["unity_time"] = Time.realtimeSinceStartup,
+                ["ssj_instrument"] = MovementPatches.InstrumentAvailable,
+            };
+            if (nm != null)
+            {
+                obj["walk_speed"] = nm.walkSpeed;
+                obj["jump_power"] = nm.jumpPower;
+                obj["wall_jump_power"] = nm.wallJumpPower;
+                obj["ssj_max_frames"] = PlayerFields.SsjMaxFrames(nm);
+                // The bonus TrySSJ adds at bucket 1, in u/s: speedMultiplier * walkSpeed * 2.75 * 3 * fixedDeltaTime.
+                obj["ssj_bonus_jump"] = 0.5f * nm.walkSpeed * 2.75f * 3f * Time.fixedDeltaTime;
+                obj["ssj_bonus_wall"] = 0.75f * nm.walkSpeed * 2.75f * 3f * Time.fixedDeltaTime;
+            }
+            return obj;
+        }
+
+        /// <summary>What this build can do, for a client that wants to check rather than assume.</summary>
+        private static JArray Features()
+        {
+            var arr = new JArray();
+            arr.Add(new JValue("monotonic_input_clock"));
+            arr.Add(new JValue("macro.ssj"));
+            arr.Add(new JValue("macro.ssj_wall"));
+            arr.Add(new JValue("obs.move_tech"));
+            arr.Add(new JValue("obs.weapon_tech"));
+            arr.Add(new JValue("obs.projectiles"));
+            arr.Add(new JValue("action.variant"));
+            if (MovementPatches.InstrumentAvailable) arr.Add(new JValue("ssj_instrument"));
+            return arr;
+        }
     }
 }
