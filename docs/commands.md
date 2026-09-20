@@ -146,8 +146,12 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
     the flag in both cases.
   - **A `"held"` exit (code 1) is not a crash**, and since 2026-09-18 it is also not expected: both
     `max_rounds` are **0** (no cap), because a HELD exit stops the driver and leaves twelve games idle with
-    nobody watching, which is strictly worse than going on training the held stages. The round robin now runs
-    until the targets are met or a human lifts `hold_before`. A HELD exit therefore means something the driver
+    nobody watching, which is strictly worse than going on training the held stages. The held stages now keep
+    getting fresh budgets until the targets are met or a human lifts `hold_before`. Since 2026-09-19 the plan
+    sets **`hold_order: sequential`** (spec §10a): the first not-done stage in plan order runs round after
+    round until it is `"done"`, and the plan's stages are level-major, so the machine finishes Level 0-1
+    (complete, then speed) before any Level 0-2 stage starts. `round_robin` is the other value and the code's
+    default. A HELD exit therefore means something the driver
     cannot train its way out of — a speed stage whose complete stage is not `"done"`, or no specialist file —
     and the log line names the stage and the reason. Do not restart the driver into it; fix the reason, or
     retune `speed.target_scale` / add a per-level `speed.targets` override in `configs/specialists.yaml`.
@@ -158,6 +162,16 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
     New-Item runs\specialists\DRIVER_PAUSE        # from python/; it then does nothing at all
     Remove-Item runs\specialists\DRIVER_PAUSE     # when the pause is over
     ```
+  - **End the current stage early** (2026-09-19, spec §10b) — never Ctrl+C, never a kill:
+    ```powershell
+    Set-Content runs\specialists\END_STAGE "Level 0-2 speed"   # from python/; name the stage, or leave it empty
+    ```
+    On its next poll (<= 60 s) the driver ends THAT stage the way the rule ends one — `"unfinished"`, reason
+    `"ended by operator"`, trainer and helpers stopped, a speed stage's weights **not** promoted over the
+    level's specialist, nothing in `models/` deleted — deletes the file, and starts whatever the plan's
+    `hold_order` chooses next. The round's weights stay in `models/spec_<level>[_speed]/`, which is where its
+    next round resumes from. A file naming a stage that is not the one running is refused, logged and deleted;
+    `DRIVER_PAUSE` wins over it (a paused driver does nothing, including deleting it).
   - **Watch it**: `python scripts/specialists_status.py` (stage, steps into it, rate and window, the MEDIAN
     official time over the last 50 fresh episodes beside the best one ever recorded, the hold line and what it
     is waiting on, settle left, the promoted table) and the monitor's `report.py --run spec_0-1` for the
