@@ -65,7 +65,22 @@ PPO_METRICS = (
 # `route_source_name` is the string half of the route layer ("none" / "gates" / "rooms"); the numeric
 # `route_source` travels in CAMPAIGN_INFO_KEYS and is charted, exactly as rl-5 of the route spec asks.
 EPISODE_LOG_RAW = ("level", "start_checkpoint", "end_pos", "end_reason", "level_seconds", "gate_hops_best",
-                   "bridge_resets", "route_source_name")
+                   "bridge_resets", "route_source_name",
+                   # Stage S0 of docs/superpowers/specs/2026-09-20-speedrun-tech.md: the per-slot time share
+                   # and per-slot kills, both LISTS of six, which is why they are here rather than in `stats`.
+                   # Six columns each in status.json would be six columns nobody reads; per episode they are
+                   # what says WHICH weapon the policy lives on.
+                   # ... and the time share per weapon VARIATION (a list of three), which is what says whether
+                   # a round sat on the Piercer or on the Marksman -- the reading a sticky-slot round has to
+                   # be judged against, because the sticky slot freezes the variation.
+                   "slot_held_frac", "slot_kills", "held_variation_frac")
+# The stage S0 counters that are ordinary numbers: one mean each in status.json's `mean_100`, one column each
+# in metrics_log.csv (scripts/poll_status.py), and the two that matter per episode go into episodes.jsonl.
+# Nothing reads them back -- no reward, no observation, no promotion rule. See `UltrakillEnv._note_behaviour`.
+SLOT_METRICS = ("slot_press_frac", "slot_same_frac", "slot_switch_frac", "slot_unowned_frac", "slot_press_per_s",
+                "fire1_frac", "fire2_frac", "punch_frac",
+                "slot_held_top_frac", "slot_known_frac", "slot_dropped_frac", "slot_blocked_frac",
+                "variation0_frac", "variation_known_frac")
 
 
 def _num(value: Any) -> float | None:
@@ -472,6 +487,9 @@ class ProgressCallback(BaseCallback):
             # The level the episode RAN on, not the one the env is about to reset into. A string, so it goes
             # through info directly rather than through field()/_num().
             "level": info.get("level"),
+            # Stage S0's weapon-channel counters, all passive. `field()` routes them through `_num`, so an env
+            # or a mod that never reports them writes None rather than breaking the row.
+            **{name: field(name) for name in SLOT_METRICS},
         }
         self.episodes += 1
         self.episodes_recent.append(stats)
@@ -614,6 +632,12 @@ class ProgressCallback(BaseCallback):
             "level_started": stats["level_started"],
             "wedged_steps": stats["wedged_steps"],
             "completed": stats["completed"],
+            # Stage S0, the two slot numbers worth having per episode: how hard the policy leans on the slot
+            # key, and how much of that was the redraw press §3.4 blames for suppressing its own fire. The
+            # other nine SLOT_METRICS are means in status.json and columns in metrics_log.csv; this file is
+            # already the biggest thing a long run writes, so only these two are added per line.
+            "slot_press_per_s": stats["slot_press_per_s"],
+            "slot_same_frac": stats["slot_same_frac"],
         }
         line.update({name: info.get(name) for name in EPISODE_LOG_RAW})
         try:
@@ -712,7 +736,8 @@ class ProgressCallback(BaseCallback):
                                                  "pitch_mean", "look_up_mean", "enemy_elev_mean", "enemy_elev_abs_mean", "enemy_elev_over15_frac",
                                                  "gates_reached", "wedged_steps", "level_started", "slide_forced_frac",
                                                  "targets_parked", "exit_banished", "route_source", "ladder_collapsed",
-                                                 "look_free_frac", "look_enemy_frac", "look_gate_frac")}
+                                                 "look_free_frac", "look_enemy_frac", "look_gate_frac",
+                                                 *SLOT_METRICS)}
         fresh_recent = {key: self._fresh_mean(key) for key in ("gates_reached", "checkpoints_level", "completed", "wedged_steps")}
         part_names = sorted({name for ep in self.episodes_recent for name in ep["reward_parts"]})
         n = len(self.episodes_recent)

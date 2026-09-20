@@ -53,7 +53,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - `python/scripts/` — `train.py`, `eval.py`, `games.py`, `campaign_driver.py` (the specialist driver),
   `supervise.py`, `mem_guard.py`, `full_run.py`, `specialists_status.py`, `poll_status.py`, `keep_best.py`,
   `post_times.py`, `dashboard.py`, `build_routes.py`, `campaign_check.py`, `skull_check.py`, `bridge_test.py`.
-- `python/tests/` — 32 no-game test files, ~823 named tests, about 3 minutes for the lot.
+- `python/tests/` — 36 no-game test files, ~870 named tests, about 3 minutes for the lot.
 - `python/configs/` — `specialists.yaml` (the specialist plan; **not** a training config),
   `campaign_gates_full.yaml` (the shared-run config it is pinned against), `campaign_0-1.yaml`,
   `cybergrind.yaml`, `il_records.yaml`, and the earlier campaign configs kept as rollbacks.
@@ -185,8 +185,8 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   baseline): `damage_dealt` is bounded to [0, 1] per enemy — an overkilled enemy with no known health bar paid
   **-250 in one step**, 3.4% of 0-2 completions had a negative total — and `completion_bonus` now pays the
   FLOOR (25), not the full 100, when a speed stage's official time is missing. Neither is validated in game.
-  Still open: guard T's mid-name-fork blind spot; a 0-3 mid-level wall probe; the memory work (another
-  engineer owns `python/`, `mod/` and `docs/notes/2026-09-18-memory.md`).
+  Still open: guard T's mid-name-fork blind spot; a 0-3 wall probe; the memory work (another engineer owns
+  `python/`, `mod/`, that note); branch `dormant-levers` — S0 slot counters on, S1/S2 + S5 OFF (`docs/commands.md`).
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
   (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2** installed; **33 of 35**
   levels ship; Violent, with all weapons unlocked in memory for AI runs only.

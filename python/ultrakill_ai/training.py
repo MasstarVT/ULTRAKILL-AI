@@ -44,6 +44,74 @@ torch.distributions.Distribution.set_default_validate_args(False)
 ENTROPY_DIMS = {-1: "look_mode", -2: "pitch", -3: "yaw"}  # the action dimensions worth naming, from the end
 ENTROPY_SAMPLE = 256  # rollout rows per entropy measurement; one forward pass an update is ~3 ms
 
+# The PPO defaults a config's `train.hyperparams` block is merged OVER. Lifted out of `main()` unchanged so the
+# resume path below can name the two that a rollout buffer is built from; every value is what it has always been.
+DEFAULT_HYPERPARAMS = {
+    "learning_rate": 3e-4,
+    "n_steps": 2048,
+    "batch_size": 512,
+    "n_epochs": 5,
+    "gamma": 0.995,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.01,
+}
+# Hyperparameters that are BAKED INTO THE ROLLOUT BUFFER at construction, not read from the model per update.
+# `RolloutBuffer.compute_returns_and_advantage` uses `self.gamma` and `self.gae_lambda`, the buffer's own copies.
+BUFFER_HYPERPARAMS = ("gamma", "gae_lambda")
+
+
+def apply_resume_hyperparams(model, hyper: dict) -> dict[str, tuple[float, float]]:
+    """Forces the config's `gamma`/`gae_lambda` onto a RESUMED model and onto its rollout buffer.
+
+    WHY THIS EXISTS. A saved SB3 zip carries the hyperparameters it was trained with, and the buffer that
+    computes GAE keeps its OWN copies of `gamma` and `gae_lambda` taken at construction. So "the config says
+    0.999 now" is only true of a resumed run if something actually writes it in both places -- and stages S1
+    and S2 of docs/superpowers/specs/2026-09-20-speedrun-tech.md are exactly a gamma change applied to a run
+    that only ever resumes (the driver re-execs `train.py --resume` every round).
+
+    WHAT WAS MEASURED, 2026-09-20, against the installed stable_baselines3 2.9.0: `BaseAlgorithm.load` does
+    `model.__dict__.update(data)` (the saved values) and then `model.__dict__.update(kwargs)` (ours) BEFORE
+    calling `model._setup_model()`, and `OnPolicyAlgorithm._setup_model` builds the rollout buffer from
+    `self.gamma` / `self.gae_lambda`. So on this version the config ALREADY wins, in the model and in the
+    buffer, and this function is a no-op that returns nothing changed. It is kept because that is an
+    undocumented ordering inside a third-party library, one line of which moving would silently train a gamma
+    stage at the old gamma and read as "the change did nothing" -- and because `pinned by
+    tests/test_resume_hyperparams.py` is cheaper than re-deriving the ordering at the next upgrade.
+
+    Returns `{name: (before, after)}` for every value it actually had to move, which is normally empty.
+    """
+    moved: dict[str, tuple[float, float]] = {}
+    buffer = getattr(model, "rollout_buffer", None)
+    for name in BUFFER_HYPERPARAMS:
+        if name not in hyper:
+            continue
+        want = float(hyper[name])
+        for holder in (model, buffer):
+            if holder is None:
+                continue
+            have = getattr(holder, name, None)
+            if have is None or float(have) == want:
+                continue
+            moved.setdefault(name, (float(have), want))
+            setattr(holder, name, want)
+    return moved
+
+
+def hyperparams_in_force(model, hyper: dict) -> str:
+    """One log line of the values ACTUALLY in force once the model exists, read off the model, not the config.
+
+    The buffer's own `gamma`/`gae_lambda` are printed separately because they are the ones GAE is computed
+    with, and a run whose two disagree is the failure this line exists to make visible at a glance.
+    """
+    buffer = getattr(model, "rollout_buffer", None)
+    live = ", ".join("%s=%s" % (name, getattr(model, name, "?"))
+                     for name in ("gamma", "gae_lambda", "n_steps", "batch_size", "n_epochs", "ent_coef",
+                                  "target_kl")
+                     if name in hyper or hasattr(model, name))
+    return "hyperparameters in force: %s | rollout buffer: gamma=%s, gae_lambda=%s" % (
+        live, getattr(buffer, "gamma", "?"), getattr(buffer, "gae_lambda", "?"))
+
 
 class EpisodeStatsCallback(BaseCallback):
     """Logs per-episode reward components and end reasons to TensorBoard."""
@@ -294,17 +362,7 @@ def main() -> None:
     env_fns = [make_env(replace(env_cfg, port=base_port + i), info_keywords) for i in range(num_envs)]
     venv = SubprocVecEnv(env_fns) if num_envs > 1 else DummyVecEnv(env_fns)
 
-    hyper = {
-        "learning_rate": 3e-4,
-        "n_steps": 2048,
-        "batch_size": 512,
-        "n_epochs": 5,
-        "gamma": 0.995,
-        "gae_lambda": 0.95,
-        "clip_range": 0.2,
-        "ent_coef": 0.01,
-        **train_cfg.get("hyperparams", {}),
-    }
+    hyper = {**DEFAULT_HYPERPARAMS, **train_cfg.get("hyperparams", {})}
     # n_steps in the config is the total rollout size; SB3 counts it per environment.
     hyper["n_steps"] = max(64, hyper["n_steps"] // num_envs)
     policy_kwargs = train_cfg.get("policy_kwargs", {"net_arch": [512, 512]})
@@ -322,8 +380,17 @@ def main() -> None:
         # hyperparameters override the saved ones so tuning applies when resuming. `verbose` belongs on this
         # branch too: without it a resumed run's train log is 0 bytes, which is most of this project's runs.
         model = cls.load(args.resume, env=venv, device=args.device, tensorboard_log="runs", verbose=verbose, **hyper)
+        # ... and forced again onto the model AND its rollout buffer, because the buffer keeps its own copies
+        # of gamma/gae_lambda and the zip carries the values the run was saved with. A no-op on
+        # stable_baselines3 2.9.0, which already applies them in this order; see `apply_resume_hyperparams`.
+        moved = apply_resume_hyperparams(model, hyper)
+        for name, (before, after) in moved.items():
+            print(f"resume: forced {name} {before} -> {after} (the saved model disagreed with the config)")
     else:
         model = cls(policy, venv, policy_kwargs=policy_kwargs, tensorboard_log="runs", device=args.device, verbose=verbose, **hyper)
+    # Printed on both paths, from the MODEL rather than from the config: a gamma stage (S1/S2 of the speedrun
+    # spec) is judged on a number that has to be verifiable in the train log of the round it ran in.
+    print(hyperparams_in_force(model, hyper), flush=True)
 
     # timesteps is the total for the run. learn() adds its argument to the loaded step count when
     # resuming, so only the remaining steps are requested.
