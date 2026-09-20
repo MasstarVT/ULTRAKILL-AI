@@ -366,7 +366,7 @@ Read a date-stamped claim as of its date; `docs/project-log.md` has anything lat
   opts back in to argmax and prints and records which mode ran; `--stochastic` still parses (a no-op in campaign mode,
   and still the way to sample in Cyber Grind, whose default is unchanged). Both flags in one command is an error.
 - Live dashboard: `python scripts/dashboard.py` (newest run) or `--run cybergrind_ppo_v2`; opens on monitor 3 below the game row (`--monitor`, `--reserve-top`); `--smoke-test` renders once and exits. A campaign run replaces the Shooting panel with a Campaign panel (fresh and all-episode completion rate, best and median official time, **gates per load** and checkpoints per load with the all-episode and fresh-start means side by side, **wedged steps per episode**, a **parked/ep + exit-banished row** for the two ladder-patience mechanisms, a **look free/gate row carrying the three per-dimension entropies**, new cells, deaths, closest to the exit, the four largest reward parts), charts fresh completion % and **gates per load** instead of kills/min and wave, and lists checkpoints instead of waves per game. On branch `next-levels` a **multi-level** run adds a `levels` block (one row per unlocked level: fresh rate and window, best time, checkpoints per load, sampling weight `w` and, since branch `curriculum-progress`, the progress score `prog` the weighting rule reads -- a `w` at the retention floor next to a flat `prog` is a level the rule has damped for being blocked) and relabels the headline `fresh score N / K levels`, because the pooled figure is then a shrunk sum and can exceed 1.0.
-- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 14 trunks walked end to end), and the three specialist files `python tests/test_specialists_config.py` (the plan pinned against `campaign_gates_full.yaml`), `python tests/test_campaign_driver.py` (the stage rule and the driver against fakes) and `python tests/test_full_run.py` (the chaining, `play_level` against `FakeLevel`, and the action mode the chain plays in). `python tests/test_eval.py` (added 2026-09-20) covers `eval.py`'s action mode: `resolve_deterministic`'s table, the flags, that every `predict` call gets the chosen mode, and that the recorded note names it. All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**36 files; 862 named tests** as of 2026-09-20 on branch `dormant-levers`, plus `test_progress.py`'s 26 that print no count; ~3 min). The four files that branch added are the dormant levers: `tests/test_slot_counters.py` (stage S0's weapon-channel counters, and the pin that they change no step output), `tests/test_sticky_slot.py` (stage S5's `sticky_weapon_slot`, off by default and byte-identical when off), `tests/test_speed_overrides.py` (the plan's `speed.rewards:` / `speed.train:` / `speed.env:` blocks, S1/S2 and S3) and `tests/test_resume_hyperparams.py` (that a RESUMED PPO takes gamma from the config, in the model and in the rollout buffer). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run, and `tests/test_freeze_recovery.py` the bounds that keep a sick game from FREEZING it (the 17:52 incident). `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code. **`test_campaign.py`'s `test_save_best_run_serialises_two_racing_writers` is load-sensitive**: it races two real threads against a 5 s lock timeout, and on a box already running twelve games it failed once in eight suite runs on 2026-09-17 (then passed 6/6 when re-run on its own). A single failure of that one test under load is not a regression -- re-run the file before believing it -- but it is worth making the race deterministic rather than timed if it recurs.
+- Tests (no game): `python tests/test_progress.py`, `python tests/test_aim.py`, `python tests/test_campaign.py`, `python tests/test_campaign_rewards.py`, `python tests/test_spaces.py`, `python tests/test_campaign_env.py`, `python tests/test_ladder_replay.py`, `python tests/test_keep_best.py` and `python tests/test_times.py` (pytest is not installed; the files also work under pytest). Also `python tests/test_transfer.py` and `python tests/test_look_mode_transfer.py` (weight surgery), `python tests/test_campaign_config.py` (the campaign config and `train.py` wiring) and the three route-fallback files `python tests/test_route_files.py` (the data), `python tests/test_route_replay.py` (A0, the branch-order safety property) and `python tests/test_route_walk.py` (the 14 trunks walked end to end), and the three specialist files `python tests/test_specialists_config.py` (the plan pinned against `campaign_gates_full.yaml`), `python tests/test_campaign_driver.py` (the stage rule and the driver against fakes) and `python tests/test_full_run.py` (the chaining, `play_level` against `FakeLevel`, and the action mode the chain plays in). `python tests/test_eval.py` (added 2026-09-20) covers `eval.py`'s action mode: `resolve_deterministic`'s table, the flags, that every `predict` call gets the chosen mode, and that the recorded note names it. All of them at once, from `python/` in PowerShell: `Get-ChildItem tests\test_*.py | ForEach-Object { .venv\Scripts\python $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }` (**36 files; 870 named tests** as of 2026-09-20 on branch `dormant-levers`, plus `test_progress.py`'s 26 that print no count; ~3 min). The four files that branch added are the dormant levers: `tests/test_slot_counters.py` (stage S0's weapon-channel counters, and the pin that they change no step output), `tests/test_sticky_slot.py` (stage S5's `sticky_weapon_slot`, off by default and byte-identical when off), `tests/test_speed_overrides.py` (the plan's `speed.rewards:` / `speed.train:` / `speed.env:` blocks, S1/S2 and S3) and `tests/test_resume_hyperparams.py` (that a RESUMED PPO takes gamma from the config, in the model and in the rollout buffer). `tests/test_games.py` covers `games.py`'s instance-count guard and launch readiness, `tests/test_supervise.py` the crash supervisor and its boot health gate, `tests/test_bridge_recovery.py` the bridge-failure recovery that keeps one sick game from killing a twelve-game run, and `tests/test_freeze_recovery.py` the bounds that keep a sick game from FREEZING it (the 17:52 incident). `test_campaign_check.py` and `test_skull_check.py` print `[FAIL]` lines from their own fake levels on purpose -- they are asserting that a broken level is reported as broken -- so judge them on their last line and their exit code. **`test_campaign.py`'s `test_save_best_run_serialises_two_racing_writers` is load-sensitive**: it races two real threads against a 5 s lock timeout, and on a box already running twelve games it failed once in eight suite runs on 2026-09-17 (then passed 6/6 when re-run on its own). A single failure of that one test under load is not a regression -- re-run the file before believing it -- but it is worth making the race deterministic rather than timed if it recurs.
   **In a worktree, set `PYTHONPATH` to that worktree's `python/`** or `import ultrakill_ai` resolves to the main tree and every test measures the wrong code: `$env:PYTHONPATH = "F:\Github\ULTRAKILL-AI-route\python"`.
 - Regenerate the route data (no game, no port, safe beside a live run): `python scripts/build_routes.py --validate` from `python/`. ~2 min for all 33 levels; it rewrites only `ultrakill_ai/routes/` and exits non-zero if any shipped level changes shape. Run it after every game update, then `python tests/test_route_files.py`.
   **In a git worktree**, run them with the main venv but with `PYTHONPATH` pointed at the worktree: the package is an editable install pointing at the main tree, so without it you silently test the wrong code. Verify once with `python -c "import ultrakill_ai; print(ultrakill_ai.__file__)"`.
@@ -400,10 +400,28 @@ New-Item runs\specialists\DRIVER_PAUSE          # FIRST. A Ctrl+C is indistingui
 python scripts\specialists_status.py            # confirm the driver has gone quiet and read the current stage
 # ... stop the driver process by PID (only the driver: the trainer and the twelve games keep running) ...
 #     edit python\configs\specialists.yaml here
-python scripts\campaign_driver.py --dry-run     # decides and exits, changing nothing: read what it says
+python scripts\campaign_driver.py --dry-run     # WHILE PAUSED: validates the plan file ONLY. See below.
 Remove-Item runs\specialists\DRIVER_PAUSE
+python scripts\campaign_driver.py --dry-run     # now it really decides, and still changes nothing
 .\runs\start_driver.cmd                         # a bare Start-Process mangles the quoted "Level 0-1"
 ```
+
+**What each of those two dry runs actually does** (2026-09-20 review; both verified by reading the code, the
+first also reproduced against a scratch runs-dir):
+
+- **While `DRIVER_PAUSE` exists, a dry run decides nothing.** `Driver.tick()` returns `"paused"` as its very
+  first statement and `Driver.run()` returns 0 after one tick under `--dry-run`, so the last line is
+  `PAUSED: …\DRIVER_PAUSE exists, doing nothing`, exit code 0. It is still worth running, because
+  `load_plan` is called in `main()` *before* the Driver is built: **a typo or a wrong type in `speed.train:`
+  or `speed.env:` is a hard error and is caught here.** That is all it proves. It does not tell you which
+  rung starts, which checkpoint it resumes from, or what config would be written.
+- **After the pause file is gone and with the driver still stopped**, the same command runs the real decision
+  path and still changes nothing: `save_state`, `seed_archives`, `ensure_games`, `ensure_trainer`,
+  `stop_stage` and the supervisor's own restart and `ensure_helpers` are all `dry_run`-guarded, and
+  `StageSupervisor.tick()`'s remaining side effect is a log line. **One caveat:** `Driver.log` is not guarded,
+  so both dry runs append their banner to the live `runs/specialists_driver.log`. If even that is unwanted,
+  pass `--runs-dir` pointed at a copy — but then the stage's own `status.json` is not there either and the
+  decision it prints is not the live one.
 
 The restarted driver re-reads the plan but **the round already running keeps its old generated config**. Two
 ways to bring the boundary forward, and which one is right is a judgement about the round in flight:
@@ -413,6 +431,12 @@ ways to bring the boundary forward, and which one is right is a judgement about 
   that stage ends). The round ends through the normal path and is recorded `unfinished — ended by operator`.
   Per the 2026-09-20 lesson: **a change to a shared reward or optimiser path must not straddle a round that
   will be judged** — land the plan first, then END_STAGE, and let that round record the operator ending.
+  **It costs up to 50k steps, and the choice should be made with that number in view.** `end_stage_now` →
+  `finish_stage` → `stop_stage` kills the trainer by pid, so it never shuts down cleanly and `latest.zip` is
+  not written (CLAUDE.md's standing gotcha). `round_init` then falls back to `supervise.choose_resume`, the
+  highest-step `ckpt_*_steps.zip`, which is written every 50k steps — so the next round resumes from a policy
+  up to 50k steps behind the one that was running, on a rung whose bar is `median_time_50` over 50 fresh
+  episodes.
 
 Afterwards, verify from the files, never from a socket: the driver log says `stage config
 configs/generated/… (init N steps)`, the generated YAML holds the new value, and `runs/<run>/<run>_train.log`
@@ -424,13 +448,16 @@ Passive per-episode counters through `env._behaviour` → `info` → `ProgressCa
 `tests/test_slot_counters.py::test_the_counters_cannot_change_a_single_step_output`, which runs the same
 actions through two envs and requires identical observation bytes, reward, end flags and wire command.
 
-Read them off `runs/<run>/status.json` (`mean_100`), `metrics_log.csv` (eleven new columns) and
+Read them off `runs/<run>/status.json` (`mean_100`), `metrics_log.csv` (thirteen new columns) and
 `episodes.jsonl`:
 
 | what | where | why |
 |---|---|---|
 | `slot_same_frac` | all three | **the number S5 waits on**: the share of decisions that pressed the slot ALREADY HELD. §3.4 measured 76.0% on the promoted `Level_0-1.zip`; that is a different checkpoint and this is the live re-take |
 | `slot_press_frac`, `slot_switch_frac` | all three | presses of any slot key, and of a different one |
+| `slot_unowned_frac` | status + csv | presses naming a slot `slot_counts` says is EMPTY — the game cannot honour them, so they do nothing. **An S5 precondition**: it is what says how much of the sticky lever's switch budget would otherwise go on switches that never happened (the lever refuses to charge for them) |
+| `variation0_frac`, `variation_known_frac` | status + csv | the share of decisions holding weapon **variation 0** — Piercer / Core Eject / Electric Railcannon / Freezeframe (§3.5) — and how much of the episode had a readable variation. **The other S5 precondition**: the sticky slot freezes the variation for the episode, so without this a round that froze on the Marksman reads as "sticky slot is worse" |
+| `held_variation_frac` | `episodes.jsonl` only | the full three-way variation time share |
 | `slot_press_per_s` | all three | the same presses per GAME second, so two runs at different `frameskip` compare |
 | `fire1_frac`, `fire2_frac`, `punch_frac` | status + csv | `firing_frac` is the OR of the two fire buttons and never separated them; `punch` was not counted at all |
 | `slot_held_top_frac`, `slot_known_frac` | status + csv | how concentrated the held weapon is, and how much of the episode had a readable slot at all |
@@ -498,9 +525,11 @@ speed:
     sticky_slot_switch_every: 3    # decisions between two honoured switches
 ```
 
-`speed.env:` is a speed-stage-only env override, validated against `EnvConfig`'s own field names (a misspelt
-key is a hard error, because `EnvConfig.from_dict` would otherwise DROP it and train at the default). It may
-not carry `level`, `rewards`, the multi-level keys or the four the speed rule owns
+`speed.env:` is a speed-stage-only env override, validated against `EnvConfig`'s own field names **and
+against each field's declared type** (a misspelt key is a hard error, because `EnvConfig.from_dict` would
+otherwise DROP it and train at the default; a wrong type is a hard error because `from_dict` does not coerce,
+so the quoted `sticky_weapon_slot: "false"` YAML will hand you is truthy and would turn the lever ON while
+the file read off). It may not carry `level`, `rewards`, the multi-level keys or the four the speed rule owns
 (`speed_bonus`, `speed_target_scale`, `speed_target_seconds`, `fresh_start_prob`).
 
 On, the lever does two things and can only ever turn a press into "keep" — it adds no press and substitutes
@@ -508,8 +537,19 @@ no slot: a press of the slot already held is dropped (in game that press re-draw
 `gunReady` stays false until the `ReadyGun()` animation event), and a switch to a different slot is honoured
 at most once per `sticky_slot_switch_every` decisions.
 
+**The cooldown is charged for a switch the game can actually perform.** A press naming a slot
+`player.slot_counts` reports EMPTY is passed through free: `SwitchWeapon` cannot move `currentSlotIndex`
+into an empty slot, nothing is drawn, and there is no cost to ration. This matters on 0-1 specifically, where
+weapons arrive one pickup at a time — charging for those presses would ration switches that never happened
+and cut real switching by up to `sticky_slot_switch_every` times, while `slot_blocked_frac` read as though
+the cooldown were working. `slot_unowned_frac` (S0, above) is how often it happens. An unanswerable
+`slot_counts` — an empty array, or a mod older than v0.5.0 — is *unknown*, not empty, and is still charged.
+
 **Do not turn this on before `slot_same_frac` has been read on the live policy.** The 76% is from another
-checkpoint and the spec says so. **`sticky_slot_switch_every: 3` is not a measurement** — the draw
+checkpoint and the spec says so. **Read `variation0_frac` first too**: the sticky slot freezes the weapon
+variation for the episode (the dropped press is the redraw, which is the policy's only way to cycle variation
+until the `variant` dim lands at S9), so a round frozen on the Marksman instead of the Piercer would show a
+worse `kills_per_min` and `firing_on_target_frac` for a reason that has nothing to do with the sticky slot. **`sticky_slot_switch_every: 3` is not a measurement** — the draw
 animation's real length cannot be read from the decompiled C# (the clips are serialized); 3 is the decisions
 covered by the nearest documented window in the spec's own table, the 200 ms `JumpReady` cooldown, at 66.7 ms
 per decision. Note also that "swap cancel" (§2) is a technique that *wants* rapid switching, so a large value

@@ -538,10 +538,27 @@ def _speed_env(path, block) -> dict:
         raise ValueError("%s: `speed.env:` must be a block of env settings, not %r" % (path, block))
     from ultrakill_ai.env import EnvConfig  # noqa: PLC0415 - see the docstring
 
-    names = {f.name for f in dataclasses.fields(EnvConfig)}
-    unexpected = sorted(set(map(str, block)) - names)
+    fields = {f.name: f for f in dataclasses.fields(EnvConfig)}
+    unexpected = sorted(set(map(str, block)) - set(fields))
     if unexpected:
         raise ValueError("%s: unknown speed.env settings %s" % (path, unexpected))
+    for key, value in block.items():
+        # The NAME check above is not enough. `EnvConfig.from_dict` does not coerce, so
+        # `sticky_weapon_slot: "false"` -- YAML's own answer to a quoted boolean -- arrives as a truthy
+        # string and turns the lever ON while the plan file says off, which is exactly the silent-wrong-value
+        # failure `_speed_train`'s number check exists to prevent. And a non-numeric
+        # `sticky_slot_switch_every` does not fail here at all: it raises inside a SubprocVecEnv worker on the
+        # first honoured switch, mid-episode, taking the trainer down into a restart loop on the same config.
+        expected = fields[str(key)].type
+        if expected == "bool" and not isinstance(value, bool):
+            raise ValueError("%s: speed.env.%s must be a YAML boolean (true/false, unquoted), not %r"
+                             % (path, key, value))
+        if expected == "int" and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError("%s: speed.env.%s must be a whole number, not %r" % (path, key, value))
+        if expected == "float" and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            raise ValueError("%s: speed.env.%s must be a number, not %r" % (path, key, value))
+        if expected == "str" and not isinstance(value, str):
+            raise ValueError("%s: speed.env.%s must be a string, not %r" % (path, key, value))
     refused = sorted(set(map(str, block)) & set(SPEED_ENV_REFUSED))
     if refused:
         raise ValueError("%s: speed.env may not set %s -- stage_config decides those (use `speed.rewards:` for "
@@ -676,8 +693,8 @@ def stage_config(plan: Plan, level: str, *, init_steps: int | None = None, kind:
     if kind == SPEED and plan.speed_train:
         # REBIND, NEVER MUTATE, exactly as `rewards` above: `train` is a SHALLOW copy of `plan.train`, so
         # `train["hyperparams"]` IS the plan's own dict and an in-place update would leak this stage's gamma
-        # into every complete stage generated afterwards from the same Plan object. Pinned by the
-        # order-independence test in tests/test_speed_train_override.py.
+        # into every complete stage generated afterwards from the same Plan object. Pinned by
+        # `test_the_train_block_does_not_leak_between_stage_kinds_in_either_order` in tests/test_speed_overrides.py.
         train["hyperparams"] = {**(train.get("hyperparams") or {}), **plan.speed_train}
     train["run_name"] = stage_run_name(level, kind)
     budget = rule.max_steps_per_stage + TIMESTEPS_SLACK

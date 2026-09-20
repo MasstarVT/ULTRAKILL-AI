@@ -49,10 +49,11 @@ BASELINE_INFO_KEYS = {
 # ... and exactly what S0 adds. `slot_press_per_s` is not here because, like `kills_per_min`, it is only set
 # on the step that ENDS the episode -- it is the one counter denominated in game seconds rather than decisions.
 NEW_INFO_KEYS = {
-    "slot_press_frac", "slot_same_frac", "slot_switch_frac",
+    "slot_press_frac", "slot_same_frac", "slot_switch_frac", "slot_unowned_frac",
     "fire1_frac", "fire2_frac", "punch_frac",
     "slot_dropped_frac", "slot_blocked_frac",
     "slot_held_frac", "slot_held_top_frac", "slot_kills", "slot_known_frac",
+    "held_variation_frac", "variation0_frac", "variation_known_frac",
 }
 
 
@@ -116,6 +117,91 @@ def test_a_press_of_the_held_slot_is_counted_as_the_redraw():
         assert info["slot_known_frac"] == 1.0
         # `slot_same_frac` is denominated in DECISIONS, which is the denominator §3.4's 76% used.
         assert info["slot_same_frac"] + info["slot_switch_frac"] == info["slot_press_frac"]
+    finally:
+        env.close()
+
+
+def test_a_press_of_an_empty_slot_is_counted_as_unowned():
+    """`player.slot_counts` says which slots hold a weapon, and the game cannot switch into an empty one.
+
+    This is measured PASSIVELY, with the sticky lever off, because it is the number that decides whether the
+    lever's ownership gate matters: on 0-1 the revolver is the only weapon for most of the level, so a policy
+    that presses 2..5 there is pressing keys that do nothing at all. It is also the precondition for reading
+    an S5 round -- a cooldown charged for those presses would ration switches that never happened.
+    """
+    env, client = make_env()
+    try:
+        client.weapon_slot = 0
+        client.slot_counts = [1, 0, 0, 0, 0]  # 0-1 after the revolver pickup and nothing else
+        env.reset()
+        env.step(slot_action(1))   # owned: the redraw
+        env.step(slot_action(4))   # empty
+        env.step(slot_action(5))   # empty
+        env.step(slot_action(0))   # no press at all
+        _, _, _, _, info = env.step(idle())
+        assert info["slot_press_frac"] == 3 / 5
+        assert info["slot_unowned_frac"] == 2 / 5
+        assert info["slot_dropped_frac"] == 0.0, "the lever is off: nothing is rewritten"
+    finally:
+        env.close()
+
+
+def test_an_unanswerable_slot_counts_is_not_counted_as_unowned():
+    """Unknown is a third outcome, never "empty": an empty array is what the mod sends before GunControl."""
+    env, client = make_env()
+    try:
+        client.weapon_slot = 0
+        client.slot_counts = []
+        env.reset()
+        for _ in range(3):
+            env.step(slot_action(4))
+        _, _, _, _, info = env.step(idle())
+        assert info["slot_press_frac"] == 3 / 4 and info["slot_unowned_frac"] == 0.0
+    finally:
+        env.close()
+
+
+def test_the_variation_held_is_measured_before_anything_freezes_it():
+    """`weapon_variation` has been on the wire and thrown away (§3.2). S5 freezes it, so it is read first.
+
+    Variation 0 is Piercer / Core Eject / Electric Railcannon / Freezeframe (§3.5) -- the set every technique
+    in the spec is built on. A sticky-slot round that happened to freeze on the Marksman would show a worse
+    `kills_per_min` and `firing_on_target_frac` for a reason that has nothing to do with the sticky slot, and
+    without this counter nothing in status.json, metrics_log.csv or episodes.jsonl could tell the two apart.
+    """
+    env, client = make_env()
+    try:
+        client.weapon_variation = 0
+        env.reset()
+        env.step(forward())
+        client.weapon_variation = 1
+        env.step(forward())
+        env.step(forward())
+        _, _, _, _, info = env.step(idle())
+        assert info["variation_known_frac"] == 1.0
+        # Two of the four decisions were TAKEN while variation 0 was held. Like every other counter here the
+        # read is off `prev` -- the observation the decision was made on -- so the change made after step 1
+        # first shows in step 2's OBSERVATION and so in step 3's count. That lag is the intended semantics:
+        # the number answers "what was the policy holding when it chose", which is what a round is judged on.
+        assert info["variation0_frac"] == 2 / 4
+        assert info["held_variation_frac"] == [2 / 4, 2 / 4, 0.0]
+        assert info["variation0_frac"] == info["held_variation_frac"][0]
+    finally:
+        env.close()
+
+
+def test_an_unknown_variation_is_never_guessed():
+    """-1 is "GunControl has not started", exactly as it is for `weapon_slot`: it is not variation 0."""
+    env, client = make_env()
+    try:
+        client.weapon_variation = -1
+        env.reset()
+        for _ in range(3):
+            env.step(forward())
+        _, _, _, _, info = env.step(idle())
+        assert info["variation_known_frac"] == 0.0
+        assert info["variation0_frac"] == 0.0
+        assert info["held_variation_frac"] == [0.0, 0.0, 0.0]
     finally:
         env.close()
 
@@ -235,10 +321,13 @@ def test_the_counters_reach_status_json_the_csv_and_episodes_jsonl():
             "kills": 3, "deaths": 0, "fresh_start": 1, "completed": 1, "level": "Level 0-1",
             "end_reason": "level_complete", "reward_parts": {},
             "slot_press_frac": 0.8, "slot_same_frac": 0.76, "slot_switch_frac": 0.04,
+            "slot_unowned_frac": 0.02,
             "slot_press_per_s": 12.0, "fire1_frac": 0.3, "fire2_frac": 0.1, "punch_frac": 0.5,
             "slot_held_top_frac": 0.9, "slot_known_frac": 1.0,
             "slot_dropped_frac": 0.0, "slot_blocked_frac": 0.0,
+            "variation0_frac": 1.0, "variation_known_frac": 0.95,
             "slot_held_frac": [0.9, 0.1, 0.0, 0.0, 0.0, 0.0], "slot_kills": [2, 1, 0, 0, 0, 0],
+            "held_variation_frac": [1.0, 0.0, 0.0],
         }
         cb._record_episode(0, info)
         snapshot = cb._snapshot(time.time())
@@ -249,6 +338,7 @@ def test_the_counters_reach_status_json_the_csv_and_episodes_jsonl():
         assert line["slot_same_frac"] == 0.76 and line["slot_press_per_s"] == 12.0
         assert line["slot_held_frac"] == [0.9, 0.1, 0.0, 0.0, 0.0, 0.0]
         assert line["slot_kills"] == [2, 1, 0, 0, 0, 0]
+        assert line["held_variation_frac"] == [1.0, 0.0, 0.0]
 
         row = poll_status.row(snapshot)
         for name in SLOT_METRICS:

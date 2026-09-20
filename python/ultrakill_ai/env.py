@@ -55,6 +55,7 @@ from ultrakill_ai.procmem import derive_game_limit, private_bytes
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
 from ultrakill_ai.spaces import (
     NUM_WEAPON_SLOTS,
+    NUM_WEAPON_VARIATIONS,
     PITCH_BINS,
     YAW_BINS,
     ObsLayout,
@@ -337,15 +338,47 @@ BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_vis
                   #   slot_switch    ... and it was a different slot
                   #   slot_known     decisions whose held slot the mod actually reported (the denominator for
                   #                  the per-slot shares; `weapon_slot` is -1 before `GunControl` starts)
-                  "slot_press", "slot_same", "slot_switch", "slot_known",
+                  #   slot_unowned   ... and the key pressed named a slot `player.slot_counts` says is EMPTY,
+                  #                  so `SwitchWeapon` cannot move `currentSlotIndex` and no switch happens.
+                  #                  0-1 acquires its weapons one pickup at a time, so this is most of the
+                  #                  level at the start; it is the number that says how much of the sticky
+                  #                  lever's switch budget would go on switches the game never performed.
+                  "slot_press", "slot_same", "slot_switch", "slot_known", "slot_unowned",
                   # What the STICKY SLOT lever suppressed, both 0 while `sticky_weapon_slot` is False.
                   "slot_dropped", "slot_blocked",
+                  # The weapon VARIATION held (`GunControl.currentVariationIndex`). The redraw §3.4 describes
+                  # cycles it, so the sticky slot FREEZES whichever variation the episode happens to hold --
+                  # and variation 0 is Piercer / Core Eject / Freezeframe (§3.5), the set every technique in
+                  # the spec wants. Without this, a sticky-slot round that froze on the Marksman reads as
+                  # "sticky slot is worse" when what was measured is "variation 1 is worse".
+                  "variation_known",
+                  *("held_variation_%d" % i for i in range(NUM_WEAPON_VARIATIONS)),
                   # Press counts for the three buttons the technique work cares about. `firing` above is
                   # fire1-OR-fire2 and cannot separate them, and nothing counted `punch` at all even though
                   # `rewards.punch` charges for it.
                   "press_fire1", "press_fire2", "press_punch",
                   *("held_slot_%d" % i for i in range(NUM_WEAPON_SLOTS)),     # decisions each slot was held
                   *("kills_slot_%d" % i for i in range(NUM_WEAPON_SLOTS)))    # kills while each slot was held
+
+
+def _slot_owned(player: dict[str, Any], slot: int) -> bool | None:
+    """Does `player.slot_counts` say slot KEY `slot` (1..5) holds a weapon? None when it cannot answer.
+
+    `ObservationBuilder.SlotCounts` sends one count per `GunControl.slots` entry, slot 1 first, and an EMPTY
+    array until `GunControl` has started -- 0-1 has no weapon at all until the revolver pickup and acquires
+    the rest one pickup at a time, so "empty" is the normal state for much of the level, not an error.
+
+    Three outcomes, never two: True owned, False known-empty, None unknown (array absent, too short, or not
+    numbers -- a mod older than v0.5.0, or a slot beyond what this build reports). Callers must not treat
+    None as False; guessing "empty" would make the sticky lever pass every press through on an old mod.
+    """
+    counts = player.get("slot_counts")
+    if not counts or not 1 <= slot <= len(counts):
+        return None
+    try:
+        return int(counts[slot - 1]) > 0
+    except (TypeError, ValueError):
+        return None
 
 
 _NO_SLOT = "<none>"  # the sentinel for "nothing to serialize against", never a real path
@@ -1564,7 +1597,14 @@ class UltrakillEnv(gym.Env):
              animation event, so a policy that presses it constantly suppresses its own primary fire (§3.4).
           2. A switch to a DIFFERENT slot is honoured at most once per `sticky_slot_switch_every` decisions,
              because a switch draws too. The counter runs over DECISIONS, not game seconds, and is reset by a
-             level load and by a respawn along with `_slide_latch`.
+             level load and by a respawn along with `_slide_latch`. A press naming a slot `slot_counts` says
+             is EMPTY is not a switch at all -- the game cannot honour it -- so it is passed through and
+             costs nothing; see the `_slot_owned` branch below.
+
+        Rule 1 cannot fire while slot index 5 is held, because the action space stops at slot KEY 5
+        (`NUM_WEAPON_CHOICES` 6 = keep plus keys 1..5) while `NUM_WEAPON_SLOTS` is 6. That is correct rather
+        than a gap: the policy has no way to press key 6, so it can never re-draw slot 5, and every key it
+        CAN press while holding slot 5 is a genuine switch to a different slot.
 
         The action that was refused is NOT replaced by anything: the step goes out with `slot: 0`, which is the
         action the policy could already have chosen, so the wire message stays inside the existing protocol and
@@ -1597,6 +1637,19 @@ class UltrakillEnv(gym.Env):
         elif was_cooling:
             command["slot"] = 0
             self._behaviour["slot_blocked"] += 1
+        elif _slot_owned(prev.get("player") or {}, slot) is False:
+            # THE COOLDOWN IS CHARGED FOR A SWITCH, AND A PRESS OF AN EMPTY SLOT IS NOT ONE.
+            # `GunControl.SwitchWeapon` cannot move `currentSlotIndex` into a slot with no weapon in it, so
+            # nothing is drawn and nothing is suppressed -- there is no cost to ration. Charging here would
+            # spend the whole switch budget on switches the game never performed and cut real switching by up
+            # to `sticky_slot_switch_every` times, while `slot_blocked_frac` read as though the cooldown were
+            # doing its job. That would corrupt the S5 round rather than break the run: the judged metrics
+            # could not separate "sticky slot did not help" from "the cooldown was spent on non-events".
+            # How often this happens is measured PASSIVELY and right now, as `slot_unowned_frac` -- S5 may
+            # not be switched on until that number has been read off a live status.json.
+            # `None` (an old mod, or a `slot_counts` too short to answer) is NOT treated as empty: unknown
+            # falls through and is charged, which is the conservative half of the rule.
+            pass
         else:
             self._slot_cooldown = max(0, int(self.cfg.sticky_slot_switch_every) - 1)
 
@@ -1648,6 +1701,15 @@ class UltrakillEnv(gym.Env):
             self._behaviour["held_slot_%d" % held] += 1
             if slot:
                 self._behaviour["slot_same" if slot == held + 1 else "slot_switch"] += 1
+        if slot and _slot_owned(player, slot) is False:
+            # A press the game CANNOT honour. Counted here, passively and whether or not the sticky lever is
+            # on, because it is the measurement that decides whether the lever's ownership gate matters: it is
+            # `slot_unowned_frac` that says how much of the policy's slot channel is aimed at empty slots.
+            self._behaviour["slot_unowned"] += 1
+        variation = player.get("weapon_variation", -1)
+        if 0 <= variation < NUM_WEAPON_VARIATIONS:
+            self._behaviour["variation_known"] += 1
+            self._behaviour["held_variation_%d" % variation] += 1
         self._behaviour["pitch_steps"] += 1
         self._behaviour["pitch_sum"] += abs(player["pitch"])
         self._behaviour["pitch_signed_sum"] += player["pitch"]
@@ -2236,6 +2298,10 @@ class UltrakillEnv(gym.Env):
         info["slot_press_frac"] = b["slot_press"] / steps   # pressed any slot key
         info["slot_same_frac"] = b["slot_same"] / steps     # ... the slot ALREADY HELD: the redraw
         info["slot_switch_frac"] = b["slot_switch"] / steps  # ... a different slot
+        # ... and the share of all decisions that pressed a slot `slot_counts` reported EMPTY. The game cannot
+        # switch into an empty slot, so these presses do nothing at all -- and the sticky lever must not spend
+        # its switch budget on them. High here means the ownership gate in `_sticky_slot` is load-bearing.
+        info["slot_unowned_frac"] = b["slot_unowned"] / steps
         info["fire1_frac"] = b["press_fire1"] / steps
         info["fire2_frac"] = b["press_fire2"] / steps
         info["punch_frac"] = b["press_punch"] / steps
@@ -2252,6 +2318,15 @@ class UltrakillEnv(gym.Env):
         info["slot_held_top_frac"] = max(held_slots) / known
         info["slot_kills"] = [b["kills_slot_%d" % i] for i in range(NUM_WEAPON_SLOTS)]
         info["slot_known_frac"] = b["slot_known"] / steps  # ... and how much of the episode had a known slot
+        # WHICH VARIATION the episode held, on the same pattern: the list per episode, one scalar in
+        # status.json. `variation0_frac` is the share of known-variation decisions holding variation 0 --
+        # Piercer, Core Eject, Electric Railcannon, Freezeframe (§3.5), the set the technique work is built
+        # on. The sticky slot freezes the variation for the episode, so this is the control reading that
+        # separates "sticky slot is worse" from "the round happened to sit on the Marksman".
+        var_known = max(1, b["variation_known"])
+        info["held_variation_frac"] = [b["held_variation_%d" % i] / var_known for i in range(NUM_WEAPON_VARIATIONS)]
+        info["variation0_frac"] = b["held_variation_0"] / var_known
+        info["variation_known_frac"] = b["variation_known"] / steps
         if self.cfg.mode == "campaign":
             # The level this episode RAN on: `info` is built in step() before SubprocVecEnv calls reset(), so a
             # switch episode's row still carries the level it played. Deliberately not in CAMPAIGN_INFO_KEYS,

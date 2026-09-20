@@ -239,6 +239,34 @@ def test_a_misspelt_env_key_is_refused_not_defaulted(tmp_path=None):
         raise AssertionError("a misspelt env key was accepted")
 
 
+def test_an_env_value_of_the_wrong_TYPE_is_refused_not_passed_through(tmp_path=None):
+    """The name check is not enough: `EnvConfig.from_dict` does not coerce, so a quoted YAML boolean is truthy.
+
+    `sticky_weapon_slot: "false"` would turn the lever ON for the next round while the plan file read off --
+    the silent-wrong-value failure `speed.train`'s number check already refuses -- and
+    `sticky_slot_switch_every: "every 3"` would not fail here at all: it raises inside a SubprocVecEnv worker
+    on the first honoured switch, mid-episode, and the driver restarts the trainer into the same config.
+    """
+    tmp_path = tmp_path or Path(__import__("tempfile").mkdtemp())
+    bad = [({"sticky_weapon_slot": "false"}, "boolean"), ({"sticky_weapon_slot": 1}, "boolean"),
+           ({"sticky_slot_switch_every": "every 3"}, "whole number"),
+           ({"sticky_slot_switch_every": True}, "whole number"),
+           ({"sticky_slot_switch_every": 2.5}, "whole number"),
+           ({"stuck_seconds": "lots"}, "number"), ({"mode": 4}, "string")]
+    for block, wanted in bad:
+        try:
+            campaign_driver.load_plan(write_plan(tmp_path, env=block))
+        except ValueError as exc:
+            assert wanted in str(exc), (block, exc)
+        else:
+            raise AssertionError("accepted %r" % (block,))
+    # ... and the right types still load, including an int where a float is declared.
+    ok = campaign_driver.load_plan(write_plan(tmp_path, env={"sticky_weapon_slot": True,
+                                                             "sticky_slot_switch_every": 4,
+                                                             "stuck_seconds": 12}))
+    assert ok.speed_env == {"sticky_weapon_slot": True, "sticky_slot_switch_every": 4, "stuck_seconds": 12}
+
+
 def test_a_plan_with_speed_rewards_and_no_shared_rewards_block_still_generates(tmp_path=None):
     """It used to raise KeyError: `env["rewards"]` was indexed, not `.get`. A legitimate file, so it must work."""
     tmp_path = tmp_path or Path(__import__("tempfile").mkdtemp())

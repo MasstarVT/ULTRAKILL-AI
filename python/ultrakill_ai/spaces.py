@@ -71,6 +71,11 @@ def noop_action(campaign: bool = False) -> np.ndarray:
 
 NUM_ENEMY_TYPES = 43  # EnemyType enum values 0..42 in the current game build
 NUM_WEAPON_SLOTS = 6
+# `GunControl.currentVariationIndex`, which the mod already sends as `player.weapon_variation` and nothing has
+# ever read. Three per slot: `CampaignPatches.OverridePrefInt` rewrites every `weapon.*` pref to 1, which
+# equips the STANDARD variant of all three weapons in each slot (spec §3.5), and pressing the slot already
+# held cycles between them (`WeaponRedrawBehaviour` 0, spec §3.4). Bookkeeping only -- no observation packs it.
+NUM_WEAPON_VARIATIONS = 3
 CAMPAIGN_BLOCK = 36  # campaign values packed after the Cyber Grind two (see campaign_block)
 
 
