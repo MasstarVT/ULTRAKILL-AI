@@ -4536,3 +4536,7 @@ unchanged (`test_off_is_the_action_stream_byte_for_byte`).
   redraw-suppression premise remains unmeasured, and the "activate neither" recommendation stands.
 - **`weapon_tech.slot`** (mod 0.8.0's block) carries the same raw field, but that mod is not installed and
   no Python consumer reads it yet; it was documented, not exercised.
+
+## 2026-09-20 — AGENTS.md, generated from CLAUDE.md
+
+The user asked for an `AGENTS.md` that stays updated. `CLAUDE.md` remains the one file anyone edits; `python/scripts/sync_agents_md.py` renders `AGENTS.md` from it (a note under the title, body untouched) and `python/tests/test_agents_md.py` fails the no-game suite whenever the two drift, so every agent that lands a `CLAUDE.md` edit is forced to re-sync. A generated copy rather than a symlink (Windows checkouts) or an `@import` (other tools do not follow it).

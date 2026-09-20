@@ -558,3 +558,4 @@ trades one gain for another.
 Judged on: `kills_per_min`, `firing_on_target_frac` and the median, with `slot_dropped_frac` /
 `slot_blocked_frac` confirming the lever is live. Revert criterion: median or `completed` worse at the next
 two checks — the standing rule, one thing at a time, ≥ 400k steps.
+- `AGENTS.md` (the same rules under the name other coding agents look for) is GENERATED: after any edit to `CLAUDE.md` run `python scripts/sync_agents_md.py` from `python/` and commit both files; `python scripts/sync_agents_md.py --check` verifies without writing.
