@@ -3157,3 +3157,118 @@ not use `times.valid_official_seconds` the way the leaderboard does.
   190–226 s says it is representative; deaths-per-crossing on the current weights is not directly measured.
 - **The effect on the value function's fit is not bounded offline.** 12.0 widens the death term's spread from
   0…−120 to 0…−288 over the observed 0–24 death range. That is what the judging plan has to catch.
+
+## 2026-09-20 — FOCUS on one level: a rung ladder toward the 0-1 record, and the two reward bugs fixed
+
+The user, verbatim: *"can we focuse on one level tell we get it to a point that is close to the speed run
+record"*. The lead chose **Level 0-1**: it is the first level, it has the most trained brain in the project
+(28.39M cumulative steps across `spec_0-1` and `spec_0-1_speed`), and it is the only level whose speed stage
+has ever passed. This entry records what was built, the numbers it was built from, and what is NOT verified.
+The design is spec §11 of `docs/superpowers/specs/2026-09-18-speed-stages.md`. Branch `focus-mode`, built in
+the worktree `F:\Github\ULTRAKILL-AI-focus` while `spec_0-2_speed` round 2 kept running on the main tree; no
+port was opened, no game was touched, and no live file was written.
+
+### The gap the ladder has to close
+
+| | seconds | x the record |
+|---|---|---|
+| Human INBOUNDS IL record (`configs/il_records.yaml`, geshem8, 2026-05-07) | **19.798** | 1.00x |
+| Human Any% IL record (leaves the level; NOT a target) | 4.915 | — |
+| `spec_0-1_speed` best single fresh run (2026-09-19) | **81.464** | **4.11x** |
+| `spec_0-1_speed` median_time_50 at promotion (2026-09-19) | **147.159** | **7.43x** |
+| The S-rank rung it passed | 150.0 | 7.58x |
+| Human casual reference playthrough | 146.58 | 7.40x |
+
+The 2026-09-19 round promoted at a 0.92 fresh rate, so the level is being FINISHED reliably; what is left is
+entirely the clock. The depth-first order of 2026-09-19 would have sent the machine to 0-2 at that point and
+left 0-1 at 7.4x the record, which is what the user's instruction refuses.
+
+### What a focus is
+
+A nullable `focus:` block in `configs/specialists.yaml`:
+
+```yaml
+focus:
+  level: "Level 0-1"
+  targets: [120, 100, 85, 72, 60, 50, 42, 35, 30, 25]
+```
+
+While it is set the driver trains **only** that level's speed stage, one RUNG at a time. Rung *k* is an
+ordinary speed stage whose `target_seconds` is `targets[k]` exactly — not the S-rank time, not scaled by
+`speed.target_scale` — using the same run (`spec_0-1_speed`), the same model directory, and `round_init`'s
+own rule for the weights (the stage's own newest checkpoint). It promotes by the unchanged speed rule (fresh
+rate ≥ 0.4 **and** `median_time_50` ≤ the rung, latched, then the settle); a met rung is recorded `"done"`
+with its target and **overwrites** the specialist, because its median is by construction faster than the one
+that was promoted; a round that hits the 8M-step cap is `"unfinished"`, promotes nothing, and repeats the
+same rung. Unbounded rounds, as today (`speed.max_rounds: 0` — never idle the machine).
+
+Rung spacing: ~15–20% at the top, where the loss is route length rather than execution (2026-09-19's time
+budget: the runs were 2x as long in PATH, not slower in speed, ~16–19 m/s, and the single biggest loss was a
+25 m shaft climb), tightening toward the bottom. The last rung, 25 s, is 1.26x the record — "close to" without
+pretending a memoryless MLP with no hazard channel and no frame stack will beat a human.
+
+**Which rung is current is derived, never stored.** `focus_rung` walks the ladder and takes the first target
+no `"done"` speed round has met; `rung_met` counts a rung met by a done round's own `target_seconds` being at
+or under it, or by its recorded `median_time` being at or under it. Nothing migrates: today's history entry
+(0-1 speed, round 2, done, target 150.0, median 147.1586145) makes every rung above 148 met and puts the
+focus on **120**, which is pinned by a literal-state test. An `"unfinished"` round proves nothing however good
+its median looked; an impossible time is rejected by `times.valid_official_seconds`.
+
+`load_plan` refuses a bad block loudly (unknown level, a level with no `kind: speed` entry, empty targets, a
+non-numeric/zero/negative target, a ladder that is not strictly decreasing, an unknown key), and
+`--start-at` is refused for any other stage while a focus with rungs left is set. When the last rung is done
+the focus STOPS, says `FOCUS COMPLETE` once, and the ordinary plan takes over.
+
+### The two reward bugs, fixed together and deliberately
+
+Both were found on 2026-09-20 (previous entry, §6) and both are on the SHARED reward path, so they change
+every stage. That was the reason not to land them beside the `death: 12.0` experiment — neither would have
+been interpretable. It is acceptable now precisely because the focus starts a new regime: the first rung is a
+new baseline, taken after the switch. The `death: 12.0` experiment of earlier today is superseded by this
+direction and its judging plan does not apply.
+
+1. **`damage_dealt` had no lower bound** (`rewards.py`, the "killed in one hit" credit). It divided by
+   `max(enemy_max_health.get(id, health), 1e-3)`, so an overkilled enemy reporting NEGATIVE health whose id
+   was missing from `enemy_max_health` produced `health × 1000`. Measured: `runs/probe_0-2_speed/rollout_11.jsonl`
+   i=2053 paid `damage_dealt = −250.0` in one decision (health −0.5 at weight 0.5), and **71 of 2,068 live
+   completions (3.43%) ended with a negative TOTAL episode reward, worst −1,119.5** — 4–20x the whole death
+   channel. The new `rewards.damage_share` bounds every per-enemy contribution to `[0, 1] × damage_dealt` in
+   BOTH credit paths, and falls back to the caller's old divisor only when the enemy's own bar is unknown or
+   unusable, so the ordinary case is arithmetically identical to what it always was.
+2. **`completion_bonus` paid the full weight when the official time was missing.** A completion with no clock
+   paid 100 while every genuine completion slower than the target paid 39–99, so the best-paying completion
+   available on a speed stage was one with no clock at all. It now pays the FLOOR (`SPEED_BONUS_MIN ×
+   level_complete` = 25) whenever a target is set and the time does not pass `times.valid_official_seconds`.
+   A run with no target — every complete stage, Cyber Grind, every older config — is untouched. A
+   checkpoint-respawn completion on a speed stage is priced the same way; it cannot arise on a shipped speed
+   stage, which forces `fresh_start_prob: 1.0`, and two env tests were updated to pin the new price.
+
+Both keep the three invariants: finishing (25 at worst) still beats not finishing, faster still pays strictly
+more than slower, and living still beats dying.
+
+### Verification
+
+All 33 no-game test files, one at a time, with `PYTHONPATH` on the worktree: **0 failures**.
+`tests/test_campaign_driver.py` 69 → **83** tests (14 new, including the literal live-state pin);
+`tests/test_campaign_rewards.py` 23 → **27** (4 new, all confirmed to FAIL against the pre-fix `rewards.py`);
+`tests/test_specialists_config.py` 12 → **14**; `tests/test_campaign_env.py` 108, with two assertions changed
+from 100.0 to 25.0 by fix 2; `tests/test_speed_death_weight.py`'s farmability table still green.
+
+A `--dry-run` of the new driver was run from an isolated scratch directory holding copies of the plan, the
+real `driver_state.json` and the live `status.json`: it kept `Level 0-2 (speed)` as the stage to resume,
+changed nothing, and named the focus and its rung. Quoted in the pull request; no port was opened
+(`_port_pids` is netstat only) and every destructive path in `supervise.Supervisor.tick` is `dry_run`-guarded.
+
+### Not verified
+
+- **Nothing here has run in game.** No rung has been trained, no reward change has been measured live, and
+  the ladder's spacing is a judgement from the 2026-09-19 time budget, not a fitted curve. The project's own
+  rule applies: never judge a policy edit from an offline probe alone.
+- **Whether 25 s is reachable at all** by a memoryless MLP with no hazard channel. If a rung turns out to be
+  unreachable the round repeats forever (`max_rounds: 0`), which is the deliberate "never idle the machine"
+  choice — it must be watched, and the ladder retuned by hand if a rung stalls over several rounds.
+- **The effect of fix 1 on the value function's fit** is not bounded offline: it removes a heavy negative
+  tail from 3.43% of episodes, which should help, but that is an expectation and not a measurement.
+- **`keep_best`'s carried `best.json`** across rungs is argued, not observed: the metric and `penalty_name`
+  are unchanged so it will not refuse to start, and a carried `best_at` can only lengthen a settle. No rung
+  boundary has actually happened yet.
