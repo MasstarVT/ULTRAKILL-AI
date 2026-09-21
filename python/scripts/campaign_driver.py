@@ -151,7 +151,7 @@ import yaml  # noqa: E402
 import supervise  # noqa: E402
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS_SHIPPED, safe_name  # noqa: E402
 from ultrakill_ai.rewards import RewardConfig  # noqa: E402
-from ultrakill_ai.times import short_level, valid_official_seconds  # noqa: E402
+from ultrakill_ai.times import UNKNOWN_DIFFICULTY, difficulty_rank, short_level, valid_official_seconds  # noqa: E402
 
 # `ultrakill_ai.progress.write_json_atomic` is the same nine lines, but importing that module pulls in
 # stable_baselines3 and therefore torch. The driver polls beside twelve games and a trainer, and
@@ -749,6 +749,14 @@ class StageSample(NamedTuple):
     # Promoting on that would open the hold line on a policy whose typical time is twice the target, which is
     # precisely what the line exists to prevent. The median is a property of the policy that is running now.
     median_time: float | None = None
+    # ... campaign.difficulty: the difficulty the MOD REPORTED, i.e. what the game's own readers got, not what
+    # the config asked for. It is what the promoted specialist's sidecar records (`finish_stage`). The plan is
+    # read ONCE at driver start while a stage's generated config is only rewritten at a stage or round
+    # boundary, so between editing `env.difficulty` and the next boundary the two disagree -- and the sidecar
+    # is a claim about the weights, which were trained on whatever the game was actually running. None when
+    # the run never reported one (an older mod, or a status.json written before the field existed), and the
+    # plan value is the fallback then.
+    difficulty: int | None = None
 
 
 EMPTY_SAMPLE = StageSample(None, None, 0, None, None)
@@ -756,7 +764,7 @@ EMPTY_SAMPLE = StageSample(None, None, 0, None, None)
 
 def read_sample(status_path: Path, best_json: Path) -> StageSample:
     """One `StageSample` from disk. A missing or half-written file reads as "nothing known yet", never raises."""
-    timesteps = rate = best_time = best_at = target = s_rank = median = None
+    timesteps = rate = best_time = best_at = target = s_rank = median = difficulty = None
     window = 0
     try:
         status = json.loads(status_path.read_text(encoding="utf-8"))
@@ -776,12 +784,31 @@ def read_sample(status_path: Path, best_json: Path) -> StageSample:
             target = _num(campaign.get("target_seconds"))
             s_rank = _num(campaign.get("s_rank_seconds"))
             median = valid_official_seconds(campaign.get("median_time_50"))
+            # `difficulty_rank` is the shared reader: it turns the mod's -1 sentinel, a missing field and any
+            # value the game cannot run into the same "not recorded", which is what the None fallback means.
+            rank = difficulty_rank(campaign.get("difficulty"))
+            difficulty = None if rank == UNKNOWN_DIFFICULTY else rank
     try:
         best = json.loads(best_json.read_text(encoding="utf-8"))
         best_at = _num(best.get("at_timesteps")) if isinstance(best, dict) else None
     except (OSError, ValueError):
         best_at = None
-    return StageSample(timesteps, rate, window, best_time, best_at, target, s_rank, median)
+    return StageSample(timesteps, rate, window, best_time, best_at, target, s_rank, median, difficulty)
+
+
+def stage_difficulty(sample: StageSample, plan_env: dict) -> int:
+    """The difficulty to STAMP ON A PROMOTED SPECIALIST: the one the stage ran on, the plan's only as a fallback.
+
+    A sidecar is a claim about weights, so it has to name the difficulty those weights were trained against.
+    The plan is read once at driver start and a stage's generated config is only rewritten at a stage or round
+    boundary, so the two disagree for a whole window: between editing `env.difficulty` and restarting the
+    round, the running trainer is still on the old generated config. A round that ended inside that window
+    would have published Violent-trained weights stamped `difficulty: 4`. `sample.difficulty` is what the mod
+    reported -- what the game's own readers got -- and only a run that never reported one falls back.
+    """
+    if sample.difficulty is not None:
+        return int(sample.difficulty)
+    return int(plan_env.get("difficulty", 3))
 
 
 def _num(value) -> float | None:
@@ -1719,7 +1746,13 @@ class Driver:
             # next stage would silently start from the stage before it. Stop and let a human look.
             self.log("NO CHECKPOINT to promote in %s: stopping. The stage produced no weights." % model_dir)
             return "no_checkpoint"
-        difficulty = int(self.plan.env.get("difficulty", 3))
+        # THE DIFFICULTY THE STAGE ACTUALLY RAN ON, not the one the plan currently asks for (2026-09-20
+        # review). The plan is read once at driver start and a generated config is only rewritten at a stage
+        # or round boundary, so in the activation window -- plan edited to 4, driver restarted, the round not
+        # yet re-started -- the running round is still on the old difficulty. Stamping the plan value there
+        # would write `difficulty: 4` into the committed sidecar of weights trained entirely on Violent. The
+        # plan is the fallback for a run that never reported one.
+        difficulty = stage_difficulty(sample, self.plan.env)
         refused = refuse_promotion(models_dir, stage.level, kind=stage.kind, status=status)
         if refused:
             # The round is still OVER and still counts -- it just does not replace a policy that was promoted

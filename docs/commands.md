@@ -464,10 +464,20 @@ Move-Item models\spec_0-1_speed\best.json models\spec_0-1_speed\best.violent.jso
 Move-Item models\spec_0-1_speed\best.zip  models\spec_0-1_speed\best.violent.zip
 ```
 
-Not strictly required — `keep_best.py` now ranks the difficulty ahead of the score, so a Brutal sample beats
-a stored Violent best outright — but it makes the round's `best.zip` unambiguously a Brutal artefact, and it
-keeps the Violent peak recoverable. Without it the first Brutal sample simply takes the record, and
-`best.json`'s new `difficulty` field records which difficulty it was measured on from then on.
+Optional, and safe to skip: `keep_best.py` ranks the difficulty ahead of the score, so the first Brutal
+sample beats a stored Violent best outright and `best.json`'s `difficulty` field records what it was measured
+on from then on. Moving them aside only makes the round's `best.zip` unambiguously a Brutal artefact and
+keeps the Violent peak recoverable by name.
+
+That clause reads the `difficulty` column of `metrics_log.csv`, and **`poll_status.py` rotates a log whose
+header predates a column it writes** — the old file becomes `metrics_log.<timestamp>.csv` and a new one
+starts with the full header, on the next poll_status start, which the driver restart above performs. It used
+to be the operator's job and the coupling was invisible: rows are written with `extrasaction="ignore"`, so
+against an old header every `difficulty` value was dropped *silently*, every sample read as an unrecorded
+difficulty, and `best.zip` would have stayed on Violent-trained weights for the whole Brutal round — which
+`campaign_driver.promote` would then have published as the level's Brutal specialist. If you ever see
+`[keep_best] WARNING ... has no 'difficulty' column` in `runs/<run>_keep_best.log`, that rotation did not
+happen (an older `poll_status.py` still running) and `best.zip` is being chosen on the clock alone.
 
 **What to expect, and what is NOT a regression:**
 
@@ -482,9 +492,10 @@ keeps the Violent peak recoverable. Without it the first Brutal sample simply ta
   completions. It prints `difficulty changed 3 -> 4; cleared the fresh-episode windows` when it happens.
 - **A slower Brutal time taking a `times.md` row is the rule working.** A level's leaderboard row is the best
   time on the hardest difficulty it has ever been completed on; the generation history keeps everything.
-- **`metrics_log.csv` is append-only and keeps its own header**, so move the old file aside to get the new
-  `difficulty` column. Until you do, every row reads as an unrecorded difficulty and `keep_best.py` compares
-  them exactly as it did before.
+- **`metrics_log.csv` restarts**, rotated aside to `metrics_log.<timestamp>.csv` by the first `poll_status.py`
+  after the switch, because the old header has no `difficulty` column. The old log is kept — it is the last
+  Violent reading — and `keep_best.py` has no samples to rank for the first few polls, so `best.zip` holds
+  what it held until the new log fills.
 
 Verify from files only: `runs/spec_0-1_speed/status.json`'s `campaign.difficulty` reads 4, the generated
 `configs/generated/spec_0-1_speed.yaml` holds `difficulty: 4`, and the next posted `times.md` row says

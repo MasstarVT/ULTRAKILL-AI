@@ -248,6 +248,51 @@ def test_a_smoothing_window_that_straddles_a_difficulty_change_is_dropped():
         assert keep_best.best_of(series)[4] == 4
 
 
+def test_a_log_with_no_difficulty_column_makes_the_clause_inert_and_is_detected():
+    """The coupling that nearly shipped: the clause above is REAL but reads a column the live log did not have.
+
+    `poll_status.py` writes with `extrasaction="ignore"`, so against a header written before the column
+    existed every `difficulty` value is dropped silently. On 2026-09-20 `runs/spec_0-1_speed/metrics_log.csv`
+    was exactly that file -- 3,292 rows, header ending `median_time_50,best_time` -- and the activation
+    procedure listed moving it aside as mere expectation-setting. Skip it and `best.zip` freezes on
+    Violent-trained weights for the whole Brutal round.
+
+    Both halves are pinned: what the stale log does (so the hazard is not forgotten), and that
+    `difficulty_column_missing` sees it, which is what makes the state visible instead of silent.
+    """
+    rates, best = [0.6] * 9 + [0.45] * 9, [80.0] * 18
+    medians = [147.0] * 9 + [240.0] * 9   # Violent first, then the slower early-Brutal medians
+    rows = campaign_rows(rates, best, median_times=medians, difficulties=[3] * 9 + [4] * 9)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # The live header: every column keep_best reads EXCEPT difficulty.
+        path = Path(tmp) / "metrics_log.csv"
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[c for c in COLUMNS if c != "difficulty"],
+                                    extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        assert keep_best.difficulty_column_missing(path), "the tripwire has to see this file"
+        series = keep_best.scored(path, "time")
+        assert {s[4] for s in series} == {keep_best.UNKNOWN_DIFFICULTY}, "every sample lost its difficulty"
+        assert abs(keep_best.best_of(series)[0] + 147.0) < 1e-9, \
+            "and the VIOLENT sample wins on score alone -- the failure this documents"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # The same data under the full header: the clause fires and the Brutal sample wins despite -240 s.
+        path = write_log(Path(tmp), rows)
+        assert not keep_best.difficulty_column_missing(path)
+        series = keep_best.scored(path, "time")
+        chosen = keep_best.best_of(series)
+        assert chosen[4] == 4 and abs(chosen[0] + 240.0) < 1e-9
+
+
+def test_the_tripwire_stays_quiet_when_there_is_no_log_yet():
+    """A run that has not polled yet is not a stale log: poll_status will write the current header."""
+    with tempfile.TemporaryDirectory() as tmp:
+        assert not keep_best.difficulty_column_missing(Path(tmp) / "metrics_log.csv")
+
+
 def test_a_best_json_without_a_difficulty_is_beaten_by_a_sample_that_has_one():
     """The upgrade path at the switch: the stored best was written before the column existed."""
     with tempfile.TemporaryDirectory() as tmp:

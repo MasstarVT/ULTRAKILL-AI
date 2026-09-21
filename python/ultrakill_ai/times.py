@@ -88,20 +88,34 @@ def difficulty_rank(difficulty) -> int:
     A run or a row that never recorded its difficulty ranks BELOW every real one, so a completion that does
     know what it played on replaces it. That is the safe direction: the alternative would let an unlabelled
     row sit above a Brutal one forever.
+
+    BOUNDED AT BOTH ENDS, at `HARDEST_DIFFICULTY` (2026-09-20 review). A rank with no ceiling makes any cell
+    above 4 outrank Brutal permanently, and since `beats_record` only ever replaces a row from a rank at least
+    as hard, no real completion could ever take that row back -- demonstrated by hand-editing a `times.md`
+    cell to `9`, which then refused a legitimate 60 s Brutal time forever. Nothing in the run can produce such
+    a value today (the mod clamps to -1..4 and `--difficulty` takes `choices=range(-1, 5)`), but a hand-edited
+    file can, and so would the one follow-up this rule anticipates: raising the mod's clamp for UKMD. The
+    ceiling is `DIFFICULTY_NAMES`' own length, so adding a name is all it would take to admit a harder one.
     """
     try:
         value = int(difficulty)
     except (TypeError, ValueError):
         return UNKNOWN_DIFFICULTY
-    return value if 0 <= value else UNKNOWN_DIFFICULTY
+    return value if 0 <= value <= HARDEST_DIFFICULTY else UNKNOWN_DIFFICULTY
 
 
 def difficulty_name(difficulty) -> str:
-    """4 -> "Brutal". Anything outside 0..4 keeps its own text, so an unexpected value is never mislabelled."""
+    """4 -> "Brutal", and anything this file does not recognise -> the empty cell.
+
+    A value outside 0..`HARDEST_DIFFICULTY` is one the game cannot have played on, so it is rendered as the
+    same empty cell as a missing one rather than as its own text (2026-09-20 review). The case that actually
+    occurs is the mod's own "I could not read the difficulty" sentinel, -1: `post_times.parse_difficulty` and
+    `full_run.LevelResult` both carry it as an int, so the old spelling put the literal text `-1` in the
+    Difficulty column, which times.md's closing comment already described as an em dash. The cell and
+    `difficulty_rank` now agree: an unranked difficulty is an empty one.
+    """
     rank = difficulty_rank(difficulty)
-    if 0 <= rank < len(DIFFICULTY_NAMES):
-        return DIFFICULTY_NAMES[rank]
-    return EMPTY if difficulty is None else str(difficulty)
+    return DIFFICULTY_NAMES[rank] if 0 <= rank < len(DIFFICULTY_NAMES) else EMPTY
 
 
 def parse_difficulty(text) -> int:

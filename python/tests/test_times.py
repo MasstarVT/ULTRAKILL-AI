@@ -179,8 +179,30 @@ def test_brutal_is_the_hardest_difficulty_the_names_know():
     assert DIFFICULTY_NAMES[HARDEST_DIFFICULTY] == "Brutal"
     assert DIFFICULTY_NAMES == ("Harmless", "Lenient", "Standard", "Violent", "Brutal")
     assert difficulty_name(4) == "Brutal" and difficulty_name(3) == "Violent"
-    # A value the names do not cover keeps its own text rather than being silently relabelled.
-    assert difficulty_name(5) == "5" and difficulty_name(None) == "—"
+    # A value the names do not cover is an EMPTY cell, not its own text: see the two tests below.
+    assert difficulty_name(5) == "—" and difficulty_name(None) == "—"
+
+
+def test_an_unrecorded_difficulty_is_an_empty_cell_and_not_the_text_minus_one():
+    """-1 is the mod's "I could not read it" sentinel, and it reaches the cell as an int, not as None.
+
+    `CampaignObserver` reports -1 when `PrefsManager` is not there to read, `post_times.parse_difficulty`
+    turns a missing field into the int -1, and `full_run.LevelResult.difficulty` defaults to it. Before
+    2026-09-20 every one of those paths printed the literal text `-1` in the Difficulty column, while
+    times.md's own closing comment promised an em dash for exactly that case.
+    """
+    assert difficulty_name(UNKNOWN_DIFFICULTY) == "—"
+    assert difficulty_name(-1) == difficulty_name(None) == "—"
+    assert parse_difficulty(difficulty_name(-1)) == UNKNOWN_DIFFICULTY, "and it still round-trips as unknown"
+
+
+def test_a_difficulty_above_the_hardest_cannot_become_an_unbeatable_row():
+    """A rank with no ceiling would let a bogus cell outrank Brutal forever, and no real run could take it back."""
+    assert difficulty_rank(5) == difficulty_rank(9) == difficulty_rank(99) == UNKNOWN_DIFFICULTY
+    assert difficulty_rank(HARDEST_DIFFICULTY) == HARDEST_DIFFICULTY
+    # The failure this bounds: a hand-edited `9` cell held the row against every later Brutal completion.
+    assert beats_record(4, 60.0, 9, 999.0), "a real Brutal time takes a row back from an impossible difficulty"
+    assert not beats_record(9, 10.0, 4, 300.0), "and an impossible difficulty never takes a Brutal row"
 
 
 def test_parse_difficulty_round_trips_every_name_and_reads_a_dash_as_unknown():

@@ -55,7 +55,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - `python/scripts/` — `train.py`, `eval.py`, `games.py`, `campaign_driver.py` (the specialist driver),
   `supervise.py`, `mem_guard.py`, `full_run.py`, `specialists_status.py`, `poll_status.py`, `keep_best.py`,
   `post_times.py`, `dashboard.py`, `build_routes.py`, `campaign_check.py`, `skull_check.py`, `bridge_test.py`.
-- `python/tests/` — 36 no-game test files, ~870 named tests, about 3 minutes for the lot.
+- `python/tests/` — 38 no-game test files, ~898 named tests, about 3 minutes for the lot.
 - `python/configs/` — `specialists.yaml` (the specialist plan; **not** a training config),
   `campaign_gates_full.yaml` (the shared-run config it is pinned against), `campaign_0-1.yaml`,
   `cybergrind.yaml`, `il_records.yaml`, and the earlier campaign configs kept as rollbacks.

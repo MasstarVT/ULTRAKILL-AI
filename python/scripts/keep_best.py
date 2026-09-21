@@ -174,6 +174,25 @@ def scored(csv_path: Path, metric: str = "kills_per_min", *,
     return out
 
 
+def difficulty_column_missing(csv_path: Path) -> bool:
+    """True when the log exists but has no `difficulty` column -- the state in which the clause below is INERT.
+
+    `poll_status.py` writes rows with `extrasaction="ignore"`, so against a header written before the column
+    existed the value is dropped without a word: every sample then reads as `UNKNOWN_DIFFICULTY`, no window
+    ever straddles a change, and `rank_key`'s difficulty term is constant. Ranking silently falls back to the
+    score alone, which at a difficulty switch is exactly the failure the clause exists to prevent -- every
+    early Brutal median loses to the Violent one it inherited. `poll_status` now rotates such a log aside by
+    itself; this is the tripwire for the case where it did not (an older poll_status still running, or a log
+    written by hand), because the symptom is otherwise invisible.
+    """
+    try:
+        with csv_path.open(encoding="utf-8", newline="") as f:
+            header = next(csv.reader(f), None)
+    except OSError:
+        return False  # no log yet: poll_status will write the current header when it makes one
+    return bool(header) and "difficulty" not in header
+
+
 def rank_key(score: float, penalty: float, difficulty=UNKNOWN_DIFFICULTY) -> tuple[int, float, float]:
     """Higher is better: the DIFFICULTY, then the score, then the negated penalty, the last two at the 4
     decimals best.json keeps.
@@ -303,8 +322,15 @@ def main() -> None:
         ap.error(f"{best_json} holds a best chosen with the {held!r} tie-break, not {metric.penalty!r}: "
                  f"pass the --metric that run was scored with")
     best = stored_best(best_json)
+    warned_no_difficulty = False
 
     while True:
+        if not warned_no_difficulty and difficulty_column_missing(csv_path):
+            warned_no_difficulty = True
+            print(f"[keep_best] WARNING {csv_path} has no 'difficulty' column, so every sample reads as an "
+                  f"unrecorded difficulty and the difficulty clause CANNOT fire: best.zip is being chosen on "
+                  f"{metric.score} alone. Move the file aside (poll_status.py does it by itself on restart) "
+                  f"before relying on best.zip across a difficulty change.", flush=True)
         series = scored(csv_path, a.metric, min_rate=a.min_rate)
         if series:
             best = save_if_better(series, model_dir, a.metric, best)

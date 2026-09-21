@@ -32,7 +32,7 @@ from ultrakill_ai.campaign import (
     progress_score,
     unlock_next,
 )
-from ultrakill_ai.times import beats_record, valid_official_seconds
+from ultrakill_ai.times import UNKNOWN_DIFFICULTY, beats_record, difficulty_rank, valid_official_seconds
 
 EPISODE_WINDOW = 100
 FRESH_WINDOW = 50  # campaign completion rate and median time are over this many fresh-start episodes
@@ -578,9 +578,19 @@ class ProgressCallback(BaseCallback):
         In practice the switch is performed BY a trainer restart, so the pooled window is empty here anyway;
         this is what makes the guarantee hold regardless, and what makes the change visible in the log. An
         episode that does not report a difficulty at all (an older mod) changes nothing.
+
+        AN UNKNOWN DIFFICULTY IS NOT A CHANGE (2026-09-20 review). The mod reports -1, not nothing, when it
+        cannot read the difficulty -- `CampaignObserver` returns `prefs != null ? prefs.GetInt("difficulty") :
+        -1` -- and that int travels through `env._end_campaign_episode` into `info["difficulty"]` unaltered.
+        Treated as a real difficulty it would read as a change TWICE: once to -1 and once back, wiping the
+        50-episode window both times, and with twelve envs on one callback a single such episode would be
+        enough. The rung needs `fresh_window >= 30`, so a recurring one could stall it indefinitely, and
+        `beats_record(-1, t, 4, best)` would refuse every completion meanwhile. It also matches the rest of
+        the codebase: `times.difficulty_rank` maps every value outside 0..`HARDEST_DIFFICULTY` to
+        `UNKNOWN_DIFFICULTY`, which means "no difficulty recorded" -- exactly the case this skips.
         """
         new = _int_or_none(difficulty)
-        if new is None or new == self.difficulty:
+        if new is None or difficulty_rank(new) == UNKNOWN_DIFFICULTY or new == self.difficulty:
             return
         if self.difficulty is not None:
             self.fresh_recent.clear()
