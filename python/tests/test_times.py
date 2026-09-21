@@ -9,7 +9,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ultrakill_ai.times import (  # noqa: E402
-    TimeEntry, format_delta, format_time, parse_time, record, record_file, valid_official_seconds)
+    DIFFICULTY_NAMES, HARDEST_DIFFICULTY, UNKNOWN_DIFFICULTY, TimeEntry, beats_record, difficulty_name,
+    difficulty_rank, format_delta, format_time, parse_difficulty, parse_time, record, record_file,
+    valid_official_seconds)
 
 # times.md at the repo root, exactly as committed before any campaign run.
 TIMES_MD = """# Times
@@ -169,6 +171,63 @@ def test_an_invalid_leaderboard_row_is_replaced_by_a_real_time():
     # ... and a valid held row still wins against a slower run, exactly as before.
     kept = record(out, entry(level="Level 0-2", seconds=200.0, rank="B"))
     assert "| 0-2 | 02:03.537 |" in table_rows(kept, "## Leaderboard")[0]
+
+
+def test_brutal_is_the_hardest_difficulty_the_names_know():
+    """4 is the ceiling, and it is called Brutal. The game's PrefsManager validator refuses anything above it."""
+    assert HARDEST_DIFFICULTY == 4
+    assert DIFFICULTY_NAMES[HARDEST_DIFFICULTY] == "Brutal"
+    assert DIFFICULTY_NAMES == ("Harmless", "Lenient", "Standard", "Violent", "Brutal")
+    assert difficulty_name(4) == "Brutal" and difficulty_name(3) == "Violent"
+    # A value the names do not cover keeps its own text rather than being silently relabelled.
+    assert difficulty_name(5) == "5" and difficulty_name(None) == "—"
+
+
+def test_parse_difficulty_round_trips_every_name_and_reads_a_dash_as_unknown():
+    for i, name in enumerate(DIFFICULTY_NAMES):
+        assert parse_difficulty(name) == i
+        assert parse_difficulty(difficulty_name(i)) == i
+    assert parse_difficulty("brutal") == 4, "the leaderboard cell is matched case-insensitively"
+    assert parse_difficulty("4") == 4
+    assert parse_difficulty("—") == UNKNOWN_DIFFICULTY
+    assert parse_difficulty(None) == UNKNOWN_DIFFICULTY
+    assert parse_difficulty("") == UNKNOWN_DIFFICULTY
+    assert difficulty_rank(None) == difficulty_rank("nonsense") == UNKNOWN_DIFFICULTY
+
+
+def test_a_harder_difficulty_takes_the_record_even_when_it_is_slower():
+    """THE new rule. A Brutal run is not competing with a Violent one, it replaces it."""
+    assert beats_record(4, 300.0, 3, 60.0), "slower Brutal beats faster Violent"
+    assert not beats_record(3, 10.0, 4, 300.0), "faster Violent never takes a Brutal row back"
+    assert beats_record(3, 59.0, 3, 60.0), "within one difficulty the faster time still wins"
+    assert not beats_record(3, 61.0, 3, 60.0)
+    assert not beats_record(3, 60.0, 3, 60.0), "a tie is not a record"
+    # No usable held row at all, and an unusable new time.
+    assert beats_record(3, 60.0, 3, None)
+    assert beats_record(3, 60.0, 3, 0.0), "a time the game could not have reported is no row"
+    assert not beats_record(4, 0.0, 3, 60.0) and not beats_record(4, None, 3, 60.0)
+    # An unrecorded difficulty ranks below every real one, in both directions.
+    assert beats_record(0, 999.0, UNKNOWN_DIFFICULTY, 10.0)
+    assert not beats_record(UNKNOWN_DIFFICULTY, 10.0, 0, 999.0)
+
+
+def test_a_slower_brutal_run_replaces_the_violent_leaderboard_row():
+    """The end-to-end shape of the 2026-09-20 switch, through `record` itself."""
+    violent = record(TIMES_MD, entry(level="Level 0-1", seconds=66.655, rank="B", generation="spec@34.89M"))
+    assert "| 0-1 | 01:06.655 | B | spec@34.89M | Violent |" in table_rows(violent, "## Leaderboard")[0]
+
+    slower_brutal = TimeEntry(level="Level 0-1", seconds=150.0, rank="C", generation="spec@36.00M",
+                              difficulty=4, date="2026-09-21", kills=30, deaths=0, notes="brutal")
+    out = record(violent, slower_brutal)
+    row = table_rows(out, "## Leaderboard")[0]
+    assert "| 0-1 | 02:30.000 | C | spec@36.00M | Brutal |" in row, row
+    # ... and the Violent time is still in the history, which keeps everything.
+    assert any("01:06.655" in r for r in table_rows(out, "## Generation history"))
+
+    # A faster Violent run afterwards does NOT take the row back, but is still recorded in the history.
+    back = record(out, entry(level="Level 0-1", seconds=60.0, rank="A", generation="spec@37.00M"))
+    assert "| 0-1 | 02:30.000 |" in table_rows(back, "## Leaderboard")[0]
+    assert any("01:00.000" in r for r in table_rows(back, "## Generation history"))
 
 
 def test_record_file_rewrites_in_place():
