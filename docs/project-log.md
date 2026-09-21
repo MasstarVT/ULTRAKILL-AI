@@ -4643,3 +4643,31 @@ Tests: the whole no-game suite one file at a time, 38 files and 898 named tests,
 `test_keep_best.py` and `test_campaign_driver.py`. `test_progress.py::test_poll_status_keeps_old_header`
 became `test_poll_status_rotates_a_log_whose_header_is_missing_columns` — it pinned exactly the invariant
 finding 1 is about, and the change of contract is deliberate.
+
+### 2026-09-21 — the last VIOLENT reading of `spec_0-1_speed`, before the switch
+
+Recorded from files only (`runs/spec_0-1_speed/metrics_log.csv`, `status.json`, `best_runs/Level_0-1.json`)
+immediately before the difficulty switch, so there is a reference for what Brutal costs. **Level 0-1, focus
+rung 1, target 100.0 s** (the level's S-rank threshold is 150.0 s). Window: the last 1M steps,
+**34,906,114 → 35,901,526**, 216 samples, 2026-09-20 22:44 → 2026-09-21 00:32.
+
+| reading | mean | median | min | max | last |
+| --- | --- | --- | --- | --- | --- |
+| `median_time_50` (s) | 116.08 | 116.16 | 107.90 | 125.42 | 118.78 |
+| `fresh_completion_rate` | 0.909 | 0.920 | 0.80 | 0.96 | 0.88 |
+| deaths / episode | 0.577 | 0.550 | 0.40 | 0.79 | 0.72 |
+| kills / min | 17.87 | 17.94 | 16.80 | 18.80 | 18.15 |
+| reward | 417.2 | 420.5 | 392.8 | 433.6 | 406.7 |
+
+`best_time` sat at **66.655 s** across the entire window — it is a lifetime minimum and had not moved, which
+is exactly why the rung gates on the median instead. That 66.655 s is the run's Violent record and the number
+every early Brutal completion will be slower than; the `best_runs/Level_0-1.json` behind it is tagged
+`"difficulty": 3`, so `beats_record` lets any valid Brutal time replace it.
+
+Trend over the 1M steps, sampled every 200k: 113.1, 118.9, 110.4, 114.8, 115.1 — about **±5 s around 116 s
+with no direction**, i.e. the control arm's median had flattened well inside the ~8 s/M bar. The switch is
+therefore not being made on top of an unresolved trend.
+
+Note `status.json`'s `campaign.difficulty` read **null** at this point: the trainer running here is the
+pre-merge code, which did not publish the field. The mod has been reporting it all along — the best-run file
+proves it — so the null is the trainer, not the game, and it fills in at the restart below.
