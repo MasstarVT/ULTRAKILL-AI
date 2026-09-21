@@ -5007,3 +5007,97 @@ the same config, so there is no adaptation period to wait out and no excuse for 
 
 **If it does not, the rollback did not restore the policy** — the resume loaded the wrong file, or something
 other than `speed.train` moved — and that has to be chased before any further tuning.
+
+### The rollback — 2026-09-21 16:33:46, back to 42,185,602 steps
+
+**Round 7 of `Level 0-1` (speed) is live from step 42,185,602**, the exact point S1 was switched on. Nothing
+was connected to a bridge port at any stage, `games.py launch` / `stop` were never run, and the twelve games
+were never restarted — they ran straight through the whole operation.
+
+| time | step |
+| --- | --- |
+| 16:24 | `runs/specialists/DRIVER_PAUSE` created |
+| 16:24 | driver stopped **by pid** (25928, its venv shim 13168, wrapper `cmd` 32408), and with it the four helpers that write the files about to be rotated — `poll_status`, `keep_best`, `post_times`, `dashboard`. **`mem_guard` was deliberately left running** so the twelve games stayed protected for the whole operation |
+| 16:26-16:31 | `speed.train:` removed from `configs/specialists.yaml`; the two shipped-plan pins in `tests/test_speed_overrides.py` inverted to "no `speed.train` block ships"; `tests/test_resume_hyperparams.py` re-documented as guarding the way **back** as well as the way out. Tests run **one file at a time**: `test_speed_overrides` 14 ok, `test_resume_hyperparams` 6 ok, `test_specialists_config` 14 ok, `test_speed_death_weight` 15 ok, `test_campaign_driver` 87 ok, `test_sticky_slot` 14 ok, `test_campaign_config` 22 ok. Committed and pushed as `bec3439` |
+| 16:31 | `latest.zip` verified at **exactly 42,185,602** by `supervise.zip_timesteps`, then **copied to a backup outside the model dir before the trainer was touched** — a graceful trainer shutdown writes `latest.zip`, which would have destroyed the rollback point |
+| 16:31 | round-6 trainer **force-killed by pid**, deepest process first (real trainer 4520, then its 12 `multiprocessing-fork` workers, then the shim and `cmd` wrapper), so no graceful save could run. `latest.zip` afterwards: same SHA-256, same 11:44:01 mtime — **untouched** |
+| 16:32 | **54 checkpoints moved** (never deleted) to `models/spec_0-1_speed/rolled_back_2026-09-21_S1/`: `ckpt_42235594` … `ckpt_44885170`, 681.8 MB. `best.zip`/`best.json` **stayed**, because `best.json` records `at_timesteps` **42,119,146** from `ckpt_42086146_steps.zip`, saved **11:38:32** — before S1 went live at 11:45:55, so `keep_best` never moved it during S1 |
+| 16:32 | `supervise.choose_resume` re-read: **`latest.zip` at 42,185,602**, the rollback point exactly |
+| 16:32 | run files rotated: `episodes.jsonl` (8,225 pre-S1 rows kept, 1,085 S1 rows aside), `metrics_log.csv` (1,332 rows kept **under the identical 109-column header**, 559 aside), `status.json` (the stale 44.8M reading) — each original kept beside the fresh file as `.s1-42.19M-44.8M` |
+| 16:33 | next round's config generated **the driver's own way** into a temp dir and diffed against the live S1 one: **exactly two lines differ**, `gamma: 0.999 → 0.998` and `gae_lambda: 0.98 → 0.95`. `difficulty: 4`, `speed_target_seconds: 100.0`, `death: 12.0`, `timesteps: 51185602` all unchanged |
+| 16:33 | `END_STAGE` written naming `Level 0-1 speed`; `DRIVER_PAUSE` removed as its own command; `--dry-run` confirmed it would end round 6 "leave models/specialists alone and choose the next stage" |
+| 16:33:40 | driver started via `runs\start_driver.cmd`. First tick ended round 6 `unfinished — ended by operator`, **`NOT promoting Level 0-1`**, and the second began **round 7** and regenerated the live config |
+| 16:33:46 | round-7 trainer started (pid 31752), `--resume models/spec_0-1_speed/latest.zip` at **42,185,602 steps**; the five helpers restarted with it |
+
+**Why `END_STAGE` and not a plain restart.** `driver_state.json` still held round 6 as `current`, and the
+driver would have re-adopted it **with the stale generated config still carrying S1's values** — the trainer
+is started from `configs/generated/spec_0-1_speed.yaml`, which is only rewritten at a round boundary. Ending
+the stage forces `begin_stage`, which regenerates that file from the edited plan. `tick` reads `END_STAGE`
+**before** `ensure_trainer`, so placing the file before starting the driver meant no trainer ever ran on the
+S1 config.
+
+**Why `status.json` had to be moved and not merely ignored.** `begin_stage` takes the new round's
+`stale_below` from the run's own `status.json`, and that file held **44.8M**. Left in place it would have
+told round 7 to ignore every sample until the trainer climbed back past 44.8M — 2.66M steps of a blind stage
+that could neither latch nor promote. With the file rotated away, `read_sample` returns no timesteps and
+`stale_below` is **`null`**: no stale gate at all, which is correct, because there is no earlier round's
+status left to confuse it.
+
+**The one thing the rollback cost.** Round 6's history row in `driver_state.json` carries `end_steps: null`,
+`fresh_completion_rate: null` and `median_time: null`, because its `status.json` had already been rotated
+when `finish_stage` read it. The truthful numbers are the ones in this entry: round 6 ran **42,185,602 →
+44,849,170** (2.66M steps) and ended at a bucket median of ~170 s. Recorded here rather than fabricated
+there.
+
+### Verification, from files only — 8 minutes after the round-7 trainer started
+
+- `runs/spec_0-1_speed_train.log`, the round's own start-up line: `hyperparameters in force: **gamma=0.998,
+  gae_lambda=0.95**, n_steps=170, batch_size=512, n_epochs=5, ent_coef=0.004, target_kl=0.03 | rollout
+  buffer: **gamma=0.998, gae_lambda=0.95**` — both halves, so the `RolloutBuffer`'s own copies reverted too.
+- **Resumed from `latest.zip` at 42,185,602** and the counter **continued** from there, not from 44.8M and
+  not from 0.
+- `configs/generated/spec_0-1_speed.yaml` (regenerated by the driver, byte-identical to the temp copy that
+  was diffed before the change): `gamma: 0.998`, `gae_lambda: 0.95`, `difficulty: 4`,
+  `speed_target_seconds: 100.0`, `timesteps: 51185602`.
+- `status.json` fresh and stepping; `start_timesteps` **42,185,602**, `target_timesteps` **51,185,602**,
+  `campaign.difficulty` **4**, `campaign.target_seconds` **100.0**.
+- `driver_state.json`: `current` = `Level 0-1` speed, **round 7**, `rung` 1 (rung 2 of 10), `target_seconds`
+  100.0, `start_steps` 42,185,602, **`stale_below` null**. Round 6's row records `promoted: false`,
+  `not_promoted_because: "it ended 'unfinished' and Level_0-1.zip already holds a promoted specialist"`.
+- **`models/specialists/Level_0-1.zip` untouched**: SHA-256
+  `FD9B4EDF7B965063272AB4114A6904C31EE3EB7B3974F12FAF08BD7ABE9BF1F6` before and after, mtime still
+  2026-09-20 19:59:57.
+- **12/12 bridge ports listening**, 12 games; `mem_guard` recycling normally (port 47808: 2.34 GB → 0.33 GB,
+  system commit 75%). Five helpers up under the new driver.
+- **No traceback after the new round's first line** — the last one sits at log line 440,819, the round-7
+  `gamma=0.998` line at 440,856, and that traceback is the `BrokenPipe` teardown of the round-6 trainer this
+  operation killed on purpose. `check_run.py`: **`ALERTS none`**.
+- **`times.md` and `best_runs/` needed no correction.** `best_runs/` holds exactly one file, `Level_0-1.json`
+  at **72.233 s**, written **08:38** — pre-S1 — and it is the same time the leaderboard row carries.
+
+**First readings after the rollback**, at 16:41:16, **66,108 steps into round 7** at 171 steps/s — recorded
+and deliberately not over-read, because the restoration check above is a full 500k bucket, not this:
+
+| | round 7, first 29 fresh | S1's last bucket | pre-S1 baseline |
+| --- | --- | --- | --- |
+| `median_time_50` | **107.9 s** | 170.4 s | ~121 s |
+| best | **80.5 s** | 99.4 s | 72–81 s |
+| fresh rate | **0.83** | 0.91 | 0.86–0.93 |
+
+All 15 of the round's first episodes carry `difficulty: 4` and `level: Level 0-1`, across **all 12 envs**.
+The rolling last-100-fresh window (which still straddles the seam into the kept pre-S1 rows, by design) reads
+90 completed, **min 75.1 s, median 108.7 s** — i.e. continuous with the pre-S1 series and nothing like S1's.
+**On this evidence the rollback restored the policy**, but the entry's own rule stands: judge it on the first
+full 500k bucket.
+
+**Not verified in this entry.** That `explained_variance` stays healthy under the restored run (only the
+pre-S1 and S1 histories were measured); any in-game behaviour — nothing was connected to a bridge port, and
+no eval was run; and whether the 43.5M bucket's 135.7 s would have resolved upward or downward had S1 been
+left running, which is now unknowable by choice.
+
+**Unrelated, found while running the suite:** `tests/test_full_run.py::test_posting_writes_one_row_per_
+completed_level_through_the_times_helpers` **fails, and failed identically before this change** (verified by
+stashing the plan edit). Its fixture posts a `difficulty=3` result against the committed `times.md`, whose
+0-1 row is now **Brutal** at 01:12.233 — and `times.beats_record` correctly refuses to let a Violent run
+replace a Brutal row. The test's assumption went stale when the Brutal times landed, not with this revert. It
+needs its fixture raised to difficulty 4; nothing else in the suite is affected.

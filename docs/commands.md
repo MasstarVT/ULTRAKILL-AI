@@ -536,12 +536,20 @@ columns. `poll_status.py` writes the row; nothing reads any of these back.
 
 ### S1 / S2 — gamma, through `speed.train:`
 
+> **S1 WAS TRIED AND REVERTED, 2026-09-21, AND S2 IS CANCELLED.** S1 ran live on `spec_0-1_speed` round 6 for
+> 2.66M steps and made the policy **slower at every quantile** — bucket median 117 → 170 s, p10 92 → 123 s,
+> best-of-bucket 75 → 99 s — while `explained_variance` held at 0.93, so the critic was fine and the policy
+> itself converged on slower play. The weights were rolled back to the 42,185,602 switch point. **S2 (gamma
+> 0.9995) is the same lever pushed further and is not to be tried**; S3 needs a fresh argument. The verdict
+> table is in `docs/project-log.md`, 2026-09-21. The mechanism below still works and is still tested — this
+> is a note about the *decision*, not the code.
+
 A SPEED stage's own PPO hyperparameters, merged over `train.hyperparams` for that kind only. Absent — which
 is what ships — means both kinds generate exactly the config they always did.
 
 ```yaml
 speed:
-  train:                 # S1. Then, only if S1's explained_variance held, gamma: 0.9995 (S2).
+  train:                 # S1, reverted 2026-09-21. S2 (gamma 0.9995) is CANCELLED -- see the note above.
     gamma: 0.999
     gae_lambda: 0.98
 ```
