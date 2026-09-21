@@ -4671,3 +4671,66 @@ therefore not being made on top of an unresolved trend.
 Note `status.json`'s `campaign.difficulty` read **null** at this point: the trainer running here is the
 pre-merge code, which did not publish the field. The mod has been reporting it all along — the best-run file
 proves it — so the null is the trainer, not the game, and it fills in at the restart below.
+
+### 2026-09-21 — BRUTAL IS LIVE on `spec_0-1_speed` (round 5, from 35,937,130 steps)
+
+Activated with the documented procedure in `docs/commands.md`: `DRIVER_PAUSE` → driver logged
+`PAUSED … doing nothing` → the driver's three pids stopped **individually** (30876, 15832, and the
+`start_driver.cmd` wrapper 35340), leaving the trainer, the five helpers and all twelve games running →
+`games.py status` showed 12/12 bridges listening, nothing to repair → dry run while paused (plan parses) →
+`Remove-Item DRIVER_PAUSE` → real dry run, which named **Level 0-1 (speed), round 4, focus rung 2 of 10,
+target 100.00 s** and adopted the running trainer → `runs\start_driver.cmd` → `END_STAGE "Level 0-1 speed"`.
+
+The plan edit itself needed no hand edit: `configs/specialists.yaml`'s `env.difficulty: 4` arrived with the
+merge of `brutal` (8427954).
+
+**Rung numbering, for the record.** The ladder is `[120, 100, 85, 72, 60, 50, 42, 35, 30, 25]`. The live rung
+is **index 1, target 100.0 s**, which the driver prints 1-based as "rung 2 of 10". 120 s is index 0 and was
+met at round 3. Anything describing the live rung as "rung 1 = 120 s" is conflating the two numberings.
+
+Round 4 ended `unfinished — ended by operator` at 2,276,088 steps in (rate 0.900, median 118.27 vs target
+100.00) and **`refuse_promotion` declined**, as designed: `models/specialists/Level_0-1.zip` still holds the
+policy promoted at round 3 and was not overwritten. Round 5 resumed from the stage's own `latest.zip` at
+35,937,130 steps — the file was there, so none of the usual up-to-50k-step loss applied. The driver relaunched
+all twelve games itself at the boundary (ports were free by then); no game was killed by hand at any point.
+
+**The switch reached the game.** Verified from files only, never a socket:
+
+- `configs/generated/spec_0-1_speed.yaml` now holds `difficulty: 4`, and diffs against the round-4 file in
+  **exactly two lines**: `difficulty: 3 → 4` and the round's own `timesteps` budget.
+- `models/spec_0-1_speed/env_config.yaml` (written by `train.py`) holds `difficulty: 4`.
+- `status.json`'s `campaign.difficulty` — **the value the MOD REPORTS**, i.e. what
+  `PrefsManager.GetInt("difficulty")` hands the game's own readers — reads **4**.
+- `episodes.jsonl`: the first 14 episodes of the round, across **all 12 envs (12/12)**, every one tagged
+  `difficulty: 4`. No env reported 3, and none reported the `-1` sentinel.
+- `metrics_log.csv` **rotated itself**, exactly as the review fix intended: the 3.5 MB Violent log is kept as
+  `metrics_log.20260921-003739.csv` and the new log carries the `difficulty` column. No
+  `[keep_best] WARNING … no 'difficulty' column` line was ever printed, and `keep_best` has since moved
+  `best.zip` four times on **Brutal** medians (124.47 s at 36,052,138), writing `"difficulty": 4` into
+  `best.json`. Without that rotation it would have sat on the Violent score of -103.45 for the whole round.
+- `times.md`: the watcher posted **0-1 01:35.007 rank A on Brutal** at 00:47:39 and pushed it (b9389e5). The
+  Violent 01:06.655 moved to the generation history with a `+28.352s` delta, as the rule says it should — a
+  slower time on a harder difficulty takes the row. **This is the thing the user asked for**: the 0-1 row now
+  says what it was actually played on.
+
+**First Brutal readings** (14 minutes in, 36,079,042 steps, 141,912 into the round), against the Violent
+baseline above — recorded, not judged:
+
+| reading | Violent (last 1M) | Brutal (first ~140k) |
+| --- | --- | --- |
+| `median_time_50` | 116.08 mean / 118.78 last | **125.34** |
+| fresh completion rate | 0.909 mean | **0.92** over 50 |
+| best official time | 66.655 s | **79.156 s** (was 95.007 at the first completion) |
+
+So the median is up about 7–9 s and the completion rate is unchanged so far. `check_run.py` reports
+`ALERTS none`; 12/12 bridges listening, system commit 68%, trainer 146 steps/s, no traceback in the driver or
+trainer log after the restart.
+
+**The control period restarts here.** The difficulty switch is an environment change and it ended the control
+arm that was running on rung 1. **No lever is to be activated until at least 2M steps later (≈37.94M) AND the
+median trend over 1M steps is flatter than ~8 s per million.** Readings from before 35,937,130 may not be
+compared with readings after it.
+
+**Revert guidance: none planned.** The user asked for the hardest difficulty and Brutal is the ceiling this
+build can run. If fresh completion stays **under 0.40 for 1.5M steps**, report to the lead rather than
+reverting — the answer is more likely to be a rung or a reward than a difficulty.
