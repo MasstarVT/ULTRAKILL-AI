@@ -4829,3 +4829,59 @@ Any one of these, and the block comes out by the same procedure:
 **Revert = delete the `speed.train:` block from `configs/specialists.yaml` and run the same activation
 procedure.** Planned next and NOT active: **S2** (gamma 0.9995, no earlier than 2M steps from here, only if
 the guards hold) and **S3** (`level_complete` 300).
+
+### Activation — 2026-09-21 11:45:55, at 42,185,602 steps
+
+**S1 is live from step 42,185,602** (round 6 of `Level 0-1` speed, trainer pid 36288). The documented
+procedure was followed exactly, and nothing was connected to a bridge port at any point.
+
+| time | step |
+| --- | --- |
+| 11:40 | `runs/specialists/DRIVER_PAUSE` created; the driver logged `PAUSED …` at **11:41:10** |
+| 11:42 | driver stopped **by pid** (32208; its venv shim 26436 and wrapper `cmd` 14256 exited with it). The trainer (2512) and all five helpers kept running — verified by command line, no `taskkill /T` |
+| 11:42:44 | `campaign_driver.py --dry-run` **while paused**: the plan loaded (this is the check that a bad `speed.train:` is a hard error), last line `PAUSED …`, exit 0 |
+| 11:42:5x | pause file removed as its own command; `--dry-run` again: `FOCUS on Level 0-1 … rung 2 of 10, target 100.00 s` and `Level 0-1 (speed): ok, 6,239,184 steps into the stage … vs target 100.00` — the right stage, the right rung |
+| 11:42:59 | driver started via `runs\start_driver.cmd` (`Start-Process -WindowStyle Hidden`). At 11:43:00 it **adopted the running trainer** (pid 2512) rather than restarting it |
+| 11:43:5x | `runs/specialists/END_STAGE` written, naming `Level 0-1 speed` |
+| 11:44:20 | round 5 ended `unfinished — ended by operator`; `NOT promoting Level 0-1 (speed)` — `models/specialists/Level_0-1.zip` untouched, as an unfinished speed round should leave it |
+| 11:44:20 | the driver relaunched all twelve games itself (ports were free); `All 12 instances ready on ports 47800-47811` |
+| 11:45:55 | boot gate passed, **round 6** trainer started: `--config configs/generated/spec_0-1_speed.yaml --resume models/spec_0-1_speed/latest.zip`, and the five helpers restarted with it |
+
+**Pre-flight diff, before `END_STAGE`.** The next round's config was generated the driver's own way
+(`load_plan` on the edited plan → `write_stage_config(..., kind=speed, target_seconds=100.0,
+init_steps=choose_resume(...))`) into a temp dir and diffed against the live
+`configs/generated/spec_0-1_speed.yaml`. **Six changed lines, all three permitted:** `gamma: 0.998 → 0.999`,
+`gae_lambda: 0.95 → 0.98`, and the round's own budget `timesteps: 44937130 → 51136138`. Nothing else moved —
+`difficulty: 4`, `speed_target_seconds: 100.0`, `death: 12.0`, `fresh_start_prob: 1.0` and every other line
+were byte-identical.
+
+**No step loss.** The standing gotcha is that `stop_stage` kills the trainer by pid, so `latest.zip` is not
+written and the next round falls back to a `ckpt_*` up to 50k steps behind. It did not apply: the round-5
+trainer wrote `Saved models\spec_0-1_speed\latest.zip` and `vec env teardown: clean` **before** the pipe
+broke, at 11:44:01 and **42,185,602 steps** — ahead of the last supervisor reading (42,177,394 at 11:43:00).
+The traceback that follows in `spec_0-1_speed_train.log` is that teardown (a `BrokenPipe` out of
+`SubprocVecEnv.step_async`), and it sits **before** the new round's first log line, not after it.
+
+**Verification, from files only — 9 minutes after the round-6 trainer started (11:54:59):**
+
+- `runs/spec_0-1_speed_train.log`, the round's own start-up line: `hyperparameters in force: **gamma=0.999,
+  gae_lambda=0.98**, n_steps=170, batch_size=512, n_epochs=5, ent_coef=0.004, target_kl=0.03 | rollout buffer:
+  **gamma=0.999, gae_lambda=0.98**` — both halves, so the `RolloutBuffer`'s own copies moved too.
+- `configs/generated/spec_0-1_speed.yaml`: `gamma: 0.999`, `gae_lambda: 0.98`, `difficulty: 4`,
+  `speed_target_seconds: 100.0`, `timesteps: 51185602` (= 42,185,602 + the 8M cap + 1M slack).
+- Resumed from **`models/spec_0-1_speed/latest.zip` at 42,185,602 steps**, and the counter **continued**:
+  42,195,094 (11:46:56) → 42,235,498 (11:51:05) → **42,274,042** (11:54:59), 88,440 steps into the stage at
+  136–177 steps/s. `status.json`: `timesteps` 42,237,406, `start_timesteps` 42,185,602, `target_timesteps`
+  51,185,602.
+- **Difficulty still 4** in `status.json` (`campaign.difficulty` 4, `best_difficulty` 4) and in **all 18** of
+  the round's first episodes, across **all 12 envs**. `campaign.target_seconds` **100.0**.
+- **12/12 ports listening**; system commit **72%**, games 20.4 GB, fattest 1.7 GB. The fresh relaunch dropped
+  the games from 24.4 GB to 14.5 GB, so `mem_guard`'s recycling pressure is reset.
+- All five helpers up and owned by the new driver: `keep_best --metric time`, `post_times --watch 600 --push`,
+  `mem_guard`, `poll_status`, `dashboard --monitor 1`.
+- **No traceback after the new round's first line** (last `Traceback` at log line 394,169; the round-6
+  `gamma=0.999` line at 394,193). `check_run.py`: **`ALERTS none`**.
+
+First readings under S1, recorded and **not** judged (the horizon above is 500k buckets over >= 2M steps, and
+the first bucket is expected to be an adaptation dip): fresh rate **0.939 over 33**, `median_time_50`
+**125.14 s**, last-100-fresh median **112.2 s**, best unchanged at **72.233 s**.
