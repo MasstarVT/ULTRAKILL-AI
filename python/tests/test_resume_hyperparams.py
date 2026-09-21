@@ -2,14 +2,20 @@
 
 No game needed:  python tests/test_resume_hyperparams.py   (or pytest)
 
-WHY THIS FILE EXISTS. Stages S1 and S2 of docs/superpowers/specs/2026-09-20-speedrun-tech.md are a gamma
-change (0.998 -> 0.999 -> 0.9995, each with `gae_lambda` 0.98) on a run that NEVER STARTS FRESH: the
-specialist driver re-execs `train.py --resume <newest ckpt>` every round, so every step of those stages is a
-resume. A saved SB3 zip carries the hyperparameters it was trained with, and `RolloutBuffer` keeps its OWN
-copies of `gamma` and `gae_lambda`, taken when the buffer is constructed and used by
-`compute_returns_and_advantage`. If either of those won, the stage would train at 0.998 while the config,
-the generated YAML and the project log all said 0.999 -- and the round would read as "the gamma change did
-nothing", which is an unattributable and very expensive wrong conclusion.
+WHY THIS FILE EXISTS. A gamma change on a run that NEVER STARTS FRESH: the specialist driver re-execs
+`train.py --resume <newest ckpt>` every round, so every step of such a stage is a resume. A saved SB3 zip
+carries the hyperparameters it was trained with, and `RolloutBuffer` keeps its OWN copies of `gamma` and
+`gae_lambda`, taken when the buffer is constructed and used by `compute_returns_and_advantage`. If either of
+those won, the stage would train at one gamma while the config, the generated YAML and the project log all
+said another -- an unattributable and very expensive wrong conclusion.
+
+THIS CUTS BOTH WAYS, AND THAT IS WHY THE FILE OUTLIVED THE STAGE IT WAS WRITTEN FOR. Stage S1 (0.998 ->
+0.999 with `gae_lambda` 0.98) went live on 2026-09-21 and was REVERTED the same day: it made the policy
+slower at every quantile over 2.66M steps (docs/project-log.md, 2026-09-21), S2 is cancelled, and no
+`speed.train:` block ships any more. Reverting is the same mechanism run backwards -- a resume that must
+train at the CONFIG's 0.998 even when the zip it loads was written at 0.999 -- so this test guards the way
+back as well as the way out. The values below are S1's, kept because they are a real pair that differs in
+both keys; nothing here reads the shipped plan.
 
 WHAT WAS MEASURED, 2026-09-20, against the installed stable_baselines3 2.9.0: the config ALREADY wins.
 `BaseAlgorithm.load` does `model.__dict__.update(data)` and then `model.__dict__.update(kwargs)` BEFORE
@@ -41,7 +47,7 @@ from ultrakill_ai.training import (  # noqa: E402
 )
 
 SAVED = {"gamma": 0.998, "gae_lambda": 0.95}
-RESUMED = {"gamma": 0.999, "gae_lambda": 0.98}  # stage S1, exactly
+RESUMED = {"gamma": 0.999, "gae_lambda": 0.98}  # what S1 was, kept as a pair that differs in both keys
 
 
 class TinyEnv(gym.Env):

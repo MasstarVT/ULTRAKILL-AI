@@ -57,29 +57,35 @@ def write_plan(tmp_path: Path, **extra_speed) -> Path:
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_the_shipped_plan_carries_S1_and_no_env_override():
-    """S1 went live 2026-09-21 (docs/project-log.md). S2 and S5 are still dormant.
+def test_the_shipped_plan_ships_no_train_or_env_override():
+    """NO `speed.train:` BLOCK SHIPS. S1 was tried 2026-09-21 and REVERTED the same day; S2 is cancelled.
 
-    The exact values are pinned, not merely their presence: the failure this guards against is a plan edited
-    to 0.99 or to gamma alone, which trains for a round and reads as "the gamma stage did nothing".
+    S1 (gamma 0.999 / gae_lambda 0.98) ran live on spec_0-1_speed round 6 for 2.66M steps and made the policy
+    slower at every quantile with a healthy critic -- bucket median 117 s -> 170 s (docs/project-log.md,
+    2026-09-21). The weights were rolled back to the switch point and the block was removed, so a SPEED stage
+    trains at exactly the same hyperparameters as a complete one again.
+
+    The failure this guards against is now the OPPOSITE of what it guarded before: a `speed.train:` block
+    reappearing in the shipped plan -- by a bad merge, a revert of the revert, or someone switching S2 on
+    without the fresh argument the log says it needs -- and silently costing another round of twelve games.
     """
     p = plan()
-    assert p.speed_train == {"gamma": 0.999, "gae_lambda": 0.98}, \
-        "S1 is on at exactly 0.999 / 0.98; S2 (gamma 0.9995) is a deliberate, separate edit"
+    assert p.speed_train == {}, \
+        "no speed.train block ships: S1 was reverted 2026-09-21 and S2 (gamma 0.9995) is CANCELLED"
     assert p.speed_env == {}, "S5 is not switched on: `speed.env:` is absent from the shipped plan"
     assert set(p.speed_rewards) == {"death"}, "only the 2026-09-20 death weight has landed"
 
 
-def test_a_complete_stage_is_untouched_and_a_speed_stage_moves_only_the_two_S1_keys():
-    """`env` still gains only what the speed rule has always added, and `train` only what S1 names."""
+def test_a_complete_stage_and_a_speed_stage_now_train_at_the_same_hyperparameters():
+    """`env` still gains only what the speed rule has always added, and `train` gains nothing at all."""
     p = plan()
     complete = campaign_driver.stage_config(p, "Level 0-1")["train"]
     speed = campaign_driver.stage_config(p, "Level 0-1", kind=SPEED)["train"]
     assert complete["hyperparams"] == p.train["hyperparams"], COMPLETE
     assert complete["hyperparams"]["gamma"] == 0.998 and complete["hyperparams"]["gae_lambda"] == 0.95
-    assert speed["hyperparams"]["gamma"] == 0.999 and speed["hyperparams"]["gae_lambda"] == 0.98
+    assert speed["hyperparams"]["gamma"] == 0.998 and speed["hyperparams"]["gae_lambda"] == 0.95
     moved = {k for k in speed["hyperparams"] if speed["hyperparams"][k] != complete["hyperparams"].get(k)}
-    assert moved == {"gamma", "gae_lambda"}, moved
+    assert moved == set(), moved
     complete_env = campaign_driver.stage_config(p, "Level 0-1")["env"]
     speed_env = campaign_driver.stage_config(p, "Level 0-1", kind=SPEED)["env"]
     assert set(speed_env) - set(complete_env) == {"speed_bonus", "speed_target_scale"}

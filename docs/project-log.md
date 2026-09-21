@@ -4885,3 +4885,125 @@ The traceback that follows in `spec_0-1_speed_train.log` is that teardown (a `Br
 First readings under S1, recorded and **not** judged (the horizon above is 500k buckets over >= 2M steps, and
 the first bucket is expected to be an adaptation dip): fresh rate **0.939 over 33**, `median_time_50`
 **125.14 s**, last-100-fresh median **112.2 s**, best unchanged at **72.233 s**.
+
+## 2026-09-21 — Lever S1 REVERTED, and the weights rolled back to the switch point
+
+**S1 (`speed.train: {gamma: 0.999, gae_lambda: 0.98}`) made the policy slower, monotonically, at every
+quantile, with a healthy critic.** It was live on `spec_0-1_speed` round 6 from **42,185,602** to
+**44,849,170** cumulative steps — **2.66M steps**, Brutal, focus rung 100 s. The block is out of
+`configs/specialists.yaml` and the weights are rolled back to 42,185,602. This entry is the verdict; the
+rollback's own facts are in the section after it.
+
+### The table, re-derived from `runs/spec_0-1_speed/episodes.jsonl`
+
+Full 500k buckets, `fresh_start == 1`, completion times from `completed == 1 and level_seconds > 1`. `rate` is
+fresh completions / fresh episodes, `mean_d` is mean deaths per fresh episode. All Brutal (difficulty 4)
+except the 35.0M bucket, which straddles the Violent-to-Brutal switch at 35,937,130.
+
+| bucket | fresh | done | rate | median | p10 | p25 | best | mean_d | era |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 35.0M | 245 | 227 | 0.927 | 114.9 | 94.6 | 102.1 | 69.1 | 0.50 | pre-S1 (Violent tail) |
+| 35.5M | 203 | 181 | 0.892 | 119.5 | 96.9 | 106.9 | 81.2 | 0.78 | pre-S1 |
+| 36.0M | 192 | 164 | 0.854 | 127.7 | 99.1 | 111.6 | 79.2 | 1.09 | pre-S1 |
+| 36.5M | 168 | 145 | 0.863 | **154.8** | 115.9 | 130.7 | 91.1 | 1.30 | pre-S1 (Brutal dip) |
+| 37.0M | 164 | 140 | 0.854 | **164.0** | 126.7 | 137.5 | 106.8 | 0.91 | pre-S1 (Brutal dip) |
+| 37.5M | 216 | 196 | 0.907 | 135.1 | 101.8 | 113.6 | 81.5 | 0.86 | pre-S1 (recovering) |
+| 38.0M | 212 | 192 | 0.906 | 125.2 | 95.7 | 106.2 | 80.1 | 1.05 | pre-S1 |
+| 38.5M | 217 | 196 | 0.903 | 116.6 | 92.0 | 101.4 | 78.4 | 1.02 | pre-S1 |
+| 39.0M | 203 | 174 | 0.857 | 119.9 | 92.7 | 106.4 | 81.3 | 1.19 | pre-S1 |
+| 39.5M | 209 | 181 | 0.866 | 124.8 | 96.5 | 107.1 | 79.7 | 1.25 | pre-S1 |
+| 40.0M | 208 | 188 | 0.904 | 129.6 | 96.3 | 110.1 | 72.2 | 1.35 | pre-S1 |
+| 40.5M | 210 | 191 | 0.910 | 123.6 | 96.6 | 106.2 | 80.0 | 1.01 | pre-S1 |
+| 41.0M | 228 | 211 | 0.925 | 122.4 | 95.3 | 106.1 | 73.7 | 0.96 | pre-S1 |
+| 41.5M | 246 | 228 | 0.927 | 119.0 | 92.2 | 101.6 | 76.2 | 0.83 | pre-S1 |
+| 42.0M | 233 | 218 | 0.936 | 117.3 | 92.4 | 102.1 | 75.1 | 0.94 | **spans the switch** (mostly pre) |
+| 42.5M | 215 | 196 | 0.912 | 135.9 | 99.2 | 112.4 | 81.2 | 1.07 | **S1** |
+| 43.0M | 199 | 181 | 0.910 | 142.8 | 104.6 | 117.2 | 87.9 | 0.98 | **S1** |
+| 43.5M | 213 | 200 | 0.939 | 135.7 | 104.7 | 117.8 | 86.4 | 1.10 | **S1** |
+| 44.0M | 172 | 140 | 0.814 | 163.1 | 114.5 | 134.7 | 92.1 | 1.24 | **S1** |
+| 44.5M | 119 | 108 | 0.908 | 170.4 | 123.4 | 138.5 | 99.4 | 1.45 | **S1, partial** (n=119) |
+
+**The baseline**, taken as the flat post-Brutal-recovery regime 38.5M-42.0M: bucket medians 116.6-129.6,
+**median of medians 121.2 s**. The S1 era ran 135.9, 142.8, 135.7, 163.1, 170.4.
+
+**Every quantile moved the same way, which is why this is not noise.** p10 **92 to 99 to 105 to 105 to 115 to
+123 s**; p25 **102 to 139 s**; best-of-bucket **75 to 81 to 88 to 86 to 92 to 99 s**; mean deaths per fresh
+episode **0.94 to 1.45**. The whole distribution shifted, not its tail: S1 did not add occasional disasters to
+an unchanged fast policy, it made the fast policy slower.
+
+**The best single run of the entire S1 era was 76.880 s** (at 42,364,018 steps), against the **72.233 s**
+already on `times.md` from 40.49M — so S1 never once beat the pre-S1 policy's best, and `times.md` needed no
+correction. `best_runs/` is likewise untouched.
+
+### The critic was fine — verified, not assumed
+
+Read out of `runs/spec_0-1_speed_train.log` (13,148 `explained_variance` / `approx_kl` rows over
+18.06M-44.90M steps):
+
+| | pre-S1 (39M to switch, n=1561) | S1 (n=1328) |
+| --- | --- | --- |
+| `explained_variance` | mean **0.9307**, min 0.577, max 0.996 | mean **0.9296**, min 0.470, max 0.992 |
+| `approx_kl` | mean **0.0336** | mean **0.0296** |
+
+The value head kept up with the longer horizon and the updates got no larger. **The policy, not the value
+fit, converged on slower play.**
+
+### Which trigger fired — stated precisely
+
+Of the four written triggers, **only trigger 4 (bucket median more than 15 s worse than baseline for two
+consecutive buckets)** is in play, and its strict reading is worth recording honestly:
+
+- **Trigger 1** (`explained_variance` < 0.80 sustained over 250k) — **did not fire**, see above.
+- **Trigger 2** (fresh completion < 0.85 over two full buckets) — **did not fire**: only 44.0M (0.814) is
+  under, and 43.5M / 44.5M sit at 0.939 / 0.908.
+- **Trigger 3** (mean deaths up by more than 1.0 for a full bucket) — **did not fire**: 1.24 and 1.45 against
+  a 0.83-1.35 baseline.
+- **Trigger 4** (threshold 121.2 + 15 = **136.2 s**) — 43.0M **142.8 fired**, 43.5M 135.7 not (by 0.5 s),
+  44.0M **163.1 fired**, 44.5M **170.4 fired but partial**. So it fires on 44.0M + 44.5M **if the partial
+  bucket counts** (n=119 fresh, 108 completions — a real sample, and 34 s past the line), and is one full
+  bucket short if it does not.
+
+**The lead called it on the whole picture and that call stands**: the horizon rule ("at least 2M steps after
+the first post-change bucket") is satisfied at 2.66M, the trend is monotone at p10, p25, median and
+best-of-bucket simultaneously, and it is still worsening at the last reading rather than flattening.
+
+**The one honest counter-argument, and why it loses.** The pre-S1 series contains its own two-bucket
+excursion to **154.8 / 164.0 s** at 36.5M/37.0M — the Brutal switch — which recovered to 135.1 by 37.5M and
+to 116.6 by 38.5M, about **1.5M steps**. S1's excursion has now run **2.66M steps** and is **still getting
+worse at the last bucket**, where Brutal's was already recovering by its third. An adaptation dip recovers;
+this did not.
+
+### Decision: revert AND roll back
+
+**Revert**, because the lever is bad. **And roll the weights back to 42,185,602**, because the policy itself
+has been degraded by 2.66M steps of training under it and the pre-S1 weights are on disk — leaving the S1
+weights in place and only changing gamma back would have kept the slow policy and asked it to un-learn 2.66M
+steps under the old discount.
+
+### What this means for the rest of the ladder
+
+S1's premise was that at gamma 0.998 the `level_complete` bonus is worth 2.7% of face value at episode start,
+so the policy "cannot feel the thing it is being asked to optimise". **That premise is now falsified for this
+policy**: given a horizon twice as long and an advantage window ~2.5x wider, it did not get faster, it got
+slower — and it did so while the critic tracked returns perfectly well. The most likely reading is that the
+longer horizon raised the value of *surviving to the end* relative to *arriving early* (deaths per episode
+rose along with the median), which is the opposite of the intended gradient, and that at this stage the
+binding constraint is route and execution, not credit-assignment distance.
+
+- **S2 (gamma 0.9995) is CANCELLED.** It is the same lever pushed further, in the direction that has just
+  been measured to hurt. It does not get tried again on the strength of the argument S1 already falsified.
+- **S3 (`level_complete` 300) needs a FRESH ARGUMENT before it is tried.** Its old justification was the same
+  discounting story — "the bonus is too faint to feel" — and that story no longer has evidence behind it.
+  Raising the bonus 3x under the unchanged 0.998 horizon is a different intervention from lengthening the
+  horizon, so it is not dead; but somebody has to make the case on its own terms, against a fresh baseline.
+- **S5 (`speed.env:`) was never switched on** and is unaffected.
+
+### The restoration check — the thing that proves the rollback worked
+
+**After the rollback the 500k-bucket median of fresh completions should return to ~120 s within the first
+full bucket** (the first complete bucket at or after ~42.5M on the restored step counter), with p10 back near
+92-97 s and best-of-bucket back near 72-81 s. It is the same weights that produced 117.3 s at 42.0M, under
+the same config, so there is no adaptation period to wait out and no excuse for a dip.
+
+**If it does not, the rollback did not restore the policy** — the resume loaded the wrong file, or something
+other than `speed.train` moved — and that has to be chased before any further tuning.

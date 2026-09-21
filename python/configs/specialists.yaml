@@ -159,26 +159,25 @@ speed:
   # once", not at "stand still". Pinned by tests/test_speed_death_weight.py.
   rewards:
     death: 12.0
-  # A SPEED STAGE'S OWN PPO HYPERPARAMETERS -- STAGE S1, SWITCHED ON 2026-09-21. Merged over `train.hyperparams`
-  # below for a SPEED stage and for nothing else, so a complete stage's generated config stays byte-identical to
-  # what `configs/campaign_gates_full.yaml` pins. Validated against `SPEED_TRAIN_KEYS` (PPO's own numeric
-  # constructor arguments); a misspelt or non-numeric key is a hard load error, never a default.
+  # NO `train:` BLOCK. A SPEED STAGE TRAINS AT `train.hyperparams` BELOW, gamma 0.998 / gae_lambda 0.95.
   #
-  # WHY. At gamma 0.998 the horizon is 1/(1-gamma) = 500 decisions, about 33 official seconds at frameskip 2 --
-  # so in a ~120 s run the `level_complete` bonus (and the speed scaling on it, which is the whole point of a
-  # speed stage) is worth 0.998^1800 = 2.7% of face value at the start of the episode, and the policy cannot
-  # feel the thing it is being asked to optimise until the last third. 0.999 doubles the horizon to 1000
-  # decisions (~67 s). `gae_lambda` moves with it because the advantage window has to widen too: at lambda 0.95
-  # the GAE weight is already down to 1e-3 by 135 decisions, so a longer gamma alone would only lengthen the
-  # bootstrap target while the credit assignment stayed short. 0.98 puts that same 1e-3 point at ~340 decisions.
+  # S1 (gamma 0.999 + gae_lambda 0.98) WAS TRIED AND REVERTED, 2026-09-21. It was live on spec_0-1_speed round 6
+  # from 42,185,602 to 44,849,170 cumulative steps (2.66M steps, Brutal, focus rung target 100 s). It made the
+  # policy SLOWER at every quantile, monotonically: the 500k-bucket median of fresh completions went
+  # 117.3 -> 135.9 -> 142.8 -> 135.7 -> 163.1 -> 170.4 s against a pre-S1 baseline of 119-130 s; p10 92 -> 123 s;
+  # best-of-bucket 75 -> 99 s; deaths/episode 0.94 -> 1.45; the S1 era's best single run was 76.88 s against the
+  # 72.233 s already on the board. `explained_variance` stayed 0.91-0.94 and `approx_kl` ~0.03 throughout, so the
+  # critic was healthy and the POLICY, not the value fit, converged on slower play. The written revert trigger
+  # (bucket median > ~15 s worse than the ~122 s baseline for two consecutive buckets) fired at 44.0M/44.5M. The
+  # weights were rolled back to the 42,185,602 switch point. Full table and reasoning: docs/project-log.md,
+  # 2026-09-21.
   #
-  # WHEN. Activated at ~42.1M cumulative steps, 6.17M into 0-1's speed stage, after the Brutal switch of
-  # 2026-09-20 (35,937,130) had held its 2M-step control period and the 500k-bucket median had sat flat at
-  # 119-130 s for 3M steps. Baseline table, horizon and the four revert triggers: docs/project-log.md,
-  # 2026-09-21. Planned next, NOT active: S2 (gamma 0.9995) and S3 (`level_complete` 300).
-  train:
-    gamma: 0.999
-    gae_lambda: 0.98
+  # CONSEQUENCES FOR THE LADDER. S2 (gamma 0.9995) is CANCELLED -- it is the same lever pushed further, and S1
+  # already falsified the premise that this policy's problem is horizon length. S3 (`level_complete` 300) needs a
+  # FRESH ARGUMENT before it is tried, because its old justification was the same discounting story.
+  #
+  # The merge mechanism itself is kept and still tested (tests/test_speed_overrides.py builds its own plans):
+  # adding a `train:` block here is all it takes to switch a hyperparameter stage back on.
 # THE FOCUS / RECORD CHASE (spec §11). The user, 2026-09-20: "can we focuse on one level tell we get it to a
 # point that is close to the speed run record". While this block is set the driver trains NOTHING ELSE: not
 # 0-2, not 0-3, not 0-4, whatever `order:`, `hold_before:` and `hold_order:` above would otherwise say. It runs
