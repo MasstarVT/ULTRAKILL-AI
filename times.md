@@ -5,7 +5,9 @@ Times are in-game level time (`mm:ss.mmm`), not wall-clock training time.
 
 ## Leaderboard
 
-Best time per level. A generation only takes a spot by beating the current record.
+Best time per level, on the **hardest difficulty that level has ever been completed on**. A completion on a
+harder difficulty takes the spot even when it is slower; within one difficulty, the faster time wins. Every
+run ever recorded is kept in the generation history below.
 
 | Level | Time | Rank | Generation | Difficulty | Date | Notes |
 |-------|------|------|------------|------------|------|-------|
@@ -59,7 +61,27 @@ Best run from each generation, newest first. Keep every generation here, even on
 
 <!--
 How to add an entry:
-- Generation history: add a row at the top of the table for the new generation's best run.
-- Leaderboard: if that run beats the level's record, replace the level's row (one row per level, sorted by level order).
+- Generation history: add a row at the top of the table for the new generation's best run. Nothing is ever
+  removed from it, whatever difficulty it was set on.
+- Leaderboard: one row per level, sorted by level order. Replace the level's row when the new run beats it
+  under THE RULE BELOW. Never edit a row to a time that was not actually set.
 - Rank is the in-game style rank (D, C, B, A, S, P). Δ vs previous is the time change from the previous generation on the same level, e.g. -1.250s.
+
+The leaderboard rule (`ultrakill_ai.times.beats_record`, which is what post_times.py and eval.py both apply,
+so nothing here has to be decided by hand):
+- A level's row is the best time on the HARDEST difficulty that has any valid completion of that level.
+- A completion on a harder difficulty ALWAYS replaces the row, EVEN WHEN IT IS SLOWER. A Violent time is not
+  a claim about Brutal, and the row is read as "this is what the AI can do".
+- Within one difficulty, the faster time wins, as it always did.
+- An easier difficulty NEVER replaces a harder row, however fast it is.
+- A row whose time the game could not have reported (<= 1.000s) counts as no row at all.
+
+Difficulty names are the game's own: Harmless, Lenient, Standard, Violent, Brutal. Brutal (4) is the hardest
+difficulty this build can run -- the game's PrefsManager validator refuses anything above it. An em dash in
+the difficulty cell means the run never recorded one; it ranks below every named difficulty.
+
+Training moved from Violent to Brutal on 2026-09-20 (the user: "make sure its on the hardest dif cuz in the
+times it dosnt show that"). The Violent rows above stand until a Brutal completion of the same level
+replaces them, which is why a slower Brutal time taking a spot is the rule working, not a regression --
+docs/project-log.md, 2026-09-20.
 -->

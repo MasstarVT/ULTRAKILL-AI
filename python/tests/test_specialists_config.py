@@ -25,6 +25,7 @@ import yaml  # noqa: E402
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS, CAMPAIGN_LEVELS_SHIPPED  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
 from ultrakill_ai.rewards import RewardConfig  # noqa: E402
+from ultrakill_ai.times import HARDEST_DIFFICULTY  # noqa: E402
 
 PLAN = ROOT / "configs" / "specialists.yaml"
 GATES_FULL = ROOT / "configs" / "campaign_gates_full.yaml"
@@ -58,16 +59,26 @@ def test_the_stage_template_is_the_full_config_minus_the_multi_level_keys():
                                           "unlock_after_fresh_episodes", "level_weight_floor",
                                           "curriculum_weighting"}
     assert set(p.env) - set(full_env) == {"level"}, "a stage names one level instead of a list"
-    assert {k for k in set(p.env) & set(full_env) if p.env[k] != full_env[k]} == set()
+    # DIFFICULTY IS THE ONE ALLOWED DIFFERENCE (2026-09-20). The plan trains on Brutal; the shared config it
+    # is pinned against stays on Violent, because that is the difficulty ITS leaderboard rows were set on and
+    # rewriting it would make them a lie. Every other key must still be identical, which is what the pin is
+    # for -- it is the reason a reward weight or a step cap cannot drift between the two files unnoticed.
+    assert {k for k in set(p.env) & set(full_env) if p.env[k] != full_env[k]} == {"difficulty"}
 
-    # And the parsed effect: only the curriculum fields may differ.
+    # And the parsed effect: only the curriculum fields and the difficulty may differ.
     full, cfg = EnvConfig.from_dict(full_env), EnvConfig.from_dict(dict(p.env))
     differing = {f.name for f in dataclasses.fields(EnvConfig)
                  if getattr(cfg, f.name) != getattr(full, f.name)}
-    assert differing == CURRICULUM_FIELDS, f"env settings changed besides the curriculum: {sorted(differing)}"
+    assert differing == CURRICULUM_FIELDS | {"difficulty"}, \
+        f"env settings changed besides the curriculum and the difficulty: {sorted(differing)}"
     assert cfg.levels == [] and cfg.curriculum_path == "", "a stage is a single-level run, by construction"
     assert cfg.rewards == full.rewards, "no reward weight may change: the same policy continues"
-    assert (cfg.difficulty, cfg.unlock_all_gear, cfg.max_steps, cfg.pitch_limit_deg) == (3, True, 12000, 45.0)
+    # Exactly Brutal, not merely "harder than before": 4 is the hardest difficulty the game will run, and a 5
+    # here would be clamped back to 4 by the mod (EpisodeController.cs) after the game's own PrefsManager
+    # validator had already refused it. The user, 2026-09-20: "make sure its on the hardest dif".
+    assert cfg.difficulty == HARDEST_DIFFICULTY == 4, "the plan trains on Brutal"
+    assert full.difficulty == 3, "the shared config keeps the difficulty its times.md rows were set on"
+    assert (cfg.unlock_all_gear, cfg.max_steps, cfg.pitch_limit_deg) == (True, 12000, 45.0)
     assert (cfg.fixed_fps, cfg.frameskip, cfg.render, cfg.soft_death) == (30, 2, False, False)
     assert cfg.gate_patience_mode == "collapsed" and cfg.prefer_route_when_collapsed is True
 

@@ -15,11 +15,13 @@ import post_times  # noqa: E402
 from test_times import TIMES_MD  # noqa: E402
 
 
-def make_run(tmp: Path, seconds: float, steps: int = 5_571_302) -> tuple[Path, Path]:
+def make_run(tmp: Path, seconds: float, steps: int = 5_571_302, difficulty=3) -> tuple[Path, Path]:
     run = tmp / "runs" / "campaign_gates"
     (run / "best_runs").mkdir(parents=True, exist_ok=True)
-    best = {"level": "Level 0-1", "seconds": seconds, "kills": 64, "deaths": 1, "rank": "B", "difficulty": 3,
-            "saved_at": "2026-09-17 06:35:52", "positions": [[0, 0, 0]]}
+    best = {"level": "Level 0-1", "seconds": seconds, "kills": 64, "deaths": 1, "rank": "B",
+            "difficulty": difficulty, "saved_at": "2026-09-17 06:35:52", "positions": [[0, 0, 0]]}
+    if difficulty is None:
+        best.pop("difficulty")
     (run / "best_runs" / "Level_0-1.json").write_text(json.dumps(best), encoding="utf-8")
     rows = [
         {"completed": True, "fresh_start": False, "level": "Level 0-1", "level_seconds": None, "timesteps": 1},
@@ -116,6 +118,50 @@ def test_push_stages_only_times_md():
     assert add[-2:] == ["--", "times.md"] and "-A" not in add and "." not in add
     assert commit[-2:] == ["--", "times.md"] and "0-1: 03:03.628" in commit[commit.index("-m") + 1]
     assert push[-3:] == ["push", "origin", "HEAD"]
+
+
+def test_a_slower_brutal_best_run_is_posted_over_a_faster_violent_row():
+    """post_times must apply the SAME rule as times.record, or the switch to Brutal posts nothing for a round.
+
+    Before the difficulty clause this was the blocking case: `spec_0-1_speed` holds a 81.5 s Violent row, and
+    every early Brutal completion is slower, so a difficulty-blind "only a faster time is posted" would have
+    left times.md claiming Violent for as long as the Brutal round ran.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run, times = make_run(Path(tmp), 81.46, difficulty=3)
+        assert post_times.post(run, times, "campaign_gates"), "the Violent row is posted first"
+        assert "| 0-1 | 01:21.460 | B | campaign_gates@5.57M | Violent |" in times.read_text(encoding="utf-8")
+        held_difficulty, held_seconds = post_times.held_record(times.read_text(encoding="utf-8"), "Level 0-1")
+        assert held_difficulty == 3 and abs(held_seconds - 81.46) < 1e-6
+
+        run, times = make_run(Path(tmp), 150.0, difficulty=4)
+        posted = post_times.post(run, times, "campaign_gates")
+        text = times.read_text(encoding="utf-8")
+        assert len(posted) == 1 and "Brutal" in posted[0], posted
+        assert "| 0-1 | 02:30.000 |" in text and "| Brutal |" in text
+        assert post_times.held_record(text, "Level 0-1") == (4, 150.0)
+
+
+def test_a_faster_violent_best_run_is_not_posted_over_a_brutal_row():
+    with tempfile.TemporaryDirectory() as tmp:
+        run, times = make_run(Path(tmp), 150.0, difficulty=4)
+        post_times.post(run, times, "campaign_gates")
+        held = times.read_text(encoding="utf-8")
+
+        run, times = make_run(Path(tmp), 60.0, difficulty=3)
+        assert post_times.post(run, times, "campaign_gates") == [], "an easier difficulty never takes the row"
+        assert times.read_text(encoding="utf-8") == held, "and nothing at all is written, not even the history"
+
+
+def test_a_best_run_without_a_difficulty_is_not_recorded_as_violent():
+    """It used to default to 3. A row that says Violent because nobody asked is the bug being fixed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run, times = make_run(Path(tmp), 440.7143, difficulty=None)
+        post_times.post(run, times, "campaign_gates")
+        row = next(line for line in times.read_text(encoding="utf-8").splitlines()
+                   if line.startswith("| 0-1 |"))
+        assert "Violent" not in row, row
+        assert post_times.held_record(times.read_text(encoding="utf-8"), "Level 0-1")[0] == -1
 
 
 if __name__ == "__main__":

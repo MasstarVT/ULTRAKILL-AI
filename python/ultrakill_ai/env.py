@@ -2235,6 +2235,12 @@ class UltrakillEnv(gym.Env):
                 "restarts": restarts, "rank": rank}
 
     def _end_campaign_episode(self, raw: dict[str, Any], reason: str, info: dict[str, Any]) -> None:
+        # The difficulty the game ACTUALLY read this episode, straight from the mod's campaign block rather
+        # than from `cfg.difficulty`: the config asks, `CampaignPatches.DifficultyOverride` answers, and only
+        # the answer is worth recording. On EVERY campaign episode, not just completions, so the episode log
+        # says what a stalled or dead episode was playing on too, and so `ProgressCallback` can tell that the
+        # difficulty changed under it without waiting for the first completion (2026-09-20, the Brutal switch).
+        info["difficulty"] = (raw.get("campaign") or {}).get("difficulty")
         if reason == "level_complete":
             info["completed"] = 1
             if self._fresh_start:

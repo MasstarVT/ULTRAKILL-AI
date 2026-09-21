@@ -4,7 +4,8 @@
 `record_file` applies it in place. It follows the rules in the file's closing HTML comment: the
 generation history gets every recorded run, newest first, with the time change against the newest
 earlier run on the same level; the leaderboard keeps one row per level, sorted by campaign order and
-replaced only by a faster time. Level cells use the short form (`0-1`) and times are `mm:ss.mmm`.
+replaced by `beats_record` -- HARDEST DIFFICULTY FIRST, then fastest. Level cells use the short form
+(`0-1`) and times are `mm:ss.mmm`.
 """
 
 from __future__ import annotations
@@ -17,6 +18,14 @@ from pathlib import Path
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS
 
 DIFFICULTY_NAMES = ("Harmless", "Lenient", "Standard", "Violent", "Brutal")
+# Every difficulty the game will let itself run. `PrefsManager`'s own validator rejects a stored difficulty
+# above 4 -- it returns 4 for anything out of 0..4, on the READ path as well as the write path -- so Brutal is
+# the hardest difficulty reachable in this build, and the mod clamps its override to the same -1..4 range
+# (`EpisodeController.cs`). The engine does carry a difficulty 5 ("ULTRAKILL MUST DIE", `GameDifficulty.UKMD`)
+# with real behaviour behind it, but nothing in the shipped game can select or store it: see
+# docs/project-log.md, 2026-09-20.
+HARDEST_DIFFICULTY = len(DIFFICULTY_NAMES) - 1  # 4, Brutal
+UNKNOWN_DIFFICULTY = -1  # a row or a run that never said which difficulty it played: ranks below every real one
 LEADERBOARD_HEADING = "## Leaderboard"
 HISTORY_HEADING = "## Generation history"
 EMPTY = "—"  # em dash: an empty cell; a row whose first cell is one is a placeholder
@@ -73,6 +82,77 @@ def valid_official_seconds(seconds) -> float | None:
     return value
 
 
+def difficulty_rank(difficulty) -> int:
+    """How hard a difficulty is, for comparison: the number itself, or `UNKNOWN_DIFFICULTY` when there is none.
+
+    A run or a row that never recorded its difficulty ranks BELOW every real one, so a completion that does
+    know what it played on replaces it. That is the safe direction: the alternative would let an unlabelled
+    row sit above a Brutal one forever.
+
+    BOUNDED AT BOTH ENDS, at `HARDEST_DIFFICULTY` (2026-09-20 review). A rank with no ceiling makes any cell
+    above 4 outrank Brutal permanently, and since `beats_record` only ever replaces a row from a rank at least
+    as hard, no real completion could ever take that row back -- demonstrated by hand-editing a `times.md`
+    cell to `9`, which then refused a legitimate 60 s Brutal time forever. Nothing in the run can produce such
+    a value today (the mod clamps to -1..4 and `--difficulty` takes `choices=range(-1, 5)`), but a hand-edited
+    file can, and so would the one follow-up this rule anticipates: raising the mod's clamp for UKMD. The
+    ceiling is `DIFFICULTY_NAMES`' own length, so adding a name is all it would take to admit a harder one.
+    """
+    try:
+        value = int(difficulty)
+    except (TypeError, ValueError):
+        return UNKNOWN_DIFFICULTY
+    return value if 0 <= value <= HARDEST_DIFFICULTY else UNKNOWN_DIFFICULTY
+
+
+def difficulty_name(difficulty) -> str:
+    """4 -> "Brutal", and anything this file does not recognise -> the empty cell.
+
+    A value outside 0..`HARDEST_DIFFICULTY` is one the game cannot have played on, so it is rendered as the
+    same empty cell as a missing one rather than as its own text (2026-09-20 review). The case that actually
+    occurs is the mod's own "I could not read the difficulty" sentinel, -1: `post_times.parse_difficulty` and
+    `full_run.LevelResult` both carry it as an int, so the old spelling put the literal text `-1` in the
+    Difficulty column, which times.md's closing comment already described as an em dash. The cell and
+    `difficulty_rank` now agree: an unranked difficulty is an empty one.
+    """
+    rank = difficulty_rank(difficulty)
+    return DIFFICULTY_NAMES[rank] if 0 <= rank < len(DIFFICULTY_NAMES) else EMPTY
+
+
+def parse_difficulty(text) -> int:
+    """The inverse of `difficulty_name`: "Brutal" -> 4, "4" -> 4, a dash or anything else -> UNKNOWN_DIFFICULTY."""
+    if text is None:
+        return UNKNOWN_DIFFICULTY
+    cell = str(text).strip()
+    for i, name in enumerate(DIFFICULTY_NAMES):
+        if cell.casefold() == name.casefold():
+            return i
+    return difficulty_rank(cell)
+
+
+def beats_record(new_difficulty, new_seconds, held_difficulty, held_seconds) -> bool:
+    """THE leaderboard rule, shared by `record` and `post_times`, so the two can never disagree.
+
+    A level's row is the best time on the HARDEST difficulty that has any valid completion for that level
+    (the lead, 2026-09-20, switching training to Brutal):
+
+    - a completion on a HARDER difficulty always replaces the row, EVEN WHEN IT IS SLOWER -- the rows are the
+      claim "this is what the AI can do", and a Violent time is not a claim about Brutal;
+    - within one difficulty the faster time wins, as it always did;
+    - an EASIER difficulty never replaces a harder row, however fast it is.
+
+    A held row whose own time is not one the game could have reported (`valid_official_seconds`) counts as no
+    row at all, and a new entry without a usable time is never a record.
+    """
+    if valid_official_seconds(new_seconds) is None:
+        return False
+    if valid_official_seconds(held_seconds) is None:
+        return True
+    new_rank, held_rank = difficulty_rank(new_difficulty), difficulty_rank(held_difficulty)
+    if new_rank != held_rank:
+        return new_rank > held_rank
+    return _ms(new_seconds) < _ms(held_seconds)
+
+
 def format_time(seconds: float) -> str:
     """83.25 -> "01:23.250", in whole milliseconds."""
     ms = _ms(max(0.0, seconds))
@@ -109,22 +189,19 @@ def record(markdown: str, entry: TimeEntry) -> str:
     level = short_level(entry.level)
     time_text = format_time(entry.seconds)
     rank = entry.rank or EMPTY
-    if 0 <= entry.difficulty < len(DIFFICULTY_NAMES):
-        difficulty = DIFFICULTY_NAMES[entry.difficulty]
-    else:
-        difficulty = str(entry.difficulty)
+    difficulty = difficulty_name(entry.difficulty)
 
-    # Leaderboard: one row per level, replaced only by a strictly faster time.
+    # Leaderboard: one row per level, replaced by `beats_record` -- hardest difficulty first, then fastest.
     start, end = _table(lines, LEADERBOARD_HEADING)
     rows = _data_rows(lines[start:end])
     row = [level, time_text, rank, entry.generation, difficulty, entry.date, entry.notes]
     held = next((i for i, cells in enumerate(rows) if cells[0] == level), None)
     if held is None:
         rows.append(row)
-    else:
-        record_time = valid_official_seconds(parse_time(rows[held][1]))
-        if record_time is None or _ms(entry.seconds) < _ms(record_time):
-            rows[held] = row
+    elif beats_record(entry.difficulty, entry.seconds,
+                      parse_difficulty(rows[held][4] if len(rows[held]) > 4 else None),
+                      parse_time(rows[held][1])):
+        rows[held] = row
     rows.sort(key=lambda cells: _LEVEL_ORDER.get(cells[0], len(_LEVEL_ORDER)))
     lines[start:end] = [_format_row(cells) for cells in rows]
 

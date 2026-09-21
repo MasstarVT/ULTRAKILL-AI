@@ -54,7 +54,9 @@ from campaign_driver import (  # noqa: E402
 from eval import resolve_deterministic  # noqa: E402  -- one rule for what `predict` gets, shared with eval.py
 from ultrakill_ai.campaign import ExplorationArchive, safe_name  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
-from ultrakill_ai.times import TimeEntry, actions_note, format_time, record_file  # noqa: E402
+from ultrakill_ai.times import (  # noqa: E402
+    HARDEST_DIFFICULTY, UNKNOWN_DIFFICULTY, TimeEntry, actions_note, difficulty_name, difficulty_rank,
+    format_time, record_file)
 
 TIMES_MD = ROOT.parent / "times.md"
 
@@ -71,7 +73,9 @@ class LevelResult:
     kills: int = 0
     deaths: int = 0
     steps: int = 0
-    difficulty: int = 3
+    # The difficulty the GAME reported for this run. `UNKNOWN_DIFFICULTY` rather than a guess: a row that
+    # says "Violent" because nobody asked is exactly the thing the 2026-09-20 switch was about.
+    difficulty: int = UNKNOWN_DIFFICULTY
     end_reason: str | None = None
     skipped: str | None = None
 
@@ -180,7 +184,8 @@ def post_results(times_md: Path, results: list[LevelResult], *, gen: str | None 
 # ---------------------------------------------------------------------------
 
 
-def eval_config(level: str, model: Path, plan, cwd: Path, *, port: int, mode: str = COMPLETE) -> EnvConfig:
+def eval_config(level: str, model: Path, plan, cwd: Path, *, port: int, mode: str = COMPLETE,
+                difficulty: int | None = None) -> EnvConfig:
     """The env one level is played with: the specialist's own training config, made eval-safe.
 
     Preference order, so a specialist is always played under the settings it was TRAINED under when they are
@@ -212,6 +217,14 @@ def eval_config(level: str, model: Path, plan, cwd: Path, *, port: int, mode: st
     cfg.best_runs_dir = ""
     cfg.bridge_relaunch = False     # an eval may never restart a game process
     cfg.env_log_dir = ""
+    # `difficulty` is deliberately NOT forced here: the preference order above already gives each specialist
+    # the difficulty it is CURRENTLY trained under, because train.py rewrites `models/<run>/env_config.yaml`
+    # from the generated stage config at the start of every round. After the 2026-09-20 switch a chained run
+    # therefore plays 0-1 on Brutal as soon as the Brutal round has written that file, and a level whose stage
+    # has not been re-run yet still plays on the Violent settings its policy was trained on -- which is the
+    # honest pairing. `--difficulty` overrides all of it, for a deliberate like-for-like comparison.
+    if difficulty is not None:
+        cfg.difficulty = difficulty
     return cfg
 
 
@@ -253,7 +266,7 @@ def play_level(level: str, env, model, *, deterministic: bool = False, max_steps
         kills=int(info.get("kills") or 0),
         deaths=int(info.get("deaths") or 0),
         steps=steps,
-        difficulty=int(difficulty if difficulty is not None else 3),
+        difficulty=difficulty_rank(difficulty),
         end_reason=info.get("end_reason"),
     )
 
@@ -279,6 +292,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--record-times", action="store_true", help="post each completed level to times.md")
     ap.add_argument("--times", default=str(TIMES_MD))
     ap.add_argument("--json", help="write the results to this file as JSON")
+    ap.add_argument("--difficulty", type=int, choices=range(-1, HARDEST_DIFFICULTY + 1), metavar="N",
+                    help="play every level on difficulty N (0 Harmless .. 4 Brutal, -1 the game's own) "
+                         "instead of each specialist's own trained difficulty; the rows posted always say "
+                         "the difficulty the GAME reported")
     return ap
 
 
@@ -300,14 +317,15 @@ def main() -> None:
 
     def play(level: str, model_path: Path) -> LevelResult:
         mode = specialist_mode(Path(a.models_dir), level)
-        cfg = eval_config(level, model_path, plan, cwd, port=a.port, mode=mode)
+        cfg = eval_config(level, model_path, plan, cwd, port=a.port, mode=mode, difficulty=a.difficulty)
         model = PPO.load(str(model_path), device="cpu")
         env = UltrakillEnv(cfg)
         attempts: list[LevelResult] = []
         try:
             cells = load_archive(env, level, cwd, a.port, mode)
-            print("%s: %s (%s stage, %d exploration cells)"
-                  % (level, model_path.name, mode, cells), flush=True)
+            print("%s: %s (%s stage, %d exploration cells, difficulty %s)"
+                  % (level, model_path.name, mode, cells, difficulty_name(cfg.difficulty)
+                     if cfg.difficulty >= 0 else "the game's own"), flush=True)
             for _ in range(max(1, a.episodes)):
                 result = play_level(level, env, model, deterministic=deterministic)
                 print("  %s time=%s kills=%d deaths=%d end=%s"

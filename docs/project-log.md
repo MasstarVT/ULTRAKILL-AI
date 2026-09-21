@@ -4540,3 +4540,106 @@ unchanged (`test_off_is_the_action_stream_byte_for_byte`).
 ## 2026-09-20 — AGENTS.md, generated from CLAUDE.md
 
 The user asked for an `AGENTS.md` that stays updated. `CLAUDE.md` remains the one file anyone edits; `python/scripts/sync_agents_md.py` renders `AGENTS.md` from it (a note under the title, body untouched) and `python/tests/test_agents_md.py` fails the no-game suite whenever the two drift, so every agent that lands a `CLAUDE.md` edit is forced to re-sync. A generated copy rather than a symlink (Windows checkouts) or an `@import` (other tools do not follow it).
+
+## 2026-09-20 â€” Brutal: the hardest difficulty, and a leaderboard that says so
+
+**The instruction.** The user, verbatim: *"make sure its on the hardest dif cuz in the times it dosnt show that"*. Every row in `times.md` said `Violent`. On 2026-09-18 the user had already asked for the maximum difficulty once speed training began, and the lead had planned Brutal "once completion is reliable"; on Level 0-1 it now is (fresh completion 0.85â€“0.92), so the switch happened here. Built on branch `brutal`; nothing live was touched.
+
+**The ceiling â€” is anything above Brutal?** Confirmed from `decompiled/` and the mod:
+
+- `GameDifficulty` (decompiled/GameDifficulty.cs) is `None = -1, Harmless, Lenient, Standard, Violent, Brutal, UKMD` â€” so a **difficulty 5 does exist in the enum**, named "Ultrakill Must Die" by `GameDifficultyExtensions.GetDifficultyName`, and `DifficultyTitle.Check()` has a `case 5:` printing "ULTRAKILL MUST DIE".
+- It is **not decoration**: difficulty 5 has real gameplay behaviour. `EnemyIdentifier` halves boss damage at 5 where 4 divides by 1.5; `FleshPrison` always spawns skull drones at 5; `MinosBoss` has two `difficulty == 5` branches; `Enemy.cs` has one; `DifficultyDependantObject` has a `case 5` with its own `UKMD` flag; and the Cyber Grind save arrays are sized 6 (`GameProgressSaver.GetCyberRankData`), with `GetProgress` / `GetPrime` / `GetEncoreProgress` all looping `i <= 5`.
+- **It is nevertheless unreachable in this build.** `PrefsManager`'s `propertyValidators["difficulty"]` returns 4 for any int outside 0..4, and `EnsureValid` runs on **both** `SetInt` and `GetInt` â€” so no menu button can store a 5 (`DifficultySelectButton.SetDifficulty` goes straight through `SetInt`), and a hand-edited prefs file reads back as 4. The mod clamps its own override to the same range (`EpisodeController.cs`: `Mathf.Clamp(..., -1, 4)`).
+
+**So: Brutal (4) is the hardest difficulty this build can select or store, and it is what the plan now uses.** The honest caveat, recorded because the task assumed a flat ceiling: UKMD is *implemented*, and because `CampaignPatches` patches the **return value** of `PrefsManager.GetInt` it bypasses the validator â€” raising the mod's clamp to 5 would make the game read 5, and `Enemy.InitializeDifficulty` does go through `GetInt`, so enemy scaling would see it. That was **not** done: it needs a mod rebuild (the DLL is locked while games run), it is a configuration the game itself refuses to produce, and no scene-authored content at 5 has ever been exercised. If the user wants UKMD, that is a decision to take deliberately, not a bug to fix.
+
+**The leaderboard rule.** `times.md`'s rows are the claim "this is what the AI can do", and a Violent time is not a claim about Brutal. New rule, in `ultrakill_ai.times.beats_record` and applied by every writer:
+
+- a level's row is the best time on the **hardest difficulty that has any valid completion of that level**;
+- a completion on a harder difficulty **always** replaces the row, even when it is slower;
+- within one difficulty the faster time still wins; an easier difficulty never replaces a harder row;
+- the generation history keeps everything, as it always did.
+
+No existing row was rewritten. The three Violent rows (0-1 01:06.655, 0-2 01:17.085, 0-3 04:23.904) stand until a Brutal completion of the same level replaces them.
+
+**What else had to become difficulty-aware, and why each one would otherwise have blocked the switch.** The binding constraint throughout: `spec_0-1_speed` holds an 81.5 s Violent best and a ~147 s Violent median, and *every early Brutal completion is slower than both*, so anything ranking on time alone would have frozen on Violent for the whole round.
+
+- `campaign.save_best_run` â€” the run's best-run file is all `post_times.py` ever reads. Now hardest-first, then fastest.
+- `post_times.held_record` / `post` â€” applies the same predicate as `times.record`, so the two can never disagree about what is postable. A best-run file with no difficulty now posts an **empty** difficulty cell instead of defaulting to 3 (a row saying "Violent" because nobody asked is the bug being fixed).
+- `ProgressCallback` â€” `best_time` now carries `best_difficulty`, both restored from `status.json`; the campaign block publishes `difficulty` and `best_difficulty`; `episodes.jsonl` carries a per-episode `difficulty`; and **the rolling windows are emptied when the reported difficulty changes**, so `median_time_50` (a focus rung's promotion gate) can never be a mixture of two games. In practice the switch is performed *by* a trainer restart, which empties them anyway â€” the windows are deliberately not restored (`_restore_levels`) â€” so this is belt and braces plus a log line.
+- `keep_best.py` â€” **the one that would have done real damage.** `--metric time` scores `median_time_50`; a rolling window, so it refills correctly on its own, but `best.json` persists across rounds in the same model dir and held a Violent score. `best.zip` would never have moved, and `campaign_driver.promote` would then have published Violent-trained weights as the level's *Brutal* specialist. `rank_key` now ranks difficulty ahead of the score, a smoothing window that straddles a change is dropped, and `best.json` records its `difficulty`. A `best.json` without one ranks lowest, so the first difficulty-tagged sample takes the record â€” the wanted direction here, and why `docs/commands.md` also says to move the Violent `best.json` / `best.zip` aside at the switch.
+- `poll_status.py` â€” carries `difficulty` into `metrics_log.csv`, the only way the number reaches `keep_best.py`. The file is append-only and keeps its own header, so it must be moved aside to gain the column; until then every row reads as unrecorded and compares exactly as before.
+- `env.py` â€” puts the difficulty the game **actually read** (the mod's `campaign.difficulty`, not `cfg.difficulty`) into every campaign episode's `info`, completion or not.
+- `eval.py` / `full_run.py` â€” gained `--difficulty N` (default: the config's). `full_run` already resolved each specialist's difficulty from its own `models/<run>/env_config.yaml`, which `train.py` rewrites every round, so a chain plays each level on the difficulty it is currently trained on without any extra step; `LevelResult.difficulty` now defaults to UNKNOWN rather than 3. Worth knowing: `models/specialists/<level>.zip` has no `env_config.yaml` beside it, so a bare `eval.py` of a promoted specialist runs at **-1**, the game's own setting â€” `eval.py` now prints the difficulty it is using.
+
+**The pin.** `tests/test_specialists_config.py` pinned the plan's env against `configs/campaign_gates_full.yaml` character for character. Difficulty is now the **one** allowed difference, asserted to be exactly 4 and `HARDEST_DIFFICULTY`; the shared config stays at 3 because that is the difficulty *its* leaderboard rows were set on, and the rest of the pin is untouched.
+
+**What to expect.** Brutal enemies hit harder and are more aggressive (the 1.5x speed multiplier is shared with Violent: `Enemy.SetSpeed` treats `difficulty >= 4` alike), so **the 0-1 median will likely rise at first** and the focus rung will take longer. The control arm running on rung 1 **ends here** â€” the switch is an environment change, and a new control period starts after it; medians from before and after may not be compared.
+
+**Activation** is the shared plan-change procedure, written out in `docs/commands.md` under "Changing the DIFFICULTY": `DRIVER_PAUSE`, stop the driver by pid, edit the plan, dry run paused, remove the pause, dry run for real, `runs\start_driver.cmd`, then `END_STAGE` so the rung restarts as a new round with a regenerated config. **Nothing in this entry was activated**: branch `brutal` is build-only, the live run kept training on Violent throughout, and no game, port or trainer was touched.
+
+Tests: the whole no-game suite, one file at a time, with `PYTHONPATH` on the worktree. Eight test files gained cases for the rules above, and each was verified to FAIL against the pre-change source.
+
+### 2026-09-20 — Brutal, review round: closing the gap between the rule and the file it reads
+
+Five findings against the branch above. All five were real; all five are fixed on `brutal` before it merges,
+each with a test that fails against the pre-fix source.
+
+**1 (major) — the difficulty clause read a column the live log did not have.** `keep_best.py --metric time`
+ranks difficulty ahead of the score, and it reads that difficulty from `metrics_log.csv`. `poll_status.py`
+writes rows with `csv.DictWriter(..., extrasaction="ignore")` against the header the file already has, so on
+`runs/spec_0-1_speed/metrics_log.csv` — 3,292 rows, header ending `median_time_50,best_time` — every
+`difficulty` value would have been dropped **silently**. Every sample then reads as unrecorded, no window
+straddles a change, `rank_key`'s difficulty term is constant, and ranking falls back to the clock alone,
+where every early Brutal median loses to the inherited Violent one. `best.zip` freezes on Violent-trained
+weights for the whole Brutal round, and if that round reaches `done`, `campaign_driver.promote` publishes
+them as the level's *Brutal* specialist. The previous entry and `docs/commands.md` both treated moving the
+file aside as optional expectation-setting, which is how a silent coupling gets skipped.
+
+Fixed at the source rather than documented harder: **`poll_status.py` now rotates a log whose header is
+missing a column it writes** — the old file becomes `metrics_log.<timestamp>.csv`, kept and never deleted,
+and a new log starts with the full header. A header that merely carries *extra* columns is left alone;
+nothing is dropped, so there is nothing to fix. `keep_best.py` gained `difficulty_column_missing` and prints
+a loud one-line warning when it runs against a log that cannot carry the column, which is the tripwire for
+the case the rotation did not happen (an older `poll_status.py` still running). This also settles three
+earlier columns — `targets_parked`, `exit_banished`, `route_source` — that the same rule had been dropping
+from existing logs since the day each was added.
+
+**2 (minor) — the promoted sidecar named the plan's difficulty, not the stage's.** `finish_stage` read
+`self.plan.env["difficulty"]`. The plan is read once at driver start while a generated config is only
+rewritten at a stage or round boundary, so through the whole activation window — plan edited to 4, driver
+restarted, round not yet re-started — the running trainer is still on the old config. A round ending there
+would have written `difficulty: 4` into the committed sidecar of weights trained entirely on Violent. New
+`StageSample.difficulty` carries what the **mod reported** (`campaign.difficulty`, via `difficulty_rank`, so
+the `-1` sentinel and any impossible value read as "not recorded"), and `stage_difficulty()` prefers it,
+falling back to the plan only for a run that never reported one. Latent, not firing: `driver_state.json` had
+`target_reached_at: null` with median 118.89 s against a 100.0 s target.
+
+**3 (minor) — an unrecorded difficulty printed as the text `-1`.** `difficulty_name` returned `str(value)`
+for anything outside the names and `EMPTY` only for a literal `None`, but every caller converts to an int
+first (`post_times.parse_difficulty` returns -1 for a missing field; `full_run.LevelResult.difficulty`
+defaults to it), so the Difficulty cell read `-1` where times.md's own closing comment promised an em dash.
+`difficulty_name` now returns the empty cell for every rank that is `UNKNOWN_DIFFICULTY`. Cosmetic; ranking
+was never affected.
+
+**4 (minor) — `difficulty_rank` had no ceiling, so a bogus cell could hold a row forever.** It accepted 5, 9,
+99, and since `beats_record` only yields a row to a rank at least as hard, a hand-edited `9` cell refused
+every later Brutal completion permanently (demonstrated against a copy of times.md). Now bounded by
+`HARDEST_DIFFICULTY`, which is `DIFFICULTY_NAMES`' own length — so admitting a harder difficulty later (UKMD)
+is a matter of adding its name, and until then an impossible value ranks as unknown, i.e. below everything.
+
+**5 (minor) — the mod's "could not read it" sentinel was treated as a difficulty change.**
+`CampaignObserver` reports -1 when `PrefsManager` is not there to read, and that int reaches
+`info["difficulty"]` unaltered, so `_note_difficulty`'s "no difficulty reported" early-out (which tested only
+`None`) never fired for it. With twelve envs on one callback, one such episode would empty the 50-episode
+window the focus rung is judged on, and the next real one would empty it again on the way back; the rung
+needs `fresh_window >= 30`, so a recurring sentinel could stall it indefinitely, and `beats_record(-1, …)`
+would refuse every completion meanwhile. It now early-outs on any rank of `UNKNOWN_DIFFICULTY`, matching
+`times.difficulty_rank`'s convention. Plausible but never demonstrated firing — `PrefsManager` is a
+persistent singleton and the live best-run file shows a clean difficulty.
+
+Tests: the whole no-game suite one file at a time, 38 files and 898 named tests, all passing. New file
+`tests/test_poll_status.py` (6 tests) for the rotation; new cases in `test_times.py`, `test_progress.py`,
+`test_keep_best.py` and `test_campaign_driver.py`. `test_progress.py::test_poll_status_keeps_old_header`
+became `test_poll_status_rotates_a_log_whose_header_is_missing_columns` — it pinned exactly the invariant
+finding 1 is about, and the change of contract is deliberate.

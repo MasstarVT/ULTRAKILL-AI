@@ -41,13 +41,14 @@ SPEED_ORDER = ["Level 0-1", "Level 0-3",
 
 
 def sample(timesteps=None, rate=None, window=0, best_time=None, best_at=None,
-           target_seconds=None, s_rank_seconds=None, median_time=None) -> cd.StageSample:
+           target_seconds=None, s_rank_seconds=None, median_time=None, difficulty=None) -> cd.StageSample:
     """`median_time` defaults to `best_time`: a run whose every completion took the same time.
 
     The speed rule gates on the MEDIAN, so the tests that are about the difference between the two pass both.
+    `difficulty` defaults to None, i.e. a run that never reported one, which is every test but the sidecar's.
     """
     return cd.StageSample(timesteps, rate, window, best_time, best_at, target_seconds, s_rank_seconds,
-                          best_time if median_time is None else median_time)
+                          best_time if median_time is None else median_time, difficulty)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +255,43 @@ def test_promote_writes_the_specialist_and_its_sidecar():
         assert sidecar["stage_steps"] == 1_500_000 and sidecar["difficulty"] == 3
         written = json.loads(destination.with_suffix(".json").read_text(encoding="utf-8"))
         assert written == sidecar
+
+
+def test_the_sidecar_records_the_difficulty_the_stage_RAN_on_not_the_plans():
+    """A sidecar is a claim about weights, so it must name what the game was actually running.
+
+    The plan is read once at driver start; a generated config is only rewritten at a stage or round boundary.
+    In the activation window -- plan edited to 4, driver restarted, the round not yet re-started -- the
+    trainer is still on the difficulty-3 config it resumed with. Stamping the plan value there marks
+    Violent-trained weights as the level's Brutal specialist.
+    """
+    plan_env = {"difficulty": 4}  # the plan already says Brutal
+    still_violent = sample(11_500_000, 0.62, 44, best_time=131.25, difficulty=3)
+    assert cd.stage_difficulty(still_violent, plan_env) == 3, "the round is still on Violent, and says so"
+
+    on_brutal = sample(12_000_000, 0.44, 41, best_time=210.0, difficulty=4)
+    assert cd.stage_difficulty(on_brutal, plan_env) == 4
+
+    # Only a run that never reported one falls back to the plan -- an older mod, or an old status.json.
+    assert cd.stage_difficulty(sample(12_000_000, 0.44, 41, best_time=210.0), plan_env) == 4
+    assert cd.stage_difficulty(sample(), {}) == 3, "and the fallback's own default is the historical 3"
+
+
+def test_read_sample_carries_the_difficulty_the_mod_reported():
+    """`campaign.difficulty` is what the game's own readers got; -1 is its "could not read it" sentinel."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        def sample_with(campaign: dict) -> cd.StageSample:
+            (root / "status.json").write_text(json.dumps({"timesteps": 1, "campaign": campaign}),
+                                              encoding="utf-8")
+            return cd.read_sample(root / "status.json", root / "nope.json")
+
+        assert sample_with({"difficulty": 4}).difficulty == 4
+        assert sample_with({"difficulty": 3}).difficulty == 3
+        assert sample_with({}).difficulty is None, "a run that never reported one"
+        assert sample_with({"difficulty": -1}).difficulty is None, "the sentinel is not a difficulty"
+        assert sample_with({"difficulty": 9}).difficulty is None, "nor is a value the game cannot run"
 
 
 # ---------------------------------------------------------------------------

@@ -2197,10 +2197,16 @@ def choose_fresh_start(
 
 
 def save_best_run(path, run: dict, lock_timeout: float = 2.0, lock_poll: float = 0.02) -> bool:
-    """Stores `run` as the level's best run if it is faster than the stored one. Returns whether it wrote.
+    """Stores `run` as the level's best run if it beats the stored one. Returns whether it wrote.
+
+    "Beats" is `times.beats_record`: the HARDEST difficulty first, then the fastest time. Without the
+    difficulty clause this file would silently block the 2026-09-20 switch to Brutal -- `spec_0-1_speed`
+    holds a 81.5 s Violent run, every early Brutal completion will be slower than that, and so the run's own
+    best-run file (which is all `post_times.py` ever reads) would keep describing a difficulty the policy no
+    longer trains on, for as long as the stage ran.
 
     Guaranteed: a missing or unreadable file, or one without a time, counts as no stored run; only a run
-    strictly faster than the stored one is written; the file is replaced atomically (retrying briefly while
+    strictly better than the stored one is written; the file is replaced atomically (retrying briefly while
     another training game has it open), so a crash mid-write never leaves a broken best run behind; and the
     read-compare-write is serialised across processes by an exclusive lock file, so two of the five training
     games finishing at nearly the same time cannot both read the same stale "stored" value and have the slower
@@ -2208,6 +2214,10 @@ def save_best_run(path, run: dict, lock_timeout: float = 2.0, lock_poll: float =
     lock is still held after `lock_timeout` seconds (a stale lock left by a killed process), this gives up and
     returns False rather than blocking the run forever.
     """
+    # Imported here, not at the top: `ultrakill_ai.times` imports CAMPAIGN_LEVELS from this module, so a
+    # module-level import would be a cycle. The predicate is pure, and this runs once per completion.
+    from ultrakill_ai.times import beats_record
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)  # the lock file needs the directory to exist too
     lock_path = path.with_name(f"{path.name}.lock")
@@ -2215,12 +2225,13 @@ def save_best_run(path, run: dict, lock_timeout: float = 2.0, lock_poll: float =
         return False
     try:
         try:
-            stored = float(json.loads(path.read_text(encoding="utf-8"))["seconds"])
+            held = json.loads(path.read_text(encoding="utf-8"))
+            stored, stored_difficulty = held["seconds"], held.get("difficulty")
         except (OSError, ValueError, KeyError, TypeError):
-            stored = math.inf
-        # `not (a < b)` (rather than `a >= b`) also refuses a NaN `run["seconds"]`, since every comparison with
-        # NaN is False either way -- do not "simplify" this into `>=`, which would let a NaN time through.
-        if not float(run["seconds"]) < stored:
+            stored, stored_difficulty = None, None
+        # `beats_record` refuses a NaN or missing `run["seconds"]` of its own accord (`valid_official_seconds`
+        # tests `math.isfinite`), which is what the old `not (a < b)` spelling was protecting against here.
+        if not beats_record(run.get("difficulty"), run.get("seconds"), stored_difficulty, stored):
             return False
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(run, separators=(",", ":")), encoding="utf-8")

@@ -315,8 +315,8 @@ def test_campaign_progress():
 
         c = s["campaign"]
         assert set(c) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time",
-                          "target_seconds", "s_rank_seconds"}, \
-            "a single-level run's campaign block, plus the target and the S threshold behind it"
+                          "target_seconds", "s_rank_seconds", "difficulty", "best_difficulty"}, \
+            "a single-level run's campaign block, plus the target, the S threshold and the difficulty"
         # The target is what the env computed live (0.75 x the level's own S-rank time), carried straight
         # through: it is how campaign_driver learns the number at all -- the driver only ever reads files.
         assert c["target_seconds"] == 90.0 and c["s_rank_seconds"] == 120.0
@@ -389,11 +389,11 @@ def test_campaign_progress():
 CURRICULUM_LEVELS = ["Level 0-1", "Level 0-3", "Level 0-4"]
 
 
-def episode_info(level, *, fresh=1, completed=0, seconds=None, checkpoints=2, gates=3, hops=1):
+def episode_info(level, *, fresh=1, completed=0, seconds=None, checkpoints=2, gates=3, hops=1, difficulty=3):
     """One finished campaign episode as the env reports it."""
     return {
         "episode": {"r": 1.0, "l": 100.0}, "level": level, "kills": 0, "deaths": 0, "wave": 0, "style": 0,
-        "completed": completed, "fresh_start": fresh, "level_seconds": seconds,
+        "completed": completed, "fresh_start": fresh, "level_seconds": seconds, "difficulty": difficulty,
         "checkpoints_level": checkpoints, "cells_new": 10, "oob_frac": 0.0, "exit_dist_min": 5.0,
         "exit_ground_dist_min": 3.0,
         "gates_reached": gates, "gate_hops_best": hops, "wedged_steps": 0, "level_started": 1,
@@ -418,6 +418,127 @@ def read_json(path: Path) -> dict:
 # ---------------------------------------------------------------------------------------------
 # Official times the game never reported (2026-09-19)
 # ---------------------------------------------------------------------------------------------
+
+
+def test_a_harder_difficulty_takes_the_best_time_even_when_it_is_slower():
+    """`best_time` is not comparable across difficulties, and it survives every trainer bounce.
+
+    Without this the 2026-09-20 Brutal switch would have left `spec_0-1_speed` reporting its 81.5 s VIOLENT
+    run as the run's best for the whole Brutal round, into status.json, the dashboards and the promoted
+    specialist's sidecar.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-1_speed"
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-1_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=81.5, difficulty=3))
+        assert (cb.best_time, cb.best_difficulty) == (81.5, 3)
+        # Slower, but on Brutal: it becomes the best, and the Violent time never comes back.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=150.0, difficulty=4))
+        assert (cb.best_time, cb.best_difficulty) == (150.0, 4)
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=40.0, difficulty=3))
+        assert (cb.best_time, cb.best_difficulty) == (150.0, 4), "an easier difficulty never takes it back"
+        # ... and within Brutal the faster time still wins.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=140.0, difficulty=4))
+        assert (cb.best_time, cb.best_difficulty) == (140.0, 4)
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert (c["best_time"], c["best_difficulty"], c["difficulty"]) == (140.0, 4, 4)
+
+
+def test_the_best_time_keeps_its_difficulty_across_a_trainer_restart():
+    """`_restore` has to carry `best_difficulty` with `best_time`, or the record is beatable by anything."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-1_speed"
+        run.mkdir(parents=True)
+        (run / "status.json").write_text(json.dumps({
+            "run_name": "spec_0-1_speed", "episodes": 10, "history": [],
+            "campaign": {"best_time": 150.0, "best_difficulty": 4, "difficulty": 4,
+                         "target_seconds": 120.0, "s_rank_seconds": 150.0},
+        }), encoding="utf-8")
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-1_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        assert (cb.best_time, cb.best_difficulty, cb.difficulty) == (150.0, 4, 4)
+        # A Violent run after the restart must not take a Brutal record.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=40.0, difficulty=3))
+        assert (cb.best_time, cb.best_difficulty) == (150.0, 4)
+
+
+def test_changing_the_difficulty_empties_the_rolling_windows():
+    """`median_time_50` is a speed rung's promotion gate; a window that straddles a change describes neither.
+
+    The switch is performed BY a trainer restart, which empties the windows anyway (`_restore_levels` never
+    carries them). This is what makes the guarantee hold whatever order things happen in: a rung can never be
+    declared met by a median that still contains completions from the easier difficulty.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-1_speed"
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-1_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        for _ in range(10):
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=60.0, difficulty=3))
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert (c["median_time_50"], c["fresh_window"], c["difficulty"]) == (60.0, 10, 3)
+
+        # One Brutal episode and the window is gone -- it does not average 60 s Violent runs with Brutal ones.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=200.0, difficulty=4))
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert c["fresh_window"] == 1, "only the Brutal episode is left in the window"
+        assert c["median_time_50"] == 200.0, "the median is the Brutal run's, not a mixture"
+        assert c["difficulty"] == 4
+
+        # Staying on Brutal does not keep clearing it.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=180.0, difficulty=4))
+        cb._write(time.time())
+        assert read_json(run / "status.json")["campaign"]["fresh_window"] == 2
+
+
+def test_the_mods_unknown_difficulty_sentinel_does_not_wipe_the_window():
+    """-1 means "I could not read it", not "the difficulty changed". It must leave the rung's window alone.
+
+    `CampaignObserver` sends -1 when `PrefsManager` is not there to read, and that int reaches
+    `info["difficulty"]` unaltered -- it is not None, so the "no difficulty reported" early-out never fired
+    for it. With twelve envs on one callback, one such episode would empty the 50-episode window the focus
+    rung is judged on, and the next real episode would empty it again on the way back.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-1_speed"
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-1_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        for _ in range(10):
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=200.0, difficulty=4))
+        assert cb.difficulty == 4 and len(cb.fresh_recent) == 10
+
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=190.0, difficulty=-1))
+        assert cb.difficulty == 4, "the sentinel does not become the run's difficulty"
+        assert len(cb.fresh_recent) == 11, "and the window keeps every episode, including that one"
+
+        # Coming back with a real 4 is not a change either, so nothing is cleared on the way back.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=180.0, difficulty=4))
+        assert len(cb.fresh_recent) == 12
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert (c["fresh_window"], c["difficulty"]) == (12, 4)
+
+        # A REAL change still empties it: the guarantee the sentinel must not weaken.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=60.0, difficulty=3))
+        assert len(cb.fresh_recent) == 1 and cb.difficulty == 3
+
+
+def test_an_episode_that_reports_no_difficulty_changes_nothing():
+    """An older mod that never sends `campaign.difficulty` must behave exactly as it always did."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-1_speed"
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-1_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        for _ in range(5):
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=60.0, difficulty=None))
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert (c["fresh_window"], c["best_time"], c["difficulty"]) == (5, 60.0, None)
+        assert c["best_difficulty"] is None
 
 
 def test_an_official_time_the_game_never_reported_is_not_a_record():
@@ -476,6 +597,9 @@ def test_curriculum_file_is_written_before_any_episode_and_lists_every_level():
         assert [data["levels"][lv]["unlocked"] for lv in CURRICULUM_LEVELS[1:]] == [False, False]
         assert data["levels"]["Level 0-3"] == {
             "unlocked": False, "fresh_window": 0, "fresh_completion_rate": None, "best_time": None,
+            # Which difficulty `best_time` was set on: a per-level `best_time` is no more comparable across
+            # difficulties than the run-wide one (2026-09-20).
+            "best_difficulty": None,
             "episodes": 0, "fresh_episodes": 0,
             # The learning-progress fields, all empty before the level has run: additive, so a reader from
             # before they existed (an older env.py on a resumed run) ignores them and samples as it always did.
@@ -795,9 +919,10 @@ def test_a_run_with_no_levels_writes_no_curriculum_file():
         assert not (run / "curriculum.json").exists()
         s = read_json(run / "status.json")["campaign"]
         assert set(s) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time",
-                          "target_seconds", "s_rank_seconds"}
+                          "target_seconds", "s_rank_seconds", "difficulty", "best_difficulty"}
         assert s["target_seconds"] is None and s["s_rank_seconds"] is None, \
             "None until a speed stage's env reports them"
+        assert (s["difficulty"], s["best_difficulty"]) == (3, 3), "the difficulty the episodes reported"
 
 
 def test_episodes_jsonl_carries_the_level_it_ran_on():
@@ -951,7 +1076,16 @@ def test_dashboard_campaign_panel():
         assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_poll_status_keeps_old_header():
+def test_poll_status_rotates_a_log_whose_header_is_missing_columns():
+    """A header that cannot hold a column poll_status writes is MOVED ASIDE, not appended to (2026-09-20).
+
+    It used to keep the old header and drop the values it had no place for, silently -- rows go through
+    `csv.DictWriter(..., extrasaction="ignore")`. That was fine while the dropped columns were diagnostics
+    nothing read back, and it stopped being fine the moment `keep_best.py --metric time` started RANKING on
+    one: against a pre-switch header every `difficulty` value vanished, every sample read as an unrecorded
+    difficulty, and `best.zip` would have stayed on Violent-trained weights through the whole Brutal round.
+    The old log is renamed, never deleted: it is the run's only record of the difficulty being left behind.
+    """
     status = {
         "state": "running", "timesteps": 123456, "episodes": 300, "window": 100, "steps_per_s": 190.0,
         "mean_100": {"reward": 12.5, "kills": 3.0, "deaths": 1.2, "completed": 0.4, "fresh_start": 0.2,
@@ -959,7 +1093,8 @@ def test_poll_status_keeps_old_header():
                      "gates_reached": 1.8, "wedged_steps": 612.0, "look_gate_frac": 0.3,
                      "targets_parked": 0.34, "exit_banished": 0.02, "route_source": 2.0},
         "mean_fresh_100": {"gates_reached": 0.9, "checkpoints_level": 0.4, "completed": 0.0},
-        "campaign": {"fresh_window": 50, "fresh_completion_rate": 0.4, "median_time_50": 95.0, "best_time": 83.25},
+        "campaign": {"fresh_window": 50, "fresh_completion_rate": 0.4, "median_time_50": 95.0,
+                     "best_time": 83.25, "difficulty": 4},
         "best_checkpoints_level": 3,
         "best_gates_reached": 4,
         "best_gate_hops": 2,
@@ -986,13 +1121,22 @@ def test_poll_status_keeps_old_header():
             )
             assert result.returncode == 0, result.stdout + result.stderr
 
+        # The old log was rotated aside and kept, with exactly the row it already had.
+        rotated = [p for p in (runs / "old_run").iterdir() if p.name.startswith("metrics_log.")
+                   and p.name != "metrics_log.csv"]
+        assert len(rotated) == 1, rotated
+        with rotated[0].open(newline="", encoding="utf-8") as f:
+            kept = list(csv.reader(f))
+        assert kept[0] == old_header and len(kept) == 2, kept
+
+        # ... and the log that replaced it has the full header, campaign columns included.
         with (runs / "old_run" / "metrics_log.csv").open(newline="", encoding="utf-8") as f:
             rows = list(csv.reader(f))
-        assert rows[0] == old_header, rows[0]
-        assert len(rows) == 3, rows
-        assert len(rows[2]) == len(old_header), (len(rows[2]), len(old_header))
-        appended = dict(zip(old_header, rows[2]))
+        assert len(rows) == 2, rows
+        appended = dict(zip(rows[0], rows[1]))
         assert appended["timesteps"] == "123456" and appended["reward"] == "12.5" and appended["part_total"] == "54.5", appended
+        assert appended["median_time_50"] == "95.0" and appended["difficulty"] == "4", \
+            "the column keep_best ranks on is the point of the rotation"
 
         # A new log gets every column, campaign ones included.
         with (runs / "new_run" / "metrics_log.csv").open(newline="", encoding="utf-8") as f:
@@ -1009,13 +1153,24 @@ def test_poll_status_keeps_old_header():
         assert logged["best_gates_reached"] == "4" and logged["best_gate_hops"] == "2", logged
         assert logged["part_gate"] == "30.0" and logged["part_gate_approach"] == "8.5", logged
         assert logged["ppo_entropy_yaw"] == "2.3", logged
-        # The ladder-patience and exit-guard mechanisms. Both are absent from `old_header`, which is exactly
-        # why an existing metrics_log.csv has to be moved aside to see them.
+        # The ladder-patience, exit-guard and route columns are all absent from `old_header`. Each one used to
+        # be dropped from an existing log forever; the rotation is what makes them appear without an operator.
         assert logged["targets_parked"] == "0.34" and logged["exit_banished"] == "0.02", logged
-        assert "targets_parked" not in appended and "exit_banished" not in appended
-        # And the route layer, for the same reason: it is a new column on an existing log.
         assert logged["route_source"] == "2.0", logged
-        assert "route_source" not in appended
+        for column in ("targets_parked", "exit_banished", "route_source", "difficulty"):
+            assert column not in kept[0], column          # never in the log that was rotated aside
+            assert appended[column] == logged[column], column  # and present in the one that replaced it
+
+        # A log that already has every column is left where it is: nothing is dropped, so nothing moves.
+        before = (runs / "new_run" / "metrics_log.csv").read_text(encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "poll_status.py"), "--run", "new_run",
+             "--runs-dir", str(runs), "--once"],
+            capture_output=True, text=True, timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert [p.name for p in (runs / "new_run").iterdir() if p.name.startswith("metrics_log")] \
+            == ["metrics_log.csv"], "no rotation when the header already fits"
+        assert (runs / "new_run" / "metrics_log.csv").read_text(encoding="utf-8").startswith(before)
 
 
 def test_the_entropy_floors_live_coefficient_reaches_status_and_the_csv():

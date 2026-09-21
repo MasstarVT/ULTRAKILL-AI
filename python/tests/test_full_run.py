@@ -32,6 +32,10 @@ from ultrakill_ai.times import parse_time, short_level  # noqa: E402
 
 TIMES_MD = ROOT.parent / "times.md"
 PLAN = types.SimpleNamespace(env={"mode": "campaign", "level": LEVEL, "fixed_fps": 30, "frameskip": 2,
+                                 # Brutal, as configs/specialists.yaml has been since 2026-09-20. The fake
+                                 # level echoes back whatever difficulty the env asked for, exactly as the
+                                 # mod does, so the chain's result carries it end to end.
+                                 "difficulty": 4,
                                  "rewards": {"level_complete": 100.0, "time": 0.02}})
 
 
@@ -84,7 +88,10 @@ def test_posting_writes_one_row_per_completed_level_through_the_times_helpers():
     with tempfile.TemporaryDirectory() as tmp:
         times = Path(tmp) / "times.md"
         shutil.copy2(TIMES_MD, times)
-        results = [LevelResult(level="Level 0-1", completed=True, seconds=1.25, rank="P", kills=40, deaths=0),
+        # difficulty=3 because the committed times.md rows are Violent: a run has to be on at least the row's
+        # own difficulty to replace it, whatever its time (`times.beats_record`).
+        results = [LevelResult(level="Level 0-1", completed=True, seconds=1.25, rank="P", kills=40, deaths=0,
+                               difficulty=3),
                    LevelResult(level="Level 0-3", completed=False, end_reason="stuck"),
                    LevelResult(level="Level 0-4", skipped="no specialist")]
         posted = full_run.post_results(times, results, gen="specialists@2026-09-18")
@@ -97,6 +104,27 @@ def test_posting_writes_one_row_per_completed_level_through_the_times_helpers():
                    if line.startswith("| %s " % short_level("Level 0-1")))
         assert parse_time(row.split("|")[2].strip()) == 1.25
         assert full_run.post_results(times, [], gen="specialists@2026-09-18") == []
+
+
+def test_a_chained_run_that_never_learned_its_difficulty_does_not_take_a_labelled_row():
+    """`LevelResult.difficulty` defaults to UNKNOWN, not to 3: a row must never say Violent by default.
+
+    An UNKNOWN run ranks below every named difficulty, so it cannot overwrite a row that does know what it
+    was set on -- however fast it is. It is still recorded in the generation history.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        times = Path(tmp) / "times.md"
+        shutil.copy2(TIMES_MD, times)
+        before = next(line for line in times.read_text(encoding="utf-8").splitlines()
+                      if line.startswith("| %s " % short_level("Level 0-1")))
+        assert LevelResult(level="Level 0-1").difficulty == -1
+        full_run.post_results(times, [LevelResult(level="Level 0-1", completed=True, seconds=1.25, rank="P")],
+                              gen="specialists@2026-09-20")
+        text = times.read_text(encoding="utf-8")
+        after = next(line for line in text.splitlines()
+                     if line.startswith("| %s " % short_level("Level 0-1")))
+        assert after == before, "an unlabelled run may not replace a Violent leaderboard row"
+        assert "specialists@2026-09-20" in text, "but the history still records that it happened"
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +155,28 @@ def test_the_eval_config_prefers_the_specialists_own_training_settings():
         cfg = full_run.eval_config(LEVEL, model_dir / "best.zip", PLAN, cwd, port=47801)
         assert cfg.max_steps == 12345 and cfg.pitch_limit_deg == 45.0
         assert cfg.levels == [] and cfg.explore_dir == "", "and then forced into eval shape anyway"
+
+
+def test_a_chain_plays_each_specialist_on_the_difficulty_it_is_currently_trained_on():
+    """The difficulty comes from the stage's own env_config.yaml, which train.py rewrites every round.
+
+    That is what makes a chained run after the 2026-09-20 switch honest without any extra step: the level
+    whose Brutal round has written that file plays Brutal, and one whose stage has not been re-run yet still
+    plays the Violent settings its policy was actually trained under. `--difficulty` overrides both.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        model_dir = cwd / "models" / "spec_0-1"
+        model_dir.mkdir(parents=True)
+        trained = EnvConfig(mode="campaign", level=LEVEL, difficulty=4)
+        (model_dir / "env_config.yaml").write_text(yaml.safe_dump(trained.to_dict()), encoding="utf-8")
+        cfg = full_run.eval_config(LEVEL, model_dir / "best.zip", PLAN, cwd, port=47801)
+        assert cfg.difficulty == 4, "the difficulty the policy is currently trained on"
+        # The explicit override wins over all of it, in both directions.
+        forced = full_run.eval_config(LEVEL, model_dir / "best.zip", PLAN, cwd, port=47801, difficulty=3)
+        assert forced.difficulty == 3
+        assert full_run.build_parser().parse_args([]).difficulty is None, "default: the config's"
+        assert full_run.build_parser().parse_args(["--difficulty", "4"]).difficulty == 4
 
         # With no env_config.yaml the generated stage config is next, and the plan template last.
         (model_dir / "env_config.yaml").unlink()
@@ -207,7 +257,7 @@ def test_play_level_reports_the_official_time_of_a_completed_level():
         assert result.seconds is not None and result.seconds > 0
         assert result.end_reason == "level_complete" and result.steps > 0
         assert isinstance(result.rank, str)
-        assert result.difficulty == 3, "the difficulty the game actually read, from the campaign block"
+        assert result.difficulty == 4, "the difficulty the game actually read, from the campaign block"
 
 
 def test_play_level_reports_a_level_that_did_not_finish_without_inventing_a_time():
@@ -264,11 +314,13 @@ def test_the_posted_row_says_which_action_mode_played_the_chain():
     with tempfile.TemporaryDirectory() as tmp:
         times = Path(tmp) / "times.md"
         shutil.copy2(TIMES_MD, times)
-        results = [LevelResult(level="Level 0-1", completed=True, seconds=1.25, rank="P", kills=40, deaths=0)]
+        results = [LevelResult(level="Level 0-1", completed=True, seconds=1.25, rank="P", kills=40, deaths=0,
+                               difficulty=3)]
         assert full_run.post_results(times, results, gen="specialists@2026-09-20") == \
             ["Level 0-1 00:01.250 rank P"]
         assert "one specialist per level (sampled actions)" in times.read_text(encoding="utf-8")
-        full_run.post_results(times, [LevelResult(level="Level 0-1", completed=True, seconds=1.2, rank="P")],
+        full_run.post_results(times, [LevelResult(level="Level 0-1", completed=True, seconds=1.2, rank="P",
+                                                  difficulty=3)],
                               gen="specialists@2026-09-20", deterministic=True)
         assert "one specialist per level (deterministic (argmax) actions)" in times.read_text(encoding="utf-8")
 

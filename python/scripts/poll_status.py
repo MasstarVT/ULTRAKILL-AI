@@ -9,9 +9,15 @@ for a trend on the night of 2026-09-15.
 Read-only: it polls a file and never touches the bridge ports, so it is safe to leave running
 alongside training.
 
-An existing `metrics_log.csv` keeps its header. Rows are written under the columns it already has, and
-values for columns it lacks are dropped, so adding a column here never shifts an old log out of
-alignment. Move the old file aside to start logging the new columns.
+An existing `metrics_log.csv` keeps its header, so adding a column here never shifts an old log out of
+alignment. When the file's header is MISSING a column this file now writes, the old file is ROTATED ASIDE
+(`metrics_log.<timestamp>.csv`, kept, never deleted) and a new one is started with the full header
+(2026-09-20 review). It used to be the operator's job to move it, and the one time it mattered that coupling
+was invisible: rows are written with `extrasaction="ignore"`, so a value for a column the header lacks is
+dropped SILENTLY. At the Brutal switch that meant every row reached `keep_best.py --metric time` tagged with
+no difficulty, its difficulty clause could not fire, and `best.zip` would have stayed on Violent-trained
+weights for the whole Brutal round -- which `campaign_driver.promote` would then have published as the
+level's Brutal specialist. A column this file writes is now always a column the log has.
 
     python scripts/poll_status.py --run cybergrind_ppo_v2            # every 30 s until stopped
     python scripts/poll_status.py --run cybergrind_ppo_v2 --once
@@ -69,7 +75,11 @@ FIELDS = [
 # gates_reached and checkpoints_level from its level load, so only these two say how a whole run goes.
 FRESH_FIELDS = ["gates_reached", "checkpoints_level", "completed"]
 # Campaign runs only (status["campaign"]): completion rate and median time over the last 50 fresh starts.
-CAMPAIGN_FIELDS = ["fresh_window", "fresh_completion_rate", "median_time_50", "best_time"]
+CAMPAIGN_FIELDS = ["fresh_window", "fresh_completion_rate", "median_time_50", "best_time",
+                   # The difficulty behind the two clocks above. `keep_best.py --metric time` ranks samples on
+                   # `median_time_50`, and a Violent median may not be compared with a Brutal one, so the
+                   # column has to reach metrics_log.csv for it to be able to tell them apart (2026-09-20).
+                   "difficulty"]
 BEST_FIELDS = ["best_checkpoints_level", "best_gates_reached", "best_gate_hops"]
 PPO_FIELDS = ["entropy_loss", "approx_kl", "clip_fraction", "explained_variance", "value_loss", "learning_rate",
               "entropy_yaw", "entropy_pitch", "entropy_look_mode",
@@ -125,6 +135,44 @@ def existing_header(path: Path) -> list[str] | None:
         return None
 
 
+def missing_columns(header: list[str], wanted: list[str]) -> list[str]:
+    """The columns this file writes that `header` has no place for -- the values that would be dropped."""
+    have = set(header)
+    return [c for c in wanted if c not in have]
+
+
+def rotate_aside(path: Path) -> Path:
+    """Renames `path` out of the way and returns where it went. The old log is KEPT: it is the only record of
+    the run so far, and at a difficulty switch it is the last reading of the difficulty being left behind."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(f"{path.stem}.{stamp}{path.suffix}")
+    n = 2
+    while target.exists():
+        target = path.with_name(f"{path.stem}.{stamp}-{n}{path.suffix}")
+        n += 1
+    path.rename(target)
+    return target
+
+
+def open_log(out_path: Path, wanted: list[str]) -> tuple[list[str], bool]:
+    """(header to write under, whether the file still needs its header row).
+
+    Rotates a log whose header is missing a column we now write -- see the module docstring. A header that
+    merely has EXTRA columns is left alone: nothing is dropped, so there is nothing to fix, and rotating would
+    throw away history for no gain.
+    """
+    header = existing_header(out_path)
+    if header is None:
+        return list(wanted), True
+    missing = missing_columns(header, wanted)
+    if not missing:
+        return header, False
+    moved = rotate_aside(out_path)
+    print(f"[poll_status] {out_path.name} had no column for {', '.join(missing)}: "
+          f"moved it to {moved.name} and started a new log with the full header", flush=True)
+    return list(wanted), True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", default="cybergrind_ppo_v2")
@@ -137,10 +185,7 @@ def main() -> None:
     out_path = Path(a.runs_dir) / a.run / "metrics_log.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    header = existing_header(out_path)
-    new = header is None
-    if new:
-        header = list(row({}).keys())
+    header, new = open_log(out_path, list(row({}).keys()))
     last_steps = None
     while True:
         try:

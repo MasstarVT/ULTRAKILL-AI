@@ -211,7 +211,13 @@ hold_order: sequential
 env:
   mode: campaign
   level: "Level 0-1"   # the driver overwrites this per stage; `levels` is deliberately absent
-  difficulty: 3
+  # BRUTAL (4), the hardest difficulty this build can run. The user, 2026-09-20: "make sure its on the hardest
+  # dif cuz in the times it dosnt show that". This is the one setting that may differ from
+  # `campaign_gates_full.yaml` (which stays at 3, the difficulty its rows were set on); the pin in
+  # tests/test_specialists_config.py asserts that it differs and that it is exactly 4. The game's own
+  # PrefsManager validator refuses a stored difficulty above 4, and the mod clamps its override to the same
+  # range, so there is nothing above this to move to: see docs/project-log.md, 2026-09-20.
+  difficulty: 4
   unlock_all_gear: true
   fixed_fps: 30
   frameskip: 2

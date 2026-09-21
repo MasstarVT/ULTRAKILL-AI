@@ -1,9 +1,11 @@
 """Post a training run's best official level times to times.md. Read-only on the run: safe while training.
 
 `eval.py --record-times` needs a game and a free bridge port; this reads what training has already saved.
-`runs/<run>/best_runs/<level>.json` holds the fastest FRESH-START completion per level (official time, rank,
+`runs/<run>/best_runs/<level>.json` holds the best FRESH-START completion per level (official time, rank,
 kills, deaths, difficulty), and `runs/<run>/episodes.jsonl` gives the step count it happened at. A level is
-posted only when its time beats the row times.md already holds, so running this repeatedly adds nothing.
+posted only when its run beats the row times.md already holds under `times.beats_record` -- hardest
+difficulty first, then fastest -- so running this repeatedly adds nothing. A best-run file that never
+recorded its difficulty posts with an empty difficulty cell rather than a guessed one.
 
     python scripts/post_times.py --run campaign_gates
     python scripts/post_times.py --run campaign_gates --watch 600 --push   (keeps times.md current by itself)
@@ -29,14 +31,14 @@ from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
 cap_blas_threads()  # before ultrakill_ai.times, which reaches numpy through ultrakill_ai.campaign
 
 from ultrakill_ai.times import (  # noqa: E402
-    LEADERBOARD_HEADING, TimeEntry, _data_rows, _ms, _table, format_time, parse_time, record_file, short_level,
-    valid_official_seconds)
+    LEADERBOARD_HEADING, UNKNOWN_DIFFICULTY, TimeEntry, _data_rows, _table, beats_record, difficulty_name,
+    format_time, parse_difficulty, parse_time, record_file, short_level, valid_official_seconds)
 
 TIMES_MD = ROOT.parent / "times.md"
 
 
-def held_time(markdown: str, level: str) -> float | None:
-    """The leaderboard's current time for `level` (scene name), or None when the level has no USABLE row.
+def held_record(markdown: str, level: str) -> tuple[int, float | None]:
+    """The leaderboard's current (difficulty, time) for `level` (scene name); the time is None with no USABLE row.
 
     A row whose own time is not a time the game could have reported (`valid_official_seconds`) reads as no
     row at all. Without that, the 00:00.000 row this file posted on 2026-09-19 would be unbeatable forever:
@@ -46,8 +48,14 @@ def held_time(markdown: str, level: str) -> float | None:
     start, end = _table(lines, LEADERBOARD_HEADING)
     for cells in _data_rows(lines[start:end]):
         if cells[0] == short_level(level):
-            return valid_official_seconds(parse_time(cells[1]))
-    return None
+            difficulty = parse_difficulty(cells[4]) if len(cells) > 4 else UNKNOWN_DIFFICULTY
+            return difficulty, valid_official_seconds(parse_time(cells[1]))
+    return UNKNOWN_DIFFICULTY, None
+
+
+def held_time(markdown: str, level: str) -> float | None:
+    """Just the time of `held_record`, kept because the leaderboard's clock is asked for on its own."""
+    return held_record(markdown, level)[1]
 
 
 def steps_of(episodes: Path, level: str, seconds: float) -> int | None:
@@ -81,18 +89,23 @@ def post(run_dir: Path, times_md: Path, run: str) -> list[str]:
         level, seconds = best["level"], valid_official_seconds(best.get("seconds"))
         if seconds is None:
             continue  # a best run the game gave no official time: never postable, whatever times.md holds
-        held = held_time(times_md.read_text(encoding="utf-8"), level)
-        if held is not None and _ms(seconds) >= _ms(held):
+        difficulty = parse_difficulty(best.get("difficulty"))
+        # THE SAME PREDICATE `times.record` will apply, so this never skips a run that the leaderboard would
+        # have taken (nor posts one it would silently drop into the history alone). Hardest difficulty first:
+        # after the 2026-09-20 switch to Brutal the first Brutal best is a record even though the Violent rows
+        # above it are faster.
+        if not beats_record(difficulty, seconds, *held_record(times_md.read_text(encoding="utf-8"), level)):
             continue
         entry = TimeEntry(
             level=level, seconds=seconds, rank=best.get("rank") or "",
             generation=generation(run, steps_of(run_dir / "episodes.jsonl", level, seconds)),
-            difficulty=int(best.get("difficulty", 3)),
+            difficulty=difficulty,
             date=(best.get("saved_at") or time.strftime("%Y-%m-%d"))[:10],
             kills=int(best.get("kills", 0)), deaths=int(best.get("deaths", 0)),
             notes="training episode (sampled actions), fresh start")
         record_file(times_md, entry)
-        posted.append(f"{short_level(level)}: {format_time(seconds)} rank {entry.rank or '-'} ({entry.generation})")
+        posted.append(f"{short_level(level)}: {format_time(seconds)} rank {entry.rank or '-'} "
+                      f"on {difficulty_name(difficulty)} ({entry.generation})")
     return posted
 
 

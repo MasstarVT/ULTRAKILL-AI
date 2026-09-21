@@ -23,6 +23,12 @@ A run's `best.json` records which tie-break chose it (`penalty_name`), and this 
 file written by another metric: the three scores are not comparable, and overwriting one would throw away a
 run's best weights.
 
+DIFFICULTY OUTRANKS THE SCORE in all three modes (2026-09-20, the switch to Brutal). A sample measured on a
+harder difficulty beats one from an easier difficulty outright, and a smoothing window that straddles a
+change is dropped. Without that, a run that moved to Brutal would keep the easier difficulty's `best.zip`
+forever -- every early Brutal median is slower than the Violent record it is being compared against -- and
+`campaign_driver.promote` would publish those weights as the level's Brutal specialist.
+
     python scripts/keep_best.py --run cybergrind_ppo_v2            # watch until stopped
     python scripts/keep_best.py --run cybergrind_ppo_v2 --once     # report and exit
     python scripts/keep_best.py --run campaign_ppo --metric campaign
@@ -49,7 +55,7 @@ from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
 
 cap_blas_threads()  # before ultrakill_ai.times, which reaches numpy through ultrakill_ai.campaign
 
-from ultrakill_ai.times import valid_official_seconds  # noqa: E402
+from ultrakill_ai.times import UNKNOWN_DIFFICULTY, difficulty_rank, valid_official_seconds  # noqa: E402
 
 SMOOTH = 9          # samples per smoothing window (~4.5 min at a 30 s poll)
 MIN_WINDOW = 100    # kills_per_min: require a full episode window behind every mean
@@ -125,11 +131,17 @@ def _penalty(row: dict, m: Metric) -> float | None:
 
 
 def scored(csv_path: Path, metric: str = "kills_per_min", *,
-           min_rate: float | None = None) -> list[tuple[float, float, float, float]]:
-    """(score, penalty, reward, timesteps), smoothed, newest last. Higher score and lower penalty are better.
+           min_rate: float | None = None) -> list[tuple[float, float, float, float, int]]:
+    """(score, penalty, reward, timesteps, difficulty), smoothed, newest last. Higher score and lower penalty
+    are better, and a HARDER difficulty beats both (`best_of`).
 
     `min_rate` overrides a gated metric's own `min_gate` (`--metric time` only); it is ignored by the others,
     which carry no gate.
+
+    A smoothing window that STRADDLES a difficulty change is dropped rather than averaged: its mean time is
+    half Violent and half Brutal and describes neither. `metrics_log.csv` rows written before the column
+    existed carry `UNKNOWN_DIFFICULTY`, and a run of them is internally consistent, so old files smooth
+    exactly as they always did.
     """
     m = METRICS[metric]
     gate_at = m.min_gate if min_rate is None else float(min_rate)
@@ -149,42 +161,86 @@ def scored(csv_path: Path, metric: str = "kills_per_min", *,
         rew = [num(r, "reward") for r in w]
         if any(v is None for v in score):
             continue
+        difficulties = {difficulty_rank(r.get("difficulty")) for r in w}
+        if len(difficulties) > 1:
+            continue  # the window straddles a difficulty change: see the docstring
         out.append((
             m.score_sign * statistics.mean(score),
             m.penalty_sign * statistics.mean([p for p in pen if p is not None] or [m.missing]),
             statistics.mean([v for v in rew if v is not None] or [0.0]),
             num(rows[i], "timesteps") or 0.0,
+            difficulties.pop(),
         ))
     return out
 
 
-def rank_key(score: float, penalty: float) -> tuple[float, float]:
-    """Higher is better: the score, then the negated penalty, both at the 4 decimals best.json keeps.
+def difficulty_column_missing(csv_path: Path) -> bool:
+    """True when the log exists but has no `difficulty` column -- the state in which the clause below is INERT.
+
+    `poll_status.py` writes rows with `extrasaction="ignore"`, so against a header written before the column
+    existed the value is dropped without a word: every sample then reads as `UNKNOWN_DIFFICULTY`, no window
+    ever straddles a change, and `rank_key`'s difficulty term is constant. Ranking silently falls back to the
+    score alone, which at a difficulty switch is exactly the failure the clause exists to prevent -- every
+    early Brutal median loses to the Violent one it inherited. `poll_status` now rotates such a log aside by
+    itself; this is the tripwire for the case where it did not (an older poll_status still running, or a log
+    written by hand), because the symptom is otherwise invisible.
+    """
+    try:
+        with csv_path.open(encoding="utf-8", newline="") as f:
+            header = next(csv.reader(f), None)
+    except OSError:
+        return False  # no log yet: poll_status will write the current header when it makes one
+    return bool(header) and "difficulty" not in header
+
+
+def rank_key(score: float, penalty: float, difficulty=UNKNOWN_DIFFICULTY) -> tuple[int, float, float]:
+    """Higher is better: the DIFFICULTY, then the score, then the negated penalty, the last two at the 4
+    decimals best.json keeps.
 
     best_of and is_better share it, so the sample picked as best is always the one compared with the stored best,
     and a restart does not re-save the best it already holds (a raw score against its own rounded copy).
+
+    Difficulty leads for the reason `times.beats_record` gives: a score from an easier difficulty is not a
+    smaller version of a harder one, it is a different measurement. `--metric time` is where it bites. On
+    2026-09-20 `spec_0-1_speed` held a Violent median of 147 s; every early Brutal median is slower than that,
+    so on score alone `best.zip` would have frozen on Violent-trained weights for the whole round and
+    `campaign_driver.promote` would then have written them out as the level's BRUTAL specialist.
     """
-    return round(score, 4), -round(penalty, 4)
+    return difficulty_rank(difficulty), round(score, 4), -round(penalty, 4)
 
 
-def best_of(series: list[tuple[float, float, float, float]]) -> tuple[float, float, float, float]:
-    """The sample with the highest score, ties broken on the lowest penalty."""
-    return max(series, key=lambda s: rank_key(s[0], s[1]))
+def best_of(series: list[tuple[float, float, float, float, int]]) -> tuple[float, float, float, float, int]:
+    """The sample on the hardest difficulty, then the highest score, ties broken on the lowest penalty."""
+    return max(series, key=lambda s: rank_key(s[0], s[1], s[4] if len(s) > 4 else UNKNOWN_DIFFICULTY))
 
 
-def is_better(candidate: tuple[float, float], stored: tuple[float, float] | None) -> bool:
-    """True when (score, penalty) strictly beats the stored best: a higher score, or the same score and a lower penalty."""
+def is_better(candidate: tuple[float, float] | tuple[float, float, int],
+              stored: tuple[float, float] | tuple[float, float, int] | None) -> bool:
+    """True when the candidate strictly beats the stored best under `rank_key`.
+
+    Both sides may be a 2-tuple without a difficulty, which then reads as `UNKNOWN_DIFFICULTY` on that side.
+    Two unknowns compare exactly as they did before difficulty existed, which is what keeps a run whose
+    metrics_log.csv predates the column behaving unchanged.
+    """
     if stored is None:
         return True
     return rank_key(*candidate) > rank_key(*stored)
 
 
-def stored_best(best_json: Path) -> tuple[float, float] | None:
-    """(score, penalty) of the saved best, or None. best.json files written before --metric keep the penalty as `deaths`."""
+def stored_best(best_json: Path) -> tuple[float, float, int] | None:
+    """(score, penalty, difficulty) of the saved best, or None.
+
+    best.json files written before --metric keep the penalty as `deaths`, and ones written before the
+    difficulty clause have no difficulty at all: those read as `UNKNOWN_DIFFICULTY`, which ranks below every
+    real difficulty, so the first sample that DOES know what it played on takes the record. That is the
+    intended direction at the Brutal switch -- and it does mean a run upgraded mid-flight re-picks its best
+    from the difficulty-tagged samples only. See docs/commands.md.
+    """
     try:
         data = json.loads(best_json.read_text(encoding="utf-8"))
         penalty = data.get("penalty", data.get("deaths"))
-        return float(data["score"]), (math.inf if penalty is None else float(penalty))
+        return (float(data["score"]), (math.inf if penalty is None else float(penalty)),
+                difficulty_rank(data.get("difficulty")))
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
 
@@ -209,12 +265,12 @@ def nearest_checkpoint(model_dir: Path, timesteps: float) -> Path | None:
     return at_or_before[-1] if at_or_before else None
 
 
-def save_if_better(series: list[tuple[float, float, float, float]], model_dir: Path, metric: str,
-                   best: tuple[float, float] | None) -> tuple[float, float] | None:
+def save_if_better(series: list[tuple[float, float, float, float, int]], model_dir: Path, metric: str,
+                   best: tuple[float, float, int] | None) -> tuple[float, float, int] | None:
     """Copies the checkpoint behind the series' best sample to best.zip when it beats `best`. Returns the best now held."""
     m = METRICS[metric]
-    score, penalty, reward, ts = best_of(series)
-    if not is_better((score, penalty), best):
+    score, penalty, reward, ts, difficulty = best_of(series)
+    if not is_better((score, penalty, difficulty), best):
         return best
     src = nearest_checkpoint(model_dir, ts)
     if not (src and src.exists()):
@@ -228,6 +284,9 @@ def save_if_better(series: list[tuple[float, float, float, float]], model_dir: P
         "score": round(score, 4),
         "penalty": round(penalty, 4) if math.isfinite(penalty) else None,  # null: no completed run yet
         "penalty_name": m.penalty,
+        # The difficulty this score was measured on; null when the samples never said. A best.json without it
+        # is beatable by any sample that knows its own difficulty (`stored_best`).
+        "difficulty": None if difficulty == UNKNOWN_DIFFICULTY else difficulty,
         "reward": round(reward, 3),
         "at_timesteps": ts,
         "checkpoint": src.name,
@@ -235,7 +294,7 @@ def save_if_better(series: list[tuple[float, float, float, float]], model_dir: P
     }, indent=2), encoding="utf-8")
     print(f"[keep_best] new best {m.score_sign * score:.2f} {m.unit} "
           f"({m.penalty} {m.penalty_sign * penalty:.2f}) at {ts:,.0f} -> {src.name}", flush=True)
-    return score, penalty
+    return score, penalty, difficulty
 
 
 def main() -> None:
@@ -263,8 +322,15 @@ def main() -> None:
         ap.error(f"{best_json} holds a best chosen with the {held!r} tie-break, not {metric.penalty!r}: "
                  f"pass the --metric that run was scored with")
     best = stored_best(best_json)
+    warned_no_difficulty = False
 
     while True:
+        if not warned_no_difficulty and difficulty_column_missing(csv_path):
+            warned_no_difficulty = True
+            print(f"[keep_best] WARNING {csv_path} has no 'difficulty' column, so every sample reads as an "
+                  f"unrecorded difficulty and the difficulty clause CANNOT fire: best.zip is being chosen on "
+                  f"{metric.score} alone. Move the file aside (poll_status.py does it by itself on restart) "
+                  f"before relying on best.zip across a difficulty change.", flush=True)
         series = scored(csv_path, a.metric, min_rate=a.min_rate)
         if series:
             best = save_if_better(series, model_dir, a.metric, best)
