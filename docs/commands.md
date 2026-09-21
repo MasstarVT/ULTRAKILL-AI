@@ -442,6 +442,62 @@ Afterwards, verify from the files, never from a socket: the driver log says `sta
 configs/generated/… (init N steps)`, the generated YAML holds the new value, and `runs/<run>/<run>_train.log`
 carries the trainer's own `hyperparameters in force: …` line.
 
+### Changing the DIFFICULTY (2026-09-20: Violent → Brutal)
+
+The user, 2026-09-20: *"make sure its on the hardest dif cuz in the times it dosnt show that"*.
+`configs/specialists.yaml`'s `env.difficulty` is now **4 (Brutal)**, the hardest difficulty the game will run
+— `PrefsManager`'s own validator refuses a stored difficulty above 4 on both the read and the write path, and
+the mod clamps its override to the same range. There is nothing above it to move to (see
+`docs/project-log.md`, 2026-09-20, for the UKMD finding).
+
+It goes through the shared procedure above — **it is an env change, so it only reaches a trainer at a stage
+or round boundary, from a driver started after the edit.** In order: `DRIVER_PAUSE`, stop the driver by pid,
+edit the plan, `--dry-run` (paused), remove the pause, `--dry-run` (real), `runs\start_driver.cmd`, then
+`Set-Content runs\specialists\END_STAGE "Level 0-1 speed"` so the rung restarts as a new round with a
+regenerated config. The round resumes from its own newest weights and an `unfinished` speed round never
+overwrites `models/specialists/<level>.zip`.
+
+**Move the stage's `best.json` and `best.zip` aside at the same time**, from `python/`:
+
+```powershell
+Move-Item models\spec_0-1_speed\best.json models\spec_0-1_speed\best.violent.json
+Move-Item models\spec_0-1_speed\best.zip  models\spec_0-1_speed\best.violent.zip
+```
+
+Not strictly required — `keep_best.py` now ranks the difficulty ahead of the score, so a Brutal sample beats
+a stored Violent best outright — but it makes the round's `best.zip` unambiguously a Brutal artefact, and it
+keeps the Violent peak recoverable. Without it the first Brutal sample simply takes the record, and
+`best.json`'s new `difficulty` field records which difficulty it was measured on from then on.
+
+**What to expect, and what is NOT a regression:**
+
+- **The 0-1 median will rise at first.** Brutal enemies move at the same 1.5× speed multiplier as Violent
+  (`Enemy.SetSpeed` treats `difficulty >= 4` alike) but hit harder and are more aggressive, and bosses take
+  less damage. The focus rung's bar (`median_time_50` ≤ the rung) is unchanged, so the rung will take longer.
+- **The control arm in progress ends here.** The difficulty switch IS an environment change; a new control
+  period starts after it, and the median trend before and after may not be compared.
+- **The rolling windows empty themselves.** `ProgressCallback` clears `fresh_recent` and every per-level
+  `fresh` deque when the reported difficulty changes, so `median_time_50` and `fresh_completion_rate` refill
+  from Brutal episodes only and a rung can never be declared met by a window still holding Violent
+  completions. It prints `difficulty changed 3 -> 4; cleared the fresh-episode windows` when it happens.
+- **A slower Brutal time taking a `times.md` row is the rule working.** A level's leaderboard row is the best
+  time on the hardest difficulty it has ever been completed on; the generation history keeps everything.
+- **`metrics_log.csv` is append-only and keeps its own header**, so move the old file aside to get the new
+  `difficulty` column. Until you do, every row reads as an unrecorded difficulty and `keep_best.py` compares
+  them exactly as it did before.
+
+Verify from files only: `runs/spec_0-1_speed/status.json`'s `campaign.difficulty` reads 4, the generated
+`configs/generated/spec_0-1_speed.yaml` holds `difficulty: 4`, and the next posted `times.md` row says
+`Brutal`. Never connect to a trainer's port to check.
+
+**Evaluating or chaining afterwards.** `full_run.py` and `eval.py` take each specialist's difficulty from its
+own `models/<run>/env_config.yaml`, which `train.py` rewrites every round — so a chained run plays each level
+on the difficulty that level is CURRENTLY trained on, and records what the game actually reported. Both now
+take `--difficulty N` (default: the config's) for a deliberate like-for-like comparison. Note that
+`models/specialists/<level>.zip` has **no** `env_config.yaml` beside it, so a bare
+`eval.py models/specialists/Level_0-1.zip` runs at difficulty **-1**, the game's own setting; `eval.py` now
+prints which difficulty it is using, and `--difficulty` is how to pin it.
+
 ### S0 — the weapon-channel counters (ALREADY ON, no switch)
 
 Passive per-episode counters through `env._behaviour` → `info` → `ProgressCallback`. Pinned inert by

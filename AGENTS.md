@@ -18,9 +18,9 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   any other level starts while `focus:` is set in `configs/specialists.yaml`. Spec §11.
 - **It learns alone.** No human demos and no recorded human routes (`routes.py` / `record_route.py` were
   deleted 2026-09-16). Route signal comes from the game's own door graph and from offline room trunks.
-- **Violent now; Brutal (difficulty 4) for the later speed pass**, switched on together with the time-scaled
-  completion bonus, so combat is re-learned once on the enemy set the records will be set on. Not before
-  completion is reliable.
+- **BRUTAL (difficulty 4), the hardest the game can run** (user, 2026-09-20: "make sure its on the hardest
+  dif"). `PrefsManager` refuses anything above 4. A `times.md` row is the best time on the HARDEST difficulty
+  that level was completed on, so a slower Brutal row replacing a Violent one is the rule working.
 - **Training is hidden from Steam**: every training game launches with `-aibridge-nosteam` (`--steam` opts
   out). No playtime is credited for training; the user accepted that.
 - **Check on the run, cheaply.** No always-on LLM monitor agents (the driver, `mem_guard.py` and
@@ -166,9 +166,9 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - Promoted so far: **0-1 SPEED stage DONE** 2026-09-19 23:18 (round 2, fresh rate 0.92, `median_time_50`
   **147.16 s** vs the 150 s S-rank target, best **81.46 s**; `Level_0-1.zip` is now the fast policy) and **0-2**
   complete (0.72, best 2:19.5; its speed stage is the live one). 0-3 complete is `"unfinished"` (0 completions).
-- `times.md` leaderboard, all Violent: **0-1 01:21.464**, **0-2 01:37.645**, **0-3 04:23.904 (B)**. The human
-  reference playthrough of 0-1 is **146.58 s**; human IL records, the real speed targets, are in
-  `docs/il-records.md`.
+- `times.md` leaderboard, still all Violent until the first Brutal completion of each level replaces the row:
+  **0-1 01:06.655**, **0-2 01:17.085**, **0-3 04:23.904 (B)**. The human reference playthrough of 0-1 is
+  **146.58 s**; human IL records, the real speed targets, are in `docs/il-records.md`.
 - **THE FOCUS (spec §11, 2026-09-20).** `focus: {level: "Level 0-1", targets: [120, 100, 85, 72, 60, 50, 42,
   35, 30, 25]}` in `configs/specialists.yaml`. Each target is a RUNG: 0-1's speed stage with that exact
   median as `target_seconds` (never the S-rank time, never scaled), same run `spec_0-1_speed`, resumed from
@@ -198,7 +198,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   S7 install is a 15-25 min full pause still to schedule. `docs/project-log.md` 2026-09-20.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
   (Cyber Grind 11 / 42, and look mode 1 is deliberately campaign-only); mod **v0.7.2 installed, v0.8.0 in
-  source**; **33 of 35** levels ship; Violent, all weapons unlocked in memory for AI runs only.
+  source**; **33 of 35** levels ship; Brutal, all weapons unlocked in memory for AI runs only.
 - Machines (backups and migration steps in `docs/machines.md`). This PC:
   `C:\Program Files (x86)\Steam\steamapps\common\ULTRAKILL`, Ryzen 9 3900X (12C/24T), 32 GB, RTX 2080 SUPER,
   **one display** — pass `--monitor 1` everywhere. Original PC:
