@@ -57,23 +57,32 @@ def write_plan(tmp_path: Path, **extra_speed) -> Path:
 # ---------------------------------------------------------------------------------------------------------
 
 
-def test_the_shipped_plan_carries_no_train_or_env_override():
+def test_the_shipped_plan_carries_S1_and_no_env_override():
+    """S1 went live 2026-09-21 (docs/project-log.md). S2 and S5 are still dormant.
+
+    The exact values are pinned, not merely their presence: the failure this guards against is a plan edited
+    to 0.99 or to gamma alone, which trains for a round and reads as "the gamma stage did nothing".
+    """
     p = plan()
-    assert p.speed_train == {}, "S1/S2 are not switched on: `speed.train:` is absent from the shipped plan"
+    assert p.speed_train == {"gamma": 0.999, "gae_lambda": 0.98}, \
+        "S1 is on at exactly 0.999 / 0.98; S2 (gamma 0.9995) is a deliberate, separate edit"
     assert p.speed_env == {}, "S5 is not switched on: `speed.env:` is absent from the shipped plan"
     assert set(p.speed_rewards) == {"death"}, "only the 2026-09-20 death weight has landed"
 
 
-def test_with_the_blocks_absent_both_kinds_generate_exactly_what_they_did():
-    """`train` is untouched for either kind, and `env` gains only what the speed rule has always added."""
+def test_a_complete_stage_is_untouched_and_a_speed_stage_moves_only_the_two_S1_keys():
+    """`env` still gains only what the speed rule has always added, and `train` only what S1 names."""
     p = plan()
-    for kind in (COMPLETE, SPEED):
-        train = campaign_driver.stage_config(p, "Level 0-1", kind=kind)["train"]
-        assert train["hyperparams"] == p.train["hyperparams"], kind
-        assert train["hyperparams"]["gamma"] == 0.998 and train["hyperparams"]["gae_lambda"] == 0.95
-    complete = campaign_driver.stage_config(p, "Level 0-1")["env"]
-    speed = campaign_driver.stage_config(p, "Level 0-1", kind=SPEED)["env"]
-    assert set(speed) - set(complete) == {"speed_bonus", "speed_target_scale"}
+    complete = campaign_driver.stage_config(p, "Level 0-1")["train"]
+    speed = campaign_driver.stage_config(p, "Level 0-1", kind=SPEED)["train"]
+    assert complete["hyperparams"] == p.train["hyperparams"], COMPLETE
+    assert complete["hyperparams"]["gamma"] == 0.998 and complete["hyperparams"]["gae_lambda"] == 0.95
+    assert speed["hyperparams"]["gamma"] == 0.999 and speed["hyperparams"]["gae_lambda"] == 0.98
+    moved = {k for k in speed["hyperparams"] if speed["hyperparams"][k] != complete["hyperparams"].get(k)}
+    assert moved == {"gamma", "gae_lambda"}, moved
+    complete_env = campaign_driver.stage_config(p, "Level 0-1")["env"]
+    speed_env = campaign_driver.stage_config(p, "Level 0-1", kind=SPEED)["env"]
+    assert set(speed_env) - set(complete_env) == {"speed_bonus", "speed_target_scale"}
 
 
 # ---------------------------------------------------------------------------------------------------------

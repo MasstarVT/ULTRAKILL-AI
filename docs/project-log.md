@@ -4734,3 +4734,98 @@ compared with readings after it.
 **Revert guidance: none planned.** The user asked for the hardest difficulty and Brutal is the ceiling this
 build can run. If fresh completion stays **under 0.40 for 1.5M steps**, report to the lead rather than
 reverting — the answer is more likely to be a rung or a reward than a difficulty.
+
+
+## 2026-09-21 — Lever S1 goes live: `speed.train: {gamma: 0.999, gae_lambda: 0.98}`
+
+The first of the three dormant levers built on 2026-09-20 (`docs/superpowers/specs/2026-09-20-speedrun-tech.md`;
+`docs/commands.md`, "The three dormant levers") is switched on, on `spec_0-1_speed`, focus rung 2 (target
+median 100 s), on Brutal.
+
+**Why now.** The Brutal switch of 2026-09-20 (35,937,130 steps) restarted the control period and set two
+conditions before any lever could move: **at least 2M further steps (>= 37.94M)** and **a median trend over 1M
+steps flatter than ~8 s per million**. Both have held for hours — the trend condition since about 38.5M, the
+step condition since about 07:00 on 2026-09-21. The run is at **42.10M** cumulative steps, 6.17M into the
+stage, and the 500k-bucket median has sat between **119.0 and 129.6 s for the last 3M steps** (range 10.6 s,
+i.e. ~3.5 s per million, well inside the bar). No monitoring ran over that window: the lead's timer had
+stopped, and the run carried itself on the driver, `keep_best`, `post_times --watch`, `mem_guard`,
+`poll_status` and `dashboard`, with 0 supervisor restarts in every hourly heartbeat from 00:38 to 10:40.
+
+### The baseline this change will be judged against
+
+Everything below is from `runs/spec_0-1_speed/episodes.jsonl` (per-episode: times, rates, deaths) and
+`runs/spec_0-1_speed/metrics_log.csv` (PPO diagnostics; the file rotated at the Brutal switch, so it carries
+Brutal only). All episodes in the window are fresh starts and all carry `difficulty: 4`.
+
+**Last 3M steps, full 500k buckets** — times in official seconds:
+
+| bucket | fresh eps | fresh rate | p10 | median | p90 | best | `median_time_50` | deaths/ep | kills/min | `explained_var` | `approx_kl` | `clip_frac` | entropy loss | steps/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 39.0–39.5M | 203 | 0.857 | 92.9 | 119.9 | 189.0 | 81.35 | 119.7 | 1.19 | 17.2 | 0.952 | 0.0328 | 0.231 | -7.10 | 159.2 |
+| 39.5–40.0M | 209 | 0.866 | 96.5 | 124.8 | 246.3 | 79.74 | 124.6 | 1.25 | 16.7 | 0.944 | 0.0336 | 0.236 | -7.12 | 164.2 |
+| 40.0–40.5M | 208 | 0.904 | 95.7 | 129.6 | 210.0 | 72.23 | 131.2 | 1.35 | 17.6 | 0.934 | 0.0344 | 0.237 | -7.08 | 160.0 |
+| 40.5–41.0M | 210 | 0.910 | 96.6 | 123.6 | 236.7 | 79.97 | 121.5 | 1.01 | 18.0 | 0.925 | 0.0340 | 0.240 | -7.18 | 161.1 |
+| 41.0–41.5M | 228 | 0.925 | 95.3 | 122.4 | 189.5 | 73.70 | 122.5 | 0.96 | 19.7 | 0.911 | 0.0344 | 0.240 | -6.99 | 153.1 |
+| 41.5–42.0M | 246 | 0.927 | 91.9 | 119.0 | 177.9 | 76.18 | 120.0 | 0.83 | 20.5 | 0.930 | 0.0336 | 0.235 | -7.02 | 149.1 |
+
+**Last 1M steps, 200k samples** (the noise floor a single reading has to be judged against):
+
+| bucket | fresh eps | fresh rate | p10 | median | p90 | best | `median_time_50` | deaths/ep | kills/min | `explained_var` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 41.0–41.2M | 94 | 0.936 | 98.4 | 124.7 | 174.9 | 77.15 | 127.0 | 0.88 | 19.2 | 0.878 |
+| 41.2–41.4M | 88 | 0.920 | 91.9 | 116.2 | 194.4 | 73.70 | 118.0 | 0.98 | 20.0 | 0.925 |
+| 41.4–41.6M | 95 | 0.916 | 96.1 | 121.4 | 196.6 | 81.85 | 121.9 | 0.91 | 19.9 | 0.942 |
+| 41.6–41.8M | 99 | 0.919 | 94.5 | 122.6 | 145.9 | 76.42 | 122.0 | 0.68 | 20.7 | 0.926 |
+| 41.8–42.0M | 98 | 0.939 | 90.1 | 115.9 | 196.1 | 76.18 | 122.0 | 1.04 | 20.7 | 0.933 |
+
+Other readings at the moment of the change: `reward_parts_mean_100` = `gate` 147.15, `gate_approach` 96.21,
+`level_complete` 87.18, `checkpoint` 52.4, `door_unlock` 40.95, `arena_clear` 29.0, `kill` 20.13,
+`damage_dealt` 20.91, `novelty` 4.15, `time` **-39.05**, `death` **-10.92**, `punch` -10.62, `damage_taken`
+-3.42. Per-dimension entropies over the 41.5–42.0M bucket: yaw 1.332, pitch 1.250, look mode 0.491.
+`median_time_50` at the change: **104.82 s** (the last-50 window is much noisier than a 500k bucket — the
+bucket medians above are the thing to judge on). Best ever **72.233 s** (`times.md`, 0-1, rank A, Brutal).
+Trainer `hyperparameters in force` before the change: `gamma=0.998, gae_lambda=0.95, n_steps=170,
+batch_size=512, n_epochs=5, ent_coef=0.004, target_kl=0.03 | rollout buffer: gamma=0.998, gae_lambda=0.95`.
+
+### The lever, and why these two numbers
+
+`speed.train:` merges over `train.hyperparams` for a SPEED stage and nothing else, so a complete stage's
+generated config stays byte-identical to what `configs/campaign_gates_full.yaml` pins.
+
+- **gamma 0.998 → 0.999.** The horizon `1/(1-gamma)` goes from 500 decisions (~33 official seconds at
+  frameskip 2) to 1000 (~67 s). In a ~120 s run — 1800 decisions — the terminal `level_complete` bonus, and
+  the speed scaling on it that is the entire point of a speed stage, is worth `0.998^1800` = **2.7%** of face
+  value at the start of an episode. The policy could not feel the thing it is being asked to optimise until
+  the last third of the run. At 0.999 that becomes 16.5%.
+- **gae_lambda 0.95 → 0.98,** because a longer gamma alone would lengthen the bootstrap target while credit
+  assignment stayed short: at lambda 0.95 the GAE weight is down to 1e-3 by ~135 decisions; at 0.98 that point
+  is ~340.
+
+This is the same pairing `tests/test_resume_hyperparams.py` was written against (`RESUMED = {"gamma": 0.999,
+"gae_lambda": 0.98}  # stage S1, exactly`), and the resume path is the part that could have failed silently:
+`RolloutBuffer` keeps its own copies of both, so `training.apply_resume_hyperparams` exists to repair a load
+that left the buffer on the saved values, and `hyperparams_in_force` prints both halves so the round can be
+verified from its own log.
+
+### HORIZON — how this is judged
+
+**On the median of full 500k buckets, over at least 2M steps after the first post-change bucket, against the
+table above.** Single readings are not evidence: the 200k table shows medians of 115.9–124.7 s inside one flat
+regime, and `median_time_50` moves further still (sd ~13 s). The first bucket after the change is expected to
+be an adaptation dip and is explicitly not the verdict — the Brutal switch cost ~35 s of median for ~1.5M
+steps before recovering.
+
+### REVERT TRIGGERS
+
+Any one of these, and the block comes out by the same procedure:
+
+1. `explained_variance` **< 0.80 sustained over 250k steps** (a longer gamma raises return variance; this is
+   the value head failing to keep up).
+2. Fresh completion **< 0.85 over two full 500k buckets** (baseline 0.86–0.93).
+3. Mean **deaths per episode up by more than 1.0** over the baseline for a full bucket — **immediate**
+   (baseline 0.83–1.35).
+4. **Bucket median worse than the baseline by more than 15 s for two consecutive buckets.**
+
+**Revert = delete the `speed.train:` block from `configs/specialists.yaml` and run the same activation
+procedure.** Planned next and NOT active: **S2** (gamma 0.9995, no earlier than 2M steps from here, only if
+the guards hold) and **S3** (`level_complete` 300).

@@ -159,6 +159,26 @@ speed:
   # once", not at "stand still". Pinned by tests/test_speed_death_weight.py.
   rewards:
     death: 12.0
+  # A SPEED STAGE'S OWN PPO HYPERPARAMETERS -- STAGE S1, SWITCHED ON 2026-09-21. Merged over `train.hyperparams`
+  # below for a SPEED stage and for nothing else, so a complete stage's generated config stays byte-identical to
+  # what `configs/campaign_gates_full.yaml` pins. Validated against `SPEED_TRAIN_KEYS` (PPO's own numeric
+  # constructor arguments); a misspelt or non-numeric key is a hard load error, never a default.
+  #
+  # WHY. At gamma 0.998 the horizon is 1/(1-gamma) = 500 decisions, about 33 official seconds at frameskip 2 --
+  # so in a ~120 s run the `level_complete` bonus (and the speed scaling on it, which is the whole point of a
+  # speed stage) is worth 0.998^1800 = 2.7% of face value at the start of the episode, and the policy cannot
+  # feel the thing it is being asked to optimise until the last third. 0.999 doubles the horizon to 1000
+  # decisions (~67 s). `gae_lambda` moves with it because the advantage window has to widen too: at lambda 0.95
+  # the GAE weight is already down to 1e-3 by 135 decisions, so a longer gamma alone would only lengthen the
+  # bootstrap target while the credit assignment stayed short. 0.98 puts that same 1e-3 point at ~340 decisions.
+  #
+  # WHEN. Activated at ~42.1M cumulative steps, 6.17M into 0-1's speed stage, after the Brutal switch of
+  # 2026-09-20 (35,937,130) had held its 2M-step control period and the 500k-bucket median had sat flat at
+  # 119-130 s for 3M steps. Baseline table, horizon and the four revert triggers: docs/project-log.md,
+  # 2026-09-21. Planned next, NOT active: S2 (gamma 0.9995) and S3 (`level_complete` 300).
+  train:
+    gamma: 0.999
+    gae_lambda: 0.98
 # THE FOCUS / RECORD CHASE (spec §11). The user, 2026-09-20: "can we focuse on one level tell we get it to a
 # point that is close to the speed run record". While this block is set the driver trains NOTHING ELSE: not
 # 0-2, not 0-3, not 0-4, whatever `order:`, `hold_before:` and `hold_order:` above would otherwise say. It runs

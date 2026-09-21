@@ -60,7 +60,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - `python/scripts/` — `train.py`, `eval.py`, `games.py`, `campaign_driver.py` (the specialist driver),
   `supervise.py`, `mem_guard.py`, `full_run.py`, `specialists_status.py`, `poll_status.py`, `keep_best.py`,
   `post_times.py`, `dashboard.py`, `build_routes.py`, `campaign_check.py`, `skull_check.py`, `bridge_test.py`.
-- `python/tests/` — 37 no-game test files, ~895 named tests, about 3 minutes for the lot.
+- `python/tests/` — 38 no-game test files, ~898 named tests, about 3 minutes for the lot.
 - `python/configs/` — `specialists.yaml` (the specialist plan; **not** a training config),
   `campaign_gates_full.yaml` (the shared-run config it is pinned against), `campaign_0-1.yaml`,
   `cybergrind.yaml`, `il_records.yaml`, and the earlier campaign configs kept as rollbacks.
@@ -166,9 +166,9 @@ Python (`python/`) builds observations and rewards from the raw game state and t
 - Promoted so far: **0-1 SPEED stage DONE** 2026-09-19 23:18 (round 2, fresh rate 0.92, `median_time_50`
   **147.16 s** vs the 150 s S-rank target, best **81.46 s**; `Level_0-1.zip` is now the fast policy) and **0-2**
   complete (0.72, best 2:19.5; its speed stage is the live one). 0-3 complete is `"unfinished"` (0 completions).
-- `times.md` leaderboard, still all Violent until the first Brutal completion of each level replaces the row:
-  **0-1 01:06.655**, **0-2 01:17.085**, **0-3 04:23.904 (B)**. The human reference playthrough of 0-1 is
-  **146.58 s**; human IL records, the real speed targets, are in `docs/il-records.md`.
+- `times.md` leaderboard (difficulty ranks ahead of the clock, so a Brutal row takes a Violent one):
+  **0-1 01:12.233 (A, Brutal)**, **0-2 01:17.085 (Violent)**, **0-3 04:23.904 (B, Violent)**. The human
+  reference playthrough of 0-1 is **146.58 s**; human IL records are in `docs/il-records.md`.
 - **THE FOCUS (spec §11, 2026-09-20).** `focus: {level: "Level 0-1", targets: [120, 100, 85, 72, 60, 50, 42,
   35, 30, 25]}` in `configs/specialists.yaml`. Each target is a RUNG: 0-1's speed stage with that exact
   median as `target_seconds` (never the S-rank time, never scaled), same run `spec_0-1_speed`, resumed from
@@ -178,9 +178,9 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   and a round that latched once and drifted back repeats its rung. 25 s is 1.26x the record. Set `focus: null`
   to go back to the plan; the focus stops itself, loudly, when the ladder is done. **The plan is read once,
   at driver start** — a running driver must be restarted before any `focus:` edit means anything.
-- **Live: `Level 0-1` (SPEED) ROUND 3 = FOCUS RUNG 1 of 10, run `spec_0-1_speed`**, started 2026-09-20 11:21
-  from that run's own `latest.zip` at **28,393,030** steps, target median **120 s**, 12 games on 47800-47811.
-  The baseline to beat: median **147.16 s**, best **81.46 s**; the record is **19.798 s**.
+- **Live: `Level 0-1` (SPEED) ROUND 5+ = FOCUS RUNG 2 of 10, run `spec_0-1_speed`**, on **Brutal** since
+  35,937,130 steps, target median **100 s**, 12 games on 47800-47811. At ~42.1M: `median_time_50` **104.8 s**,
+  best **72.233 s**, fresh rate **0.93**; the record is **19.798 s**. Lever **S1 on 2026-09-21** (below).
   0-2 speed round 2 was ENDED BY THE OPERATOR at 29.23M steps ("unfinished", nothing promoted): its death
   5->12 experiment got only ~1.8M steps and has **NO VERDICT** (deaths/episode 4.58 -> 4.66). Its standing
   finding holds: 0-2 speed is a DEATH problem, not navigation (OLS **+22.3 s/death**, intercept 121.1 s;
@@ -193,7 +193,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   **-250 in one step**, 3.4% of 0-2 completions had a negative total — and `completion_bonus` now pays the
   FLOOR (25), not the full 100, when a speed stage's official time is missing. Neither is validated in game.
   Still open: guard T's mid-name-fork blind spot; a 0-3 wall probe; the memory work (another engineer owns
-  `python/`, `mod/`, that note); branch `dormant-levers` — S0 slot counters on, S1/S2 + S5 OFF (`docs/commands.md`).
+  `python/`, `mod/`, that note); levers — S0 and **S1 (gamma 0.999/λ 0.98) ON**, S2/S3/S5 OFF (`docs/commands.md`).
 - **Mod v0.8.0 source is merged but NOT installed** — GO on the SSJ macro, M2 `ssj_wall` cut to reserved; the
   S7 install is a 15-25 min full pause still to schedule. `docs/project-log.md` 2026-09-20.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**
