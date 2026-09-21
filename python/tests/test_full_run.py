@@ -4,7 +4,9 @@ No game needed:  python tests/test_full_run.py   (or pytest)
 
 The chaining logic -- the order, the skipped levels, the total, the times.md posting -- is tested against an
 injected `play`, and `play_level` itself is driven against `test_campaign_env.FakeLevel`, the same fake bridge
-the campaign env tests use. Nothing here opens a port or writes into the repo.
+the campaign env tests use. Nothing here opens a port, or reads or writes anything in the repo -- the posting
+tests build their own times.md from `test_times.TIMES_MD` and say which leaderboard row they are posting
+against (`fixture_times`), so the suite never depends on what the live run last wrote to the real file.
 """
 
 from __future__ import annotations
@@ -12,7 +14,6 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import shutil
 import sys
 import tempfile
 import types
@@ -27,10 +28,10 @@ import full_run  # noqa: E402
 import yaml  # noqa: E402
 from full_run import LevelResult  # noqa: E402
 from test_campaign_env import LEVEL, FakeLevel, forward  # noqa: E402
+from test_times import TIMES_MD as EMPTY_TIMES_MD  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
-from ultrakill_ai.times import parse_time, short_level  # noqa: E402
+from ultrakill_ai.times import TimeEntry, format_time, parse_time, record, short_level  # noqa: E402
 
-TIMES_MD = ROOT.parent / "times.md"
 PLAN = types.SimpleNamespace(env={"mode": "campaign", "level": LEVEL, "fixed_fps": 30, "frameskip": 2,
                                  # Brutal, as configs/specialists.yaml has been since 2026-09-20. The fake
                                  # level echoes back whatever difficulty the env asked for, exactly as the
@@ -43,6 +44,33 @@ def make_specialists(models: Path, levels) -> None:
     (models / "specialists").mkdir(parents=True, exist_ok=True)
     for level in levels:
         full_run.specialist_path(models, level).write_bytes(b"weights")
+
+
+def held_row(level=LEVEL, seconds=183.628, difficulty=3, rank="A") -> TimeEntry:
+    """The leaderboard row a posting test is posting AGAINST, stated by the test itself."""
+    return TimeEntry(level=level, seconds=seconds, rank=rank, generation="fixture@1.00M", difficulty=difficulty,
+                     date="2026-09-20", kills=1, deaths=0, notes="fixture row")
+
+
+def fixture_times(tmp: Path, *held: TimeEntry) -> Path:
+    """A times.md of OUR OWN under `tmp`, holding exactly the rows `held` names.
+
+    Never the repo's real times.md. That file is whatever the live training run last posted -- its 0-1 row
+    went Brutal on 2026-09-20 -- so a test that copied it was asserting against a moving target, and the
+    difficulty rule (`times.beats_record`, hardest difficulty first) then refused the Violent post these tests
+    make. The seed rows go in through `times.record` itself, so the fixture can only ever hold rows the
+    helper under test would have written.
+    """
+    text = EMPTY_TIMES_MD
+    for entry in held:
+        text = record(text, entry)
+    path = tmp / "times.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def leaderboard_row(text: str, level: str) -> str:
+    return next(line for line in text.splitlines() if line.startswith("| %s " % short_level(level)))
 
 
 # ---------------------------------------------------------------------------
@@ -86,10 +114,9 @@ def test_the_generation_names_the_chain_and_the_date():
 
 def test_posting_writes_one_row_per_completed_level_through_the_times_helpers():
     with tempfile.TemporaryDirectory() as tmp:
-        times = Path(tmp) / "times.md"
-        shutil.copy2(TIMES_MD, times)
-        # difficulty=3 because the committed times.md rows are Violent: a run has to be on at least the row's
-        # own difficulty to replace it, whatever its time (`times.beats_record`).
+        # The fixture holds a Violent 0-1 row, and the chain posts Violent: a run has to be on at least the
+        # row's own difficulty to replace it, whatever its time (`times.beats_record`).
+        times = fixture_times(Path(tmp), held_row(level="Level 0-1", seconds=183.628, difficulty=3))
         results = [LevelResult(level="Level 0-1", completed=True, seconds=1.25, rank="P", kills=40, deaths=0,
                                difficulty=3),
                    LevelResult(level="Level 0-3", completed=False, end_reason="stuck"),
@@ -100,9 +127,14 @@ def test_posting_writes_one_row_per_completed_level_through_the_times_helpers():
         assert "specialists@2026-09-18" in text and "00:01.250" in text
         assert "one specialist per level" in text
         # The leaderboard row for 0-1 is now this (absurdly fast) time, because the helper replaces a slower one.
-        row = next(line for line in text.splitlines()
-                   if line.startswith("| %s " % short_level("Level 0-1")))
-        assert parse_time(row.split("|")[2].strip()) == 1.25
+        assert parse_time(leaderboard_row(text, "Level 0-1").split("|")[2].strip()) == 1.25
+        assert format_time(183.628) not in leaderboard_row(text, "Level 0-1"), "the seeded row is gone"
+        assert len([line for line in text.splitlines()
+                    if line.startswith("| %s " % short_level("Level 0-1"))]) == 1, "one row per level"
+        assert not [line for line in text.splitlines()
+                    if line.startswith(("| %s " % short_level("Level 0-3"),
+                                        "| %s " % short_level("Level 0-4")))], \
+            "a level that did not complete, or was skipped, gets no row at all"
         assert full_run.post_results(times, [], gen="specialists@2026-09-18") == []
 
 
@@ -113,18 +145,47 @@ def test_a_chained_run_that_never_learned_its_difficulty_does_not_take_a_labelle
     was set on -- however fast it is. It is still recorded in the generation history.
     """
     with tempfile.TemporaryDirectory() as tmp:
-        times = Path(tmp) / "times.md"
-        shutil.copy2(TIMES_MD, times)
-        before = next(line for line in times.read_text(encoding="utf-8").splitlines()
-                      if line.startswith("| %s " % short_level("Level 0-1")))
+        times = fixture_times(Path(tmp), held_row(level="Level 0-1", seconds=183.628, difficulty=3))
+        before = leaderboard_row(times.read_text(encoding="utf-8"), "Level 0-1")
         assert LevelResult(level="Level 0-1").difficulty == -1
         full_run.post_results(times, [LevelResult(level="Level 0-1", completed=True, seconds=1.25, rank="P")],
                               gen="specialists@2026-09-20")
         text = times.read_text(encoding="utf-8")
-        after = next(line for line in text.splitlines()
-                     if line.startswith("| %s " % short_level("Level 0-1")))
-        assert after == before, "an unlabelled run may not replace a Violent leaderboard row"
+        assert leaderboard_row(text, "Level 0-1") == before, \
+            "an unlabelled run may not replace a Violent leaderboard row"
         assert "specialists@2026-09-20" in text, "but the history still records that it happened"
+
+
+def test_a_violent_chain_cannot_take_a_brutal_row_but_a_slower_brutal_chain_can():
+    """The 2026-09-20 rule, through `post_results`: hardest difficulty first, then fastest.
+
+    This is the case that used to be hidden by copying the repo's real times.md -- once its 0-1 row went
+    Brutal, the Violent post above was correctly refused and the test failed for a reason that had nothing to
+    do with `full_run`. Now the row is stated here, and both directions are asserted.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        times = fixture_times(Path(tmp), held_row(level="Level 0-1", seconds=143.5, difficulty=4))
+        before = leaderboard_row(times.read_text(encoding="utf-8"), "Level 0-1")
+        assert "Brutal" in before
+
+        # Violent, and far faster: the history takes it, the leaderboard does not.
+        assert full_run.post_results(times, [LevelResult(level="Level 0-1", completed=True, seconds=1.25,
+                                                         rank="P", difficulty=3)],
+                                     gen="specialists@violent") == ["Level 0-1 00:01.250 rank P"]
+        text = times.read_text(encoding="utf-8")
+        assert leaderboard_row(text, "Level 0-1") == before, "a Violent time is not a claim about Brutal"
+        assert "specialists@violent" in text, "the generation history still records the run"
+
+        # Brutal, and SLOWER than the held Brutal row: still refused, because within a difficulty time wins.
+        full_run.post_results(times, [LevelResult(level="Level 0-1", completed=True, seconds=200.0, rank="C",
+                                                  difficulty=4)], gen="specialists@slow-brutal")
+        assert leaderboard_row(times.read_text(encoding="utf-8"), "Level 0-1") == before
+
+        # Brutal and faster: the row moves.
+        full_run.post_results(times, [LevelResult(level="Level 0-1", completed=True, seconds=130.25, rank="A",
+                                                  difficulty=4)], gen="specialists@fast-brutal")
+        row = leaderboard_row(times.read_text(encoding="utf-8"), "Level 0-1")
+        assert parse_time(row.split("|")[2].strip()) == 130.25 and "Brutal" in row
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +373,7 @@ def test_the_action_flags_parse_and_cannot_both_be_given():
 
 def test_the_posted_row_says_which_action_mode_played_the_chain():
     with tempfile.TemporaryDirectory() as tmp:
-        times = Path(tmp) / "times.md"
-        shutil.copy2(TIMES_MD, times)
+        times = fixture_times(Path(tmp), held_row(level="Level 0-1", seconds=183.628, difficulty=3))
         results = [LevelResult(level="Level 0-1", completed=True, seconds=1.25, rank="P", kills=40, deaths=0,
                                difficulty=3)]
         assert full_run.post_results(times, results, gen="specialists@2026-09-20") == \

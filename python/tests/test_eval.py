@@ -9,8 +9,9 @@ completed 0 of 5 argmax episodes against 19 of 20 sampled -- all five ended "stu
 So campaign evaluation now samples by default, Cyber Grind keeps its old argmax default, and the times.md row
 has to say which of the two produced the time.
 
-Nothing here opens a port, loads a policy or writes into the repo: the rollout runs against a stub env and a
-policy that only records the flag it was handed, and the recorded row goes into a temp copy of times.md.
+Nothing here opens a port, loads a policy, or reads or writes anything in the repo: the rollout runs against a
+stub env and a policy that only records the flag it was handed, and the recorded row goes into a times.md
+built from `test_times.TIMES_MD`, not into a copy of the live leaderboard.
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
-import shutil
 import sys
 import tempfile
 import types
@@ -27,13 +27,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
+sys.path.insert(0, str(ROOT / "tests"))
 
 import eval as eval_script  # noqa: E402  -- scripts/eval.py, not the builtin
 import numpy as np  # noqa: E402
+from test_times import TIMES_MD as EMPTY_TIMES_MD  # noqa: E402
 from ultrakill_ai.times import actions_note  # noqa: E402
 
-TIMES_MD = ROOT.parent / "times.md"
 MODEL = "models/specialists/Level_0-1.zip"
+
+
+def fixture_times(tmp: Path) -> Path:
+    """An empty times.md of our own under `tmp` -- never a copy of the repo's real one.
+
+    The real file is whatever the live training run last posted (its 0-1 row went Brutal on 2026-09-20), and
+    `times.beats_record` ranks hardest difficulty first, so a test that copied it would silently start
+    depending on the leaderboard's current contents.
+    """
+    path = tmp / "times.md"
+    path.write_text(EMPTY_TIMES_MD, encoding="utf-8")
+    return path
 
 
 class RecordingPolicy:
@@ -146,8 +159,7 @@ def test_the_recorded_row_says_which_action_mode_produced_the_time():
     assert actions_note(False) == "sampled actions"
     assert actions_note(True) == "deterministic (argmax) actions"
     with tempfile.TemporaryDirectory() as tmp:
-        times = Path(tmp) / "times.md"
-        shutil.copy2(TIMES_MD, times)
+        times = fixture_times(Path(tmp))
         model = types.SimpleNamespace(num_timesteps=1_000_000)
         args = argparse.Namespace(record_times=True, model=MODEL)
 
@@ -167,8 +179,7 @@ def test_the_recorded_row_says_which_action_mode_produced_the_time():
 
 def test_nothing_is_recorded_without_record_times():
     with tempfile.TemporaryDirectory() as tmp:
-        times = Path(tmp) / "times.md"
-        shutil.copy2(TIMES_MD, times)
+        times = fixture_times(Path(tmp))
         before = times.read_text(encoding="utf-8")
         info = {"completed": True, "level_seconds": 12.5, "rank": "A", "kills": 3, "deaths": 0,
                 "style": 0, "difficulty": 3, "restarts": 0}
