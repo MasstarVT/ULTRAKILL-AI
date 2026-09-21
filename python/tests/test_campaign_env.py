@@ -109,6 +109,7 @@ class FakeLevel:
     """
 
     def __init__(self):
+        self.settings: dict = {}  # what `configure` was last given; `_obs` echoes its difficulty back
         self.resets: list[bool] = []  # the checkpoint flag of every reset
         self.reset_scenes: list[str | None] = []  # the scene name of every reset, so a level switch is visible
         self.scene_name = LEVEL
@@ -407,7 +408,11 @@ class FakeLevel:
             "ground_ray_center": self.ground_center if self.ground_center is not None else self._ground_rays()[0],
             "stats": {"kills": self.kills, "style": 0, "seconds": self.seconds, "restarts": self.restarts, "level_complete": over},
             "campaign": {
-                "mission": 1, "difficulty": 3, "seconds": self.seconds, "timer_running": not over,
+                # The difficulty the GAME read, which the mod reports back each step. The fake echoes whatever
+                # the env asked for at reset, exactly as `CampaignPatches.DifficultyOverride` does, so a test
+                # can follow a difficulty all the way from the config to the episode info.
+                "mission": 1, "difficulty": self.settings.get("difficulty", 3),
+                "seconds": self.seconds, "timer_running": not over,
                 "level_started": True, "level_over": over, "restarts": self.restarts, "input_locked": self.locked,
                 "exit": self._exit_block(),
                 "checkpoints": [{"id": CHECKPOINT_ID, "pos": [0.0, 1.0, 20.0], "activated": self.checkpoint, "current": self.checkpoint}],
@@ -550,6 +555,40 @@ def test_fresh_start_walked_to_the_exit_completes_the_level():
         run = json.loads((Path(tmp) / "best_runs" / "Level_0-1.json").read_text(encoding="utf-8"))
         assert run["level"] == LEVEL and run["seconds"] == fake.seconds and run["deaths"] == 0
         assert run["positions"][0] == [0.0, 1.0, 0.0] and run["positions"][-1] == [0.0, 1.0, EXIT_Z]
+
+
+def test_the_episode_info_carries_the_difficulty_the_game_actually_read():
+    """Not `cfg.difficulty`: the config ASKS, the mod's campaign block ANSWERS, and only the answer is a fact.
+
+    It is what `ProgressCallback` folds into `best_time`, the fresh-episode windows and status.json, so a
+    Brutal round's numbers can never be silently compared with a Violent one's (2026-09-20).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        env, fake = make_env(best_runs_dir=str(Path(tmp) / "best_runs"), difficulty=4)
+        env.reset(seed=0)
+        assert fake.settings["difficulty"] == 4
+        for _ in range(100):
+            _, _, terminated, truncated, info = env.step(forward())
+            if terminated or truncated:
+                break
+        assert info["end_reason"] == "level_complete"
+        assert info["difficulty"] == 4, "the episode says which difficulty it was played on"
+        env.close()
+        run = json.loads((Path(tmp) / "best_runs" / "Level_0-1.json").read_text(encoding="utf-8"))
+        assert run["difficulty"] == 4, "and so does the best-run file post_times.py reads"
+
+
+def test_an_episode_that_does_not_complete_still_reports_its_difficulty():
+    with tempfile.TemporaryDirectory() as tmp:
+        env, _ = make_env(fresh_start_prob=0.0, max_steps=5, best_runs_dir=tmp, difficulty=4)
+        env.reset(seed=0)
+        for _ in range(5):
+            _, _, terminated, truncated, info = env.step(forward())
+            if terminated or truncated:
+                break
+        assert not info.get("completed"), "the level is not finished in five decisions"
+        assert info["difficulty"] == 4
+        env.close()
 
 
 def test_completion_after_a_checkpoint_respawn_has_no_official_time():

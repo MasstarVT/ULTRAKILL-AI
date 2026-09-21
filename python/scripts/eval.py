@@ -33,7 +33,8 @@ import yaml  # noqa: E402
 
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS, ExplorationArchive, safe_name  # noqa: E402
 from ultrakill_ai.env import EnvConfig, UltrakillEnv  # noqa: E402
-from ultrakill_ai.times import TimeEntry, actions_note, format_time, record_file  # noqa: E402
+from ultrakill_ai.times import (  # noqa: E402
+    HARDEST_DIFFICULTY, TimeEntry, actions_note, difficulty_name, format_time, record_file)
 
 TIMES_MD = Path(__file__).resolve().parents[2] / "times.md"
 
@@ -128,6 +129,10 @@ def build_parser() -> argparse.ArgumentParser:
                               "nothing; still the opt-in for Cyber Grind, whose default stays argmax")
     parser.add_argument("--level", help='campaign scene, e.g. "Level 0-1" (default: the level in env_config.yaml next to the model)')
     parser.add_argument("--record-times", action="store_true", help="campaign: add the fastest completion to times.md")
+    parser.add_argument("--difficulty", type=int, choices=range(-1, HARDEST_DIFFICULTY + 1), metavar="N",
+                        help="play on difficulty N (0 Harmless .. 4 Brutal, -1 the game's own setting) instead "
+                             "of the one in the env config next to the model; the row times.md gets always "
+                             "says the difficulty the GAME reported, not the one asked for")
     return parser
 
 
@@ -149,6 +154,14 @@ def main() -> None:
         elif cfg.levels:
             cfg.level, cfg.levels = cfg.levels[0], []
             print(f"the env config lists several levels; evaluating {cfg.level} (pass --level to choose another)")
+    if args.difficulty is not None:
+        cfg.difficulty = args.difficulty
+    # Say it out loud. Without an env_config.yaml beside the model -- which is the case for
+    # `models/specialists/<level>.zip`, whose settings live in the JSON sidecar's `env_config` path instead --
+    # `cfg` is a default EnvConfig and this is -1, meaning "whatever difficulty the game itself is set to".
+    # A time measured that way is not comparable with a training row, so the run has to announce it.
+    print(f"difficulty: {cfg.difficulty} ({difficulty_name(cfg.difficulty)})" if cfg.difficulty >= 0 else
+          "difficulty: -1 (the game's own setting: pass --difficulty to pin it)")
     if args.realtime:
         cfg.unlimited_fps = False
         cfg.mute = False

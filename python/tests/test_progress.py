@@ -315,8 +315,8 @@ def test_campaign_progress():
 
         c = s["campaign"]
         assert set(c) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time",
-                          "target_seconds", "s_rank_seconds"}, \
-            "a single-level run's campaign block, plus the target and the S threshold behind it"
+                          "target_seconds", "s_rank_seconds", "difficulty", "best_difficulty"}, \
+            "a single-level run's campaign block, plus the target, the S threshold and the difficulty"
         # The target is what the env computed live (0.75 x the level's own S-rank time), carried straight
         # through: it is how campaign_driver learns the number at all -- the driver only ever reads files.
         assert c["target_seconds"] == 90.0 and c["s_rank_seconds"] == 120.0
@@ -389,11 +389,11 @@ def test_campaign_progress():
 CURRICULUM_LEVELS = ["Level 0-1", "Level 0-3", "Level 0-4"]
 
 
-def episode_info(level, *, fresh=1, completed=0, seconds=None, checkpoints=2, gates=3, hops=1):
+def episode_info(level, *, fresh=1, completed=0, seconds=None, checkpoints=2, gates=3, hops=1, difficulty=3):
     """One finished campaign episode as the env reports it."""
     return {
         "episode": {"r": 1.0, "l": 100.0}, "level": level, "kills": 0, "deaths": 0, "wave": 0, "style": 0,
-        "completed": completed, "fresh_start": fresh, "level_seconds": seconds,
+        "completed": completed, "fresh_start": fresh, "level_seconds": seconds, "difficulty": difficulty,
         "checkpoints_level": checkpoints, "cells_new": 10, "oob_frac": 0.0, "exit_dist_min": 5.0,
         "exit_ground_dist_min": 3.0,
         "gates_reached": gates, "gate_hops_best": hops, "wedged_steps": 0, "level_started": 1,
@@ -418,6 +418,95 @@ def read_json(path: Path) -> dict:
 # ---------------------------------------------------------------------------------------------
 # Official times the game never reported (2026-09-19)
 # ---------------------------------------------------------------------------------------------
+
+
+def test_a_harder_difficulty_takes_the_best_time_even_when_it_is_slower():
+    """`best_time` is not comparable across difficulties, and it survives every trainer bounce.
+
+    Without this the 2026-09-20 Brutal switch would have left `spec_0-1_speed` reporting its 81.5 s VIOLENT
+    run as the run's best for the whole Brutal round, into status.json, the dashboards and the promoted
+    specialist's sidecar.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-1_speed"
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-1_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=81.5, difficulty=3))
+        assert (cb.best_time, cb.best_difficulty) == (81.5, 3)
+        # Slower, but on Brutal: it becomes the best, and the Violent time never comes back.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=150.0, difficulty=4))
+        assert (cb.best_time, cb.best_difficulty) == (150.0, 4)
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=40.0, difficulty=3))
+        assert (cb.best_time, cb.best_difficulty) == (150.0, 4), "an easier difficulty never takes it back"
+        # ... and within Brutal the faster time still wins.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=140.0, difficulty=4))
+        assert (cb.best_time, cb.best_difficulty) == (140.0, 4)
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert (c["best_time"], c["best_difficulty"], c["difficulty"]) == (140.0, 4, 4)
+
+
+def test_the_best_time_keeps_its_difficulty_across_a_trainer_restart():
+    """`_restore` has to carry `best_difficulty` with `best_time`, or the record is beatable by anything."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-1_speed"
+        run.mkdir(parents=True)
+        (run / "status.json").write_text(json.dumps({
+            "run_name": "spec_0-1_speed", "episodes": 10, "history": [],
+            "campaign": {"best_time": 150.0, "best_difficulty": 4, "difficulty": 4,
+                         "target_seconds": 120.0, "s_rank_seconds": 150.0},
+        }), encoding="utf-8")
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-1_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        assert (cb.best_time, cb.best_difficulty, cb.difficulty) == (150.0, 4, 4)
+        # A Violent run after the restart must not take a Brutal record.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=40.0, difficulty=3))
+        assert (cb.best_time, cb.best_difficulty) == (150.0, 4)
+
+
+def test_changing_the_difficulty_empties_the_rolling_windows():
+    """`median_time_50` is a speed rung's promotion gate; a window that straddles a change describes neither.
+
+    The switch is performed BY a trainer restart, which empties the windows anyway (`_restore_levels` never
+    carries them). This is what makes the guarantee hold whatever order things happen in: a rung can never be
+    declared met by a median that still contains completions from the easier difficulty.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-1_speed"
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-1_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        for _ in range(10):
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=60.0, difficulty=3))
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert (c["median_time_50"], c["fresh_window"], c["difficulty"]) == (60.0, 10, 3)
+
+        # One Brutal episode and the window is gone -- it does not average 60 s Violent runs with Brutal ones.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=200.0, difficulty=4))
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert c["fresh_window"] == 1, "only the Brutal episode is left in the window"
+        assert c["median_time_50"] == 200.0, "the median is the Brutal run's, not a mixture"
+        assert c["difficulty"] == 4
+
+        # Staying on Brutal does not keep clearing it.
+        cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=180.0, difficulty=4))
+        cb._write(time.time())
+        assert read_json(run / "status.json")["campaign"]["fresh_window"] == 2
+
+
+def test_an_episode_that_reports_no_difficulty_changes_nothing():
+    """An older mod that never sends `campaign.difficulty` must behave exactly as it always did."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "runs" / "spec_0-1_speed"
+        cb = ProgressCallback(run / "status.json", 1000, "spec_0-1_speed", 1, update_every_s=0.0)
+        cb._on_training_start()
+        for _ in range(5):
+            cb._record_episode(0, episode_info("Level 0-1", completed=1, seconds=60.0, difficulty=None))
+        cb._write(time.time())
+        c = read_json(run / "status.json")["campaign"]
+        assert (c["fresh_window"], c["best_time"], c["difficulty"]) == (5, 60.0, None)
+        assert c["best_difficulty"] is None
 
 
 def test_an_official_time_the_game_never_reported_is_not_a_record():
@@ -476,6 +565,9 @@ def test_curriculum_file_is_written_before_any_episode_and_lists_every_level():
         assert [data["levels"][lv]["unlocked"] for lv in CURRICULUM_LEVELS[1:]] == [False, False]
         assert data["levels"]["Level 0-3"] == {
             "unlocked": False, "fresh_window": 0, "fresh_completion_rate": None, "best_time": None,
+            # Which difficulty `best_time` was set on: a per-level `best_time` is no more comparable across
+            # difficulties than the run-wide one (2026-09-20).
+            "best_difficulty": None,
             "episodes": 0, "fresh_episodes": 0,
             # The learning-progress fields, all empty before the level has run: additive, so a reader from
             # before they existed (an older env.py on a resumed run) ignores them and samples as it always did.
@@ -795,9 +887,10 @@ def test_a_run_with_no_levels_writes_no_curriculum_file():
         assert not (run / "curriculum.json").exists()
         s = read_json(run / "status.json")["campaign"]
         assert set(s) == {"fresh_window", "fresh_completion_rate", "median_time_50", "best_time",
-                          "target_seconds", "s_rank_seconds"}
+                          "target_seconds", "s_rank_seconds", "difficulty", "best_difficulty"}
         assert s["target_seconds"] is None and s["s_rank_seconds"] is None, \
             "None until a speed stage's env reports them"
+        assert (s["difficulty"], s["best_difficulty"]) == (3, 3), "the difficulty the episodes reported"
 
 
 def test_episodes_jsonl_carries_the_level_it_ran_on():

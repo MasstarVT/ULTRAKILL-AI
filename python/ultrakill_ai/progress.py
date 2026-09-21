@@ -32,7 +32,7 @@ from ultrakill_ai.campaign import (
     progress_score,
     unlock_next,
 )
-from ultrakill_ai.times import valid_official_seconds
+from ultrakill_ai.times import beats_record, valid_official_seconds
 
 EPISODE_WINDOW = 100
 FRESH_WINDOW = 50  # campaign completion rate and median time are over this many fresh-start episodes
@@ -66,6 +66,10 @@ PPO_METRICS = (
 # `route_source` travels in CAMPAIGN_INFO_KEYS and is charted, exactly as rl-5 of the route spec asks.
 EPISODE_LOG_RAW = ("level", "start_checkpoint", "end_pos", "end_reason", "level_seconds", "gate_hops_best",
                    "bridge_resets", "route_source_name",
+                   # The difficulty the game actually read for this episode, as the mod reported it back. An
+                   # episode row that does not say which difficulty it played on cannot be compared with one
+                   # from the other side of the 2026-09-20 Brutal switch.
+                   "difficulty",
                    # Stage S0 of docs/superpowers/specs/2026-09-20-speedrun-tech.md: the per-slot time share
                    # and per-slot kills, both LISTS of six, which is why they are here rather than in `stats`.
                    # Six columns each in status.json would be six columns nobody reads; per episode they are
@@ -90,6 +94,12 @@ def _num(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return f if math.isfinite(f) else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    """A whole number, or None for anything that is not one. The difficulty fields' own reader."""
+    f = _num(value)
+    return None if f is None else int(f)
 
 
 def _mean(values) -> float | None:
@@ -153,7 +163,15 @@ class ProgressCallback(BaseCallback):
         # that inheritance. best_gate_hops is a MINIMUM (lower is better), so it needs its own comparison.
         self.best_gates_reached: float | None = None
         self.best_gate_hops: float | None = None
-        self.best_time: float | None = None  # fastest fresh-start completion, official level seconds
+        self.best_time: float | None = None  # best fresh-start completion, official level seconds
+        # WHICH DIFFICULTY `best_time` was set on, and which one the run is playing on now. `best_time` is not
+        # a number that can be compared across difficulties: on 2026-09-20 the run switched from Violent to
+        # Brutal, and the 81.5 s Violent record would otherwise have stood as `spec_0-1_speed`'s "best" for the
+        # rest of the run, because every early Brutal completion is slower. The pair is ranked by
+        # `times.beats_record` -- hardest difficulty first, then fastest -- so the first Brutal completion takes
+        # the record however slow it is, and no Violent one ever takes it back.
+        self.best_difficulty: int | None = None
+        self.difficulty: int | None = None
         # A speed stage's target: the level's own S-rank time scaled by `speed_target_scale`, as the env
         # computed it live. The last non-None value wins (it is a constant per level), and it is how
         # `campaign_driver` learns the target at all -- the driver only ever reads files, so the number has to
@@ -207,6 +225,13 @@ class ProgressCallback(BaseCallback):
             # carrying an impossible minimum forever (2026-09-19: a 0.0 restored here would have kept every
             # real completion out of `best_time` for the rest of the run).
             self.best_time = valid_official_seconds(old["campaign"].get("best_time"))
+            # Carried WITH the time it belongs to. A restored `best_time` without its difficulty would read as
+            # "unknown", and an unknown ranks below every real difficulty (`times.difficulty_rank`), so the
+            # next completion of any kind would take the record -- which is the opposite of what a restart
+            # should do to a record set before it. `difficulty` is carried for the same reason: it is what
+            # makes the switch DETECTABLE across the trainer restart that performs it.
+            self.best_difficulty = _int_or_none(old["campaign"].get("best_difficulty"))
+            self.difficulty = _int_or_none(old["campaign"].get("difficulty"))
             self.target_seconds = _num(old["campaign"].get("target_seconds"))
             self.s_rank_seconds = _num(old["campaign"].get("s_rank_seconds"))
             self._restore_levels(old["campaign"].get("levels"))
@@ -231,6 +256,7 @@ class ProgressCallback(BaseCallback):
             record = self._level_record(str(name))
             record["unlocked"] = bool(old.get("unlocked")) or record["unlocked"]
             record["best_time"] = valid_official_seconds(old.get("best_time"))  # healed on restore, as above
+            record["best_difficulty"] = _int_or_none(old.get("best_difficulty"))  # with the time it belongs to
             record["episodes"] = int(_num(old.get("episodes")) or 0)
             # Cumulative, so it carries like `episodes` and NOT like the windows: the safety valve counts how
             # many fresh tries a level has had in total, and a restart must not hand it a clean slate or a run
@@ -261,6 +287,7 @@ class ProgressCallback(BaseCallback):
                 "fresh": deque(maxlen=FRESH_WINDOW),  # (completed, level_seconds) of its own fresh starts
                 "recent": deque(maxlen=EPISODE_WINDOW),  # the two early-progress signals, all episodes
                 "best_time": None,
+                "best_difficulty": None,  # which difficulty `best_time` was set on: see `best_difficulty` above
                 "episodes": 0,
                 "fresh_episodes": 0,  # cumulative fresh starts; what `unlock_after_fresh_episodes` counts
                 # Learning-progress statistics, over this level's FRESH episodes only. All of them are scalars
@@ -291,6 +318,7 @@ class ProgressCallback(BaseCallback):
                 "fresh_window": len(fresh),
                 "fresh_completion_rate": (sum(c for c, _ in fresh) / len(fresh)) if fresh else None,
                 "best_time": record["best_time"],
+                "best_difficulty": record["best_difficulty"],
                 "episodes": int(record["episodes"]),
                 "fresh_episodes": int(record["fresh_episodes"]),
                 # The learning-progress statistics `campaign.level_weights(rule="progress")` reads. Additive:
@@ -505,13 +533,16 @@ class ProgressCallback(BaseCallback):
             self.s_rank_seconds = stats["s_rank_seconds"]
         if stats["fresh_start"] is not None:
             self.campaign = True
+            # Before anything is folded into a window: a window that straddles a difficulty change describes
+            # no policy at all (see `_note_difficulty`).
+            self._note_difficulty(info.get("difficulty"))
             if stats["fresh_start"]:
                 # A completion whose official time the game never reported counts as a COMPLETION with no
                 # time: the rate is unaffected, and the clock statistics below simply have one fewer sample.
                 completed, seconds = stats["completed"] or 0.0, valid_official_seconds(stats["level_seconds"])
                 self.fresh_recent.append((completed, seconds))
-                if completed and seconds is not None and (self.best_time is None or seconds < self.best_time):
-                    self.best_time = seconds
+                if completed and beats_record(self.difficulty, seconds, self.best_difficulty, self.best_time):
+                    self.best_time, self.best_difficulty = seconds, self.difficulty
                 reached = stats["gates_reached"]
                 if reached is not None and (self.best_gates_reached is None or reached > self.best_gates_reached):
                     self.best_gates_reached = reached
@@ -531,6 +562,33 @@ class ProgressCallback(BaseCallback):
             "episodes": self.per_env.get(env_index, {}).get("episodes", 0) + 1,
         }
         self._log_episode(env_index, info, stats)
+
+    def _note_difficulty(self, difficulty) -> None:
+        """Folds this episode's difficulty in, EMPTYING the rolling windows when it changed.
+
+        `median_time_50` and `fresh_completion_rate` are windows over the last 50 fresh episodes, and a speed
+        rung is declared met when the median sits under its target (`campaign_driver.stage_verdict`). Across a
+        difficulty change that window is a mixture of two different games: on 2026-09-20 the run moved from
+        Violent to Brutal, where enemies are faster and hit harder, and a window still holding 40 Violent
+        completions could have declared the rung met on times no Brutal policy had set. Emptying it costs the
+        stage the ~50 fresh episodes it takes to refill -- the same price every trainer restart already pays,
+        since the windows are deliberately not restored (`_restore_levels`) -- and buys a median that is a
+        property of one difficulty.
+
+        In practice the switch is performed BY a trainer restart, so the pooled window is empty here anyway;
+        this is what makes the guarantee hold regardless, and what makes the change visible in the log. An
+        episode that does not report a difficulty at all (an older mod) changes nothing.
+        """
+        new = _int_or_none(difficulty)
+        if new is None or new == self.difficulty:
+            return
+        if self.difficulty is not None:
+            self.fresh_recent.clear()
+            for record in self.per_level.values():
+                record["fresh"].clear()
+            print(f"ProgressCallback: difficulty changed {self.difficulty} -> {new}; "
+                  "cleared the fresh-episode windows (completion rate and median time restart from empty)")
+        self.difficulty = new
 
     def _record_level_episode(self, stats: dict) -> None:
         """Folds one finished episode into its level's record, then unlocks the next level if it has been earned.
@@ -558,8 +616,8 @@ class ProgressCallback(BaseCallback):
             record["fresh_episodes"] += 1
             completed, seconds = stats["completed"] or 0.0, valid_official_seconds(stats["level_seconds"])
             record["fresh"].append((completed, seconds))
-            if completed and seconds is not None and (record["best_time"] is None or seconds < record["best_time"]):
-                record["best_time"] = seconds
+            if completed and beats_record(self.difficulty, seconds, record["best_difficulty"], record["best_time"]):
+                record["best_time"], record["best_difficulty"] = seconds, self.difficulty
             self._record_level_progress(record, stats)
         nxt = unlock_next(self.order, self._level_table(), unlock_rate=self.unlock_rate,
                           unlock_window=self.unlock_window,
@@ -677,6 +735,12 @@ class ProgressCallback(BaseCallback):
             "fresh_completion_rate": sum(completed for completed, _ in self.fresh_recent) / n if n else None,
             "median_time_50": statistics.median(times) if times else None,
             "best_time": self.best_time,
+            # The difficulty everything above was measured on, and the one `best_time` belongs to. They travel
+            # in status.json because that file is the ONLY way the numbers reach `campaign_driver`,
+            # `keep_best.py` (through poll_status's metrics_log.csv) and the dashboards, none of which connect
+            # to a bridge. Without them a Violent median and a Brutal median are the same column.
+            "difficulty": self.difficulty,
+            "best_difficulty": self.best_difficulty,
             # Additive, and None on every run that is not a speed stage: the target
             # `campaign_driver.stage_verdict` compares `best_time` against before promoting, and the raw S-rank
             # threshold it was scaled from.

@@ -15,7 +15,7 @@ import keep_best  # noqa: E402
 
 # The metrics_log.csv columns keep_best reads, as poll_status.py writes them.
 COLUMNS = ["wall_time", "timesteps", "episodes", "window", "reward", "kills_per_min", "deaths",
-           "fresh_window", "fresh_completion_rate", "median_time_50", "best_time"]
+           "fresh_window", "fresh_completion_rate", "median_time_50", "best_time", "difficulty"]
 
 # models/cybergrind_ppo_v2/best.json as keep_best.py wrote it before --metric existed.
 OLD_BEST_JSON = {
@@ -45,7 +45,8 @@ def grind_rows(kills_per_min: list[float], window: int = 100) -> list[dict]:
 
 
 def campaign_rows(rates: list[float], best_times: list[float | None], fresh_window: int = 50,
-                  median_times: list[float | None] | None = None) -> list[dict]:
+                  median_times: list[float | None] | None = None,
+                  difficulties: list[int | None] | None = None) -> list[dict]:
     """`median_time_50` defaults to `best_time`, which is what a run that never varies would write.
 
     The two are separate columns because they are separate statistics: `best_time` is the run's lifetime
@@ -53,9 +54,14 @@ def campaign_rows(rates: list[float], best_times: list[float | None], fresh_wind
     that cares about the difference passes both.
     """
     medians = list(median_times) if median_times is not None else list(best_times)
+    # `difficulties` defaults to a column of empty cells, i.e. a metrics_log.csv from before the column
+    # existed: every such sample reads as UNKNOWN_DIFFICULTY and they all compare with each other as before.
+    diffs = list(difficulties) if difficulties is not None else [None] * len(rates)
     return [{"timesteps": 10_000 * (i + 1), "window": 100, "reward": 10.0 * i, "fresh_window": fresh_window,
-             "fresh_completion_rate": rate, "best_time": best_time, "median_time_50": median}
-            for i, (rate, best_time, median) in enumerate(zip(rates, best_times, medians))]
+             "fresh_completion_rate": rate, "best_time": best_time, "median_time_50": median,
+             "difficulty": difficulty}
+            for i, (rate, best_time, median, difficulty)
+            in enumerate(zip(rates, best_times, medians, diffs))]
 
 
 def test_kills_per_min_needs_a_full_window():
@@ -72,9 +78,10 @@ def test_kills_per_min_smoothing_is_unchanged():
     with tempfile.TemporaryDirectory() as tmp:
         series = keep_best.scored(write_log(Path(tmp), grind_rows([float(k) for k in range(1, 12)])), "kills_per_min")
         assert [round(s[0], 9) for s in series] == [5.0, 6.0, 7.0]  # 11 samples give 3 full 9-sample windows
-        score, deaths, reward, timesteps = series[0]
+        score, deaths, reward, timesteps, difficulty = series[0]
         assert abs(deaths - 1.6) < 1e-9  # mean of 2.0 - 0.1 * i over i = 0..8
         assert abs(reward - 104.0) < 1e-9 and timesteps == 50_000  # timesteps of the window's middle sample
+        assert difficulty == -1, "a Cyber Grind log has no difficulty column: UNKNOWN, and all samples agree"
 
 
 def test_campaign_needs_twenty_fresh_episodes():
@@ -122,7 +129,7 @@ def test_old_best_json_reads_deaths_as_penalty():
         path = Path(tmp) / "best.json"
         path.write_text(json.dumps(OLD_BEST_JSON, indent=2), encoding="utf-8")
         stored = keep_best.stored_best(path)
-        assert stored == (7.1567, 1.5478)
+        assert stored == (7.1567, 1.5478, -1), "no difficulty recorded: UNKNOWN"
         assert keep_best.is_better((7.1567, 1.40), stored) and not keep_best.is_better((7.1567, 1.60), stored)
         assert not keep_best.is_better((7.15674, 1.5478), stored)  # compared at the precision best.json keeps
         assert keep_best.stored_best(Path(tmp) / "missing.json") is None
@@ -137,15 +144,17 @@ def test_new_best_copies_checkpoint_and_records_penalty():
         model_dir = Path(tmp)
         (model_dir / "ckpt_100000_steps.zip").write_bytes(b"early")
         (model_dir / "ckpt_200000_steps.zip").write_bytes(b"late")
-        series = [(0.25, 95.0, 40.0, 150_000.0), (0.5, 81.5, 60.0, 230_000.0)]
-        assert keep_best.save_if_better(series, model_dir, "campaign", None) == (0.5, 81.5)
+        series = [(0.25, 95.0, 40.0, 150_000.0, 3), (0.5, 81.5, 60.0, 230_000.0, 3)]
+        assert keep_best.save_if_better(series, model_dir, "campaign", None) == (0.5, 81.5, 3)
         assert (model_dir / "best.zip").read_bytes() == b"late"  # newest checkpoint at or before 230k steps
         saved = json.loads((model_dir / "best.json").read_text(encoding="utf-8"))
-        assert set(saved) == {"score_metric", "score", "penalty", "penalty_name", "reward", "at_timesteps", "checkpoint", "saved_at"}
+        assert set(saved) == {"score_metric", "score", "penalty", "penalty_name", "difficulty", "reward",
+                              "at_timesteps", "checkpoint", "saved_at"}
         assert saved["score_metric"] == "fresh_completion_rate, smoothed over 9 samples"
         assert saved["score"] == 0.5 and saved["penalty"] == 81.5 and saved["penalty_name"] == "best_time"
+        assert saved["difficulty"] == 3, "the difficulty the score was measured on travels with it"
         assert saved["reward"] == 60.0 and saved["at_timesteps"] == 230_000.0 and saved["checkpoint"] == "ckpt_200000_steps.zip"
-        assert keep_best.stored_best(model_dir / "best.json") == (0.5, 81.5)
+        assert keep_best.stored_best(model_dir / "best.json") == (0.5, 81.5, 3)
         assert keep_best.stored_penalty_name(model_dir / "best.json") == "best_time"
 
 
@@ -203,6 +212,61 @@ def test_time_ranks_the_policys_median_and_not_the_runs_lifetime_best():
         assert not keep_best.is_better((-240.0, -0.52), (-120.0, -0.45))
 
 
+def test_a_harder_difficulty_outranks_a_better_score():
+    """`--metric time` is where this bites: every early Brutal median is slower than the Violent record.
+
+    On score alone `best.zip` would have frozen on Violent-trained weights for the whole Brutal round after
+    the 2026-09-20 switch, and `campaign_driver.promote` would then have published exactly those weights as
+    the level's BRUTAL specialist.
+    """
+    # -147 s on Violent against a much worse -240 s on Brutal: the harder difficulty wins anyway.
+    assert keep_best.is_better((-240.0, -0.45, 4), (-147.0, -0.92, 3))
+    assert not keep_best.is_better((-100.0, -0.92, 3), (-240.0, -0.45, 4)), "Violent never takes it back"
+    # Within one difficulty nothing changed at all.
+    assert keep_best.is_better((-120.0, -0.45, 4), (-240.0, -0.52, 4))
+    assert not keep_best.is_better((-240.0, -0.52, 4), (-120.0, -0.45, 4))
+    # An unrecorded difficulty ranks below a recorded one, and two unrecorded ones compare as they always did.
+    assert keep_best.is_better((-240.0, -0.45, 3), (-100.0, -0.92, -1))
+    assert keep_best.is_better((-100.0, -0.92), (-240.0, -0.45)), "two 2-tuples: the old behaviour, unchanged"
+    series = [(-120.0, -0.9, 0.0, 1.0, 3), (-240.0, -0.4, 0.0, 2.0, 4), (-100.0, -0.9, 0.0, 3.0, 3)]
+    assert keep_best.best_of(series)[3] == 2.0, "the Brutal sample, though it has the worst score"
+
+
+def test_a_smoothing_window_that_straddles_a_difficulty_change_is_dropped():
+    """Its mean time is half Violent and half Brutal and describes neither policy."""
+    with tempfile.TemporaryDirectory() as tmp:
+        # 9 Violent rows, then 9 Brutal ones: the 8 windows that span the boundary must not be scored.
+        rates, best = [0.6] * 18, [100.0] * 18
+        medians = [100.0] * 9 + [200.0] * 9
+        rows = campaign_rows(rates, best, median_times=medians, difficulties=[3] * 9 + [4] * 9)
+        series = keep_best.scored(write_log(Path(tmp), rows), "time")
+        assert len(series) == 2, "only the all-Violent window and the all-Brutal one survive"
+        by_difficulty = {s[4]: s[0] for s in series}
+        assert set(by_difficulty) == {3, 4}
+        assert abs(by_difficulty[3] + 100.0) < 1e-9 and abs(by_difficulty[4] + 200.0) < 1e-9
+        # ... and the Brutal one is chosen despite being 100 s slower.
+        assert keep_best.best_of(series)[4] == 4
+
+
+def test_a_best_json_without_a_difficulty_is_beaten_by_a_sample_that_has_one():
+    """The upgrade path at the switch: the stored best was written before the column existed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        model_dir = Path(tmp)
+        (model_dir / "ckpt_100000_steps.zip").write_bytes(b"violent")
+        (model_dir / "ckpt_200000_steps.zip").write_bytes(b"brutal")
+        (model_dir / "best.json").write_text(json.dumps({
+            "score": -147.0, "penalty": -0.92, "penalty_name": "fresh_completion_rate",
+            "at_timesteps": 100_000.0, "checkpoint": "ckpt_100000_steps.zip"}), encoding="utf-8")
+        stored = keep_best.stored_best(model_dir / "best.json")
+        assert stored == (-147.0, -0.92, -1)
+        # A slower Brutal sample takes it, and best.json now records the difficulty so the next comparison
+        # is a like-for-like one.
+        series = [(-240.0, -0.45, 10.0, 230_000.0, 4)]
+        assert keep_best.save_if_better(series, model_dir, "time", stored) == (-240.0, -0.45, 4)
+        assert (model_dir / "best.zip").read_bytes() == b"brutal"
+        assert json.loads((model_dir / "best.json").read_text(encoding="utf-8"))["difficulty"] == 4
+
+
 def test_a_median_the_game_cannot_have_produced_never_scores_on_time():
     """metrics_log.csv is append-only: rows written before the 2026-09-19 fix still hold impossible times.
 
@@ -235,8 +299,8 @@ def test_time_saves_the_checkpoint_and_guards_the_other_metrics_best_json():
         model_dir = Path(tmp)
         (model_dir / "ckpt_100000_steps.zip").write_bytes(b"early")
         (model_dir / "ckpt_200000_steps.zip").write_bytes(b"late")
-        series = [(-131.25, -0.42, 40.0, 150_000.0), (-118.50, -0.44, 60.0, 230_000.0)]
-        assert keep_best.save_if_better(series, model_dir, "time", None) == (-118.5, -0.44)
+        series = [(-131.25, -0.42, 40.0, 150_000.0, 4), (-118.50, -0.44, 60.0, 230_000.0, 4)]
+        assert keep_best.save_if_better(series, model_dir, "time", None) == (-118.5, -0.44, 4)
         assert (model_dir / "best.zip").read_bytes() == b"late"
         saved = json.loads((model_dir / "best.json").read_text(encoding="utf-8"))
         assert saved["score"] == -118.5 and saved["penalty"] == -0.44
@@ -246,9 +310,9 @@ def test_time_saves_the_checkpoint_and_guards_the_other_metrics_best_json():
         assert keep_best.stored_penalty_name(model_dir / "best.json") == "fresh_completion_rate"
         assert keep_best.METRICS["campaign"].penalty == "best_time" != "fresh_completion_rate"
         assert keep_best.METRICS["time"].penalty == "fresh_completion_rate"
-        # ... and a slower later run does not move best.zip.
-        assert keep_best.save_if_better([(-140.0, -0.9, 0.0, 240_000.0)], model_dir, "time",
-                                        (-118.5, -0.44)) == (-118.5, -0.44)
+        # ... and a slower later run on the SAME difficulty does not move best.zip.
+        assert keep_best.save_if_better([(-140.0, -0.9, 0.0, 240_000.0, 4)], model_dir, "time",
+                                        (-118.5, -0.44, 4)) == (-118.5, -0.44, 4)
 
 
 def test_the_campaign_and_kills_metrics_are_untouched_by_the_signs():
@@ -266,12 +330,12 @@ def test_restart_does_not_resave_the_same_best():
     with tempfile.TemporaryDirectory() as tmp:
         model_dir = Path(tmp)
         (model_dir / "ckpt_50000_steps.zip").write_bytes(b"weights")
-        series = [(0.0, math.inf, -30.0, 60_000.0)]  # no completed run yet
+        series = [(0.0, math.inf, -30.0, 60_000.0, 3)]  # no completed run yet
         keep_best.save_if_better(series, model_dir, "campaign", None)
         saved = json.loads((model_dir / "best.json").read_text(encoding="utf-8"))
         assert saved["penalty"] is None and saved["penalty_name"] == "best_time"  # strict JSON has no infinity
         stored = keep_best.stored_best(model_dir / "best.json")
-        assert stored[0] == 0.0 and math.isinf(stored[1])
+        assert stored[0] == 0.0 and math.isinf(stored[1]) and stored[2] == 3
         (model_dir / "best.zip").unlink()
         assert keep_best.save_if_better(series, model_dir, "campaign", stored) == stored
         assert not (model_dir / "best.zip").exists()

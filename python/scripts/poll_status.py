@@ -69,7 +69,11 @@ FIELDS = [
 # gates_reached and checkpoints_level from its level load, so only these two say how a whole run goes.
 FRESH_FIELDS = ["gates_reached", "checkpoints_level", "completed"]
 # Campaign runs only (status["campaign"]): completion rate and median time over the last 50 fresh starts.
-CAMPAIGN_FIELDS = ["fresh_window", "fresh_completion_rate", "median_time_50", "best_time"]
+CAMPAIGN_FIELDS = ["fresh_window", "fresh_completion_rate", "median_time_50", "best_time",
+                   # The difficulty behind the two clocks above. `keep_best.py --metric time` ranks samples on
+                   # `median_time_50`, and a Violent median may not be compared with a Brutal one, so the
+                   # column has to reach metrics_log.csv for it to be able to tell them apart (2026-09-20).
+                   "difficulty"]
 BEST_FIELDS = ["best_checkpoints_level", "best_gates_reached", "best_gate_hops"]
 PPO_FIELDS = ["entropy_loss", "approx_kl", "clip_fraction", "explained_variance", "value_loss", "learning_rate",
               "entropy_yaw", "entropy_pitch", "entropy_look_mode",

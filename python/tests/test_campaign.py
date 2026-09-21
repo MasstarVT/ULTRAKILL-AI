@@ -2564,6 +2564,43 @@ def test_save_best_run_overwrites_with_a_faster_run():
         assert [p.name for p in path.parent.iterdir()] == ["Level_0-1.json"]
 
 
+def test_save_best_run_keeps_the_hardest_difficulty_before_the_fastest_time():
+    """The run's own best-run file is all post_times.py ever reads, so it has to rank the same way.
+
+    Ranked on time alone, `spec_0-1_speed`'s 81.5 s Violent run would have held this file for the whole
+    Brutal round after the 2026-09-20 switch -- every early Brutal completion is slower than it -- and the
+    leaderboard would have gone on claiming a difficulty the policy no longer trained on.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "Level_0-1.json"
+        assert save_best_run(path, best_run(81.5, difficulty=3)) is True
+        # Slower, but harder: it takes the file.
+        assert save_best_run(path, best_run(150.0, difficulty=4)) is True
+        assert json.loads(path.read_text(encoding="utf-8"))["difficulty"] == 4
+        # A much faster Violent run never takes it back.
+        assert save_best_run(path, best_run(40.0, difficulty=3)) is False
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert (stored["difficulty"], stored["seconds"]) == (4, 150.0)
+        # Within Brutal, the faster time still wins, and a tie still keeps the stored run.
+        assert save_best_run(path, best_run(140.0, difficulty=4)) is True
+        assert save_best_run(path, best_run(140.0, difficulty=4, kills=9)) is False
+        assert json.loads(path.read_text(encoding="utf-8"))["seconds"] == 140.0
+
+
+def test_save_best_run_still_refuses_a_time_the_game_never_reported():
+    """The NaN/zero guard the old `not (a < b)` spelling provided has to survive the difficulty clause."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "Level_0-1.json"
+        assert save_best_run(path, best_run(float("nan"), difficulty=4)) is False
+        assert save_best_run(path, best_run(0.0, difficulty=4)) is False
+        assert not path.exists()
+        assert save_best_run(path, best_run(95.5, difficulty=3)) is True
+        # ... and none of them displaces a stored run either, however much harder they claim to be.
+        assert save_best_run(path, best_run(float("nan"), difficulty=4)) is False
+        assert save_best_run(path, best_run(0.0, difficulty=4)) is False
+        assert json.loads(path.read_text(encoding="utf-8"))["seconds"] == 95.5
+
+
 def test_save_best_run_overwrites_an_unreadable_file():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "Level_0-1.json"

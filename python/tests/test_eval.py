@@ -97,6 +97,23 @@ def test_the_action_flags_parse_and_cannot_both_be_given():
             raise AssertionError("asking for both modes at once must be refused, not silently resolved")
 
 
+def test_the_difficulty_override_parses_and_defaults_to_the_configs():
+    """`models/specialists/<level>.zip` has NO env_config.yaml beside it, so without this flag an eval of a
+    promoted specialist runs at EnvConfig's default difficulty of -1: whatever the game itself happens to be
+    set to. The flag is how a recorded time is pinned to a difficulty on purpose."""
+    parser = eval_script.build_parser()
+    assert parser.parse_args([MODEL]).difficulty is None, "default: the env config's own value"
+    assert parser.parse_args([MODEL, "--difficulty", "4"]).difficulty == 4
+    assert parser.parse_args([MODEL, "--difficulty", "-1"]).difficulty == -1, "-1 is the game's own setting"
+    with contextlib.redirect_stderr(io.StringIO()):
+        for refused in ("5", "-2"):
+            try:
+                parser.parse_args([MODEL, "--difficulty", refused])
+            except SystemExit:
+                continue
+            raise AssertionError(f"--difficulty {refused} is not a difficulty this build can run")
+
+
 # ---------------------------------------------------------------------------
 # What predict is actually handed
 # ---------------------------------------------------------------------------
