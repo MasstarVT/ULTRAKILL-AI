@@ -5101,3 +5101,124 @@ stashing the plan edit). Its fixture posts a `difficulty=3` result against the c
 0-1 row is now **Brutal** at 01:12.233 — and `times.beats_record` correctly refuses to let a Violent run
 replace a Brutal row. The test's assumption went stale when the Brutal times landed, not with this revert. It
 needs its fixture raised to difficulty 4; nothing else in the suite is affected.
+
+## 2026-09-22 — Where Level 0-1 loses its time ON BRUTAL: a recorded time budget of round 7
+
+**What was done.** 26 episodes recorded on a hand-started private game on port **47812**
+(`-aibridge-nosteam`, 368x207, `-job-worker-count 3`), against a **copy** of
+`models/spec_0-1_speed/ckpt_45685042_steps.zip` and the stage's own
+`configs/generated/spec_0-1_speed.yaml` (difficulty **4**, rung target 100 s): stochastic sampling, fresh
+loads only, exploration counts read from `explore_Level_0-1_47800.npz` and never written back. No trainer
+port was connected to at any point. Recordings: `python/runs/probe_0-1_brutal/` (97 MB, 26 files plus
+`rollout_summary.json`). `mem_guard` recycled the private game once mid-probe (23:40:24, pid 31976), which
+cost one episode as `bridge_reset`; the game was killed afterwards by the pid that then owned 47812 (1968)
+and `games.py status` confirmed exactly 12 games left, commit back to 83%.
+
+**The probe reproduces the live run.** 21 completions of 26 (0.81 against the live 0.92-0.94, on n=26),
+median official time **111.4 s** against the live `episodes.jsonl` median of **111.4 s** since the 42.19M
+rollback (n=1,636) and `status.json`'s `median_time_50` of 119.4. Probe best **82.48 s**, p10 87.7.
+
+**THE SHAFT IS SOLVED.** The 2026-09-19 Violent budget's single largest loss — the 25 m climb between
+`192,31,594` and `202,56,452`, 150.5 s median — is now **15.4 s median, 5.3 s best**. It is the third
+largest remaining loss, not the first. Nothing in this entry should be read against that old table without
+that correction.
+
+**The time budget, by ladder rung** (legs bucketed by the recording's own `target_hops`; leg *h* runs from
+crediting rung *h*+1 to crediting rung *h*; 21 completions; the best66 column is the run's saved **66.662 s
+Brutal** best, `best_runs/Level_0-1.json`, split by the same 8 m x 6 m reach cylinder from positions alone):
+
+| leg | median s | best s | worst s | best66 s | gap s | share |
+|---|---|---|---|---|---|---|
+| `146,31,640 -> 192,31,594` **ARENA 2** | 24.7 | 18.7 | 44.7 | 16.4 | **+8.3** | 26.1% |
+| `40,-9,552 -> 40,11,624` **PIT EDGE** | 11.2 | 2.9 | 72.7 | 3.2 | **+8.0** | 25.2% |
+| `192,31,594 -> 202,56,452` **SHAFT** | 15.4 | 5.3 | 57.4 | 8.9 | **+6.5** | 20.4% |
+| `66,21,640 -> 146,31,640` | 4.7 | 3.3 | 8.3 | 1.9 | +2.7 | 8.7% |
+| `40,1,470 -> 40,-9,490` | 3.5 | 1.1 | 6.4 | 1.4 | +2.1 | 6.8% |
+| `40,1,408 -> 40,1,470` **ARENA 1** | 15.5 | 12.2 | 27.9 | 14.0 | +1.6 | 4.9% |
+| `40,11,624 -> 66,21,640` **PIT** | 3.1 | 1.3 | 68.1 | 2.1 | +1.0 | 3.3% |
+| the other four (r8->r7 ... exit) | 20.0 | — | — | 18.7 | +1.5 | 4.6% |
+| **total** | **98.2** | **56.7** | **331.1** | **66.6** | **+31.6** | |
+
+Sum-of-leg-bests is **56.7 s**, below the 66.66 s lifetime best, so every leg's best is already in the
+policy's repertoire: what is left on this level is consistency, not capability. The top three legs hold
+**22.8 s of the 31.6 s** gap.
+
+**The biggest single mechanism is the pit, and it is not a death.** Between rung 6 (`40,-9,552`) and rung 4
+(`66,21,640`) the agent falls off the walkway and the game yanks it back without killing it. Over the 21
+completions: **215 rescues, median 7 per completion** (mean 10.2, p90 22, max 46; every completion had at
+least one); median **10.2 s airborne over the pit per completion**, mean 15.4, p90 **36.9 s**, max 64.7.
+One fall costs a median **1.40 s** and buys a median **3.9 m** of net displacement — it is pure loss. 106 of
+the 215 falls launch from the single 10 m cell **(40,-10,560)**; 183 of them reach **y ≈ -40** before the
+rescue fires. The same mechanism is in the 2026-09-20 Violent recordings at the same place (213 rescues over
+19 completions, median 15.2 s per completion), so it is **not** something Brutal introduced.
+
+**It is also what separates a fast run from a slow one.** Fastest third (n=7, median 98.6 s) against slowest
+third (n=7, median 131.0 s), attributed leg by leg: the `40,-9,552 -> 40,11,624` leg is **+15.6 s = 73.4%**
+of the 21.2 s gap and the shaft **+6.2 s = 29.1%**; every other leg is within ±2.5 s and four are negative.
+Whole-run: pit rescues **4.7 -> 18.3**, horizontal path **1,983 m -> 3,200 m**, decisions 1,648 -> 2,372,
+deaths 0.9 -> 1.7, kills 34.4 -> 38.0. Slow runs are not uniformly slower runs; they are runs that fell in
+the pit.
+
+**Post-clear wandering is the second clean category.** Summed over the three arena legs, the time after the
+last arena enemy dies and before the next rung is credited is **24.9 s median per completion, 22% of the
+run** (8.5 s after arena 1, 8.7 s after arena 2, 7.3 s after the Malicious Face). It is not dithering: the
+agent moves at a median 16.5-18.7 m/s with only 0.3-0.9 s grounded under 2 m/s, but takes a path **2.4-2.9x
+its own net displacement**. Rolled up, the median run is **31.1 s arena fight (28%), 18.8 s post-clear
+inside an arena leg (17%), 64.2 s travel with nothing alive (58%)**.
+
+**Deaths cost about 7 s each, not 14.** 32 deaths over the 26 recordings (1.23 per recording, 1.38 per
+completion). A death is only ever visible as `restarts` ticking up — `dead` is False in every sampled frame,
+because the respawn happens inside the two-frame frameskip; anything counting deaths off `dead` in a
+recording reads zero. Measured death-to-back-within-8 m-of-the-death-spot: median **6.77 s**, mean 7.61,
+p90 13.4, max 23.8, on a median **67.7 m** checkpoint setback (Violent 2026-09-20: 0.40 per recording,
+median 5.44 s, 46.7 m). Deaths cluster on the shaft leg (11), arena 2 (10) and the boss leg (5). The live
+regression over 1,680 completions gives **+13.8 s per death holding kills fixed** (+15.6 univariate,
+R^2 0.132) — about twice the mechanical rewind, so roughly half of that association is common cause, not the
+death itself.
+
+**Kills track time even with deaths held at zero.** Among the 513 live zero-death completions since 42.19M:
+28-31 kills -> 89.5 s, 32-35 -> 96.2, 36-39 -> 103.2, 40-43 -> 109.7, 44-47 -> 122.5 s, i.e. about **+2.4 s
+per extra kill**. Median kills is **38**; the 66.662 s best run took **31**; the floor observed is 24.
+Deaths add only ~1 kill each (mean kills 37.0 at 0 deaths, 40.6 at 4), so these are not respawn re-kills.
+Direction of causation is not established by this data.
+
+**Aim and the fire channel.** Over a median completion: fires on **83.9%** of decisions, an enemy is visible
+on 45.9%, and it is firing **on target on 15.1%**. Per arena: arena 1 322 shots / 16% on target, arena 2 305
+/ 39%, the Malicious Face 162 / 34%. `punch` is pressed on **61.6%** of decisions and `slot` on 55.8%.
+Held-slot share over the run: slot 3 **50.4%**, slot 5 21.8%, slot 4 16.1%, slot 1 9.9%, slot 2 1.9%.
+
+**The distribution is a MIXTURE, not one broad mode.** On the 1,656 live fresh completions since 42.19M, a
+two-component log-normal beats one on BIC by **313** (268.0 -> -44.9): **74.9% at a 107.1 s median**
+(sd(log) 0.160) plus **25.1% at a 155.1 s median** (sd(log) 0.305), separated by 1.59 pooled sd(log). The
+smoothed density has its mode at **100 s**. Conditioning on zero deaths does **not** dissolve it (n=513, BIC
+still picks two: 78.9% at 98.7 s, 21.1% at 139.7 s). So the 108-118 s median is a fast mode near the p10
+plus a slow mode a quarter of the time — which points at avoiding a specific failure, and the fast/slow leg
+attribution above names it: the pit.
+
+**Waits the game imposes are negligible.** `input_locked` never fired in a completion; "arena alive with
+nothing on screen" is 1.3 s on arena 2 and 0.0 elsewhere; "arena alive with no enemy spawned" (a wave timer)
+is 0.0 s everywhere.
+
+**Non-completions (5 of 26).** One never started the level (`stuck` at `29,3,407`, `level_seconds` null —
+the 2026-09-19 dead end (a), still present); one was the guard's `bridge_reset`; **three ended in the pit
+corridor** at `44,-6,501`, `42,-11,512` and `41,-12,558`. Live, over 117 fresh non-completions since 42.19M,
+`gate_hops_best` is 3 (27), 9 (25), 6 (20), 4 (15), 2 (14), and the top `end_pos` cells are `(40,0,410)` and
+`(140,30,640)`.
+
+**Reward rate per game second, by leg** (pooled over the 21 completions; `time` is -0.30/s everywhere): the
+two legs that hold the loss pay the least — `40,-9,552 -> 40,11,624` **net +1.238/s** and the shaft
+**+1.458/s**, against +3.5 to +27 on every leg that is going well. `gate_approach` on the pit-edge leg is
++0.601/s. `death` charges -0.332/s on the shaft leg and -0.196/s on arena 2.
+
+**Not verified.** Enemy TYPES per arena — `probe_rollout.py` records `n_enemies` / `n_visible` /
+`nearest_dist` but no type, so "enemies by type" is not in this budget; `docs/level-survey.md` says 0-1
+ships 16 `ActivateArena` (3 of which lock doors), 7 `ActivateNextWave`, 106 enemy objects and a Malicious
+Face in the exit room, and that is scene parsing, not per-leg measurement. The best run's per-leg SECONDS
+are approximate: its 1,144 recorded decisions map to its 66.662 s clock at 0.0583 s per decision rather than
+the nominal 0.0667, so its seconds are uniformly scaled by 0.874 (the same ratio the probe's own completions
+show, 99.637 s over 1,719 decisions); its per-leg DECISION counts are exact. The 2026-09-20 Violent
+comparison recordings come from a **different, weaker policy** (the promoted `Level_0-1.zip`, median 139.8 s)
+so Brutal-vs-Violent leg deltas mix a difficulty change with a policy change and settle nothing on their
+own. Whether the pit falls are a geometry problem or a control problem was NOT tested in game (no
+`--scripted` geometry probe was run). Per-leg medians are n=21. Nothing was changed: no config, reward,
+plan, policy, port, trainer or game, and **no change is proposed here**.
