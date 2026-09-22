@@ -150,7 +150,7 @@ def completion_reward(cfg: RewardConfig, deaths: float, progress: float = 400.0,
 # ---------------------------------------------------------------------------------------------------------
 def test_the_speed_stage_prices_a_death_at_twelve():
     p = plan()
-    assert p.speed_rewards == {"death": 12.0}, "one weight, and the plan names it"
+    assert p.speed_rewards["death"] == 12.0, "the plan names the weight"
     assert speed_rewards().death == 12.0
     assert EnvConfig.from_dict(campaign_driver.stage_config(p, "Level 0-2")["env"]).rewards.death == 5.0, \
         "a COMPLETE stage is untouched"

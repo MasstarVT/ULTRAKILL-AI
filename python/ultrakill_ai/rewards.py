@@ -45,6 +45,11 @@ class RewardConfig:
     door_unlock: float = 0.0  # per door unlocked by play, once per level load (respawn unlocks never pay)
     novelty: float = 0.0  # times CampaignStep.novelty, the summed 1/sqrt(N+1) of cells new this episode
     path: float = 0.0  # per metre of new best NavMesh distance to the exit
+    # THE PIT (2026-09-22). Charged per DECISION on which no ground lay within `layout.ground_ray_length`
+    # (30 m) beneath the player -- the env's own `_oob_steps` condition, the same count `info["oob_frac"]`
+    # reports, so the reward channel and the metric it is judged by cannot drift apart. 0.0 is every run
+    # before this and every complete stage; only a speed stage's `speed.rewards:` block moves it.
+    oob: float = 0.0
     # The door-graph route (campaign.gates): the signal the NavMesh never gave, since `path.status` was never
     # once `complete` in 2.9M logged steps. `gate` is the milestone, `gate_approach` the shaping between them.
     gate: float = 0.0  # per new lower `hops` value reached, once per level load
@@ -158,6 +163,7 @@ class CampaignStep:
     gate_approach: float = 0.0  # metres of new best closeness to the current gate/exit target
     item_pickups: int = 0  # accepted item types picked up for the first time this level load
     item_placements: int = 0  # altar puzzles solved for the first time this level load
+    oob_steps: int = 0  # 1 when the ground ray ran its full length and found nothing: off the map, or falling
 
 
 @dataclass
@@ -257,6 +263,10 @@ def compute_reward(
         # Paid before the player check: the env has already marked these milestones paid, so a step that
         # arrives without a player (a level load) must not drop them.
         r.add("time", -cfg.time)
+        # Beside `time` on purpose: both are clock charges, and both must be paid on a frame that carries no
+        # player -- a fall does not stop the game's timer. `oob_steps` is 0 or 1, so this term is non-positive
+        # in every state and at every weight: there is no input that makes it pay.
+        r.add("oob", -cfg.oob * campaign.oob_steps)
         r.add("checkpoint", cfg.checkpoint * campaign.checkpoints)
         r.add("arena_clear", cfg.arena_clear * campaign.arenas)
         r.add("door_unlock", cfg.door_unlock * campaign.doors)

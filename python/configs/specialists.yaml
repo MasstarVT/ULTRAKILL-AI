@@ -157,8 +157,37 @@ speed:
   # makes 19 crossings where the median run makes 46, at an identical exposure FRACTION. Waiting cannot lower
   # p(death | crossing) and costs 0.313 per official second, so the gradient this buys points at "go through
   # once", not at "stand still". Pinned by tests/test_speed_death_weight.py.
+  #
+  # WHY `oob` EXISTS (2026-09-22, Level 0-1 on Brutal). The per-leg time budget of 26 recorded episodes
+  # (runs/probe_0-1_brutal, 21 completions, median 111.4 s) puts the largest single named loss on the pit
+  # between rungs 6 (40,-9,552) and 4 (66,21,640): 215 rescues over the 21 completions, a median 7 per
+  # completion, EVERY completion had at least one, and the fast third vs the slow third of the probe differs
+  # by 15.6 s on that one leg -- 73% of the whole fast/slow gap. It is not a death: the agent falls, the game
+  # teleports it back, one fall costs a median 1.40 s and buys a median 3.9 m. The env already COUNTS the
+  # condition every step (`_oob_steps`, reported as `oob_frac`) and nothing read it back, so a fall was paid
+  # -0.02 of `time` and nothing else: `novelty` pays 0 with no ground under the player, and `gate_approach`
+  # only pays a NEW best closeness, which falling never sets.
+  # TARGETING, re-derived per decision from the recordings with the env's own rule (completions only,
+  # 41,520 decisions): 55.8% of all oob decisions are on the pit-edge leg (48.2% of that leg's decisions),
+  # 28.9% on the pit leg (51.4%), 10.9% on the shaft (9.1%), 2.5% unattributed, and 9 of the 41,520 elsewhere
+  # -- 0 on both arena legs' fighting, 0 on every travel leg that goes well. `seconds = 93.90 + 0.0985 * oob`
+  # over the 21 completions, R2 0.581 (deaths alone, live, are R2 0.132).
+  # THE SIZE. One oob decision is 1/15 s of dead time. Its objective price at the median completion is `time`
+  # 0.02 plus the completion bonus's own slope, d(bonus)/d(official) = -level_complete * 0.75 * target /
+  # official^2 = -0.604/s, i.e. 0.0403 -> 0.0603 objective. The policy FEELS 0.02 now plus 0.0403 x 0.998^1180
+  # (the pit is ~1,180 decisions before the completion) = 0.0238. The shortfall is 0.0365 at the mechanical
+  # 0.0667 s per decision and 0.054 at the measured OLS 0.0985 s; taken at the slower live median (128.9 s)
+  # it is 0.0273. Band 0.027-0.054.
+  # WHY 0.035 AND NOT THE MIDPOINT. The charge is not free on the SHAFT leg, which is the level's third
+  # largest loss and was solved by this policy (150.5 s -> 15.4 s): there, airborne decisions earn MORE than
+  # grounded ones (+0.1386 vs +0.0931 per decision, measured), so a weight at or above 0.0455 would invert
+  # that ordering and push the policy off a climb it has learned. 0.035 keeps a 23% margin under it while
+  # still turning the pit-edge leg's airborne stream net negative (+0.0291 -> -0.0059) and the pit leg's
+  # (+0.0186 -> -0.0164). Pinned by tests/test_speed_oob_weight.py; derivation and revert triggers in
+  # docs/project-log.md, 2026-09-22.
   rewards:
     death: 12.0
+    oob: 0.035
   # NO `train:` BLOCK. A SPEED STAGE TRAINS AT `train.hyperparams` BELOW, gamma 0.998 / gae_lambda 0.95.
   #
   # S1 (gamma 0.999 + gae_lambda 0.98) WAS TRIED AND REVERTED, 2026-09-21. It was live on spec_0-1_speed round 6
