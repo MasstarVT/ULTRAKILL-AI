@@ -11,7 +11,7 @@ run ever recorded is kept in the generation history below.
 
 | Level | Time | Rank | Generation | Difficulty | Date | Notes |
 |-------|------|------|------------|------------|------|-------|
-| 0-1 | 01:04.067 | B | spec_0-1_speed@50.95M | Brutal | 2026-09-22 | training episode (sampled actions), fresh start |
+| 0-1 | 01:01.996 | B | spec_0-1_speed@51.48M | Brutal | 2026-09-22 | training episode (sampled actions), fresh start |
 | 0-2 | 01:17.085 | S | spec_0-2_speed@28.29M | Violent | 2026-09-20 | training episode (sampled actions), fresh start |
 | 0-3 | 04:23.904 | B | campaign_gates@13.39M | Violent | 2026-09-18 | training episode (sampled actions), fresh start |
 
@@ -21,6 +21,7 @@ Best run from each generation, newest first. Keep every generation here, even on
 
 | Generation | Level | Time | Rank | Kills | Deaths | Δ vs previous | Date | Notes |
 |------------|-------|------|------|-------|--------|---------------|------|-------|
+| spec_0-1_speed@51.48M | 0-1 | 01:01.996 | B | 30 | 0 | -2.071s | 2026-09-22 | training episode (sampled actions), fresh start |
 | spec_0-1_speed@50.95M | 0-1 | 01:04.067 | B | 27 | 0 | -2.595s | 2026-09-22 | training episode (sampled actions), fresh start |
 | spec_0-1_speed@42.53M | 0-1 | 01:06.662 | B | 31 | 0 | -5.571s | 2026-09-21 | training episode (sampled actions), fresh start |
 | spec_0-1_speed@40.49M | 0-1 | 01:12.233 | A | 42 | 0 | -6.147s | 2026-09-21 | training episode (sampled actions), fresh start |
