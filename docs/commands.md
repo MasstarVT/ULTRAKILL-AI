@@ -642,8 +642,17 @@ update, a crash) takes the driver, its trainer, the five helpers and all twelve 
 Launch the driver through Windows Task Scheduler instead; the task's tree is the scheduler's, not the app's:
 
     schtasks /Create /F /TN "ULTRAKILL-AI driver" /TR '"F:\Github\ULTRAKILL-AI\python\runs\start_driver.cmd"' /SC ONCE /ST 23:58
+    # then set the task's priority to NORMAL (4): the default 7 = below normal, and Windows trims the working
+    # sets of below-normal children to ~140 MB, so the supervisor's 600 MB boot gate never passes and the
+    # trainer never starts (2026-09-22). Export the XML, edit <Priority>7 -> 4, re-create from it:
+    $xml = (schtasks /Query /TN "ULTRAKILL-AI driver" /XML ONE) -join "`n"
+    $xml = $xml -replace '<Priority>\d+</Priority>', '<Priority>4</Priority>'
+    Set-Content "$env:TEMP\driver_task.xml" $xml -Encoding Unicode
+    schtasks /Create /F /TN "ULTRAKILL-AI driver" /XML "$env:TEMP\driver_task.xml"
     schtasks /Run /TN "ULTRAKILL-AI driver"
 
-(`/SC ONCE` with a start time is only there because `schtasks` insists on a schedule; `/Run` is what starts it.)
+(`/SC ONCE` with a start time is only there because `schtasks` insists on a schedule; `/Run` is what starts it.
+Children inherit the priority class, so a driver started at priority 7 launches priority-7 games: fix the task
+BEFORE running it, or stop the driver and its never-trained games and run it again.)
 The driver then relaunches the games and the trainer by itself. After any app restart: `python scripts/check_run.py`;
 if it shows 0/12 ports, no `campaign_driver.py` process and no `DRIVER_PAUSE`, run the `/Run` line above.
