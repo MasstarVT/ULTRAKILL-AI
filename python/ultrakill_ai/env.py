@@ -2138,6 +2138,7 @@ class UltrakillEnv(gym.Env):
         camp = raw.get("campaign") or {}
         checkpoints, arenas, doors, pickups, placements = self.milestones.update(raw.get("campaign"))
         novelty = 0.0
+        oob = 0  # the same condition `_oob_steps` counts, carried into the reward (rewards.RewardConfig.oob)
         player = raw.get("player")
         pos = player["pos"] if player else None
         # Kills and style restart the stuck clock (see below) and, for the same reason, suspend the gate
@@ -2155,6 +2156,7 @@ class UltrakillEnv(gym.Env):
             self._last_pos = list(pos)
             ground = self._ground_point(raw)
             if ground is None:
+                oob = 1
                 self._oob_steps += 1
             else:
                 novelty = self.archive.visit(ground)
@@ -2185,7 +2187,8 @@ class UltrakillEnv(gym.Env):
         else:
             self._steps_since_progress += 1
         return CampaignStep(checkpoints=checkpoints, arenas=arenas, doors=doors, novelty=novelty, path_gain=path_gain,
-                            gates=gates_new, gate_approach=approach, item_pickups=pickups, item_placements=placements)
+                            gates=gates_new, gate_approach=approach, item_pickups=pickups, item_placements=placements,
+                            oob_steps=oob)
 
     def _note_speed_target(self, raw: dict[str, Any]) -> None:
         """Reads the level's own S-rank time off the first observation that carries one, once.

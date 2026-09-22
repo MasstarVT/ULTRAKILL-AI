@@ -73,7 +73,8 @@ def test_the_shipped_plan_ships_no_train_or_env_override():
     assert p.speed_train == {}, \
         "no speed.train block ships: S1 was reverted 2026-09-21 and S2 (gamma 0.9995) is CANCELLED"
     assert p.speed_env == {}, "S5 is not switched on: `speed.env:` is absent from the shipped plan"
-    assert set(p.speed_rewards) == {"death"}, "only the 2026-09-20 death weight has landed"
+    assert set(p.speed_rewards) == {"death", "oob"}, \
+        "the 2026-09-20 death weight and the 2026-09-22 oob weight, and no other reward lever"
 
 
 def test_a_complete_stage_and_a_speed_stage_now_train_at_the_same_hyperparameters():

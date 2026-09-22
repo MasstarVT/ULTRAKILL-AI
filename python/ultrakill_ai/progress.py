@@ -700,6 +700,11 @@ class ProgressCallback(BaseCallback):
             "level_started": stats["level_started"],
             "wedged_steps": stats["wedged_steps"],
             "completed": stats["completed"],
+            # The share of this episode's decisions with no ground within 30 m under the player (2026-09-22).
+            # It was already a status.json 100-episode mean, which a trainer restart throws away; per episode
+            # it is the mechanism metric for the speed stage's `oob` weight, and the only way to bucket it by
+            # 500k steps the way every other judgement on this run is made.
+            "oob_frac": stats["oob_frac"],
             # Stage S0, the two slot numbers worth having per episode: how hard the policy leans on the slot
             # key, and how much of that was the redraw press §3.4 blames for suppressing its own fire. The
             # other nine SLOT_METRICS are means in status.json and columns in metrics_log.csv; this file is

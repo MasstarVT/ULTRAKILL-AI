@@ -5222,3 +5222,168 @@ so Brutal-vs-Violent leg deltas mix a difficulty change with a policy change and
 own. Whether the pit falls are a geometry problem or a control problem was NOT tested in game (no
 `--scripted` geometry probe was run). Per-leg medians are n=21. Nothing was changed: no config, reward,
 plan, policy, port, trainer or game, and **no change is proposed here**.
+
+## 2026-09-22 — The pit gets a price: `speed.rewards: {oob: 0.035}`, live on round 8 of `spec_0-1_speed`
+
+**One change**, landed on `main` as a `--no-ff` merge of `speed-fix` and switched on at a round boundary that
+was forced by hand. It follows directly from the Brutal time budget in the entry above, which named the pit
+as the single largest mechanism and found that the env already COUNTS it and nothing reads it back.
+
+**What the weight is.** A new `RewardConfig` field, `oob`, charged **per decision on which the ground ray
+found nothing within 30 m beneath the player** — literally the condition `UltrakillEnv._campaign_progress`
+already counts into `_oob_steps` and reports as `info["oob_frac"]`, so the reward channel and the metric it
+will be judged by cannot drift apart. It defaults to **0.0**, so `campaign_gates_full.yaml`,
+`campaign_0-1.yaml` and `cybergrind.yaml` build an identical `RewardConfig` and a COMPLETE stage's generated
+config is byte-identical to what it was (pinned by `tests/test_specialists_config.py`). It reaches a SPEED
+stage and nothing else, through the plan's `speed.rewards:` block.
+
+**Why this and not something else.** During a fall the policy is paid `time` -0.02 and nothing else:
+`novelty` pays 0 with no ground under the player (the 2026-09-16 archive fix) and `gate_approach` pays only a
+NEW best closeness, which falling away from the rung never sets. The real price of a fall is the deferred
+completion bonus, and at gamma 0.998 the pit sits ~1,180 decisions from the exit, where that channel is
+delivered at **9.4%** of face value. S1 (2026-09-21) is the standing proof that this policy cannot be made to
+feel a deferred cost by lengthening the horizon, so the remaining move is to put the cost at the moment of
+the mistake — which is exactly what `death: 12.0` did on 0-2.
+
+**Targeting, re-derived per decision from `runs/probe_0-1_brutal` with the env's own rule** (completions
+only, 41,520 decisions, split by the recordings' own `target_hops`):
+
+| leg | oob / decisions | of that leg | of all oob | per completion |
+|---|---|---|---|---|
+| 5 `40,-9,552 -> 40,11,624` PIT EDGE | 2,767 / 5,740 | 48.2% | **55.8%** | 131.8 |
+| 4 `40,11,624 -> 66,21,640` PIT | 1,434 / 2,789 | 51.4% | **28.9%** | 68.3 |
+| 1 `192,31,594 -> 202,56,452` SHAFT | 539 / 5,953 | 9.1% | 10.9% | 25.7 |
+| 6 `40,-9,490 -> 40,-9,552` | 88 / 1,262 | 7.0% | 1.8% | 4.2 |
+| (unattributed, incl. the exit leg) | 126 / 4,578 | 2.8% | 2.5% | 6.0 |
+| 2 ARENA 2, 8 ARENA 1, and 9 / 7 / 3 / 0 | 7 / 8,532, 1 / 8,336, 0 / 4,330 | ~0% | 0.1% | 0.3 |
+
+84.7% of the charge is the two pit legs, 95.6% with the shaft, and it is **silent on the ~31 s of arena
+fighting** the budget called close to irreducible and on every travel leg that goes well. `ground_drop` was
+never None in 54,246 recorded decisions, so a missing ray never charges. `rollout_6`, a 1,522-decision
+non-completion that never left the start area, has `oob_frac` exactly 0.0 — the false-positive check.
+Predictive power over the 21 completions: `seconds = 93.90 + 0.0985 * oob_decisions`, **R2 0.581** (Pearson
+0.762, residual sd 17.8 s), against R2 0.132 for deaths alone on the live rows.
+
+**Why 0.035 and not the band's midpoint.** One oob decision is 1/15 s of dead time. Its objective price at
+the median completion is `time` 0.02 plus the completion bonus's own slope, `d(bonus)/d(official) =
+-level_complete * 0.75 * target / official^2 = -0.604/s`, i.e. 0.0403 -> **0.0603 objective**; the policy
+feels 0.02 + 0.0403 x 0.998^1180 = **0.0238**. The shortfall is **0.0365** at the mechanical 0.0667 s per
+decision and **0.054** at the measured OLS 0.0985 s. The midpoint of that band is 0.04, and it was **not**
+taken, because the charge is not free on the SHAFT leg — the level's third largest loss and a climb this
+policy solved (150.5 s -> 15.4 s). There, measured over all 26 recordings, **airborne decisions earn more
+than grounded ones** (+0.1386 vs +0.0931 per decision), so any weight at or above the **0.0455 crossover**
+inverts that ordering and pushes the policy off the climb. 0.035 keeps a 23% margin under it, still turns the
+pit-edge leg's airborne stream net negative (+0.0291 -> -0.0059) and the pit leg's (+0.0186 -> -0.0164), and
+is below even the mechanical shortfall. Pinned by `tests/test_speed_oob_weight.py`.
+
+**Scale.** At the live `mean_100` of 46.2M steps (`oob_frac` 0.1259 x length 2,035.5 = 256 charged decisions)
+it is **-9.0 per episode** against a mean episode reward of 418.6 (-2.1%) — smaller than `death` (-12.5),
+`punch` (-10.0) and `time` (-40.7).
+
+**Farm bounds** (all asserted in `tests/test_speed_oob_weight.py`). `-cfg.oob * oob_steps` with `oob_steps`
+in {0,1} is **non-positive in every state and at every weight**: there is no input that makes it pay, so it
+cannot be farmed. The avoidance it buys is not degenerate either. *Refuse to cross the pit*: forfeits the six
+remaining gate rungs (90) plus the completion bonus at its floor (25) — counting neither arena, neither door
+unlock, no checkpoint and none of the ~400 m of `gate_approach` — against at most 896 x 0.035 = **31.4**
+saved at the worst crossing ever recorded and 5.8 at the median; and a fall pays no novelty, no approach and
+no path, so it FEEDS the `stuck_seconds: 45` clock rather than escaping it. *Die instead of being rescued*:
+one rescue is 22.87 charges = **0.80** against `death` 12.0 + the lethal hit, a 14x margin that inverts only
+above w = 0.52; the longest spell ever recorded (89 decisions) is 3.1. *Finishing > not finishing* is
+strictly widened — the non-completions pay MORE (`rollout_24`: 2,736 decisions = -95.8) than any completion.
+*Faster > slower* is untouched. **Deliberately NOT fed into the stuck-clock progress condition**: a sustained
+fall must keep ticking toward `stuck`, as it does today, or the 2026-09-16 dive-off-the-map farm comes back.
+
+**Also landed, and inert for training:** `oob_frac` is now written per row into `runs/<run>/episodes.jsonl`.
+It was already a `status.json` 100-episode mean, which a trainer restart throws away; without the column the
+mechanism cannot be bucketed by 500k steps the way every other judgement on this run is made.
+
+**Files:** `python/ultrakill_ai/rewards.py` (the weight, `CampaignStep.oob_steps`, the charge beside `time`),
+`python/ultrakill_ai/env.py` (three tokens in `_campaign_progress`), `python/ultrakill_ai/progress.py` (the
+episode column), `python/configs/specialists.yaml` (`speed.rewards: {death: 12.0, oob: 0.035}` with the
+derivation), `python/tests/test_speed_oob_weight.py` (new, 15 tests) and three existing test files re-pinned.
+The whole no-game suite was run one file at a time against the worktree: **39 files, 0 failures**.
+
+### The round boundary was forced by hand, and why
+
+At 46,188,082 steps the stage rule had **already latched**: `driver_state.json` carried
+`target_reached_at = 46,134,574` and `status.json`'s `median_time_50` read 96.81 against the rung's 100 s, so
+round 7 would have ended `done` at ~46,460,302 (settle 300k from `best.json`'s `at_timesteps` 46,160,302),
+promoted `best.zip` over `models/specialists/Level_0-1.zip` and moved the focus ladder to the **85 s rung**.
+That was refused, for two reasons:
+
+1. **The latch fired on a reading the project's own noise rule says is not evidence.** A single
+   `median_time_50` is a 50-episode window with sd ~13 s, and it read 119.4, 125.9 and 134.2 within the
+   preceding few hours. The authority is the full 500k bucket, and the eight full buckets since the rollback
+   are **106.0-117.9 s** — including 117.9 for the most recent one. The policy is not at a 100 s median.
+2. **It would have been two changes at once.** At the 85 s rung the bonus slope falls from -0.604/s to
+   -0.514/s and the mean `level_complete` from ~92 to ~82, so a median-keyed verdict on `oob` could not have
+   been separated from a rung-induced slowdown. `docs/commands.md` says it directly: *a change to a shared
+   reward or optimiser path must not straddle a round that will be judged.*
+
+So `DRIVER_PAUSE` went up first (at 46,224,802 steps, which froze the decision), the driver was stopped by
+pid, the plan was landed, and the round was ended with `END_STAGE` — recorded `unfinished — ended by
+operator`, **not promoted** (`refuse_promotion`), the rung **not** recorded as met, so round 8 repeats the
+same 100 s rung with the same generated config plus `oob`. The cost is the discarded latch and up to 50k
+steps: `stop_stage` kills the trainer by pid so `latest.zip` is not written and `round_init` resumes from the
+newest `ckpt_*_steps.zip`. Nothing else is lost — the weights stay in `models/spec_0-1_speed/`.
+
+### Baseline, horizon and the revert triggers
+
+**Baseline**, taken the same way immediately before the change, from `runs/spec_0-1_speed/episodes.jsonl`:
+the eight FULL 500k buckets of fresh completions since the 42,185,602 rollback.
+
+| bucket | n | p10 | median | p90 | best | fresh rate | deaths | kills |
+|---|---|---|---|---|---|---|---|---|
+| 42,185,602 | 227 | 85.7 | 106.9 | 160.6 | 66.66 | 0.92 | 0.87 | 37.0 |
+| 42,685,602 | 229 | 85.2 | 112.0 | 191.4 | 66.89 | 0.93 | 1.09 | 37.8 |
+| 43,185,602 | 221 | 89.9 | 112.6 | 167.7 | 77.38 | 0.93 | 0.83 | 37.1 |
+| 43,685,602 | 233 | 90.0 | 115.2 | 160.1 | 75.61 | 0.94 | 1.00 | 36.4 |
+| 44,185,602 | 234 | 96.8 | 117.2 | 164.5 | 78.89 | 0.94 | 1.03 | 37.0 |
+| 44,685,602 | 223 | 89.7 | 112.5 | 173.4 | 74.44 | 0.92 | 1.24 | 36.6 |
+| 45,185,602 | 256 | 85.6 | 106.0 | 143.2 | 73.98 | 0.95 | 0.94 | 35.5 |
+| 45,685,602 | 212 | 88.6 | 117.9 | 186.8 | 70.02 | 0.90 | 1.30 | 37.2 |
+
+Mean of medians **112.5 s** (sd 4.1, range 106.0-117.9), p10 band **85.2-96.8**, fresh rate **0.90-0.95**,
+deaths **0.83-1.30**, kills **35.5-37.8**. Pooled median over the eight, 111.88 s (n=1,835) — which matches
+the recordings' 111.43 s, so the probe is the live run.
+
+**Mechanism metric, checked FIRST and independent of the noisy median:** mean `oob_frac` per fresh episode
+per 500k bucket, from the new column. Pre-change references: probe completions median 0.0919 / mean 0.1101
+(167 / 236 decisions), live `mean_100` **0.1259** at 46.2M. Also `status.json`'s
+`reward_parts_mean_100["oob"]`, expected about **-9** at the start of round 8 and falling as the behaviour
+changes. **If `oob_frac` has not fallen by the second full post-change bucket the lever is INERT, and nothing
+the median does is evidence either way** — say so and stop, do not reason from the median.
+
+**Primary metric:** bucket median of `level_seconds` over fresh completions. **Secondary:** bucket p10, fresh
+rate, deaths and kills per fresh episode, and a re-run of the per-leg recording once >= 2M steps have passed.
+**Horizon:** >= 2M steps after the first FULL post-change bucket, i.e. 4-5 full buckets. No verdict before
+that.
+
+**Revert triggers — any one, on FULL buckets only:**
+1. bucket median worse than 112.5 s by > 15 s for two consecutive buckets (the S1 trigger, unchanged);
+2. mean deaths per fresh episode above ~2.2 for a full bucket — the "dive to die rather than be rescued"
+   failure;
+3. fresh completion rate below 0.80 for a full bucket — the "refused to cross the pit" failure;
+4. bucket p10 worse than the 85.2-96.8 band by > 15 s for two consecutive buckets — the "uniformly more
+   careful" failure, which a median can hide;
+5. **on the >= 2M-step per-leg re-recording, the shaft leg (hops 1) median up by more than ~3 s (20% of its
+   15.4 s) while the pit-edge leg falls** — the term trading one leg for another. This is the trigger the
+   0.0455 crossover exists to make unlikely, and it is the one a whole-run median would hide.
+
+**Revert** = delete `oob` from `speed.rewards` (or set 0.0) and restart the driver so the next round
+regenerates the config. No checkpoint rollback is needed: a reward weight is not stored in a checkpoint.
+**Success / stop early:** bucket median <= 100 s for two consecutive full buckets at fresh rate >= 0.4, at
+which point the driver's own rung rule passes honestly and the ladder moves to 85 s on its own.
+
+**Not verified.** Whether the pit is geometry or control — still no `--scripted` probe over
+`40,-9,552 -> 66,21,640` and no collider inspection, the same gap the budget declares. Causation from the
+falls to the slow mode is **not** established; the evidence is association plus the per-leg attribution. The
+per-leg reward rates that set the constant are an average over the policy's CURRENT behaviour, not a
+counterfactual between an airborne and a grounded route. The 66.662 s best run could not be measured for
+`oob` at all (`best_runs/Level_0-1.json` carries positions, kills, style, restarts, deaths, rank and
+difficulty — no ground reading), so its rescue count is an inference from positions. The charged predicate
+is **not itself an observation input**: `spaces.py` packs the 8-ray, 4 m body-relative ring, not
+`ground_ray_center`, so the policy sees a good proxy for the void and not the exact scalar it is charged for.
+`speed.rewards` is plan-wide, so a later level whose intended route requires a deliberate >30 m drop would be
+charged for taking it and needs its own override before its speed stage starts; today `focus:` and
+`hold_before: "Level 0-4"` mean only 0-1's speed stage ever runs.
