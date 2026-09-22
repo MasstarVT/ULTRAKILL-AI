@@ -72,8 +72,7 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   $_.FullName; if ($LASTEXITCODE -ne 0) { throw "$($_.Name) failed" } }`.
 - **The live trainer is the specialist driver** (`scripts/campaign_driver.py`): start it with
   `schtasks /Run /TN "ULTRAKILL-AI driver"` (runs `runs/start_driver.cmd`, no flags, OUTSIDE the desktop app's
-  process tree — an app restart killed the whole run on 2026-09-22; recipe in `docs/commands.md`).
-  `driver_state.json` decides the stage. `--dry-run` decides and exits. Pause: `New-Item runs\specialists\DRIVER_PAUSE`.
+  process tree; recipe in `docs/commands.md`). `--dry-run` decides and exits. Pause: `New-Item runs\specialists\DRIVER_PAUSE`.
 - Watch it: `python scripts/check_run.py` (one cheap health reading with an ALERTS line; exit 1 = look),
   `python scripts/specialists_status.py` (read-only), and per stage
   `python scripts/dashboard.py --run spec_0-3 --monitor 1`.
