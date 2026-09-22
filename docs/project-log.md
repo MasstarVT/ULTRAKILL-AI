@@ -5387,3 +5387,70 @@ is **not itself an observation input**: `spaces.py` packs the 8-ray, 4 m body-re
 `speed.rewards` is plan-wide, so a later level whose intended route requires a deliberate >30 m drop would be
 charged for taking it and needs its own override before its speed stage starts; today `focus:` and
 `hold_before: "Level 0-4"` mean only 0-1's speed stage ever runs.
+
+### Activation, 2026-09-22 00:19-00:38 — and one thing the documented procedure gets wrong
+
+The order actually used, which is `docs/commands.md`'s "the procedure every lever shares" with the END_STAGE
+step at the end:
+
+1. **00:19:28** `New-Item runs\specialists\DRIVER_PAUSE` — **first**, and ahead of any work, because the
+   settle boundary was only ~235k steps (~25 min at 158 steps/s) away and a paused driver cannot end a stage.
+   The driver logged `PAUSED` at 00:20:10 and the trainer kept running throughout.
+2. Built, tested and merged the change (`f3063e9`, merged as `62bc1c6`, pushed).
+3. **00:31:4x** stopped the driver by pid — `19072` (the interpreter), `39620` (the venv redirector) and
+   `35052` (`cmd /c start_driver.cmd`), each with `Stop-Process -Id`, **never** `taskkill /T`: the trainer's
+   own `cmd` (31752) is a CHILD of the driver, so a tree kill would have taken the run down. The trainer
+   (31752 -> 17572 -> 32324) was verified alive afterwards.
+4. **00:31:52** `campaign_driver.py --dry-run` **while paused** — this is the step that validates the plan
+   file, and it is where a misspelt `speed.rewards` key would have been a hard error. It printed
+   `FOCUS on Level 0-1 ... now on rung 2 of 10, target 100.00 s` and then `PAUSED ... doing nothing`.
+5. **00:31:56** removed `DRIVER_PAUSE` and ran `--dry-run` again, now on the real decision path: same rung
+   and target, `Level 0-1 (speed): ok, 4,161,984 steps into the stage, rate 0.960 over 50 fresh, median
+   **128.15** (best 66.66) vs target 100.00`. **That median is the whole argument for forcing the boundary**:
+   the same statistic read 96.81 eleven minutes earlier. One 50-episode window, sd ~13 s.
+6. **00:32:09** wrote `END_STAGE` with the text `Level 0-1 speed` (the naming form, so a stale file could not
+   end the wrong stage), **then** started the driver with `runs\start_driver.cmd`. That order matters: the
+   file is read before the stage verdict in `tick()`, so the latched `done` verdict never got the chance to
+   promote and advance the rung.
+7. **00:32:10** `END_STAGE: ending Level 0-1 (speed, round 7)` -> `STAGE END ... unfinished -- ended by
+   operator (rate 0.960 over 50 fresh, median 127.59, best 66.66, target 100.00, 4,162,968 steps into the
+   stage)` -> `NOT promoting` -> **00:32:27** `stage config ... (init 46,348,750 steps)` and `STAGE 2/33
+   Level 0-1 (speed, round 8) ... FOCUS rung 2 of 10 ... target 100.00 s`.
+
+**Step loss: about 180 steps.** Round 7 ended at 46,348,570 and round 8 resumed from `latest.zip` at
+**46,348,750** — the trainer did write it on the way out, so the 50k worst case in `docs/commands.md` did not
+materialise.
+
+**THE ONE DEVIATION, and it should be in the procedure.** `docs/commands.md` promises that stopping the
+driver by pid leaves "the trainer and the twelve games running". The trainer did survive — **the twelve games
+did not.** At 00:32:28 the new driver found *all* of 47800-47811 not listening and relaunched them, which cost
+**~95 s of cold start** (ready 00:34:00, boot gate passed 00:34:02) and nothing else, because the trainer was
+being replaced at that moment anyway. Anyone timing this differently — restarting the driver mid-round
+without ending the stage — would pay that 95 s as real downtime on a live trainer, so **expect the games to
+go with the driver and plan the restart for a moment when the trainer is stopping too.** Side effect worth
+naming: the relaunch reset the games' leak, and system commit went 73% -> **61%**.
+
+**Verified in force, 00:34-00:38, from files only — no socket, no trainer port touched:**
+
+- `models/spec_0-1_speed/env_config.yaml` line 81: **`oob: 0.035`** (beside `death: 12.0`, `difficulty: 4`)
+  — the env the new trainer actually built.
+- `configs/generated/spec_0-1_speed.yaml` diffed against a copy generated the driver's own way into a temp
+  dir before the merge: the **only** differences from the pre-change live file are `oob: 0.035` and the
+  round's `timesteps` budget (51,185,602 -> 55,348,750, i.e. init + 8M + the 1M slack). Nothing else moved.
+- `runs/spec_0-1_speed/status.json`: `reward_parts_mean_100` now carries **`"oob": -9.849`** (predicted ~-9.0
+  at the pre-change `oob_frac`), `campaign.difficulty` **4**, `campaign.target_seconds` **100.0**.
+- `runs/spec_0-1_speed/episodes.jsonl`: rows now carry **`oob_frac`** (0.126-0.179 on the first post-change
+  completions).
+- `runs/spec_0-1_speed_train.log`: `hyperparameters in force: gamma=0.998, gae_lambda=0.95, n_steps=170,
+  batch_size=512, n_epochs=5, ent_coef=0.004, target_kl=0.03` — unchanged, no S1 residue. The tracebacks in
+  that file (`BrokenPipeError`, `EOFError`) are the OLD trainer being killed at 00:32:10 and precede the new
+  trainer's banner; nothing after it.
+- Trainer pid 34740 at **151 steps/s**; all five helpers restarted by the supervisor at 00:34:03
+  (`poll_status`, `keep_best`, `mem_guard`, `post_times`, `dashboard`).
+- `scripts/check_run.py` at 00:37:41: `Level 0-1 [speed, round 8]`, `12/12 listening`, system commit 64%,
+  **`ALERTS none`**.
+
+**Round 8 starts at 46,348,750 steps**, so the first FULL post-change 500k bucket is 46,348,750-46,848,750
+and the earliest honest verdict is ~48.9M. `CLAUDE.md` and `AGENTS.md` were deliberately NOT touched (their
+"Current state" block is stale about a different stage; fixing it is not this change), so
+`scripts/sync_agents_md.py` was not needed and `tests/test_agents_md.py` still passes.
