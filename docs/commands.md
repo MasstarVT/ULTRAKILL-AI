@@ -634,3 +634,16 @@ Judged on: `kills_per_min`, `firing_on_target_frac` and the median, with `slot_d
 `slot_blocked_frac` confirming the lever is live. Revert criterion: median or `completed` worse at the next
 two checks — the standing rule, one thing at a time, ≥ 400k steps.
 - `AGENTS.md` (the same rules under the name other coding agents look for) is GENERATED: after any edit to `CLAUDE.md` run `python scripts/sync_agents_md.py` from `python/` and commit both files; `python scripts/sync_agents_md.py --check` verifies without writing.
+
+## Starting the driver so it survives a desktop-app restart (2026-09-22)
+
+A process started from a Claude desktop session belongs to that app's process tree, and an app restart (an
+update, a crash) takes the driver, its trainer, the five helpers and all twelve games down with it -- silently.
+Launch the driver through Windows Task Scheduler instead; the task's tree is the scheduler's, not the app's:
+
+    schtasks /Create /F /TN "ULTRAKILL-AI driver" /TR '"F:\Github\ULTRAKILL-AI\python\runs\start_driver.cmd"' /SC ONCE /ST 23:58
+    schtasks /Run /TN "ULTRAKILL-AI driver"
+
+(`/SC ONCE` with a start time is only there because `schtasks` insists on a schedule; `/Run` is what starts it.)
+The driver then relaunches the games and the trainer by itself. After any app restart: `python scripts/check_run.py`;
+if it shows 0/12 ports, no `campaign_driver.py` process and no `DRIVER_PAUSE`, run the `/Run` line above.
