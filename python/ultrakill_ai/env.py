@@ -8,7 +8,7 @@ import random
 import time
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import gymnasium as gym
 import numpy as np
@@ -42,11 +42,14 @@ from ultrakill_ai.protocol import (
     DEFAULT_RESET_TIMEOUT,
     DEFAULT_STEP_TIMEOUT,
     RECOVERABLE,
+    TECH_LAYOUT_FEATURES,
     BridgeClient,
     BridgeClosed,
     BridgeError,
+    BridgeIncompatible,
     BridgeSceneUnknown,
     BridgeTimeout,
+    mod_features,
 )
 from ultrakill_ai.envlog import EnvLog, env_log_path
 from ultrakill_ai.procmem import GB as PROC_GB
@@ -54,9 +57,11 @@ from ultrakill_ai.procmem import MB as PROC_MB
 from ultrakill_ai.procmem import derive_game_limit, private_bytes
 from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
 from ultrakill_ai.spaces import (
+    MOVE_TECH_FIELDS,
     NUM_WEAPON_SLOTS,
     NUM_WEAPON_VARIATIONS,
     PITCH_BINS,
+    TECH_LAYOUTS,
     YAW_BINS,
     ObsLayout,
     action_space,
@@ -90,6 +95,8 @@ DEFAULT_WEDGE_HOLD_S = 3.0  # wedge_seconds 0 turns the episode end off; countin
 # decision, all 146 such moves that cost HP land on the level's known rescue points, and none is anything else.
 # Three real rescues moved 8.9-10.3 m and are missed, which errs toward charging less. See `_note_rescue`.
 RESCUE_JUMP_M = 12.0
+SSJ_GAP_S = 0.012  # the mod's own `ssj_gap_s` default: the middle of SSJ bucket 1 (docs/protocol.md), sent explicitly
+MOVE_TECH_GRACE = 30  # v2: frames with a player and no usable `move_tech` before the one-time warning
 
 
 def _known_fields(cls, d: dict[str, Any]) -> dict[str, Any]:
@@ -241,6 +248,18 @@ class EnvConfig:
     # NOTE THE TENSION the spec records: "swap cancel" (§2) is a technique that WANTS rapid switching, so a
     # large number here trades one gain for another. Judge them together.
     sticky_slot_switch_every: int = 3
+    # THE S7 TECH LAYOUT (docs/superpowers/specs/2026-09-20-speedrun-tech.md §4.1-§4.3; the plan is
+    # docs/superpowers/plans/2026-09-23-tech-break-python.md). "v1" -- the default, and every run before the break
+    # -- is the 479-input, 12-dimension policy BYTE FOR BYTE (tests/test_tech_layout.py pins it). "v2" is 530
+    # inputs and 15 dimensions / 57 logits; it needs mod 0.8.0 and refuses to start against anything older.
+    tech_layout: str = "v1"
+    # The v2 gates: which new heads may reach the game. A value that is off here is masked in Python (it never
+    # reaches the wire), refused by the mod as well where the mod has a switch for it, and its logits are pinned
+    # in training (training.pin_action_rows). The defaults are the S7 scope: M1 `ssj` alone.
+    macro_ssj: bool = True
+    macro_ssj_wall: bool = False  # also the mod's `macro_ssj_wall`; M2 was cut to reserved (2026-09-20 review)
+    variant_switching: bool = False  # also the mod's `variant_switching`; opens at S9
+    hook_action: bool = False  # the whiplash: a plain HoldButton the mod cannot refuse; opens at S10
     archive_save_steps: int = 20000  # env lifetime steps between exploration-archive saves
     archive_save_seconds: float = 600.0  # ... or this much wall time, whichever comes first
 
@@ -329,6 +348,20 @@ class EnvConfig:
         for key in self.RUN_ONLY_FIELDS:
             out.pop(key, None)
         return out
+
+
+class TechGates(NamedTuple):
+    """Which v2 heads may reach the game: the macro VALUES forwarded, and whether variant / hook are."""
+
+    macros: frozenset
+    variant: bool
+    hook: bool
+
+
+def tech_gates(cfg: EnvConfig) -> TechGates:
+    """The gates of a config. Macro values 3-5 have no switch: they are reserved and not built in the mod."""
+    macros = frozenset(v for v, on in ((1, cfg.macro_ssj), (2, cfg.macro_ssj_wall)) if on)
+    return TechGates(macros, bool(cfg.variant_switching), bool(cfg.hook_action))
 
 
 BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_visible", "close", "angle_sum", "yaw_err_sum", "dist_sum", "yaw_sum",
@@ -525,14 +558,29 @@ class UltrakillEnv(gym.Env):
                              f"got {self.cfg.curriculum_weighting!r}")
         # The level is mutable from here on: a curriculum run changes it at a fresh load and nowhere else.
         self.level = (self.cfg.levels[0] if self.cfg.levels else self.cfg.level) if campaign else self.cfg.level
-        if self.cfg.layout.campaign != campaign:
-            # The layout follows the mode (Cyber Grind 448 inputs, campaign 479). Replaced, not edited in place:
-            # train.py builds each game's config with dataclasses.replace, so they all share one layout object.
-            self.cfg = replace(self.cfg, layout=replace(self.cfg.layout, campaign=campaign))
+        if self.cfg.tech_layout not in TECH_LAYOUTS:
+            # Caught here, not in a worker's first step: a typo would otherwise build v1 shapes under a config
+            # everyone reads as v2.
+            raise ValueError(f"tech_layout must be one of {TECH_LAYOUTS}, got {self.cfg.tech_layout!r}")
+        tech = self.cfg.tech_layout == "v2"
+        if tech and not campaign:
+            raise ValueError("tech_layout v2 is campaign-only: Cyber Grind's 448 / 11 layout never widens")
+        if self.cfg.layout.campaign != campaign or self.cfg.layout.tech != tech:
+            # The layout follows the mode and the tech switch (Cyber Grind 448 inputs, campaign 479, tech 530).
+            # Replaced, not edited in place: train.py builds each game's config with dataclasses.replace, so they
+            # all share one layout object.
+            self.cfg = replace(self.cfg, layout=replace(self.cfg.layout, campaign=campaign, tech=tech))
 
         self.observation_space = self.cfg.layout.space()
-        # Campaign only: the look mode is appended as a 12th dimension, so Cyber Grind checkpoints stay loadable.
-        self.action_space = action_space(campaign)
+        # Campaign only: the look mode is appended as a 12th dimension, so Cyber Grind checkpoints stay loadable;
+        # tech_layout v2 appends macro / variant / hook after it (15 dims, 57 logits).
+        self.action_space = action_space(campaign, tech=tech)
+        self._tech = tech
+        self._gates = tech_gates(self.cfg)
+        self._mod_features: frozenset = frozenset()  # hello.features at the last connect
+        self._macro_reasons: dict[str, int] = {}  # per episode: why each sent macro did not run
+        self._move_tech_missing = 0  # consecutive v2 frames with a player and no usable move_tech
+        self._move_tech_warned = False
 
         self.client = BridgeClient(self.cfg.host, self.cfg.port,
                                    timeout=self.cfg.step_timeout_s, reset_timeout=self.cfg.reset_timeout_s)
@@ -645,7 +693,8 @@ class UltrakillEnv(gym.Env):
         retry = self.cfg.connect_retry_s
         if self._recovery_deadline is not None:
             retry = self._clamp(retry, self._recovery_deadline)
-        self.client.connect(retry_seconds=retry)
+        hello = self.client.connect(retry_seconds=retry)
+        self._check_mod(hello)
         mod_layout = self.cfg.layout.mod_config()
         # Ask the mod for more enemies than the policy sees so damage rewards aren't missed.
         mod_layout["max_enemies"] = max(32, self.cfg.layout.max_enemies)
@@ -667,8 +716,53 @@ class UltrakillEnv(gym.Env):
             difficulty=self.cfg.difficulty,
             unlock_all_gear=self.cfg.unlock_all_gear,
             **mod_layout,
+            **self._tech_mod_config(),
         )
         self._connected = True
+
+    def _required_features(self) -> set[str]:
+        """The `hello.features` this config cannot run without. Empty under v1: a 0.7.2 DLL serves v1 as today."""
+        return set(TECH_LAYOUT_FEATURES) if self._tech else set()
+
+    def _check_mod(self, hello: dict[str, Any] | None) -> None:
+        """Refuses, loudly and unrecoverably, a mod that cannot serve this config (see BridgeIncompatible)."""
+        self._mod_features = mod_features(hello)
+        need = self._required_features()
+        if not need:
+            return
+        version = (hello or {}).get("mod_version")
+        missing = sorted(need - self._mod_features)
+        if missing:
+            self.envlog.event("mod_incompatible", mod=version, missing=",".join(missing))
+            raise BridgeIncompatible(
+                f"port {self.cfg.port}: tech_layout {self.cfg.tech_layout!r} needs mod features {missing}; the game "
+                f"runs mod {version!r} with features {sorted(self._mod_features) or 'none'}. Install mod 0.8.0 "
+                "(docs/commands.md, 'S7 -- the one break') or set tech_layout back to v1.")
+        self.envlog.event("mod_features_ok", mod=version, layout=self.cfg.tech_layout)
+
+    def _tech_mod_config(self) -> dict[str, Any]:
+        """The mod 0.8.0 settings, sent EXPLICITLY on every connect -- or nothing at all to a 0.7.x DLL.
+
+        The mod's config is per GAME PROCESS, not per connection (docs/protocol.md): a private test that switched
+        `variant_switching` on, or a v2 client before a rollback, would otherwise be inherited by whoever connects
+        next. So every switch is sent with the value THIS config means. Against a DLL that advertises no
+        `features` (0.7.x) the dict is empty and the configure call is today's, key for key.
+        """
+        if not self._tech and "obs.move_tech" not in self._mod_features:
+            return {}
+        return {
+            "obs_move_tech": self._tech,  # block A
+            "obs_weapon_tech": False,  # block B: S9
+            "obs_projectiles": False,  # block C: S10
+            "obs_input_clock": False,  # a diagnostic, never for training
+            "macros": True,  # the master switch; a macro still runs only when an action asks for one
+            "macro_ssj_wall": bool(self._tech and 2 in self._gates.macros),
+            "allow_reserved_macros": False,
+            "macro_wall_lead_unsafe": False,
+            "variant_switching": bool(self._tech and self._gates.variant),
+            "ssj_gap_s": SSJ_GAP_S,
+            "ssj_indicator": False,
+        }
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         """One bounded retry against a rebuilt connection, then the failure is real and is raised.

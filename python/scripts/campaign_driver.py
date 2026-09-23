@@ -559,6 +559,15 @@ def _speed_env(path, block) -> dict:
             raise ValueError("%s: speed.env.%s must be a number, not %r" % (path, key, value))
         if expected == "str" and not isinstance(value, str):
             raise ValueError("%s: speed.env.%s must be a string, not %r" % (path, key, value))
+    layout = block.get("tech_layout")
+    if layout is not None:
+        from ultrakill_ai.spaces import TECH_LAYOUTS  # noqa: PLC0415 - lazy for the same reason as EnvConfig above
+
+        if layout not in TECH_LAYOUTS:
+            # At plan load, not in twelve workers: an unknown value raises in UltrakillEnv.__init__, i.e. a crash
+            # loop, and a typo that happened to be accepted would train a layout nobody asked for.
+            raise ValueError("%s: speed.env.tech_layout must be one of %s, not %r"
+                             % (path, list(TECH_LAYOUTS), layout))
     refused = sorted(set(map(str, block)) & set(SPEED_ENV_REFUSED))
     if refused:
         raise ValueError("%s: speed.env may not set %s -- stage_config decides those (use `speed.rewards:` for "

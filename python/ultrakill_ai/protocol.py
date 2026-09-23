@@ -78,6 +78,29 @@ class BridgeSceneUnknown(BridgeError):
 RECOVERABLE = (BridgeTimeout, BridgeClosed, BridgeSceneUnknown)
 
 
+class BridgeIncompatible(RuntimeError):
+    """The mod on the other end cannot serve what this client is configured for -- e.g. `tech_layout: v2` against
+    a 0.7.2 DLL, which would otherwise train 530 inputs of which 51 are always zero.
+
+    DELIBERATELY NOT a BridgeError and NOT in RECOVERABLE. `UltrakillEnv._try_reconnect_until` retries every
+    BridgeError, and its last rung relaunches the game: a wrong DLL would then cost a relaunch loop across twelve
+    games. This escapes every handler instead, so the worker -- and with it the trainer -- dies with this message in
+    runs/<run>_train.log. That is the loud failure spec §4.7 asks for.
+    """
+
+
+# What a `tech_layout: v2` client needs in `hello.features` (docs/protocol.md). A 0.7.x DLL sends no such array.
+TECH_LAYOUT_FEATURES = ("monotonic_input_clock", "macro.ssj", "obs.move_tech")
+
+
+def mod_features(hello: dict[str, Any] | None) -> frozenset[str]:
+    """`hello.features` as a set of strings; missing (a 0.7.x DLL) or malformed reads as the empty set."""
+    raw = (hello or {}).get("features")
+    if not isinstance(raw, (list, tuple)):
+        return frozenset()
+    return frozenset(f for f in raw if isinstance(f, str))
+
+
 class _LineReader:
     """Newline-delimited reads off a socket with a WALL-CLOCK bound, not a per-syscall one.
 
