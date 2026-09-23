@@ -666,12 +666,18 @@ Launch the driver through Windows Task Scheduler instead; the task's tree is the
     # trainer never starts (2026-09-22). Export the XML, edit <Priority>7 -> 4, re-create from it:
     $xml = (schtasks /Query /TN "ULTRAKILL-AI driver" /XML ONE) -join "`n"
     $xml = $xml -replace '<Priority>\d+</Priority>', '<Priority>4</Priority>'
+    # and remove the default 72-hour ExecutionTimeLimit (PT72H), or Task Scheduler stops the driver -- and
+    # whatever of the run hangs off its process tree -- three days later (found 2026-09-22):
+    $xml = $xml -replace '<ExecutionTimeLimit>[^<]*</ExecutionTimeLimit>', '<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
     Set-Content "$env:TEMP\driver_task.xml" $xml -Encoding Unicode
     schtasks /Create /F /TN "ULTRAKILL-AI driver" /XML "$env:TEMP\driver_task.xml"
     schtasks /Run /TN "ULTRAKILL-AI driver"
 
 (`/SC ONCE` with a start time is only there because `schtasks` insists on a schedule; `/Run` is what starts it.
 Children inherit the priority class, so a driver started at priority 7 launches priority-7 games: fix the task
-BEFORE running it, or stop the driver and its never-trained games and run it again.)
+BEFORE running it, or stop the driver and its never-trained games and run it again. To change settings of a
+task that is already RUNNING without stopping it, use `Set-ScheduledTask -TaskName "ULTRAKILL-AI driver"
+-Settings (New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -Priority 4 ...)`; a
+`schtasks /Delete` would stop the running instance.)
 The driver then relaunches the games and the trainer by itself. After any app restart: `python scripts/check_run.py`;
 if it shows 0/12 ports, no `campaign_driver.py` process and no `DRIVER_PAUSE`, run the `/Run` line above.
