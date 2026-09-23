@@ -5805,3 +5805,122 @@ switched on only after the two buckets confirm the 97-102 s policy is back.
 **Not verified.** Whether the rollback restores the 97-102 s policy: only the two full buckets can say that.
 The actual cause of the slide. What `Binds.json` held before 17:40. The archive counts loaded at 18:03
 (inferred, not logged). Any in-game behaviour: no eval was run and no bridge port was connected to.
+
+## 2026-09-23 — The decisive test: REPLAY R14a from its own `latest.zip` (52,245,598), in the post-reboot setup
+
+**Why: the restart-drift diagnosis, as the lead handed it to this operation.** This entry does not re-derive the
+audit or the A/B numbers below; they are recorded as given.
+
+- Round 14 (rung 85) started 2026-09-22 11:21 from `models/spec_0-1_speed/latest.zip` at 52,245,598 steps
+  (**"R14a"**). Its training held a **96.8-101.1 s** median for 3.4M steps.
+- After the 17:40 PC reboot, two mid-round resumes from `ckpt_55645054` both drifted to **108-113 s** within
+  ~1-2.5M steps of training, at every quantile, deathless runs included: **"R14b"** (18:03) and **"R14c"**
+  (23:29, after the rollback in the entry above).
+- **The resume path has no mechanism.** The audit found no difference: same command, same config, same
+  hyperparameters in force, same SB3 zip contents including the optimizer. The `ent_coef` reset and the env
+  resets happen on both paths. There is no VecNormalize.
+- **The frozen A/B could not resolve it.** On a private game, n=36 per arm, the median difference had a CI of
+  ±15 s. The weights' behaviour fingerprints do differ: weapon-slot mix, look mode, boss-leg time.
+- **Every restart perturbs the median.** Since round 7, each restart moved it **+4-10 s** in its first
+  **0.15-0.4M steps**. The seven restarts before the reboot recovered; the two after it did not. **A restart
+  must not be judged on that window.**
+- **Conclusion.** The weights drift DURING TRAINING from 55.645M in the current setup. It is unknown whether
+  the post-reboot SETUP causes this, or whether 55.645M was a fragile point.
+
+**The test.** Resume from the SAME FILE R14a started from, with the same config, in the post-reboot setup.
+The file is `latest.zip` at 52,245,598, SHA-256 prefix `45f182a4bac7cb95b5dc`, with a second copy in
+`python/runs/rollback_backup_2026-09-22_reboot/`. If training from R14a's own start point reproduces R14a's
+numbers, the setup is fine. If it drifts like R14b and R14c, the setup is what changed.
+
+### THE PRE-REGISTERED READING (fixed before any replay data existed)
+
+Read on **500k buckets of fresh Brutal completions** from `python/runs/spec_0-1_speed/episodes.jsonl`, ignoring
+the first **0.4M steps after the resume** (52,245,598 to 52,645,598):
+
+- **RECOVERS** if the **+0.8-1.5M** and **+1.5-2.5M** medians are **<= 102 s**, with deathless-run medians
+  **<= 91 s**. R14a read **98.3/100.8** and **89.2/87.7** on the same windows. Verdict: the setup is fine and
+  55.645M was fragile. Keep training.
+- **DRIFTS** if they are **>= 106 s**, with deathless **>= 95 s**. Verdict: the post-reboot setup changes
+  training. Next: compare the Task Scheduler lineage against the pre-reboot launch.
+- **In between**: extend to +4M.
+- **The step counts, from resume 52,245,598**: judge on **53.05M-53.75M** (+0.8-1.5M) and **53.75M-54.75M**
+  (+1.5-2.5M). The +4M extension runs to **56.25M**.
+- **Nothing else changes**: `fall_hp` stays at **0.0** (dormant), `oob` **0.035** and `death` **12** stay, target
+  **85**, difficulty **4**.
+
+**Kept from the post-reboot setup, deliberately:**
+- the OS update;
+- the Task Scheduler lineage: the driver started at 23:29 and was not restarted for this, and the games run as
+  descendants of `mem_guard`;
+- the `fall_hp` code at weight 0.0. It adds four per-episode readings and no reward;
+- **the exploration archives, which were NOT rolled back.** They carry the counts of R14a, R14b and R14c. The
+  2026-09-22 entry found them saturated above the observation map's 1,000 point, so the feature and the novelty
+  pay are flat either way. That is still a difference from R14a, which loaded the 11:21 archives.
+
+The replay's checkpoints reuse R14a's file names (`ckpt_52295590` onward). R14a's own files are in a
+subdirectory, so nothing collides.
+
+### The replay, 2026-09-23 03:49-03:54
+
+Nothing connected to a bridge port. `games.py launch` / `stop` were never run, and no game was stopped by this
+operation. `mem_guard` (32012) and the driver (16580, the Task Scheduler one from 22 Sep 23:29) were left
+running. The driver was NOT restarted. This time the recipe was a pause, then trainer surgery, then unpause.
+
+| time | step |
+| --- | --- |
+| 03:49 | `mem_guard.py --dry-run`: 12 games, 23.7 GB total, fattest 2.3 GB, system commit 80%. 12/12 bridge ports listening. `models/specialists/Level_0-1.zip` SHA-256 `CD812F25…4039683D` |
+| 03:51:49 | `runs/specialists/DRIVER_PAUSE` created. The driver logged `PAUSED` at 03:52:17 |
+| 03:52 | copied to `python/runs/rollback_backup_2026-09-23_replay/`: `latest.zip` (`45f182a4bac7cb95b5dc…4c73d923`; `supervise.zip_timesteps` 52,245,598; mtime 2026-09-22 11:20:54, identical to the 2026-09-22 backup copy), `best.zip` (`1a08aeca…3291d387ef0`, 52,845,502), `best.json` and `driver_state.json` (`d368dfb0…`) |
+| 03:52:28 | the trainer was force-stopped, **real trainer process (10572) FIRST**, then its 12 `multiprocessing-fork` workers. The venv shim (35780) and the `cmd` wrapper (11664) exited on their own once the trainer was gone. The last logged rollout was 57,819,694, and `status.json` read 57,820,330. Afterwards `latest.zip` had the same SHA-256 and mtime, and the train log has no "Saved" line (only the workers' `BrokenPipeError` tracebacks) |
+| 03:52:36 | `poll_status`, `keep_best`, `post_times`, `dashboard` stopped by pid (real process, then shim, then `cmd`). No `.git/index.lock`, and no git child of `post_times` |
+| 03:52:51 | **111 checkpoints MOVED** (never deleted) to `models/spec_0-1_speed/rolled_back_2026-09-23_replay/`, 1,401.4 MB: **68 from R14a** (`ckpt_52295590` … `ckpt_55645054`) and **43 from R14c** (`ckpt_55695046` … `ckpt_57794710`). 788 checkpoints were scanned; the file name and the zip's `num_timesteps` agreed on every one, and none was unreadable. `best.zip` and `best.json` were moved there too (`best.json` recorded 52,858,030, past the resume point). The newest kept checkpoint is `ckpt_52220182`, so `supervise.choose_resume` answers `latest.zip` at 52,245,598. `latest.zip` stayed in place. `models/specialists/Level_0-1.zip` was not touched |
+| 03:52:57 | run files rotated; the originals are kept as `.replay-52.25M-57.8M`. `episodes.jsonl`: 13,295 rows with `timesteps` < 52,245,598 kept (max 52,244,446), 2,913 aside (1,819 from R14a, 1,094 from R14c). `metrics_log.csv`: 3,557 rows kept under the same 109-column header (CRLF kept), 1,239 aside. `status.json`: the 57,820,330 reading (start 55,645,054) moved aside with no replacement |
+| 03:53 | `driver_state.json` checked and left alone, byte-identical to the backup. `current` = Level 0-1 speed, round 14, rung index 2 (85 s), `start_steps` = `stale_below` = 52,245,598, `target_reached_at` null, `init` = `latest.zip`. The round's 8M cap again counts from 52,245,598 |
+| 03:53:09 | `campaign_driver.py --dry-run`: "FOCUS on Level 0-1 … now on rung 3 of 10, target 85.00 s", then `PAUSED`. The pause file was still in place, so the official dry run stops before the trainer line. A one-tick dry run of the same `Driver` class, with only the pause path redirected (its log went to a scratch file, and nothing was written), printed "`[dry-run] would start the trainer: … --resume F:/Github/ULTRAKILL-AI/python/models/spec_0-1_speed/latest.zip`". `choose_resume` returned `latest.zip`, 52,245,598 |
+| 03:53:3x | 12/12 ports listening; `DRIVER_PAUSE` removed as its own command |
+| 03:54:18 | the RUNNING driver started the trainer: "`started trainer for Level 0-1 (pid 33976, resume latest.zip at 52,245,598 steps)`". It started `poll_status`, `keep_best`, `post_times` and `dashboard` at 03:54:19 |
+
+### Verification, from files only (04:03-04:05, ~9.5 minutes after the trainer started)
+
+- **Train log, the new start.** `hyperparameters in force: gamma=0.998, gae_lambda=0.95, n_steps=170,
+  batch_size=512, n_epochs=5, ent_coef=0.004, target_kl=0.03 | rollout buffer: gamma=0.998, gae_lambda=0.95`.
+  This line and the `entropy floor` line are character for character R14a's (2026-09-22 11:21).
+  - The first rollout reads `total_timesteps` **52,247,638** (52,245,598 + 2,040), `ep_len_mean` 1.85e3 and
+    `ep_rew_mean` 415. R14a's first rollout reads exactly the same.
+  - No traceback after the start. Explained variance 0.935 and approx_kl 0.026 at 52.34M.
+- **`status.json`** is fresh and stepping: `start_timesteps` **52,245,598**, 52,336,174 at 04:03:54,
+  `campaign.difficulty` **4**, `target_seconds` **85.0**.
+  - `steps_per_s` read **141**, and `check_run` said 111. Averaged since 03:54:18 the run did ~157. R14c's
+    `status.json` read 171 at the same age. **This was not investigated.**
+- **All 45 new episodes** are Level 0-1 on difficulty 4, spread over all 12 envs, and each one carries the
+  rescue readings.
+- **`models/spec_0-1_speed/env_config.yaml`** (03:54:22): `difficulty: 4`, `death: 12.0`, `oob: 0.035`,
+  `fall_hp: 0.0`, `speed_target_seconds: 85.0`.
+- **Processes.** 12/12 bridge ports listening, 12 games and 12 workers. Five helpers: the kept `mem_guard`
+  (32012) plus a new `poll_status`, `keep_best`, `post_times` and `dashboard`. The driver is still 16580.
+  `check_run.py`: **`ALERTS none`**, system commit 80%.
+- **`models/specialists/Level_0-1.zip` is untouched**: SHA-256
+  `CD812F25816D94B8E4EE1BBC544F8E76AA217EF1260DECB4ED8A78BA4039683D`, mtime 2026-09-22 08:59:36, before and
+  after.
+- **`keep_best` re-seeded `best.zip` on restart**, in two steps:
+  - first `ckpt_50921098` (89.63 s), a round-13-era row that stayed in the rotated `metrics_log.csv`;
+  - then `ckpt_52295590`, the replay's first checkpoint (88.43 s at 52,314,178, on a ~40-episode window).
+  - **So `best.zip` now comes from inside the unjudged first 0.4M.**
+- **The first 90.6k steps, not judged** (they are inside the first 0.4M). The replay had 44 fresh episodes,
+  38 completions, median ~90.0 s, best 66.2 s. R14a's first 90.6k steps, from the rotated file: 39 fresh
+  episodes, 37 completions, median ~93.9 s, best 69.3 s.
+
+**Not verified.**
+- **The verdict itself.** It needs the 53.05M-53.75M and 53.75M-54.75M windows. At ~150-160 steps/s the second
+  window closes roughly 4-4.5 h after 04:04.
+- **The diagnosis above.** The audit, the A/B and the restart-perturbation history were taken as given.
+- **Why `steps_per_s` is lower than R14c's at the same age.**
+- **Any in-game behaviour.** No eval was run and no bridge port was connected to.
+
+**How the resume was proven.** The official `--dry-run` could not show the resume line while the pause file
+existed. The resume is proven by three things: the redirected one-tick dry run, the running driver's own
+"started trainer … latest.zip at 52,245,598" line, and the trainer's first rollout at 52,247,638.
+
+`CLAUDE.md`: the stale "Live" line (rolled back to 55,645,054, next two buckets 97-102 s) was replaced in place
+by the replay and its reading. The file is still 219 lines, and `AGENTS.md` was regenerated with
+`scripts/sync_agents_md.py`.
