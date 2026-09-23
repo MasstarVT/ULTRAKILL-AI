@@ -6209,3 +6209,23 @@ batch_size=512, n_epochs=5, ent_coef=0.004, target_kl=0.03` -- unchanged. `statu
 action 12 x 45, from the round-15 weights at **S16 = 57,524,386**. **The first 0.4M steps after the restart (to
 57,924,386) are not judged**; 500k buckets anchor there. `docs/commands.md`'s `fall_hp` section header still says
 "ON since 2026-09-23" and needs the same one-word update.
+
+## 2026-09-23 17:33-17:40 — EVERYTHING STOPPED on the user's instruction ("we are going to stop everything")
+
+Order followed: `runs/specialists/DRIVER_PAUSE` created 17:33:40 (left in place); the driver stopped by pid
+only (python 20900, shim 7108, the task's cmd 27496); the trainer (20708, 31460) and the five helpers stopped by
+pid; no env worker processes remained; `games.py stop` closed the 12 games (no run live at that point);
+verified: 0 `ULTRAKILL.exe`, 0 of our python processes, 0 bridge ports listening. The hourly watch routine
+`ultrakill-training-watch` is DISABLED (re-enable it when training resumes). The Task Scheduler task
+"ULTRAKILL-AI driver" still exists (`/Run` restarts everything; remove `DRIVER_PAUSE` first).
+
+State at the stop: `spec_0-1_speed` round 16 (focus rung 3 of 10, 85 s), `status.json` at **59,561,518** steps;
+newest checkpoint `models/spec_0-1_speed/ckpt_59524066_steps.zip` (17:30:19), which is what the driver resumes
+from (`latest.zip` is not written on a pid stop). Config in force: `death` 12 + `oob` 0.035, difficulty 4, target
+85 s, no `fall_hp`. Round-16 full buckets so far: 103.1 s (deaths 1.28) and 93.1 s (deaths 1.00); best this
+round 64.3 s; `times.md` 1:00.851 (B, Brutal). The tech break (plan `docs/superpowers/plans/2026-09-23-tech-break-python.md`):
+Tasks 1-5 LANDED on main (main = 06d150e; every landing kept v1 byte-identical, pinned by hash and by
+step-byte pins in `tests/test_tech_layout.py` / `tests/test_tech_env.py`); Task 6 (`quarantine_pre_tech.py`)
+was interrupted mid-work in the worktree `F:\Github\ULTRAKILL-AI-tech` (branch `tech-break-python`), its
+uncommitted changes left there; Tasks 7-12 not started. Nothing of the break is switched on: `tech_layout`
+defaults to v1 and mod 0.7.2 is installed.
