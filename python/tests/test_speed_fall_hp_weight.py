@@ -12,6 +12,13 @@ there 0 times (one-sided Fisher p = 0.0054). The fall was charged `damage_taken`
 nothing -- and the death it sets up arrives where GAE's direct trace is ~1e-7. `fall_hp` charges the HP a
 rescue removes, at the fall. Deaths are the head of the rung-85 loss: +8.07 s each (live OLS, n=1,712).
 
+THE LEVER SHIPS DORMANT (2026-09-22). It was built, reviewed and tested for the 85 s rung, and NOT switched on:
+the live policy had started an unexplained slide just before the switch (bucket medians 96.8-102.1 s for seven
+buckets, then 110.2 and 108.4 after the 55.65M trainer restart; zero-death runs ~88 -> 94-101 s), and a new
+reward term judged against a moving baseline proves nothing (docs/project-log.md, 2026-09-22). The code path -- the
+detector, the four episode readings and the charge at weight 0.0 -- is live at the next trainer start; the
+weight is one line in `speed.rewards:`. `test_the_lever_ships_dormant...` pins both halves.
+
 WHAT THIS FILE PINS. The measured constants and the sizing band, the ceiling, the detector (a rescue is a
 >= 12 m one-decision move on a non-death step, and nothing else is), that the weight at 0 changes no step,
 that the readings reach episodes.jsonl, and the farm table: the term never pays, a fall stays cheaper than a
@@ -23,7 +30,10 @@ from __future__ import annotations
 
 import math
 import sys
+import tempfile
 from pathlib import Path
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -65,8 +75,21 @@ TARGET, MEDIAN = 85.0, 100.1                  # the focus rung, and the probe's 
 RUNGS_AFTER_THE_PIT = 6
 
 
-def plan():
+def shipped_plan():
     return campaign_driver.load_plan(PLAN)
+
+
+def plan():
+    """The shipped plan with the lever switched on the way it will be: one line under `speed.rewards:`.
+
+    Written to a temp file and read back through `load_plan`, so the switch goes through the same validation
+    against RewardConfig's fields that a real plan edit does.
+    """
+    data = yaml.safe_load(PLAN.read_text(encoding="utf-8"))
+    data["speed"].setdefault("rewards", {})["fall_hp"] = WEIGHT
+    out = Path(tempfile.mkdtemp()) / "plan.yaml"
+    out.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    return campaign_driver.load_plan(out)
 
 
 def speed_env(level: str = "Level 0-1") -> dict:
@@ -159,13 +182,22 @@ def one(env, parts: dict) -> dict:
 # ---------------------------------------------------------------------------------------------------------
 # THE RULE AND THE CONSTANT
 # ---------------------------------------------------------------------------------------------------------
-def test_the_speed_stage_charges_fall_hp_at_0_04():
+def test_the_lever_ships_dormant_and_switches_on_with_one_plan_line():
+    shipped = shipped_plan()
+    assert "fall_hp" not in shipped.speed_rewards, "DORMANT: the shipped plan does not name the weight"
+    live = campaign_driver.stage_config(shipped, "Level 0-1", kind=campaign_driver.SPEED)["env"]
+    assert EnvConfig.from_dict(live).rewards.fall_hp == 0.0, "so the live speed stage builds the inert default"
+    assert RewardConfig().fall_hp == 0.0, "the default is inert"
+    # ... and switched on, it is exactly the designed weight on the speed stage and nothing on a complete one.
     p = plan()
-    assert p.speed_rewards["fall_hp"] == WEIGHT, "the plan names the weight"
+    assert p.speed_rewards["fall_hp"] == WEIGHT
     assert speed_rewards().fall_hp == WEIGHT
     complete = EnvConfig.from_dict(campaign_driver.stage_config(p, "Level 0-1")["env"]).rewards
     assert complete.fall_hp == 0.0, "a COMPLETE stage is untouched, and so is every config that never names it"
-    assert RewardConfig().fall_hp == 0.0, "the default is inert"
+    # The switch moves that one weight and nothing else in the generated speed config.
+    on = campaign_driver.stage_config(p, "Level 0-1", kind=campaign_driver.SPEED)["env"]
+    assert {k: v for k, v in on.items() if k != "rewards"} == {k: v for k, v in live.items() if k != "rewards"}
+    assert {k: v for k, v in on["rewards"].items() if k != "fall_hp"} == live["rewards"]
 
 
 def test_every_shipped_non_speed_config_builds_the_inert_default():

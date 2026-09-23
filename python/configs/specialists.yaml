@@ -186,34 +186,17 @@ speed:
   # (+0.0186 -> -0.0164). Pinned by tests/test_speed_oob_weight.py; derivation and revert triggers in
   # docs/project-log.md, 2026-09-22.
   #
-  # WHY `fall_hp` EXISTS (2026-09-22, Level 0-1 on Brutal, the 85 s rung). The rung-85 time budget (28 recorded
-  # episodes in runs/probe_0-1_rung85, median 100.1 s = the live median) puts DEATHS at the head of the typical
-  # run's loss (+8.07 s each, live OLS), and the recordings say where most of them come from. The pit and the
-  # shaft are NON-INSTAKILL DeathZones: decompiled/DeathZone.cs hurts the player by min(50, hp - 1) and
-  # teleports them back, and only FakeHurts at 1 HP. So two falls leave 1 HP -- 89% of recordings reach it --
-  # and 18 of 31 deaths (PRE: 16 of 32) had a rescue as their last HP drop: one-hit kills in arena 2 and at
-  # the boss, a median ~300 decisions after the fall. 21 of 28 recordings entered arena 2 at exactly 1 HP and
-  # died there 13 times; the 7 that entered at 50-100 HP died there 0 times (one-sided Fisher p = 0.0054). The
-  # fall itself was charged `damage_taken` 0.01/HP -- 0.5, 0.49, then nothing -- while the death it sets up
-  # arrives ~300 decisions later, where GAE's trace (0.998 x 0.95)^300 is ~1e-7 and only the critic carries it.
-  # `fall_hp` charges the HP a rescue removes, at the fall. It charges only a FAILED crossing; `oob` charges
-  # every airborne decision over the void, successful ones included, and is capped by the shaft crossover.
-  # THE SIZE. Put the discounted expected death penalty at the fall: rescue-linked deaths per recording x
-  # `death` 12 x gamma^gap / HP per recording, minus the 0.01 `damage_taken` already charges.
-  #   NEW 0.643 x 12 x 0.998^299.5 (0.549) / 99 - 0.01 = 0.033;  PRE 0.615 x 12 x 0.666 / 99 - 0.01 = 0.040;
-  #   over the mean 117.6 HP instead of the median 99: 0.026.  Band 0.026-0.040 (the death's own time cost,
-  #   left out here, would raise it; the critic, which sees HP, already carries part of it, which lowers it).
-  # 0.04 is the top of that band and well under the undiscounted 0.065-0.068 -- conservative, as `death` 12
-  # and `oob` 0.035 were. CEILING: (fall_hp + damage_taken) x 99 < `death` 12, i.e. fall_hp < 0.111, so the
-  # two falls to 1 HP always cost less than the death they stand in for. Per fall: 2.0 + 0.5 (was 0.5); a fall
-  # at 1 HP still 0. About -4.7 per episode at the recorded mean (oob ~-9, death ~-14, time ~-40).
-  # KNOWN ASYMMETRY: per HP, a run that will floor anyway pays less the less HP it brings to the pit, a net
-  # 0.03/HP tilt against healing before a fall (at most ~2 per life). Watched by `hp_lost_other`. Pinned by
-  # tests/test_speed_fall_hp_weight.py; baseline, horizon and revert triggers in docs/project-log.md, 2026-09-22.
+  # `fall_hp` -- BUILT 2026-09-22, DORMANT (not in the block below). Charged per HP a rescue teleport removes:
+  # the pit and the shaft are non-instakill DeathZones (min(50, hp - 1), then a teleport), two falls leave 1 HP,
+  # and 18 of 31 recorded deaths on the 85 s rung were one-hit kills set up that way ~300 decisions earlier.
+  # Designed weight 0.04 (discounted band 0.026-0.040, ceiling 0.111). NOT switched on because the live policy
+  # started an unexplained slide just before the switch, and a lever judged against a moving baseline proves
+  # nothing. To switch it on: add `fall_hp: 0.04` below, at a round boundary, by the procedure in
+  # docs/commands.md. Derivation, farm bounds and the judging plan: docs/project-log.md, 2026-09-22, and
+  # tests/test_speed_fall_hp_weight.py.
   rewards:
     death: 12.0
     oob: 0.035
-    fall_hp: 0.04
   # NO `train:` BLOCK. A SPEED STAGE TRAINS AT `train.hyperparams` BELOW, gamma 0.998 / gae_lambda 0.95.
   #
   # S1 (gamma 0.999 + gae_lambda 0.98) WAS TRIED AND REVERTED, 2026-09-21. It was live on spec_0-1_speed round 6

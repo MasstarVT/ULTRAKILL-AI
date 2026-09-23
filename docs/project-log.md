@@ -5454,3 +5454,212 @@ naming: the relaunch reset the games' leak, and system commit went 73% -> **61%*
 and the earliest honest verdict is ~48.9M. `CLAUDE.md` and `AGENTS.md` were deliberately NOT touched (their
 "Current state" block is stale about a different stage; fixing it is not this change), so
 `scripts/sync_agents_md.py` was not needed and `tests/test_agents_md.py` still passes.
+
+## 2026-09-22 — Rung 85: the time budget, a pit-HP lever built and left DORMANT, and the slide that stopped it
+
+The 85 s rung (focus rung 3 of 10) has trained since 52,245,598 steps. This entry records the measurement made on
+it, the one lever it led to (`fall_hp`, built, tested and merged, **not switched on**), and why it was not
+switched on: the live policy slid ~8-10 s slower after the 55.65M trainer restart, for a reason not found, and
+a lever judged against a moving baseline proves nothing. **Nothing live changed.** No config, plan weight,
+checkpoint or process was touched.
+
+### The rung-85 time budget (recorded 2026-09-22 18:10-18:37)
+
+A private game on 47812 (`-aibridge-nosteam`, 368x207, `-job-worker-count 3`) ran a COPY of
+`models/spec_0-1_speed/ckpt_55695046_steps.zip` with `configs/generated/spec_0-1_speed.yaml` (difficulty 4,
+target 85, `oob` 0.035, `death` 12), stochastic, every episode a fresh load: **28 recordings, 26 completions**
+(the other 2 were mem_guard recycling the private game). Recordings: `python/runs/probe_0-1_rung85/`
+(gitignored), analysis in its `analysis/` folder. **The probe reproduced live at the time**: official median
+100.1 s, p10 79.9, deaths 1.15 per completion, against 99.7 / 80.0 / 1.12 over the 1,712 live fresh completions
+since the rung began.
+
+Per leg (the recording's own `target_hops`, official clock), NEW = this probe, PRE = `runs/probe_0-1_brutal`
+(ckpt 45,685,042, before `oob`), B62 = the 61.996 s best run split by the reach cylinder:
+
+| leg | NEW med / best | B62 | PRE med | NEW - B62 |
+|---|---|---|---|---|
+| 9 spawn | 2.6 / 2.1 | 2.4 | 3.1 | +0.1 |
+| 8 ARENA 1 | 13.9 / 10.1 | 13.9 | 15.5 | 0.0 |
+| 7 | 1.9 / 0.8 | 1.5 | 3.5 | +0.5 |
+| 6 | 3.2 / 2.4 | 2.6 | 3.4 | +0.6 |
+| 5 PIT EDGE | 7.3 / 3.4 | 2.8 | 11.2 | +4.5 |
+| 4 PIT | 4.2 / 1.5 | 2.8 | 3.1 | +1.4 |
+| 3 | 4.7 / 2.9 | 3.7 | 4.7 | +0.9 |
+| 2 ARENA 2 | 22.4 / 15.9 | 14.6 | 24.7 | +7.9 |
+| 1 SHAFT | 15.2 / 8.2 | 8.0 | 15.4 | +7.2 |
+| 0 | 0.8 / 0.4 | 0.6 | 0.9 | +0.1 |
+| exit / BOSS | 12.7 / 7.3 | 9.1 | 12.6 | +3.5 |
+| SUM | 88.8 / 55.1 | 61.9 | 98.2 | +26.8 |
+
+- The sum of per-leg bests (55.1 s) is under B62: every leg's best is already in the repertoire. Median
+  official (100.1) minus the sum of leg medians (88.8) is **11.3 s of INCIDENT time** -- a death, a pit spike,
+  a failed-climb loop -- landing in a different leg each run, which per-leg medians hide.
+- Per completion: arena fighting 27.3 s (PRE 31.1), post-clear walking 25.1 s (unchanged; it is the walk from
+  where the agent fights to the exit door, 2.1-2.7x net displacement at 16.5-18.9 m/s), travel 58.2 s.
+  Game-imposed waits ~0.
+- **Deaths are the head of the typical run's loss.** Live since 52.25M: median 88.4 s with 0 deaths (24% of
+  completions), 98.7 with 1, 107.9 with 2, 124.4 with 3; OLS `seconds = 40.6 + 8.07*deaths + 0.95*kills +
+  0.091*oob_decisions` (R2 0.784).
+- **The pit's median got cheaper since `oob`, its tail did not** (pit complex median 29.1 -> 25.2 s, p90 55.0 ->
+  113.9): 4 of 26 completions lost 80-185 s in one pit leg, one of them to a death just before the (76,20,640)
+  checkpoint that respawned the player BEHIND the pit (172.6 s, 86 rescues). Live, 16 of the 55.0M bucket's 20
+  stuck endings were in the pit zone, 7 of them after being sent back.
+- **The shaft's median held (15.2 vs 15.4 s), its tail got heavier**: failed climbs 6.7 -> 13.5 per completion,
+  dash share in the shaft 0.59 -> 0.39, a shaft leg containing a death 55.6 s against 13.8 without.
+- Completions are a MIXTURE: 80.1% at 96.3 s + 19.9% at 150.5 s (log-normal fit, dBIC 532); zero-death runs with
+  under 150 oob decisions are one mode at 82.7 s. **An 85 s median needs more than half of all runs close to
+  clean: the problem is FREQUENCY, not capability** -- 19.4% of live completions were already at or under 85 s.
+
+### Why so many deaths: the game's own pit rule
+
+`decompiled/DeathZone.cs`: a `notInstakill` zone hurts the player by `damage` (50) while hp > 50, by hp - 1
+while hp > 1, only `FakeHurt`s at 1 HP, then teleports them back. **Two falls leave 1 HP**, and on Brutal the
+next hit kills. Re-derived from both probe sets with the env's own new rule (a >= 12 m one-decision move on a
+non-death step; 114,877 decision pairs; all 146 that cost HP land on the level's known rescue points, no false
+positives; 3 real rescues at 8.9-10.3 m are missed):
+
+- 89% of NEW recordings (92% PRE) were floored to 1 HP by a rescue. Rescue HP per recording: median 99, mean
+  117.6 (PRE 119.7); 2.68 HP-costing rescues and 1.32 floor events per recording.
+- **18 of 31 NEW deaths (16 of 32 PRE) had a rescue as their last HP drop**, a median 299.5 (PRE 203)
+  decisions after it: 12 in arena 2, 3 at the boss, 3 in the pit legs.
+- **21 of 28 NEW recordings entered arena 2 on exactly 1 HP and 13 of them died there; the 7 that entered on
+  50-100 HP died there 0 times** (one-sided Fisher p = 0.0054). PRE: 20 on 1 HP (10 died), 2 above (0).
+- The fall was charged `damage_taken` 0.01/HP: 0.5, 0.49, then nothing. The death it sets up arrives ~300
+  decisions later, where GAE's direct trace (0.998 x 0.95)^300 is ~1e-7; only the critic (which sees HP)
+  can carry it back.
+
+### The lever: `fall_hp` (merged, DORMANT)
+
+- `rewards.py`: `RewardConfig.fall_hp` (default **0.0**) and `CampaignStep.rescue_hp`, charged beside `oob` as
+  `-fall_hp * max(0, rescue_hp)` -- non-positive for every input.
+- `env.py`: `_note_rescue` (`RESCUE_JUMP_M = 12.0`), excluded on the env's own `died` verdict; a checkpoint
+  respawn is applied after the reward and becomes the next `prev`, so it is never compared; a jump that raises
+  HP is counted but charges nothing; a fall at 1 HP removes nothing and charges nothing. **Not fed to the stuck
+  clock**, like `oob`. Four per-episode readings: `rescues` (every teleport, free ones included), `rescue_hp`
+  (the charged quantity), `rescue_floored` (rescues taking the player from above 1 HP to 1) and
+  `hp_lost_other` (HP lost on every other non-death step).
+- `progress.py`: the four readings go to `episodes.jsonl` through `EPISODE_LOG_RAW`; `CAMPAIGN_INFO_KEYS`, and
+  so the Monitor's columns, are unchanged. They start at the next trainer start, weight or no weight -- which
+  is also how the live baseline the lever needs gets collected.
+- `configs/specialists.yaml`: a DORMANT note only; `speed.rewards` is still `{death: 12.0, oob: 0.035}`, and the
+  generated speed config is unchanged apart from a round's own `timesteps` (checked by generating it the
+  driver's own way into a temp dir). Observation 479 / action 12 x 45 unchanged.
+- Tests: new `tests/test_speed_fall_hp_weight.py` (23: the switch is one plan line and moves only that weight,
+  the sizing band, the ceiling, the detector end to end on a fake corridor with HP and a DeathZone, the farm
+  table); `tests/test_slot_counters.py` re-pinned for the four info keys. The whole no-game suite, one file at a
+  time with `PYTHONPATH` on the worktree: **40 files, 0 failures** -- twice, once with the weight in the plan
+  and once in the shipped dormant form. The new file fails on the old code (`ImportError: RESCUE_JUMP_M`).
+
+**The size, for when it is switched on.** Put the discounted expected `death` penalty at the fall:
+rescue-linked deaths per recording x 12 x gamma^gap / HP per recording, minus the 0.01 already charged -- NEW
+0.643 x 12 x 0.549 / 99 - 0.01 = **0.033**, PRE 0.615 x 12 x 0.666 / 99 - 0.01 = **0.040**, over the mean 117.6
+HP **0.026**. Band 0.026-0.040; undiscounted 0.065-0.068. **Designed weight 0.04**: the top of the discounted
+band. (The design proposed 0.06; the review showed the derivation ignored discounting and that the critic
+already sees HP, so the term is added credit-assignment shaping, not the correction of a "0.99 mispricing".)
+**Ceiling** (fall_hp + damage_taken) x 99 < `death` 12, i.e. fall_hp < 0.111: the two falls to 1 HP always cost
+less than the death they stand in for. Per fall: 2.0 + 0.5 (was 0.5); at 1 HP still 0. About -4.7 per episode
+at the recorded mean.
+
+**Farm bounds** (pinned): it never pays; one rescue (<= 2.5) and a whole life's falls (<= 4.95) stay under half a
+death; dying to respawn on 100 HP buys nothing (more HP to lose); refusing the pit saves at most 3.96 against
+>= 115 forfeited and a stuck clock; the clock's ordering is untouched, and one avoided 50-HP fall can justify at
+most ~2.1 s of care (0.94 objective per second at the rung). **Known asymmetry**: per HP, a run that floors
+anyway pays less the less HP it brings to the pit -- a net (0.04 - 0.01) x 49 = 1.47 per life tilt against
+healing before a fall (arena 1 heals ~64 HP per recording). Bounded, not observed, watched by `hp_lost_other`.
+
+**Not chosen** (design review): post-clear walking (the walk to the door; shortening it is the refused
+route-progress / higher-time-cost kind -- its one real sub-loss, the exit target's `ground_pos` 15.5 m from
+where the level actually ends, ~2-3 s, is a candidate of its own); `death` up (charges the wrong decision: 58% of
+deaths were set up ~300 decisions earlier); `oob` up (capped by the 0.0455 shaft crossover, and it charges
+successful crossings); one global `damage_taken` (rescue HP is worth ~0.078/HP of downstream death, enemy HP
+~0.017: any single weight mis-prices one of them 4-5x); a flat per-floor charge (no per-HP asymmetry, but it
+taxes any healing after a floor -- kept as the fallback).
+
+### Why it was NOT switched on: the live policy slid after the 55.65M restart
+
+The whole run was relaunched at 17:47 and again at 18:02 (around the move to Task Scheduler, `9d06a5f` /
+`349659d`); the trainer resumed from `ckpt_55645054` at 18:03. Fresh completions per full 500k bucket, from
+`runs/spec_0-1_speed/episodes.jsonl` (the last two full buckets are after the restart):
+
+| bucket | n | p10 / median / p90 / best | rate | deaths/ep | oob/ep | stuck/100 | zero-death median | residual |
+|---|---|---|---|---|---|---|---|---|
+| 54.0M | 257 | 81.3 / 101.1 / 142.8 / 71.2 | 0.95 | 1.21 | 318 | 1.8 | 87.2 | -1.7 |
+| 54.5M | 236 | 82.1 / 99.5 / 154.0 / 70.1 | 0.90 | 1.25 | 273 | 5.7 | 89.8 | +2.6 |
+| 55.0M | 223 | 80.7 / 97.8 / 159.9 / 65.0 | 0.89 | 1.20 | 386 | 8.0 | 86.8 | -1.1 |
+| 55.5M | 226 | 81.2 / 102.1 / 156.6 / 67.1 | 0.92 | 1.25 | 390 | 5.7 | 90.8 | -0.5 |
+| **56.0M** | 237 | **90.4 / 110.2** / 149.8 / 73.9 | 0.93 | **1.00** | 253 | 3.5 | **101.3** | **+9.3** |
+| **56.5M** | 232 | **85.7 / 108.4** / 153.8 / 72.2 | 0.92 | **0.96** | 224 | 3.6 | **94.4** | **+13.9** |
+
+`residual` = mean of `level_seconds` minus `42.2 + 8.32*deaths + 0.90*kills + 0.091*oob_decisions`, fitted on
+52.25-55.5M: before the restart it is -4 to +3, after it +9 to +14. So the policy now **dies less, falls less
+and is still ~10 s slower**, and the extra time is not deaths, kills or pit. Seven full buckets before it read
+96.8-102.1 (sd ~1.9). The first 125k after the restart already read 103-105; the latest three 106.4 / 108.2 /
+103.1.
+
+**Checked and NOT the cause** (read-only): difficulty is 4 on every row either side; no commit touched
+`python/ultrakill_ai`, `train.py`, the driver, the configs or the mod after 00:xx; the installed plugin is the
+2026-09-18 DLL and the game assemblies are 2026-09-15's; `Preferences/Prefs.json` is unchanged since 09-20
+(`Binds.json` was rewritten at 17:40 with the default binding set -- what it held before is unknown); throughput
+145-158 steps/s either side; mem_guard recycles 8-12 an hour either side; the novelty archives were not reset
+(`cells_new` 318-339 -> 349-372, a little higher, as slower runs cover more ground); decisions per official
+second 16.3-16.5 either side, so the clock is honest and the extra seconds are extra decisions. PPO is healthy
+(entropy ~7.1, KL 0.030-0.034, explained variance 0.86-0.98). One thing the restart DID do: the entropy
+controller restarts at the base `ent_coef` 0.004 (documented, `training.py`), so it was ~0.005 over the first
+250k after the restart against ~0.012 before, then climbed back. Whether that nudged the policy is not known.
+
+**So switching `fall_hp` on now would have been judged against a baseline that had just moved ~8 s**, and the
+lever's own "uniformly more careful" trigger (p10 above 88 s) was already met with no change at all. A term
+that makes falls dearer on top of a policy that has just turned more careful by itself is also the worst
+moment to learn anything from it.
+
+### What to do next
+
+1. **Find the slide first.** Cheapest: let one or two more full buckets land (57.0M, 57.5M) and see whether it
+   reverts. Most informative: re-run the recorded time budget (same pipeline: `probe_rollout.py` on 47812, then
+   `analysis/legs85.py`) on the newest checkpoint against `ckpt_55695046` (already recorded) to see WHICH legs
+   gained the ~10 s. If it is policy drift that persists, a weight rollback to the 55.6M checkpoints (as after
+   S1) is a decision for the lead, not taken here.
+2. **Then switch `fall_hp` on** (`docs/commands.md`), with the judging plan below and a baseline of full buckets
+   that are flat. The four readings will already be in `episodes.jsonl` from the next trainer start, so the
+   mechanism metrics can get a live baseline before the weight moves.
+3. A design property worth measuring, NOT verified as a cause of anything: **tightening the rung weakens the
+   pull toward it.** Above the target the bonus is `100 * (0.25 + 0.75 * target / official)`, so at a 100 s
+   completion its slope falls from 0.75/s at the 100 s rung to 0.6375/s at 85 (and to 0.54/s at 72), and the
+   bonus itself from 100 to 88.75. Kills per completion rose 34-36 -> 37-40 across 54-56.5M. A lever that
+   anchors the bonus scale to a fixed reference instead of the rung would need its own evidence.
+4. The deterministic-vs-stochastic probe (`probe_rollout --deterministic`) is still unrun: the frequency problem
+   may be partly sampling noise.
+
+### The judging plan, for when `fall_hp` is switched on
+
+**Baseline**: the last 4 full 500k buckets immediately before the switch, only if they are flat (no bucket
+median more than ~5 s from their mean); median, p10, fresh rate, deaths, oob decisions and stuck endings per
+fresh episode, and -- new -- `rescue_hp`, `rescue_floored` and `hp_lost_other` per fresh episode if a trainer
+start has already put them in the log. Probe references otherwise: `rescue_hp` NEW 117.6 (sd 88.5, SE ~16.7),
+PRE 119.7; floors 1.32 / 1.23 per episode; share floored 0.89 / 0.92 (SE ~0.04); `hp_lost_other` NEW 320,
+PRE 266.
+
+**Mechanism first**: `rescue_hp` and floors per episode down, deaths per episode down, `status.json`
+`reward_parts_mean_100["fall_hp"]` about -4 to -5 at the start and shrinking. **Moved** = two consecutive full
+buckets clearly below the baseline (or, against the probe references only, `rescue_hp` <= 95 or floors <= 1.0).
+**Inert** = neither by the 4th full post-change bucket: remove it and do not reason from the median.
+**Primary**: bucket median of fresh completions. **Horizon**: >= 2M steps after the first FULL post-change
+bucket. **Expectation, not verified**: 1-3 s off the median (the targeted deaths cost ~6.1 s each in arena 2).
+
+**Revert triggers, any one, full buckets only**: (1) median above baseline mean + 7 s for two consecutive
+buckets -- also roll the weights back to the switch checkpoint; (2) deaths per fresh episode above baseline +
+0.3 for two; (3) fresh rate below 0.85 for two; (4) p10 above the baseline band + 7 s for two; (5) stuck endings
+above 15 per 100 for two, mostly in the pit zone (x < 80, z 480-630); (6) `hp_lost_other` 25% or more above
+baseline for two while `rescue_hp` falls -- the asymmetry (`part_damage_taken` cannot show it: it contains the
+rescue HP too; the fallback is a flat ~3-4 once per rescue that floors the player); (7) on the >= 2M-step
+re-recording, the pit complex median up more than 5 s or the shaft median up more than 3 s while HP-costing
+rescues fall. **Revert** = remove the line and restart the driver by the same procedure.
+
+**Not verified**: causation (the arena-2 table is an association, n=28); live episodes carry no HP yet; the
+zone's 50 damage is inferred from the recorded drops, not read from the scene; whether `rescues` also counts a
+teleport-sized first step after a level load or a respawn (it would be HP-neutral and charge nothing); whether
+other levels' DeathZones behave the same; the effect size; the slide's cause.
+
+`CLAUDE.md`: the stale "Live" line (round 7, rung 2, 100 s) was replaced in place by the current one (round 14,
+rung 3, 85 s, the slide, `fall_hp` dormant) and the levers line gained `fall_hp` OFF; still 219 lines;
+`AGENTS.md` regenerated with `scripts/sync_agents_md.py`.
