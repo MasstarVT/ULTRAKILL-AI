@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from collections import Counter
@@ -53,6 +54,25 @@ def age_of_last_stamp(path: Path) -> float | None:
         except ValueError:
             continue
     return None
+
+
+DRIVER_QUERY = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+                "Where-Object { $_.CommandLine -match 'campaign_driver' } | "
+                "ForEach-Object { $_.ProcessId }")
+
+
+def parse_pids(text: str) -> list[int]:
+    return [int(tok) for tok in text.split() if tok.isdigit()]
+
+
+def driver_pids(timeout: float = 40.0) -> list[int] | None:
+    """Pids of every python process running campaign_driver.py (a read-only WMI query), None if the query failed."""
+    try:
+        done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", DRIVER_QUERY],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_pids(done.stdout) if done.returncode == 0 else None
 
 
 def main() -> int:
@@ -138,8 +158,12 @@ def main() -> int:
         if (age_of_last_stamp(guard_log) or 0) > 2400:
             alerts.append("mem_guard has been silent for over 40 min: is it running?")
     driver_age = age_of_last_stamp(ROOT / "runs" / "specialists_driver.log")
-    print("driver    last log line %.0f min ago" % ((driver_age or 0) / 60))
-    if driver_age is None or driver_age > 4500:
+    pids = driver_pids()
+    alive = "process query failed" if pids is None else ("pid %s" % ",".join(map(str, pids)) if pids else "NOT RUNNING")
+    print("driver    %s, last log line %.0f min ago" % (alive, (driver_age or 0) / 60))
+    if pids is not None and not pids:
+        alerts.append("the driver process is NOT running")
+    elif driver_age is None or driver_age > 4500:
         alerts.append("the driver has logged nothing for over 75 min: is it running?")
     if (ROOT / "runs" / "specialists" / "DRIVER_PAUSE").exists():
         alerts.append("DRIVER_PAUSE exists (a bounce in progress, or one left behind)")
