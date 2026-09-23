@@ -187,16 +187,19 @@ speed:
   # docs/project-log.md, 2026-09-22.
   #
   # `fall_hp` -- built 2026-09-22, SWITCHED ON 2026-09-23 at a round boundary (round 15 of spec_0-1_speed, rung
-  # 85). Charged per HP a rescue teleport removes: the pit and the shaft are non-instakill DeathZones (min(50,
-  # hp - 1), then a teleport), two falls leave 1 HP, and 18 of 31 recorded deaths on the 85 s rung were one-hit
-  # kills set up that way ~300 decisions earlier. 0.04 = the top of the discounted band 0.026-0.040 (ceiling
-  # 0.111). Derivation and farm bounds: docs/project-log.md, 2026-09-22; the baseline, horizon and revert
-  # triggers: docs/project-log.md, 2026-09-23 ("`fall_hp` goes live"). Pinned by tests/test_speed_fall_hp_weight.py.
-  # Revert = delete the line, by the same procedure.
+  # 85) as `fall_hp: 0.04`, and REVERTED 2026-09-23 at the round-16 boundary by the pre-registered INERT rule:
+  # over 4 full post-switch buckets `rescue_hp` per episode (94.9 / 105.3 / 96.5 / 102.3) and floors (1.05 /
+  # 1.22 / 1.25 / 1.20) never made two consecutive buckets below the baseline band; the reading is in
+  # docs/project-log.md, 2026-09-23 13:30. The line is ABSENT again, so a speed stage builds the RewardConfig
+  # default 0.0 (inert). What it was: charged per HP a rescue teleport removes: the pit and the shaft are
+  # non-instakill DeathZones (min(50, hp - 1), then a teleport), two falls leave 1 HP, and 18 of 31 recorded
+  # deaths on the 85 s rung were one-hit kills set up that way ~300 decisions earlier. 0.04 = the top of the
+  # discounted band 0.026-0.040 (ceiling 0.111). Derivation and farm bounds: docs/project-log.md, 2026-09-22;
+  # the baseline, horizon and revert triggers: docs/project-log.md, 2026-09-23 ("`fall_hp` goes live"). Pinned
+  # (dormant) by tests/test_speed_fall_hp_weight.py. Switching it on again = the one line, same procedure.
   rewards:
     death: 12.0
     oob: 0.035
-    fall_hp: 0.04
   # NO `train:` BLOCK. A SPEED STAGE TRAINS AT `train.hyperparams` BELOW, gamma 0.998 / gae_lambda 0.95.
   #
   # S1 (gamma 0.999 + gae_lambda 0.98) WAS TRIED AND REVERTED, 2026-09-21. It was live on spec_0-1_speed round 6

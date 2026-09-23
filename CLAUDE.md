@@ -173,9 +173,9 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   and a round that latched once and drifted back repeats its rung. 25 s is 1.26x the record. Set `focus: null`
   to go back to the plan; the focus stops itself, loudly, when the ladder is done. **The plan is read once,
   at driver start** — a running driver must be restarted before any `focus:` edit means anything.
-- **Live: `Level 0-1` (SPEED) ROUND 15 = FOCUS RUNG 3 of 10 (85 s), run `spec_0-1_speed`**, Brutal, 12 games;
-  `speed.rewards` = `death` 12 + `oob` 0.035 + **`fall_hp` 0.04, LIVE from round 15** (2026-09-23; the R14a replay
-  read RECOVERS; baseline median 101.7 s, triggers and the ignored first 0.4M in the log). Best **62.0 s**.
+- **Live: `Level 0-1` (SPEED) ROUND 16 = FOCUS RUNG 3 of 10 (85 s), run `spec_0-1_speed`**, Brutal, 12 games;
+  `speed.rewards` = `death` 12 + `oob` 0.035 only: **`fall_hp` 0.04 REVERTED 2026-09-23** (live in round 15 only;
+  inert at 4 full buckets, rescue_hp/floors never moved; weights kept; readings in the log). Best **62.0 s**.
   0-2 speed round 2 was ENDED BY THE OPERATOR at 29.23M steps ("unfinished", nothing promoted): its death
   5->12 experiment got only ~1.8M steps and has **NO VERDICT** (deaths/episode 4.58 -> 4.66). Its standing
   finding holds: 0-2 speed is a DEATH problem, not navigation (OLS **+22.3 s/death**, intercept 121.1 s;
@@ -187,8 +187,8 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   baseline): `damage_dealt` is bounded to [0, 1] per enemy — an overkilled enemy with no known health bar paid
   **-250 in one step**, 3.4% of 0-2 completions had a negative total — and `completion_bonus` now pays the
   FLOOR (25), not the full 100, when a speed stage's official time is missing. Neither is validated in game.
-  Still open: guard T's mid-name-fork blind spot; a 0-3 wall probe; the memory work (another engineer owns
-  `python/`, `mod/`, that note); levers — S0 ON, **S1 REVERTED, S2 CANCELLED**, `fall_hp` ON, S3/S5 OFF (`docs/commands.md`).
+  Still open: guard T's mid-name-fork blind spot; a 0-3 wall probe; the memory work (another engineer owns `python/`,
+  `mod/`, that note); levers — S0 ON, **S1 REVERTED, S2 CANCELLED**, `fall_hp` REVERTED (inert), S3/S5 OFF (`docs/commands.md`).
 - **Mod v0.8.0 source is merged but NOT installed** — GO on the SSJ macro, M2 `ssj_wall` cut to reserved; the
   S7 install is a 15-25 min full pause still to schedule. `docs/project-log.md` 2026-09-20.
 - Numbers a newcomer needs: observation **479** floats; campaign action space **12 dimensions / 45 logits**

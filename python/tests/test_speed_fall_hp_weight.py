@@ -12,13 +12,18 @@ there 0 times (one-sided Fisher p = 0.0054). The fall was charged `damage_taken`
 nothing -- and the death it sets up arrives where GAE's direct trace is ~1e-7. `fall_hp` charges the HP a
 rescue removes, at the fall. Deaths are the head of the rung-85 loss: +8.07 s each (live OLS, n=1,712).
 
-THE LEVER SHIPPED DORMANT (2026-09-22) AND WAS SWITCHED ON 2026-09-23. It was built, reviewed and tested for the
-85 s rung, and first NOT switched on: the live policy had started an unexplained slide just before the switch
-(bucket medians 96.8-102.1 s for seven buckets, then 110.2 and 108.4 after the 55.65M trainer restart), and a new
-reward term judged against a moving baseline proves nothing (docs/project-log.md, 2026-09-22). The 2026-09-23
-replay from 52.25M showed the slide was the 55.645M weights, not the setup, and four flat buckets (medians
-100.1-103.0 s) became the baseline; the weight went live as ONE line in `speed.rewards:` (docs/project-log.md,
-2026-09-23). `test_the_lever_ships_live...` pins that the line is there and that it is the whole switch.
+THE LEVER SHIPPED DORMANT (2026-09-22), WAS SWITCHED ON 2026-09-23, AND WAS REVERTED THE SAME DAY. It was built,
+reviewed and tested for the 85 s rung, and first NOT switched on: the live policy had started an unexplained slide
+just before the switch (bucket medians 96.8-102.1 s for seven buckets, then 110.2 and 108.4 after the 55.65M
+trainer restart), and a new reward term judged against a moving baseline proves nothing (docs/project-log.md,
+2026-09-22). The 2026-09-23 replay from 52.25M showed the slide was the 55.645M weights, not the setup, and four
+flat buckets (medians 100.1-103.0 s) became the baseline; the weight went live as ONE line in `speed.rewards:`
+for round 15 of spec_0-1_speed (docs/project-log.md, 2026-09-23). It was REMOVED at the round-16 boundary by the
+pre-registered INERT rule: over 4 full post-switch buckets `rescue_hp` per episode (94.9 / 105.3 / 96.5 / 102.3)
+and floors (1.05 / 1.22 / 1.25 / 1.20) never made two consecutive buckets below the baseline band (< 91.3 or
+< 1.09); weights kept (docs/project-log.md, 2026-09-23 13:30). `test_the_lever_ships_dormant_again...` pins
+that the line is gone and that it is still the whole switch; `plan()` below is the shipped plan PLUS the line, so
+every sizing and farm test here still reads the lever at its designed weight.
 
 WHAT THIS FILE PINS. The measured constants and the sizing band, the ceiling, the detector (a rescue is a
 >= 12 m one-decision move on a non-death step, and nothing else is), that the weight at 0 changes no step,
@@ -98,12 +103,17 @@ def _plan_with(weight: float | None):
 
 
 def plan():
-    """The plan with the lever on at the designed weight: since 2026-09-23 that is the shipped plan itself."""
+    """The plan with the lever on at the designed weight: the shipped plan plus the one `fall_hp` line.
+
+    That was the shipped plan itself during round 15 (2026-09-23); since the same day's revert it is the form a
+    re-activation would ship, and every sizing and farm test in this file reads the lever through it.
+    """
     return _plan_with(WEIGHT)
 
 
 def dormant_plan():
-    """The shipped plan with the one `fall_hp` line removed: the revert, and the 2026-09-22 dormant form."""
+    """The shipped plan with the one `fall_hp` line removed: the 2026-09-22 form, and again since the 2026-09-23
+    revert -- so today it builds exactly what the shipped plan builds."""
     return _plan_with(None)
 
 
@@ -197,19 +207,24 @@ def one(env, parts: dict) -> dict:
 # ---------------------------------------------------------------------------------------------------------
 # THE RULE AND THE CONSTANT
 # ---------------------------------------------------------------------------------------------------------
-def test_the_lever_ships_live_at_0_04_and_is_one_plan_line():
+def test_the_lever_ships_dormant_again_since_the_2026_09_23_revert_and_is_one_plan_line():
+    """Live for round 15 only (2026-09-23), REVERTED at the round-16 boundary by the pre-registered INERT rule."""
     shipped = shipped_plan()
-    assert shipped.speed_rewards["fall_hp"] == WEIGHT, "LIVE since 2026-09-23: the shipped plan names the weight"
-    live = campaign_driver.stage_config(shipped, "Level 0-1", kind=campaign_driver.SPEED)["env"]
-    assert EnvConfig.from_dict(live).rewards.fall_hp == WEIGHT, "so the live speed stage builds the weight"
-    assert speed_rewards().fall_hp == WEIGHT
+    assert "fall_hp" not in shipped.speed_rewards, \
+        "REVERTED 2026-09-23 (inert at 4 full buckets): the shipped plan does not name the weight"
+    off = campaign_driver.stage_config(shipped, "Level 0-1", kind=campaign_driver.SPEED)["env"]
+    assert "fall_hp" not in off["rewards"], "so the shipped speed config carries no `fall_hp` key"
+    assert EnvConfig.from_dict(off).rewards.fall_hp == 0.0, "... and builds the inert default"
     assert RewardConfig().fall_hp == 0.0, "the default is inert"
     complete = EnvConfig.from_dict(campaign_driver.stage_config(shipped, "Level 0-1")["env"]).rewards
     assert complete.fall_hp == 0.0, "a COMPLETE stage is untouched, and so is every config that never names it"
-    # The line is the whole switch: removed (the revert, and the 2026-09-22 dormant form) the speed stage builds
-    # the inert default, and the two generated speed configs differ in that one weight and nothing else.
-    off = campaign_driver.stage_config(dormant_plan(), "Level 0-1", kind=campaign_driver.SPEED)["env"]
-    assert "fall_hp" not in off["rewards"] and EnvConfig.from_dict(off).rewards.fall_hp == 0.0
+    dormant = campaign_driver.stage_config(dormant_plan(), "Level 0-1", kind=campaign_driver.SPEED)["env"]
+    assert dormant == off, "removing the line from the shipped plan changes nothing: it is already gone"
+    # The line is the whole switch: set (the round-15 form, and any re-activation) the speed stage builds the
+    # weight, and the two generated speed configs differ in that one weight and nothing else.
+    live = campaign_driver.stage_config(plan(), "Level 0-1", kind=campaign_driver.SPEED)["env"]
+    assert live["rewards"]["fall_hp"] == WEIGHT and EnvConfig.from_dict(live).rewards.fall_hp == WEIGHT
+    assert speed_rewards().fall_hp == WEIGHT, "the sizing tests below read the lever at its designed weight"
     assert {k: v for k, v in live.items() if k != "rewards"} == {k: v for k, v in off.items() if k != "rewards"}
     assert {k: v for k, v in live["rewards"].items() if k != "fall_hp"} == off["rewards"]
 
@@ -227,6 +242,7 @@ def test_every_shipped_non_speed_config_builds_the_inert_default():
 
 
 def test_the_override_reaches_every_speed_stage_and_no_complete_stage():
+    """With the line set (`plan()`, the re-activation form), every speed stage gets it and no complete stage."""
     p = plan()
     for level in ("Level 0-1", "Level 0-2", "Level 0-3"):
         assert campaign_driver.stage_config(p, level, kind=campaign_driver.SPEED)["env"]["rewards"]["fall_hp"] == WEIGHT

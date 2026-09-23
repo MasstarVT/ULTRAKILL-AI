@@ -178,11 +178,13 @@ def test_the_hold_line_sits_in_front_of_every_stage_past_0_3():
 def test_a_speed_stage_only_adds_the_bonus_switch_the_death_weight_and_oob():
     """No observation or action change, so the level's own specialist loads into it unchanged.
 
-    THREE reward weights differ from a complete stage's, and only for this kind: `death` 5.0 -> 12.0
-    (2026-09-20), `oob` 0.0 -> 0.035 (2026-09-22) and `fall_hp` 0.0 -> 0.04 (2026-09-23), the last two of which
-    exist ONLY in a speed stage's config because their `RewardConfig` defaults are 0.0 and the shared configs
-    never name them. A reward weight is not a policy parameter -- it is a scalar read into `RewardConfig` at env
-    construction -- so every existing checkpoint still loads. The derivations are in configs/specialists.yaml
+    TWO reward weights differ from a complete stage's, and only for this kind: `death` 5.0 -> 12.0
+    (2026-09-20) and `oob` 0.0 -> 0.035 (2026-09-22), the second of which exists ONLY in a speed stage's config
+    because its `RewardConfig` default is 0.0 and the shared configs never name it. `fall_hp` (0.0 -> 0.04) was
+    a third from 2026-09-23 (round 15 of spec_0-1_speed) until it was REVERTED the same day at the round-16
+    boundary by the pre-registered INERT rule (docs/project-log.md, 2026-09-23 13:30): it is absent again, so a
+    speed stage builds its inert 0.0 default like every other config. A reward weight is not a policy parameter
+    -- it is a scalar read into `RewardConfig` at env construction -- so every existing checkpoint still loads. The derivations are in configs/specialists.yaml
     beside the keys and in docs/project-log.md; the farm bounds are pinned in tests/test_speed_death_weight.py,
     tests/test_speed_oob_weight.py and tests/test_speed_fall_hp_weight.py.
     """
@@ -199,17 +201,19 @@ def test_a_speed_stage_only_adds_the_bonus_switch_the_death_weight_and_oob():
     assert changed == {"fresh_start_prob", "rewards"}
     assert speed["fresh_start_prob"] == 1.0 and complete["fresh_start_prob"] == 0.2
     # ... and inside `rewards`, exactly what the plan's `speed.rewards:` block names and nothing else: one
-    # weight MOVED (`death`) and two weights ADDED (`oob` and `fall_hp`, which no shared config carries because
-    # their RewardConfig default of 0.0 is what every non-speed run means).
-    assert set(speed["rewards"]) - set(complete["rewards"]) == {"oob", "fall_hp"}, "only `oob` and `fall_hp` appear"
+    # weight MOVED (`death`) and one weight ADDED (`oob`, which no shared config carries because its
+    # RewardConfig default of 0.0 is what every non-speed run means). `fall_hp` was a second ADDED weight for
+    # round 15 only (2026-09-23) and is gone again since the same day's revert.
+    assert set(speed["rewards"]) - set(complete["rewards"]) == {"oob"}, "only `oob` appears"
     assert not set(complete["rewards"]) - set(speed["rewards"]), "no weight disappears"
     moved = {k for k in set(speed["rewards"]) & set(complete["rewards"])
              if speed["rewards"][k] != complete["rewards"][k]}
     assert moved == {"death"}
-    assert p.speed_rewards == {"death": 12.0, "oob": 0.035, "fall_hp": 0.04}
+    assert p.speed_rewards == {"death": 12.0, "oob": 0.035}
     assert (speed["rewards"]["death"], complete["rewards"]["death"]) == (12.0, 5.0)
     assert speed["rewards"]["oob"] == 0.035 and "oob" not in complete["rewards"]
-    assert speed["rewards"]["fall_hp"] == 0.04 and "fall_hp" not in complete["rewards"]
+    assert "fall_hp" not in speed["rewards"] and "fall_hp" not in complete["rewards"], \
+        "`fall_hp` REVERTED 2026-09-23 (inert at 4 full buckets): neither stage kind names it"
     assert {k: v for k, v in speed.items() if k not in added | changed} == \
         {k: v for k, v in complete.items() if k not in changed}
     cfg = EnvConfig.from_dict(speed)
@@ -219,8 +223,9 @@ def test_a_speed_stage_only_adds_the_bonus_switch_the_death_weight_and_oob():
     base = EnvConfig.from_dict(complete).rewards
     assert base.oob == 0.0, "a complete stage builds the RewardConfig default: the term is inert there"
     assert base.fall_hp == 0.0, "... and so does `fall_hp`"
-    assert dataclasses.replace(cfg.rewards, death=base.death, oob=base.oob, fall_hp=base.fall_hp) == base, \
-        "every reward weight but `death`, `oob` and `fall_hp` is the complete stage's"
+    assert cfg.rewards.fall_hp == 0.0, "... and, since the 2026-09-23 revert, so does a speed stage"
+    assert dataclasses.replace(cfg.rewards, death=base.death, oob=base.oob) == base, \
+        "every reward weight but `death` and `oob` is the complete stage's"
     env = UltrakillEnv(cfg)
     try:
         assert env.observation_space.shape == (479,), "the same policy shape: an existing checkpoint loads"
