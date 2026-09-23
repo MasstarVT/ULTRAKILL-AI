@@ -121,13 +121,39 @@ def test_the_file_helpers_replace_whole_and_read_presence():
     with tempfile.TemporaryDirectory() as tmp:
         run_dir = Path(tmp) / "runs" / RUN
         assert read_mod_incompatible(run_dir) is None
-        assert write_mod_incompatible(run_dir, "first\n") == run_dir / MOD_INCOMPATIBLE_FILE
-        assert write_mod_incompatible(run_dir, "second\n") == run_dir / MOD_INCOMPATIBLE_FILE
+        assert write_mod_incompatible(run_dir, "first\n") == (run_dir / MOD_INCOMPATIBLE_FILE, None)
+        assert write_mod_incompatible(run_dir, "second\n") == (run_dir / MOD_INCOMPATIBLE_FILE, None)
         assert read_mod_incompatible(run_dir) == "second\n", "a later refusal replaces the report whole"
         assert sorted(p.name for p in run_dir.iterdir()) == [MOD_INCOMPATIBLE_FILE]
         blocker = Path(tmp) / "a_file"
         blocker.write_text("", encoding="utf-8")
-        assert write_mod_incompatible(blocker / "run", "x") is None, "unwritable is None, never an exception"
+        written, error = write_mod_incompatible(blocker / "run", "x")  # a FILE where the run directory should be
+        assert written is None and error and error.split(":")[0] in ("FileExistsError", "NotADirectoryError"), error
+
+
+def test_a_file_that_cannot_be_written_is_said_in_the_env_log_and_the_exception():
+    """Unwritten, the file restores the respawn loop it exists to stop: that must reach runs/<run>_train.log."""
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "runs" / RUN
+        (run_dir / MOD_INCOMPATIBLE_FILE).mkdir(parents=True)  # a DIRECTORY where the file should go
+        message = refuse(run_dir)
+        assert "could NOT be written" in message and "DRIVER_PAUSE" in message, message
+        error = message.split("could NOT be written (")[1].split(")")[0]
+        assert error.split(":")[0] in ("PermissionError", "IsADirectoryError"), error
+        env_log = (run_dir / "env_47800.log").read_text(encoding="utf-8")
+        line = next(ln for ln in env_log.splitlines() if "mod_incompatible_file" in ln)
+        assert "written=False" in line and error.split(":")[0] in line, line
+        assert not list(run_dir.glob("*.tmp")), "the temp file is cleaned up"
+
+
+def test_a_written_file_leaves_the_exception_as_it_was():
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "runs" / RUN
+        message = refuse(run_dir)
+        assert "could NOT be written" not in message and message.endswith("set tech_layout back to v1.")
+        line = next(ln for ln in (run_dir / "env_47800.log").read_text(encoding="utf-8").splitlines()
+                    if "mod_incompatible_file" in ln)
+        assert "written=True" in line and "error=" not in line, line
 
 
 # ---------------------------------------------------------------------------------------------
@@ -211,6 +237,28 @@ def test_another_runs_file_does_not_stop_this_stage():
         h.driver.begin_stage("Level 0-1", h.init)
         refuse(h.tmp / "runs" / "spec_0-3")
         assert h.driver.tick() == "started"
+
+
+def test_a_stage_end_into_a_refused_run_stops_at_once_and_says_it_once():
+    """`finish_stage` starts the NEXT stage's trainer; when that run holds the file the driver exits on that very
+    tick, instead of returning "advanced" and logging the whole block again at the next poll."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h = tcd.harness(tmp)
+        h.driver.begin_stage("Level 0-1", h.init)
+        h.driver.tick()
+        h.trainer_up("spec_0-1")
+        h.write_status("spec_0-1", 11_000_000, 0.55, 40, best_time=131.25)
+        h.write_best("spec_0-1", 10_950_000)
+        assert h.driver.tick() == "ok"  # the target latches; the settle is still owed
+        refuse(h.driver.stage_run_dir("Level 0-3"))  # the next stage's run
+        h.write_status("spec_0-1", 11_400_000, 0.48, 50, best_time=131.25)
+        h.spawned.clear()
+        assert h.driver.run(max_ticks=5) == supervise.EXIT_MOD_INCOMPATIBLE
+        assert h.driver.state.current.level == "Level 0-3", "the next stage is begun and kept for after the fix"
+        assert [e["level"] for e in h.driver.state.history] == ["Level 0-1"], "the finished stage is recorded"
+        assert h.trainer_commands == [] and h.launched == []
+        log = (h.tmp / "runs" / "specialists_driver.log").read_text(encoding="utf-8")
+        assert log.count("Exiting with code 4") == 1 and log.count("MOD INCOMPATIBLE") == 1, log
 
 
 # ---------------------------------------------------------------------------------------------

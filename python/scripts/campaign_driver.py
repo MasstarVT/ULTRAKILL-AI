@@ -1712,9 +1712,8 @@ class Driver:
         # trainer can change which DLL is installed. Without this a dead trainer is respawned every poll, forever.
         if sup.mod_incompatible(log=self.log):
             return "mod_incompatible"
-        if not self.ensure_games(sup):
-            self.log("games did not come up; trying again at the next poll")
-            return "waiting"
+        # The resume file and its layout BEFORE the games: neither needs a game, and no trainer is running to write
+        # a newer checkpoint meanwhile, so a mismatch no longer launches twelve games only to leave them idle.
         resume, steps = supervise.choose_resume(self.model_dir(stage.level, stage.kind), self.zip_steps)
         if resume is None:
             resume, steps = Path(stage.init), self.zip_steps(Path(stage.init))
@@ -1722,10 +1721,14 @@ class Driver:
         if problem:
             # NOT a crash loop: training.main would refuse the same file at every restart, twelve games up and
             # nothing learning. Say it once and keep polling; check_run.py's ALERTS shows the missing trainer. The
-            # fix is the S7 runbook's migration -- after it, the next poll starts the trainer by itself.
-            self.log_once("layout:%s" % stage.run, "LAYOUT MISMATCH -- trainer NOT started for %s (%s): %s"
-                          % (stage.level, stage.kind, problem))
+            # fix is the S7 runbook's migration -- after it, the next poll starts the trainer by itself. Keyed on
+            # the FILE as well as the run, so a different wrong file (a botched migration) is reported too.
+            self.log_once("layout:%s:%s" % (stage.run, resume.name),
+                          "LAYOUT MISMATCH -- trainer NOT started for %s (%s): %s" % (stage.level, stage.kind, problem))
             return "layout_mismatch"
+        if not self.ensure_games(sup):
+            self.log("games did not come up; trying again at the next poll")
+            return "waiting"
         command = supervise.shell_command(
             self.cfg.python, "scripts/train.py",
             ["--config", sup.cfg.config, "--resume", resume.as_posix()],
@@ -1859,7 +1862,10 @@ class Driver:
         # The freshly promoted checkpoint stays the fallback for the ordinary "next level up" case.
         init = self.round_init(nxt) or destination or Path(stage.init)
         started = self.begin_stage(nxt.level, init, nxt.kind, rung=self.rung_for(nxt))
-        self.ensure_trainer(started, self.supervisor_for(started), self.processes())
+        if self.ensure_trainer(started, self.supervisor_for(started), self.processes()) == "mod_incompatible":
+            # The next stage's run already holds the file: stop NOW (`run` exits 4), not after logging the whole
+            # block a second time at the next poll.
+            return "mod_incompatible"
         return "advanced"
 
     # -- ending a stage on purpose (the END_STAGE control file) -------------------------------------
@@ -1970,7 +1976,9 @@ class Driver:
         procs = self.processes()
         trainer = self.ensure_trainer(stage, sup, procs)
         if trainer != "running":
-            return trainer  # "started" (grace now runs) or "waiting" (no games yet)
+            # "started" (grace now runs), "waiting" (no games yet), "layout_mismatch" (no trainer; keep polling) or
+            # "mod_incompatible" (no game, no trainer; `run` exits 4)
+            return trainer
 
         health = sup.tick()
         if health in ("budget", "no_resume", "mod_incompatible"):

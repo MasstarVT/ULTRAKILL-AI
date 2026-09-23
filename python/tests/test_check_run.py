@@ -51,7 +51,6 @@ def test_age_of_last_stamp_reads_the_newest_stamped_line():
         assert check_run.age_of_last_stamp(path / "missing") is None
 
 
-
 def test_every_runs_mod_incompatible_file_is_one_alert():
     """While runs/<run>/MOD_INCOMPATIBLE exists the driver starts nothing for that run: say so, per run, in ALERTS."""
     with tempfile.TemporaryDirectory() as tmp:

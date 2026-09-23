@@ -761,18 +761,26 @@ class UltrakillEnv(gym.Env):
                 f"port {self.cfg.port}: tech_layout {self.cfg.tech_layout!r} needs mod features {missing}; the game "
                 f"runs mod {version!r} with features {sorted(self._mod_features) or 'none'}. Install mod 0.8.0 "
                 "(docs/commands.md, 'S7 -- the one break') or set tech_layout back to v1.")
-            self._write_mod_incompatible(message, version, missing)
+            failed = self._write_mod_incompatible(message, version, missing)
+            if failed:
+                # In the exception too, so it reaches runs/<run>_train.log: without the file nothing stops the
+                # driver respawning this trainer at every poll.
+                message += (f" ALSO: {Path(self.cfg.env_log_dir) / MOD_INCOMPATIBLE_FILE} could NOT be written "
+                            f"({failed}), so the driver and supervise.py will keep restarting this trainer: pause "
+                            "them (DRIVER_PAUSE / SUPERVISOR_PAUSE) until the mod is installed.")
             raise BridgeIncompatible(message)
         self.envlog.event("mod_features_ok", mod=version, layout=self.cfg.tech_layout)
 
-    def _write_mod_incompatible(self, message: str, version: Any, missing: list[str]) -> None:
+    def _write_mod_incompatible(self, message: str, version: Any, missing: list[str]) -> str | None:
         """`runs/<run>/MOD_INCOMPATIBLE`, so the refusal stops the FLEET and not just this worker (see
         BridgeIncompatible). Only a training run has a run directory -- `env_log_dir`, which train.py alone fills
         (`fill_run_dirs`) -- so an eval, a check script or a test only raises. Written, never deleted: a successful
         connect leaves an old file alone, because only the operator may declare the mod fixed.
+
+        Returns None, or `"<ErrorType>: <error>"` when the file could not be written (also in the env log).
         """
         if not self.cfg.env_log_dir:
-            return
+            return None
         path = Path(self.cfg.env_log_dir) / MOD_INCOMPATIBLE_FILE
         text = "\n".join([
             message,
@@ -786,9 +794,9 @@ class UltrakillEnv(gym.Env):
             "(they exit with code 4). Remove %s after installing the mod (or after setting tech_layout back to "
             "v1); nothing removes it for you." % path,
         ]) + "\n"
-        written = write_mod_incompatible(self.cfg.env_log_dir, text)
-        self.envlog.event("mod_incompatible_file", path=written.as_posix() if written else None,
-                          written=bool(written))
+        written, error = write_mod_incompatible(self.cfg.env_log_dir, text)
+        self.envlog.event("mod_incompatible_file", path=path.as_posix(), written=written is not None, error=error)
+        return error
 
     def _tech_mod_config(self) -> dict[str, Any]:
         """The mod 0.8.0 settings, sent EXPLICITLY on every connect -- or nothing at all to a 0.7.x DLL.

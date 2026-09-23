@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
 import zipfile
+import zlib
 from pathlib import Path
 
 import torch
@@ -160,6 +162,113 @@ def test_a_v1_stage_on_todays_files_still_starts():
         h.driver.begin_stage("Level 0-1", h.init)
         fake_ckpt(h.tmp / "models" / "spec_0-1" / "latest.zip", 479, CAMPAIGN_NVEC_V1)
         assert h.driver.tick() == "started"
+
+
+# -- review follow-up: unreadable zips of every kind, the log-once key, no games launched for a mismatch ------
+
+
+def _patch_entry(path: Path, *, flags: int | None = None, method: int | None = None, data_byte: int | None = None):
+    """Rewrites the one member's header fields in place: `flags` / `method` in BOTH headers (the local file header
+    at offset 0 and the central directory entry), or the first byte of its compressed data."""
+    raw = bytearray(path.read_bytes())
+    central = raw.index(b"PK\x01\x02")
+    for header, flag_at, method_at in ((0, 6, 8), (central, 8, 10)):
+        if flags is not None:
+            struct.pack_into("<H", raw, header + flag_at, flags)
+        if method is not None:
+            struct.pack_into("<H", raw, header + method_at, method)
+    if data_byte is not None:
+        name_len, extra_len = struct.unpack_from("<HH", raw, 26)
+        raw[30 + name_len + extra_len] = data_byte
+    path.write_bytes(bytes(raw))
+    return path
+
+
+def _unreadable_zips(tmp: Path) -> dict[str, tuple[Path, type]]:
+    """One zip per failure `checkpoint_shapes` once let escape, with the exception zipfile/int really raise."""
+    tmp.mkdir(parents=True, exist_ok=True)
+    out = {}
+    out["encrypted"] = (_patch_entry(fake_ckpt(tmp / "encrypted.zip", 479, CAMPAIGN_NVEC_V1), flags=0x1),
+                        RuntimeError)
+    out["method"] = (_patch_entry(fake_ckpt(tmp / "method.zip", 479, CAMPAIGN_NVEC_V1), method=99),
+                     NotImplementedError)
+    deflated = tmp / "deflate.zip"
+    with zipfile.ZipFile(deflated, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        z.writestr("data", json.dumps({"observation_space": {"_shape": [479]}}) * 20)
+    out["deflate"] = (_patch_entry(deflated, data_byte=0xFF), zlib.error)  # BTYPE 11: an invalid block type
+    infinite = tmp / "infinite.zip"
+    with zipfile.ZipFile(infinite, "w") as z:
+        z.writestr("data", '{"observation_space": {"_shape": [Infinity]}, "action_space": {"nvec": "[3 3]"}}')
+    out["infinity"] = (infinite, OverflowError)
+    return out
+
+
+def test_every_kind_of_unreadable_zip_is_left_to_sb3():
+    with tempfile.TemporaryDirectory() as tmp:
+        for kind, (path, raised) in _unreadable_zips(Path(tmp)).items():
+            try:  # the fixture really is the failure it is named for
+                with zipfile.ZipFile(path) as z:
+                    data = json.loads(z.read("data").decode("utf-8"))
+                int(data["observation_space"]["_shape"][0])
+            except raised:
+                pass
+            else:
+                raise AssertionError("%s: expected %s" % (kind, raised.__name__))
+            assert checkpoint_shapes(path) is None, kind
+            assert checkpoint_layout(path) is None and resume_problem(path, "v2") is None, kind
+
+
+def test_an_unreadable_resume_file_does_not_stall_the_driver():
+    """Before, the exception escaped `ensure_trainer` into "tick failed; continuing" every poll, no trainer started."""
+    for kind in ("encrypted", "method", "deflate", "infinity"):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = harness(tmp)
+            h.driver.begin_stage("Level 0-1", h.init)
+            path, _ = _unreadable_zips(h.tmp / "fixtures")[kind]
+            latest = h.tmp / "models" / "spec_0-1" / "latest.zip"
+            latest.write_bytes(path.read_bytes())
+            assert h.driver.tick() == "started", kind
+            assert len(h.trainer_commands) == 1, kind
+
+
+def _v2_stage(h) -> Path:
+    h.driver.begin_stage("Level 0-1", h.init)
+    generated = h.tmp / "configs" / "generated" / "spec_0-1.yaml"
+    data = yaml.safe_load(generated.read_text(encoding="utf-8"))
+    data["env"]["tech_layout"] = "v2"
+    generated.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return h.tmp / "models" / "spec_0-1"
+
+
+def test_a_mismatch_is_logged_once_per_file_and_again_for_a_new_wrong_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        h = harness(tmp)
+        model_dir = _v2_stage(h)
+        fake_ckpt(model_dir / "latest.zip", 479, CAMPAIGN_NVEC_V1)
+        log = h.tmp / "runs" / "specialists_driver.log"
+        for _ in range(3):
+            assert h.driver.tick() == "layout_mismatch"
+        assert log.read_text(encoding="utf-8").count("LAYOUT MISMATCH") == 1, "once per (run, file), not per poll"
+        # A botched migration: a newer file, still not v2 (530 inputs, the v1 action head).
+        fake_ckpt(model_dir / "ckpt_20000000_steps.zip", 530, CAMPAIGN_NVEC_V1)
+        for _ in range(2):
+            assert h.driver.tick() == "layout_mismatch"
+        text = log.read_text(encoding="utf-8")
+        assert text.count("LAYOUT MISMATCH") == 2 and "ckpt_20000000_steps.zip takes 530 inputs" in text
+        assert h.trainer_commands == []
+
+
+def test_a_mismatch_launches_no_games():
+    """The resume file and its layout are read BEFORE `ensure_games`: twelve games launched to idle is waste."""
+    with tempfile.TemporaryDirectory() as tmp:
+        h = harness(tmp)
+        model_dir = _v2_stage(h)
+        fake_ckpt(model_dir / "latest.zip", 479, CAMPAIGN_NVEC_V1)
+        h.ports = {}  # nothing listening: a start would launch all twelve
+        assert h.driver.tick() == "layout_mismatch"
+        assert h.launched == [] and h.spawned == []
+        fake_ckpt(model_dir / "latest.zip", 530, CAMPAIGN_NVEC_V2)
+        assert h.driver.tick() == "started" and h.launched == [(12, 1)]
 
 
 if __name__ == "__main__":

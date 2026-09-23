@@ -112,12 +112,14 @@ TECH_LAYOUT_FEATURES = ("monotonic_input_clock", "macro.ssj", "obs.move_tech")
 MOD_INCOMPATIBLE_FILE = "MOD_INCOMPATIBLE"
 
 
-def write_mod_incompatible(run_dir: str | os.PathLike[str], text: str) -> Path | None:
-    """Writes `<run_dir>/MOD_INCOMPATIBLE` atomically and returns its path, or None when it could not be written.
+def write_mod_incompatible(run_dir: str | os.PathLike[str], text: str) -> tuple[Path | None, str | None]:
+    """Writes `<run_dir>/MOD_INCOMPATIBLE` atomically: `(its path, None)`, or `(None, "<ErrorType>: <error>")`.
 
     Twelve workers refuse the same DLL within a second of each other, so each writes its own temp file and
-    `os.replace`s it in: a reader sees one whole report, never two interleaved. A replace that loses the race (or
-    any other OSError) is swallowed -- the caller raises BridgeIncompatible either way, and one winner is enough.
+    `os.replace`s it in: a reader sees one whole report, never two interleaved. An OSError (a replace that loses
+    the race, a run directory that cannot exist) is not raised -- the caller raises BridgeIncompatible either way
+    -- but it is RETURNED, so the caller can say it: a file that silently failed to appear restores the very
+    respawn loop it exists to stop, and that has to be visible in the train log.
     """
     path = Path(run_dir) / MOD_INCOMPATIBLE_FILE
     tmp = path.with_name("%s.%d.tmp" % (MOD_INCOMPATIBLE_FILE, os.getpid()))
@@ -125,13 +127,13 @@ def write_mod_incompatible(run_dir: str | os.PathLike[str], text: str) -> Path |
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, path)
-    except OSError:
+    except OSError as exc:
         try:
             tmp.unlink()
         except OSError:
             pass
-        return None
-    return path
+        return None, "%s: %s" % (type(exc).__name__, exc)
+    return path, None
 
 
 def read_mod_incompatible(run_dir: str | os.PathLike[str]) -> str | None:

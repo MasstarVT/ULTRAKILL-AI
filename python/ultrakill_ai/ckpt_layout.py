@@ -28,13 +28,20 @@ MIGRATION_HINT = ("migrate it with `python scripts/add_tech_heads.py <this zip> 
 
 
 def checkpoint_shapes(path) -> tuple[int, tuple[int, ...]] | None:
-    """(observation width, action nvec) out of an SB3 zip, or None when it cannot be read."""
+    """(observation width, action nvec) out of an SB3 zip, or None when it cannot be read.
+
+    EVERY failure is None, not a named list of them: zipfile alone raises RuntimeError (an encrypted member),
+    NotImplementedError (an unknown compression method) and zlib.error (a corrupt deflate stream), and
+    `int(float("inf"))` is an OverflowError. Anything that escaped here would escape the driver's `ensure_trainer`
+    into "tick failed; continuing" every poll with no trainer started -- a silent stall on the v1 path. None hands
+    the file to SB3's own load, exactly as before this guard existed.
+    """
     try:
         with zipfile.ZipFile(path) as z:
             data = json.loads(z.read("data").decode("utf-8"))
         width = int(data["observation_space"]["_shape"][0])
         nvec = tuple(int(v) for v in re.findall(r"-?\d+", str(data["action_space"]["nvec"])))
-    except (OSError, KeyError, IndexError, TypeError, ValueError, zipfile.BadZipFile, UnicodeDecodeError):
+    except Exception:  # noqa: BLE001 - see the docstring: an unreadable checkpoint is SB3's to judge
         return None
     return (width, nvec) if nvec else None
 
