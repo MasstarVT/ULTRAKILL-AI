@@ -591,7 +591,7 @@ it is copied. **S4 (halving `gate`, `gate_approach`, `checkpoint`, `door_unlock`
 — an earlier measurement says cutting gate pay lowers the speed gradient, and it needs its own evidence after
 S1–S3.
 
-### `fall_hp` — HP lost to rescue teleports, through `speed.rewards:` (built 2026-09-22, DORMANT)
+### `fall_hp` — HP lost to rescue teleports, through `speed.rewards:` (built 2026-09-22, ON since 2026-09-23)
 
 The env counts every rescue (a >= 12 m one-decision move on a non-death step: the game's non-instakill
 DeathZone putting the player back on the walkway) and writes four columns to `episodes.jsonl` from the next
@@ -602,13 +602,14 @@ speed:
   rewards:
     death: 12.0
     oob: 0.035
-    fall_hp: 0.04   # NOT SET TODAY -- switch on at a round boundary, by the procedure above
+    fall_hp: 0.04   # SET 2026-09-23 (round 15 of spec_0-1_speed); revert = delete the line, same procedure
 ```
 
-Then update the pin in `tests/test_speed_fall_hp_weight.py` (`..._ships_dormant...`) and the `{"death", "oob"}`
-sets in `tests/test_specialists_config.py` and `tests/test_speed_overrides.py`. Derivation, farm bounds, the
-baseline to take and the revert triggers: `docs/project-log.md`, 2026-09-22. Take the baseline from full
-buckets that are not sliding — that is why it was not switched on.
+The pins are `tests/test_speed_fall_hp_weight.py` (`..._ships_live...`, which also checks that removing the line
+is the whole revert) and the `speed_rewards` dicts in `tests/test_specialists_config.py` and
+`tests/test_speed_overrides.py`; a revert updates all three. Derivation and farm bounds: `docs/project-log.md`,
+2026-09-22. The baseline it is judged against, the horizon and the revert triggers: `docs/project-log.md`,
+2026-09-23 ("`fall_hp` goes live").
 
 ### S5 — the sticky weapon slot, through `speed.env:`
 

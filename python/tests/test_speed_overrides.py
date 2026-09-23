@@ -3,9 +3,10 @@
 No game needed:  python tests/test_speed_overrides.py   (or pytest)
 
 Stages S1/S2 (gamma) and S3 (`level_complete`) of docs/superpowers/specs/2026-09-20-speedrun-tech.md, plus
-the path stage S5's sticky slot reaches a config by. THE SHIPPED PLAN SETS NONE OF THEM except the `death:
-12.0` that landed on 2026-09-20, and the first test in this file is the pin that says so: every lever here is
-DORMANT, and turning one on is a line in `configs/specialists.yaml`, never a code change.
+the path stage S5's sticky slot reaches a config by. THE SHIPPED PLAN SETS NONE OF THEM; its only speed
+override is `speed.rewards: {death: 12.0, oob: 0.035, fall_hp: 0.04}` (2026-09-20, -22, -23), and the first test
+in this file is the pin that says so: every lever here is DORMANT, and turning one on is a line in
+`configs/specialists.yaml`, never a code change.
 
 The three blocks share one rule, and it is the rule these tests exist to hold:
 
@@ -73,8 +74,8 @@ def test_the_shipped_plan_ships_no_train_or_env_override():
     assert p.speed_train == {}, \
         "no speed.train block ships: S1 was reverted 2026-09-21 and S2 (gamma 0.9995) is CANCELLED"
     assert p.speed_env == {}, "S5 is not switched on: `speed.env:` is absent from the shipped plan"
-    assert set(p.speed_rewards) == {"death", "oob"}, \
-        "the 2026-09-20 death weight and the 2026-09-22 oob weight, and no other reward lever"
+    assert p.speed_rewards == {"death": 12.0, "oob": 0.035, "fall_hp": 0.04}, \
+        "the 2026-09-20 death weight, the 2026-09-22 oob weight and the 2026-09-23 fall_hp weight, and no other"
 
 
 def test_a_complete_stage_and_a_speed_stage_now_train_at_the_same_hyperparameters():

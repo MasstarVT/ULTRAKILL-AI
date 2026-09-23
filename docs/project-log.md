@@ -5924,3 +5924,110 @@ existed. The resume is proven by three things: the redirected one-tick dry run, 
 `CLAUDE.md`: the stale "Live" line (rolled back to 55,645,054, next two buckets 97-102 s) was replaced in place
 by the replay and its reading. The file is still 219 lines, and `AGENTS.md` was regenerated with
 `scripts/sync_agents_md.py`.
+
+## 2026-09-23 — `fall_hp` goes live at 0.04 on `spec_0-1_speed` (rung 85): the baseline, the horizon, the revert triggers
+
+**One change**: `speed.rewards.fall_hp: 0.04` in `python/configs/specialists.yaml`, beside `death: 12.0` and
+`oob: 0.035`. It is the lever built and left DORMANT on 2026-09-22 (derivation, farm bounds and the judging plan:
+the 2026-09-22 "Rung 85" entry above, `### The lever: fall_hp` and `### The judging plan`; pinned by
+`tests/test_speed_fall_hp_weight.py`). A non-positive charge per decision: `-0.04 x` the HP a non-instakill
+DeathZone rescue removed on that decision (`env._note_rescue`: a >= 12 m one-decision move on a non-death step
+with an HP drop). **Weight 0.04** = the top of the discounted band 0.026-0.040; ceiling 0.111 (two falls to 1 HP
+always cost less than a death). Nothing else moves: difficulty 4, rung target 85 s, `oob` 0.035, `death` 12,
+gamma 0.998 / gae_lambda 0.95, observation 479, action 12 x 45.
+
+**Why now.** The replay entry above resolved the drift question: the pre-registered +1.5-2.5M window
+(53.75M-54.75M) read median 101.6 s / deathless 90.6 s against the RECOVERS bound 102 / 91 (re-read today from
+the same file: 101.7 / 90.8, n 530, rate 0.943; window 1, 53.05M-53.75M: 103.4 / 91.0). So the post-reboot setup
+does not drift training, 55.645M was a fragile point, and the run keeps training from its current weights. The
+four full 500k buckets after the replay's ignored 0.4M are FLAT (medians 100.1-103.0, every one within 1.6 s of
+their 101.7 mean; the 2026-09-22 judging plan asked for <= ~5 s), which is the precondition that plan set.
+
+### THE BASELINE (read 2026-09-23 08:40-08:50, before anything was touched)
+
+From `python/runs/spec_0-1_speed/episodes.jsonl`, fresh Brutal Level 0-1 episodes (`fresh_start` 1,
+`difficulty` 4), buckets anchored at the replay resume 52,245,598; last row read 54,875,434. Per fresh
+EPISODE unless noted; times are `level_seconds` of fresh completions. `oob` = `oob_frac x length` (decisions);
+`floored` = share of episodes with >= 1 `rescue_floored`; `stuck (pit)` = `end_reason` stuck per 100, and how
+many of them ended in the pit zone (x < 80, z 480-630). The first 0.4M after the resume (to 52,645,598) is not
+judged.
+
+**500k buckets** (the judging unit):
+
+| bucket | n | rate | p10 / median / p90 / best | deathless med (n) | deaths | oob | kills | rescues | rescue_hp | floors | floored | hp_lost_other | stuck/100 (pit) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 52.246-52.746 (ignored 0.4M) | 265 | 0.947 | 78.0 / 97.1 / 137.2 / 66.2 | 88.8 (79) | 0.90 | 248 | 35.3 | 8.86 | 91.4 | 1.12 | 0.864 | 270 | 1.9 (2) |
+| **52.746-53.246** | 258 | 0.926 | 83.3 / **100.7** / 155.8 / 68.8 | 92.3 (72) | 0.97 | 269 | 34.9 | 9.39 | 91.3 | 1.09 | 0.829 | 273 | 4.3 (0) |
+| **53.246-53.746** | 274 | 0.934 | 81.0 / **103.0** / 139.7 / 69.1 | 91.0 (85) | 0.84 | 264 | 34.7 | 8.99 | 112.0 | 1.26 | 0.894 | 224 | 3.3 (2) |
+| **53.746-54.246** | 274 | 0.953 | 78.8 / **100.1** / 145.5 / 63.5 | 87.6 (77) | 1.01 | 284 | 35.0 | 9.72 | 103.5 | 1.13 | 0.843 | 253 | 1.5 (1) |
+| **54.246-54.746** | 256 | 0.938 | 82.3 / **103.0** / 158.0 / 69.6 | 92.4 (58) | 1.09 | 334 | 34.7 | 13.67 | 108.2 | 1.22 | 0.879 | 245 | 3.5 (3) |
+| 54.746- (partial at 08:40) | 73 | 0.904 | 83.0 / 102.8 / 149.1 / 66.6 | 91.2 (18) | 1.01 | 303 | 35.2 | 10.74 | 115.9 | 1.25 | 0.945 | 216 | 4.1 (1) |
+
+**THE BASELINE = the four bold buckets** (52.746M-54.746M, n 1,062 fresh, pooled median 101.6, pooled p10 81.1,
+best 63.5): median mean **101.7** (100.1-103.0), p10 band **78.8-83.3**, deathless median 87.6-92.4 (mean 90.8),
+fresh rate **0.926-0.953**, deaths/episode **0.84-1.09 (mean 0.98)**, oob 264-334, kills 34.7-35.0, rescue_hp
+**91.3-112.0 (mean 103.8)**, floors 1.09-1.26 (mean 1.18), floored share 0.83-0.89, hp_lost_other **224-273
+(mean 248.6)**, stuck 1.5-4.3 per 100 (6 of the 1,062 episodes stuck in the pit zone). `rescues` per episode
+is a MEAN over a heavy tail (median 5-6 per episode; the 54.5M quarter's 18.8 is a handful of pit loops of
+90-206 rescues each); `rescue_hp` is capped by health and is the one to read. The same file in 250k buckets:
+
+| 250k bucket | n | rate | p10 / med / p90 / best | deathless (n) | deaths | oob | rescues | rescue_hp | floors | floored | hp_other | stuck (pit) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 52.246 (ignored) | 129 | 0.938 | 76.1 / 97.7 / 133.5 / 66.2 | 84.2 (41) | 0.84 | 207 | 7.17 | 93.4 | 1.09 | 0.822 | 261 | 3.1 (2) |
+| 52.496 (part ignored) | 136 | 0.956 | 80.1 / 96.5 / 145.5 / 70.3 | 94.0 (38) | 0.96 | 286 | 10.47 | 89.5 | 1.15 | 0.904 | 279 | 0.7 (0) |
+| 52.746 | 135 | 0.926 | 81.0 / 96.6 / 140.7 / 68.8 | 92.4 (37) | 0.93 | 241 | 8.19 | 82.1 | 1.00 | 0.800 | 273 | 4.4 (0) |
+| 52.996 | 123 | 0.927 | 85.5 / 106.4 / 178.3 / 74.3 | 91.9 (35) | 1.02 | 300 | 10.71 | 101.5 | 1.19 | 0.862 | 272 | 4.1 (0) |
+| 53.246 | 135 | 0.926 | 81.8 / 104.8 / 131.6 / 73.0 | 95.0 (38) | 0.85 | 225 | 7.99 | 103.9 | 1.19 | 0.889 | 223 | 4.4 (2) |
+| 53.496 | 139 | 0.942 | 79.9 / 101.3 / 148.4 / 69.1 | 88.7 (47) | 0.83 | 302 | 9.96 | 119.8 | 1.33 | 0.899 | 225 | 2.2 (0) |
+| 53.746 | 145 | 0.966 | 77.1 / 96.1 / 146.0 / 63.5 | 86.0 (41) | 0.99 | 271 | 8.98 | 102.3 | 1.13 | 0.828 | 237 | 0.7 (0) |
+| 53.996 | 129 | 0.938 | 80.3 / 105.0 / 143.2 / 73.7 | 96.8 (36) | 1.03 | 298 | 10.56 | 105.0 | 1.13 | 0.860 | 271 | 2.3 (1) |
+| 54.246 | 135 | 0.956 | 82.2 / 102.3 / 143.8 / 69.6 | 91.9 (41) | 1.07 | 262 | 9.10 | 110.2 | 1.24 | 0.874 | 247 | 2.2 (0) |
+| 54.496 | 121 | 0.917 | 82.5 / 104.0 / 176.1 / 72.1 | 96.5 (17) | 1.12 | 413 | 18.77 | 106.0 | 1.21 | 0.884 | 242 | 5.0 (3) |
+| 54.746 (partial) | 73 | 0.904 | 83.0 / 102.8 / 149.1 / 66.6 | 91.2 (18) | 1.01 | 303 | 10.74 | 115.9 | 1.25 | 0.945 | 216 | 4.1 (1) |
+
+**PPO and behaviour** (`metrics_log.csv`, mean of the poll rows per 500k bucket, same anchoring):
+
+| bucket | explained_variance | approx_kl | kills_per_min | on_target_frac | entropy_loss | ent_coef_live | clip_fraction |
+|---|---|---|---|---|---|---|---|
+| 52.246 | 0.908 | 0.0322 | 21.38 | 0.140 | -7.02 | 0.0097 | 0.231 |
+| 52.746 | 0.918 | 0.0332 | 20.14 | 0.153 | -7.09 | 0.0076 | 0.231 |
+| 53.246 | 0.903 | 0.0320 | 19.77 | 0.153 | -7.07 | 0.0092 | 0.232 |
+| 53.746 | 0.913 | 0.0318 | 20.60 | 0.170 | -7.17 | 0.0085 | 0.229 |
+| 54.246 | 0.935 | 0.0323 | 19.46 | 0.181 | -7.21 | 0.0086 | 0.233 |
+
+**`status.json` `reward_parts_mean_100`** at 54,878,734 (the last 100 episodes): `oob` **-10.85**, `death`
+**-12.36**, `level_complete` **+78.76**, `time` **-37.38**, `damage_taken` -3.51, `punch` -9.09, `gate` 145.65,
+`gate_approach` 95.29, `checkpoint` 53.2, `door_unlock` 36.6, `arena_clear` 28.5, `kill` 18.35,
+`damage_dealt` 18.66, `novelty` 2.62; no `fall_hp` key (a zero part is never created). `mean_100`: reward 404.4,
+length 1,869, deaths 1.03, `oob_frac` 0.142. **Expected once live**: `fall_hp` = -0.04 x rescue_hp, about
+**-4.2 per episode** at the baseline's 103.8 (the 2026-09-22 estimate from the probe was -4.7), shrinking if
+the lever works.
+
+### HORIZON, and the window that is never judged
+
+The round-15 trainer start (the switch) is step **S**. **The first 0.4M steps after S are ignored** -- every
+restart since round 7 moved the median +4-10 s for its first 0.15-0.4M steps (the replay entry). Post-change
+buckets are 500k, anchored at **S + 0.4M**; the first full one is [S+0.4M, S+0.9M). **No verdict before S +
+2.9M** (>= 2M steps after the first full post-change bucket). **Mechanism first**: `rescue_hp` and floors per
+episode down (**moved** = two consecutive full buckets below the baseline band, `rescue_hp` < 91.3 or floors <
+1.09), deaths per episode down, `reward_parts_mean_100["fall_hp"]` ~-4 and shrinking. **Inert** = neither by
+the 4th full post-change bucket: remove the line and do not reason from the median. **Primary**: bucket median
+of fresh completions. **Expectation, not verified**: 1-3 s off the median.
+
+### REVERT TRIGGERS -- any one, on FULL post-change buckets only, two consecutive buckets unless noted
+
+1. median above **108.7 s** (baseline 101.7 + 7) -- also roll the weights back to the switch checkpoint;
+2. deaths per fresh episode above **1.28** (0.98 + 0.3);
+3. fresh rate below **0.85**;
+4. p10 above **90.3 s** (the 78.8-83.3 band + 7);
+5. stuck endings above **15 per 100**, mostly in the pit zone (x < 80, z 480-630);
+6. `hp_lost_other` **>= 311** per episode (baseline 248.6 + 25%) while `rescue_hp` falls;
+7. on a per-leg re-recording at >= 2M steps: the pit complex median up > 5 s or the shaft up > 3 s (single
+   reading). The only recorded reference is the 2026-09-22 NEW probe (pit complex 25.2 s, shaft 15.2 s) on
+   `ckpt_55695046`, weights the replay discarded -- **no recording of the current weights exists**, so a
+   re-recording of the switch checkpoint would be the cleaner comparator.
+
+**Revert** = remove the line from `speed.rewards` and restart the driver by the same procedure (pause, stop the
+driver by pid, edit, test, commit + push, unpause, dry run, `schtasks /Run`, END_STAGE). Also watch: a new
+focus-rung latch inside the horizon (median_time_50 <= 85 plus the 300k settle) would promote and move the
+ladder to 72 s, a second change; at a 101.7 s baseline median it is not expected.
