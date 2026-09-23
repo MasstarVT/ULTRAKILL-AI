@@ -956,11 +956,13 @@ class UltrakillEnv(gym.Env):
         # The mod reports a macro on THIS reply only. `_skip_locked` can replace `cur` with a later frame (an input
         # lock right after the step), so the report is taken first and put back for block D's packer.
         macro_report = cur.get("macro") if tech is not None else None
+        # Counted BEFORE the lock is stepped through: a bridge fault inside `_skip_locked` must not leave a sent
+        # macro counted with neither a ran nor a refused verdict.
+        self._note_macro_result(macro_report)
         if campaign:
             cur = self._guard_exit(self._skip_locked(cur))
         if macro_report is not None and "macro" not in cur:
             cur["macro"] = macro_report
-        self._note_macro_result(macro_report)
         self._raw = cur
         self._steps += 1
         self._lifetime_steps += 1
@@ -996,6 +998,9 @@ class UltrakillEnv(gym.Env):
             if died and player is not None and not completed:
                 # A death does not end a campaign episode: the penalty is paid above, then the player respawns at
                 # the checkpoint and the level clock keeps running, as in real play.
+                # Deliberately, a macro report is NOT carried onto the respawn frame (unlike the input-lock case):
+                # that frame is a new life at the checkpoint, so block D reads "no macro" there, while the
+                # counters above have already recorded the verdict.
                 cur = self._respawn()
                 self._raw = cur
                 player = cur.get("player")
@@ -1833,10 +1838,14 @@ class UltrakillEnv(gym.Env):
 
     def _pop_tech(self, command: dict[str, Any]) -> dict[str, Any] | None:
         """Takes the three v2 heads off the decoded command. None under v1 (`decode_action` adds them at width 15)."""
-        if "macro" not in command:
-            return None
-        return {"macro": int(command.pop("macro")), "variant": int(command.pop("variant")),
-                "hook": bool(command.pop("hook"))}
+        tech = None if "macro" not in command else {
+            "macro": int(command.pop("macro")), "variant": int(command.pop("variant")),
+            "hook": bool(command.pop("hook"))}
+        # A 12-wide action on a v2 env, or a 15-wide one on v1, is a layout mismatch: fail loudly, never silently
+        # drop (or silently act on) the tech heads.
+        assert (tech is not None) == self._tech, (
+            f"a tech_layout {self.cfg.tech_layout} env got an action {'with' if tech else 'without'} the tech heads")
+        return tech
 
     def _apply_tech(self, command: dict[str, Any], tech: dict[str, Any] | None) -> None:
         """Puts on the wire exactly what the gates allow, and counts every request whether or not it was sent.
@@ -1891,7 +1900,8 @@ class UltrakillEnv(gym.Env):
             return
         move = raw.get("move_tech")
         names = [name for name, *_ in MOVE_TECH_FIELDS]
-        missing = [n for n in names if n not in move] if isinstance(move, dict) else names
+        # A field sent as null is missing too: the packer reads it as 0.0, exactly like an absent one.
+        missing = [n for n in names if move.get(n) is None] if isinstance(move, dict) else names
         if not missing:
             self._move_tech_missing = 0
             return
@@ -2647,7 +2657,9 @@ class UltrakillEnv(gym.Env):
             info["macro_ran_frac"] = b["macro_ran"] / steps
             info["macro_refused_frac"] = b["macro_refused"] / steps
             info["macro_landed_frac"] = b["macro_landed"] / steps
-            info["macro_ran_share"] = b["macro_ran"] / max(1, b["macro_sent"])
+            # None, not 0.0, for an episode that sent nothing: status.json averages this ratio per episode, and a
+            # zero from every no-send episode would drag the one "near 0 = design bug" metric toward 0.
+            info["macro_ran_share"] = b["macro_ran"] / b["macro_sent"] if b["macro_sent"] else None
             info["variant_request_frac"] = b["variant_request"] / steps
             info["hook_request_frac"] = b["hook_request"] / steps
             info["macro_refusal_reasons"] = dict(self._macro_reasons)

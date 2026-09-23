@@ -10,6 +10,7 @@ key for key (the key sets below were read off FakeLevel on 2026-09-23, before th
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import socket
@@ -33,6 +34,7 @@ from ultrakill_ai.env import EnvConfig, UltrakillEnv, tech_gates  # noqa: E402
 from ultrakill_ai.protocol import (  # noqa: E402
     RECOVERABLE,
     TECH_LAYOUT_FEATURES,
+    BridgeClosed,
     BridgeError,
     BridgeIncompatible,
     mod_features,
@@ -531,12 +533,124 @@ def test_progress_carries_the_macro_channel_only_when_the_env_reports_it():
                 assert "macro_sent_frac" not in mean and "macro_refusal_reasons" not in line
 
 
+# The macro channel as the env reports it, for the ProgressCallback tests below.
+TECH_INFO = {"macro_request_frac": 0.1, "macro_sent_frac": 0.02, "macro_ran_frac": 0.005,
+             "macro_refused_frac": 0.015, "macro_landed_frac": 0.005, "macro_ran_share": 0.25,
+             "variant_request_frac": 0.15, "hook_request_frac": 0.1, "macro_refusal_reasons": {}}
+
+
+def test_macro_ran_share_is_none_when_nothing_was_sent_and_only_senders_are_averaged():
+    from test_progress import episode_info  # noqa: PLC0415
+
+    from ultrakill_ai.progress import ProgressCallback  # noqa: PLC0415
+
+    env, _ = tech_env()
+    try:
+        env.reset()
+        _, _, _, _, info = env.step(tech_action(macro=4))  # requested, masked: nothing sent
+        assert info["macro_request_frac"] == 1.0 and info["macro_sent_frac"] == 0.0
+        assert info["macro_ran_share"] is None, "a no-send episode has no share, not a share of 0"
+    finally:
+        env.close()
+
+    def window(shares):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / "v2"
+            cb = ProgressCallback(run / "status.json", 1000, "v2", 1, update_every_s=0.0)
+            cb._on_training_start()
+            for share in shares:
+                cb._record_episode(0, {**episode_info("Level 0-1"), **TECH_INFO, "macro_ran_share": share})
+            cb._write(time.time())
+            mean = json.loads((run / "status.json").read_text(encoding="utf-8"))["mean_100"]
+            lines = [json.loads(s) for s in (run / "episodes.jsonl").read_text(encoding="utf-8").splitlines()]
+        return mean, [line["macro_ran_share"] for line in lines]
+
+    mean, logged = window([None, 0.5, None, 1.0])
+    assert mean["macro_ran_share"] == 0.75, "only the two senders are averaged"
+    assert logged == [None, 0.5, None, 1.0], "episodes.jsonl records a no-send episode's share as null"
+    mean, _ = window([None, None])
+    assert "macro_ran_share" not in mean and mean["macro_sent_frac"] == 0.02, mean
+
+
+def test_a_bridge_fault_inside_the_lock_leaves_every_sent_macro_with_a_verdict():
+    env, fake = tech_env(bridge_backoff_s=0.0, bridge_retries=3)
+    step = fake.step
+
+    def fault_inside_the_lock(command):
+        obs = step(command)
+        if command.get("macro"):
+            fake.fail_next_steps(BridgeClosed("dropped while the lock was stepped through"))
+        return obs
+
+    fake.step = fault_inside_the_lock
+    try:
+        env.reset()
+        fake.lock_steps = 3
+        _, _, _, truncated, info = env.step(tech_action(macro=1))
+        assert truncated and info["end_reason"] == "bridge_reset", info.get("end_reason")
+        b = env._behaviour
+        assert b["macro_sent"] == 1 and b["macro_sent"] == b["macro_ran"] + b["macro_refused"], b
+        assert info["macro_sent_frac"] == info["macro_ran_frac"] + info["macro_refused_frac"]
+    finally:
+        env.close()
+
+
+def test_a_death_step_counts_the_macro_but_the_respawn_frame_packs_no_block_d():
+    """Deliberate (the comment at `_respawn` in `_step`): the respawn frame is a new life at the checkpoint, so its
+    block D reads "no macro"; the counters, which the S8 gate does not read from the frame, still record it."""
+    env, fake = tech_env()
+    try:
+        env.reset()
+        fake.kill_next = True
+        obs, *_ = env.step(tech_action(macro=1))
+        assert env._deaths == 1, "the step died and respawned"
+        assert env._behaviour["macro_ran"] == 1 and env._behaviour["macro_landed"] == 1
+        assert not obs[519:522].any(), obs[519:522]
+    finally:
+        env.close()
+
+
+def test_an_action_of_the_other_layouts_width_fails_loudly():
+    for build, wrong in ((tech_env, lambda: action(move=True)), (make_env, tech_action)):
+        env, fake = build()
+        try:
+            env.reset()
+            before = fake.steps
+            try:
+                env.step(wrong())
+            except AssertionError as exc:
+                assert "tech_layout" in str(exc), exc
+            else:
+                raise AssertionError(f"a {env.cfg.tech_layout} env accepted a {len(wrong())}-wide action")
+            assert fake.steps == before, "nothing reached the game"
+        finally:
+            env.close()
+
+
+def test_a_move_tech_field_sent_as_null_counts_as_missing():
+    env, fake = tech_env()
+    fake.move_tech["slide_grace"] = None
+    events: list[tuple[str, dict]] = []
+    env.envlog.event = lambda name, **kw: events.append((name, kw))
+    try:
+        obs, _ = env.reset()
+        for _ in range(40):
+            obs, *_ = env.step(tech_action(move=False))
+        assert env._move_tech_warned
+        warned = [kw for name, kw in events if name == "move_tech_missing"]
+        assert len(warned) == 1 and "slide_grace" in warned[0]["what"], warned
+        assert obs[489] == 0.0 and np.allclose(obs[479:489], EXPECTED_A[:10], atol=1e-6)
+    finally:
+        env.close()
+
+
 # ---------------------------------------------------------------------------------------------
 # Task 3's v1 pins: the step bytes, the step outputs, the info keys and the status.json / episodes.jsonl keys
-# of a v1 env, against the BASE COMMIT 0be539f (the code the live fleet imports). Computed on 2026-09-23 by a
-# scratch runner that imported `ultrakill_ai` from `git archive 0be539f python/ultrakill_ai` BEFORE importing this
-# module, then called `v1_script()` / `v1_progress_keys()` -- the same way V1_CONFIG_LINE pins the connect. A v1
-# env's step, info and status files may not change by one byte; if one of these fails, the v1 path moved.
+# of a v1 env, against the BASE COMMIT 0be539f (the code the live fleet imports). A v1 env's step, info and
+# status files may not change by one byte; if one of these fails, the v1 path moved -- find what moved it.
+# The constants are what `tests/tools/tech_v1_pins.py` prints when run against the base commit's package (it
+# extracts it with `git archive`); run against the working tree, it proves nothing. `v1_pins()` is the one
+# computation both use, and a failure names every pin that differs.
 # ---------------------------------------------------------------------------------------------
 
 V1_SCRIPT_SEED, V1_SCRIPT_STEPS = 20260923, 400
@@ -551,6 +665,13 @@ V1_OUTPUTS_SHA256 = "4781c3d7928659e8d26feb0cda80a4ced1453aa910aace33fb94068695a
 V1_INFO_KEYS_SHA256 = "41a187e9ada19713cc2b1af49020a165d9d0c7e2e9288c5a75fcdd76056d725a"
 # status.json's top-level, mean_100 (59) and campaign keys, in order, and every episodes.jsonl line's keys
 V1_PROGRESS_KEYS_SHA256 = "8178818d96a63d0c11054f144c22242ae35a6a3bb8aeb94307cc12eb1e192112"
+V1_PIN_NAMES = ("V1_FORWARD_LINE", "V1_WIRE_LINES", "V1_WIRE_SHA256", "V1_OUTPUTS_SHA256", "V1_INFO_KEYS_SHA256",
+                "V1_PROGRESS_KEYS_SHA256")
+# What each pin is, for a failure message: which of the step line, the wire, the outputs, or a key set moved.
+V1_PIN_WHAT = {"V1_FORWARD_LINE": "the step line for forward()", "V1_WIRE_LINES": "the number of step lines",
+               "V1_WIRE_SHA256": "the step lines", "V1_OUTPUTS_SHA256": "the step outputs (obs, reward, info)",
+               "V1_INFO_KEYS_SHA256": "the info key set", "V1_PROGRESS_KEYS_SHA256": "the status.json / "
+               "episodes.jsonl key sets"}
 
 
 class WireLevel(FakeLevel):
@@ -569,11 +690,13 @@ def _sha(obj) -> str:
     return hashlib.sha256(json.dumps(obj, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+@functools.lru_cache(maxsize=1)
 def v1_script() -> dict:
     """A v1 env driven through a fixed seeded script against FakeLevel -- mod 0.5.0, no `features`, so nothing 0.8
     is configured: the live fleet's situation. Random actions over the whole 12-dim space (look modes 1 / 2 and
     slot presses included), input locks, deaths and one-shot kills injected at fixed steps, and a reset after
-    every episode end. Returns the wire lines, a digest of every step output, and every info dict."""
+    every episode end. Returns the wire lines, a digest of every step output, and every info dict. Cached: three
+    tests read it, and nothing mutates what it returns."""
     env, _ = make_env()
     env.client = fake = WireLevel()
     rng = np.random.default_rng(V1_SCRIPT_SEED)
@@ -605,7 +728,12 @@ def v1_script() -> dict:
     return {"wire": fake.wire, "outputs": outputs.hexdigest(), "infos": infos}
 
 
-def v1_progress_keys(infos: list[dict]) -> dict:
+def v1_info_keys() -> list[str]:
+    return sorted({k for info in v1_script()["infos"] for k in info})
+
+
+@functools.lru_cache(maxsize=1)
+def v1_progress_keys() -> dict:
     """The key shape of status.json and episodes.jsonl after ProgressCallback records the script's episodes."""
     from ultrakill_ai.progress import ProgressCallback  # noqa: PLC0415
 
@@ -613,7 +741,7 @@ def v1_progress_keys(infos: list[dict]) -> dict:
         run = Path(tmp) / "v1"
         cb = ProgressCallback(run / "status.json", 1000, "v1", 1, update_every_s=0.0)
         cb._on_training_start()
-        for info in infos:
+        for info in v1_script()["infos"]:
             if "end_reason" in info:
                 cb._record_episode(0, {**info, "episode": {"r": 1.0, "l": 100.0}})
         cb._write(time.time())
@@ -624,32 +752,53 @@ def v1_progress_keys(infos: list[dict]) -> dict:
             "line": [list(line) for line in lines]}
 
 
-def test_the_v1_step_bytes_are_the_base_commits():
+@functools.lru_cache(maxsize=1)
+def v1_pins() -> dict:
+    """Every v1 pin's value as the imported `ultrakill_ai` computes it, by constant name."""
     env, _ = make_env()
     env.client = fake = WireLevel()
     try:
         env.reset()
         env.step(forward())
-        assert fake.wire == [V1_FORWARD_LINE], fake.wire
     finally:
         env.close()
     wire = v1_script()["wire"]
-    digest = hashlib.sha256("\n".join(wire).encode("utf-8")).hexdigest()
-    assert (len(wire), digest) == (V1_WIRE_LINES, V1_WIRE_SHA256), (len(wire), digest)
+    return {"V1_FORWARD_LINE": fake.wire[0] if len(fake.wire) == 1 else fake.wire,
+            "V1_WIRE_LINES": len(wire),
+            "V1_WIRE_SHA256": hashlib.sha256("\n".join(wire).encode("utf-8")).hexdigest(),
+            "V1_OUTPUTS_SHA256": v1_script()["outputs"],
+            "V1_INFO_KEYS_SHA256": _sha(v1_info_keys()),
+            "V1_PROGRESS_KEYS_SHA256": _sha(v1_progress_keys())}
+
+
+def v1_pin_mismatches() -> list[str]:
+    """One line per pin that differs, naming what it pins. Every pin, whichever test asks: a failure then says at
+    once whether the step line, the wire, the outputs or a key set moved (or several)."""
+    now = v1_pins()
+    return [f"{name} ({V1_PIN_WHAT[name]}) moved: pinned {globals()[name]!r}, now {now[name]!r}"
+            for name in V1_PIN_NAMES if now[name] != globals()[name]]
+
+
+def _assert_pins(names: tuple[str, ...], *detail) -> None:
+    bad = v1_pin_mismatches()
+    if any(line.split(" ", 1)[0] in names for line in bad):
+        raise AssertionError("\n".join([*bad, *map(str, detail)]))
+
+
+def test_the_v1_step_bytes_are_the_base_commits():
+    _assert_pins(("V1_FORWARD_LINE", "V1_WIRE_LINES", "V1_WIRE_SHA256"))
 
 
 def test_the_v1_step_outputs_and_info_keys_are_the_base_commits():
-    run = v1_script()
-    keys = sorted({k for info in run["infos"] for k in info})
-    assert _sha(keys) == V1_INFO_KEYS_SHA256, keys
+    keys = v1_info_keys()
+    _assert_pins(("V1_OUTPUTS_SHA256", "V1_INFO_KEYS_SHA256"), f"info keys now: {keys}")
     assert not [k for k in keys if k.startswith(("macro_", "variant_request", "hook_request"))], keys
-    assert run["outputs"] == V1_OUTPUTS_SHA256, run["outputs"]
 
 
 def test_the_v1_status_json_and_episode_line_keys_are_the_base_commits():
-    shape = v1_progress_keys(v1_script()["infos"])
+    shape = v1_progress_keys()
     assert shape["episodes"] >= 2, "the script must end several episodes for the pin to mean anything"
-    assert _sha(shape) == V1_PROGRESS_KEYS_SHA256, shape
+    _assert_pins(("V1_PROGRESS_KEYS_SHA256",), f"key shape now: {shape}")
 
 
 if __name__ == "__main__":
