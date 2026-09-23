@@ -50,6 +50,12 @@ class RewardConfig:
     # reports, so the reward channel and the metric it is judged by cannot drift apart. 0.0 is every run
     # before this and every complete stage; only a speed stage's `speed.rewards:` block moves it.
     oob: float = 0.0
+    # FALLS THAT COST HEALTH (2026-09-22). Charged per HP that a game-side rescue teleport removed: a
+    # non-instakill `DeathZone` (the pit, the shaft) hurts the player by min(50, hp - 1) and puts them back on
+    # the walkway, so two falls leave them on 1 HP and the next hit kills. The env measures it
+    # (`CampaignStep.rescue_hp`, reported per episode as `rescue_hp`). On top of `damage_taken`, which already
+    # charges the same HP at its own weight. 0.0 everywhere but a speed stage's `speed.rewards:` block.
+    fall_hp: float = 0.0
     # The door-graph route (campaign.gates): the signal the NavMesh never gave, since `path.status` was never
     # once `complete` in 2.9M logged steps. `gate` is the milestone, `gate_approach` the shaping between them.
     gate: float = 0.0  # per new lower `hops` value reached, once per level load
@@ -164,6 +170,7 @@ class CampaignStep:
     item_pickups: int = 0  # accepted item types picked up for the first time this level load
     item_placements: int = 0  # altar puzzles solved for the first time this level load
     oob_steps: int = 0  # 1 when the ground ray ran its full length and found nothing: off the map, or falling
+    rescue_hp: float = 0.0  # HP a rescue teleport removed this step (UltrakillEnv._note_rescue); 0 otherwise
 
 
 @dataclass
@@ -267,6 +274,9 @@ def compute_reward(
         # player -- a fall does not stop the game's timer. `oob_steps` is 0 or 1, so this term is non-positive
         # in every state and at every weight: there is no input that makes it pay.
         r.add("oob", -cfg.oob * campaign.oob_steps)
+        # A rescue's HP, clamped at 0 so no input can make it pay. It is 0 on a death step and on a respawn (the
+        # env never measures those), so a death cannot re-pay anything, and a fall at 1 HP costs nothing more.
+        r.add("fall_hp", -cfg.fall_hp * max(0.0, campaign.rescue_hp))
         r.add("checkpoint", cfg.checkpoint * campaign.checkpoints)
         r.add("arena_clear", cfg.arena_clear * campaign.arenas)
         r.add("door_unlock", cfg.door_unlock * campaign.doors)

@@ -84,6 +84,12 @@ PITCH_CAP = max(abs(b) for b in PITCH_BINS)  # 20 degrees per decision
 MODE1_PITCH_LIMIT = 85.0  # inside the game's own +-90 clamp (ActionInjector.ApplyLook)
 ARCHIVE_CHECK_EVERY = 500  # steps between exploration-archive schedule checks (the save itself costs ~16 ms)
 DEFAULT_WEDGE_HOLD_S = 3.0  # wedge_seconds 0 turns the episode end off; counting still uses this hold
+# A RESCUE is a one-decision move of at least this many metres on a step that is not a death: the game's
+# non-instakill DeathZone teleporting the player back onto the walkway. Measured over 114,877 recorded decision
+# pairs on Level 0-1 (runs/probe_0-1_rung85 + runs/probe_0-1_brutal): ordinary movement tops out at 11.99 m per
+# decision, all 146 such moves that cost HP land on the level's known rescue points, and none is anything else.
+# Three real rescues moved 8.9-10.3 m and are missed, which errs toward charging less. See `_note_rescue`.
+RESCUE_JUMP_M = 12.0
 
 
 def _known_fields(cls, d: dict[str, Any]) -> dict[str, Any]:
@@ -600,6 +606,10 @@ class UltrakillEnv(gym.Env):
         self._positions: list[list[float]] = []  # fresh-start episodes only, for best runs
         self._cells_new = 0
         self._oob_steps = 0  # steps with no ground under the player: off the map, or in a fall
+        self._rescues = 0  # rescue teleports this episode, free ones (at 1 HP) included (_note_rescue)
+        self._rescue_hp = 0.0  # HP those rescues removed: the quantity `RewardConfig.fall_hp` charges
+        self._rescue_floored = 0  # rescues that took the player from above 1 HP down to 1
+        self._hp_lost_other = 0.0  # HP lost on every other non-death step: enemies, mostly
         self._exit_dist_min = math.inf
         self._exit_ground_dist_min = math.inf
         self._episodes = 0
@@ -735,6 +745,10 @@ class UltrakillEnv(gym.Env):
             self._positions = []
             self._cells_new = 0
             self._oob_steps = 0
+            self._rescues = 0
+            self._rescue_hp = 0.0
+            self._rescue_floored = 0
+            self._hp_lost_other = 0.0
             self._exit_dist_min = math.inf
             self._exit_ground_dist_min = math.inf
             self._parks_at_start = self.gates.parks
@@ -836,7 +850,7 @@ class UltrakillEnv(gym.Env):
         )
         # Milestones, novelty, route gates and path progress are measured before the reward, from the frame the
         # policy caused; `prev` is needed as well, because kills and style reset the stuck clock.
-        campaign_step = self._campaign_progress(prev, cur) if campaign else None
+        campaign_step = self._campaign_progress(prev, cur, died=died) if campaign else None
         wedged = campaign and self._note_wedge(prev, cur)
         # Graded BEFORE the reward, because a speed stage's completion bonus needs the official time of this
         # very frame. It reads only `cur`, so nothing below it can change the answer.
@@ -2133,7 +2147,47 @@ class UltrakillEnv(gym.Env):
             self._wedged_steps += 1
         return self._wedge_run >= self._wedge_hold
 
-    def _campaign_progress(self, prev: dict[str, Any], raw: dict[str, Any]) -> CampaignStep:
+    def _note_rescue(self, prev: dict[str, Any], raw: dict[str, Any], died: bool) -> float:
+        """Counts a rescue teleport on this step and returns the HP it removed (0.0 on any other step).
+
+        THE GAME'S RULE (decompiled/DeathZone.cs). A zone with `notInstakill` does not kill: it hurts the player
+        by `damage` (50) while hp > damage, by hp - 1 while hp > 1, and only `FakeHurt`s at 1 HP, then puts
+        them back on the walkway. So two falls from full health leave 1 HP, and every fall after that is free.
+        On Level 0-1 on Brutal 58% of deaths (18 of 31 recorded) were one-hit kills set up that way, a
+        median ~300 decisions after the fall that caused them.
+
+        THE SIGNATURE, measured (see RESCUE_JUMP_M): a move of 12 m or more in one decision on a step that is
+        not a death. Exclusions, each load-bearing:
+          - `died` is the env's own verdict (a dead or missing player, or a soft-death increment), so the lethal
+            hit is never counted here -- `damage_taken` and `death` already price it.
+          - A checkpoint respawn is applied AFTER the reward and becomes the next step's `prev`, so its
+            teleport is never compared against the frame before it; and a respawn heals, so it could not charge.
+          - An HP RISE across a jump is counted as a rescue but charges nothing.
+        Every other HP drop on a non-death step lands in `_hp_lost_other`, the reading that would show a policy
+        trading rescue HP for enemy HP (the per-HP charge's one known asymmetry).
+        """
+        player = raw.get("player")
+        before = prev.get("player")
+        if died or not player or not before or player.get("dead"):
+            return 0.0
+        hp, hp_before = player.get("hp"), before.get("hp")
+        pos, pos_before = player.get("pos"), before.get("pos")
+        if hp is None or hp_before is None or pos is None or pos_before is None:
+            return 0.0
+        lost = float(hp_before) - float(hp)
+        if math.dist(pos, pos_before) >= RESCUE_JUMP_M:
+            self._rescues += 1
+            if lost > 0.0:
+                self._rescue_hp += lost
+                if float(hp) <= 1.0 < float(hp_before):
+                    self._rescue_floored += 1
+                return lost
+            return 0.0
+        if lost > 0.0:
+            self._hp_lost_other += lost
+        return 0.0
+
+    def _campaign_progress(self, prev: dict[str, Any], raw: dict[str, Any], died: bool = False) -> CampaignStep:
         """What the level did this step. Any progress restarts the stuck clock."""
         camp = raw.get("campaign") or {}
         checkpoints, arenas, doors, pickups, placements = self.milestones.update(raw.get("campaign"))
@@ -2174,6 +2228,8 @@ class UltrakillEnv(gym.Env):
                 if ground_exit:
                     self._exit_ground_dist_min = min(self._exit_ground_dist_min,
                                                      math.dist(pos, ground_exit))
+        # Measured, never fed to the stuck clock below: like `oob`, a fall must keep ticking toward `stuck`.
+        rescue_hp = self._note_rescue(prev, raw, died)
         if camp.get("level_started"):
             self._level_started = True
         path_gain = self.path_progress.update(camp.get("path"))
@@ -2188,7 +2244,7 @@ class UltrakillEnv(gym.Env):
             self._steps_since_progress += 1
         return CampaignStep(checkpoints=checkpoints, arenas=arenas, doors=doors, novelty=novelty, path_gain=path_gain,
                             gates=gates_new, gate_approach=approach, item_pickups=pickups, item_placements=placements,
-                            oob_steps=oob)
+                            oob_steps=oob, rescue_hp=rescue_hp)
 
     def _note_speed_target(self, raw: dict[str, Any]) -> None:
         """Reads the level's own S-rank time off the first observation that carries one, once.
@@ -2388,6 +2444,13 @@ class UltrakillEnv(gym.Env):
             # Steps with no ground beneath: falling, or off the map entirely. The first campaign run banked 47%
             # of its novelty in the void below the level, so this is the number that says whether that is over.
             info["oob_frac"] = self._oob_steps / steps
+            # The four rescue readings (`_note_rescue`): the mechanism metrics of the speed stage's `fall_hp`
+            # weight. Episode totals, never fractions, and carried to episodes.jsonl through EPISODE_LOG_RAW --
+            # deliberately NOT in CAMPAIGN_INFO_KEYS, so the Monitor's columns are exactly what they were.
+            info["rescues"] = self._rescues
+            info["rescue_hp"] = self._rescue_hp
+            info["rescue_floored"] = self._rescue_floored
+            info["hp_lost_other"] = self._hp_lost_other
             info["exit_dist_min"] = None if math.isinf(self._exit_dist_min) else self._exit_dist_min
             info["exit_ground_dist_min"] = (None if math.isinf(self._exit_ground_dist_min)
                                             else self._exit_ground_dist_min)

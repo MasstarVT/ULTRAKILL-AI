@@ -185,6 +185,15 @@ speed:
   # still turning the pit-edge leg's airborne stream net negative (+0.0291 -> -0.0059) and the pit leg's
   # (+0.0186 -> -0.0164). Pinned by tests/test_speed_oob_weight.py; derivation and revert triggers in
   # docs/project-log.md, 2026-09-22.
+  #
+  # `fall_hp` -- BUILT 2026-09-22, DORMANT (not in the block below). Charged per HP a rescue teleport removes:
+  # the pit and the shaft are non-instakill DeathZones (min(50, hp - 1), then a teleport), two falls leave 1 HP,
+  # and 18 of 31 recorded deaths on the 85 s rung were one-hit kills set up that way ~300 decisions earlier.
+  # Designed weight 0.04 (discounted band 0.026-0.040, ceiling 0.111). NOT switched on because the live policy
+  # started an unexplained slide just before the switch, and a lever judged against a moving baseline proves
+  # nothing. To switch it on: add `fall_hp: 0.04` below, at a round boundary, by the procedure in
+  # docs/commands.md. Derivation, farm bounds and the judging plan: docs/project-log.md, 2026-09-22, and
+  # tests/test_speed_fall_hp_weight.py.
   rewards:
     death: 12.0
     oob: 0.035

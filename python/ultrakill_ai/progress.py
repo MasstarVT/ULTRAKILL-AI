@@ -77,7 +77,12 @@ EPISODE_LOG_RAW = ("level", "start_checkpoint", "end_pos", "end_reason", "level_
                    # ... and the time share per weapon VARIATION (a list of three), which is what says whether
                    # a round sat on the Piercer or on the Marksman -- the reading a sticky-slot round has to
                    # be judged against, because the sticky slot freezes the variation.
-                   "slot_held_frac", "slot_kills", "held_variation_frac")
+                   "slot_held_frac", "slot_kills", "held_variation_frac",
+                   # The speed stage's `fall_hp` weight (2026-09-22): rescue teleports this episode, the HP
+                   # they removed (the charged quantity), how many took the player from above 1 HP to 1, and
+                   # the HP lost on every other non-death step. Per episode, because the judgement is by 500k
+                   # bucket and a status.json mean does not survive a trainer restart.
+                   "rescues", "rescue_hp", "rescue_floored", "hp_lost_other")
 # The stage S0 counters that are ordinary numbers: one mean each in status.json's `mean_100`, one column each
 # in metrics_log.csv (scripts/poll_status.py), and the two that matter per episode go into episodes.jsonl.
 # Nothing reads them back -- no reward, no observation, no promotion rule. See `UltrakillEnv._note_behaviour`.
