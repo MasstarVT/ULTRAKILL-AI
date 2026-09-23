@@ -53,6 +53,7 @@ V1_CONFIG_LINE = (
     '"horizontal_rays":16,"ground_rays":8,"ray_length":50.0,"ground_ray_length":30.0}'
 )
 V1_HELLO_LINE = '{"type":"hello","protocol":1}'
+V1_RELEASE_LINE = '{"type":"release"}'
 TECH_CONFIG_KEYS = {
     "obs_move_tech", "obs_weapon_tech", "obs_projectiles", "obs_input_clock", "macros", "macro_ssj_wall",
     "allow_reserved_macros", "macro_wall_lead_unsafe", "variant_switching", "ssj_gap_s", "ssj_indicator",
@@ -161,9 +162,10 @@ class LoopbackMod:
         self._thread.join(timeout=10.0)
 
 
-def connect_over_loopback(hello: dict, **overrides) -> tuple[list[str], BaseException | None]:
-    """Runs a real env's connect -- the real BridgeClient, real JSON on a real socket -- against `hello`.
-    Returns every line the mod received and the exception the connect raised, if any."""
+def connect_over_loopback(hello: dict, **overrides) -> tuple[list[str], BaseException | None, bool]:
+    """Runs a real env's connect and then its ordinary close -- the real BridgeClient, real JSON on a real
+    socket -- against `hello`. Returns every line the mod received, the exception the connect raised (if any),
+    and whether the connect left the client's socket open."""
     mod = LoopbackMod(hello)
     env = UltrakillEnv(EnvConfig(mode="campaign", level=LEVEL, fixed_fps=30, frameskip=2, port=mod.port,
                                  **overrides))
@@ -173,12 +175,14 @@ def connect_over_loopback(hello: dict, **overrides) -> tuple[list[str], BaseExce
         env._ensure_connected()
     except Exception as exc:  # noqa: BLE001 - handed back to the test, which asserts on its type
         raised = exc
-    finally:
-        env.client._drop()  # no `release`: the lines under test are the connect's alone
+    left_open = env.client._sock is not None
+    try:
         env.close()
+    finally:
+        env.client._drop()  # only ever does anything if close() did not hang up, so a failing test cannot leak
         # The client has hung up, so the server thread has read everything it will ever get before join returns.
         mod.close()
-    return list(mod.lines), raised
+    return list(mod.lines), raised, left_open
 
 
 # ---------------------------------------------------------------------------------------------
@@ -203,23 +207,25 @@ def test_the_connect_bytes_on_a_real_socket():
     hello_072 = {"type": "hello", "protocol": 1, "mod_version": "0.7.2", "scene": LEVEL}
     hello_080 = {**hello_072, "mod_version": "0.8.0", "features": list(V08_FEATURES)}
 
-    # v1 against 0.7.2 -- the live fleet today: exactly today's two lines.
-    lines, raised = connect_over_loopback(hello_072)
+    # v1 against 0.7.2 -- the live fleet today: exactly today's lines, the close's release included.
+    lines, raised, _ = connect_over_loopback(hello_072)
     assert raised is None, raised
-    assert lines == [V1_HELLO_LINE, V1_CONFIG_LINE], lines
+    assert lines == [V1_HELLO_LINE, V1_CONFIG_LINE, V1_RELEASE_LINE], lines
 
     # v1 against 0.8.0: today's config line, then every 0.8 switch appended, OFF.
-    lines, raised = connect_over_loopback(hello_080)
+    lines, raised, _ = connect_over_loopback(hello_080)
     assert raised is None, raised
-    assert len(lines) == 2 and lines[0] == V1_HELLO_LINE, lines
+    assert len(lines) == 3 and lines[0] == V1_HELLO_LINE and lines[2] == V1_RELEASE_LINE, lines
     assert lines[1].startswith(V1_CONFIG_LINE[:-1] + ","), lines[1]
     sent = json.loads(lines[1])
     assert set(sent) == {"type"} | V1_CONFIG_KEYS | TECH_CONFIG_KEYS
     assert {k: sent[k] for k in TECH_CONFIG_KEYS} == OFF_08
 
-    # v2 against 0.7.2: the hello and nothing after it -- the refusal comes before any configure.
-    lines, raised = connect_over_loopback(hello_072, tech_layout="v2")
+    # v2 against 0.7.2: the hello and nothing after it -- the refusal comes before any configure, and it hangs
+    # up rather than leave an open socket behind `_connected = False`, which close() would skip.
+    lines, raised, left_open = connect_over_loopback(hello_072, tech_layout="v2")
     assert isinstance(raised, BridgeIncompatible), repr(raised)
+    assert not left_open, "a refused mod's socket must be dropped before the error is raised"
     assert lines == [V1_HELLO_LINE], lines
 
 
@@ -249,6 +255,60 @@ def test_a_v2_env_on_a_0_7_2_mod_fails_loudly_at_connect():
     finally:
         env.close()
     assert fake.configures == 0, "nothing may be configured on a mod that cannot serve the layout"
+    assert fake.drops == 1, "the refused connection is hung up, not left open"
+
+
+def test_the_mod_is_checked_on_every_connect_not_only_the_first():
+    """A game relaunched onto an old DLL, or a DLL swapped under a running fleet, must be refused at the
+    reconnect too: a check at the first connect alone would train v2 against a mod that no longer serves it."""
+    env, fake = tech_env()
+    try:
+        env.reset()
+        assert fake.configures == 1
+        fake.features, fake.mod_version = [], "0.7.2"
+        try:
+            env._try_reconnect_until(time.monotonic() + 30.0)
+        except BridgeIncompatible as exc:
+            assert "0.7.2" in str(exc), exc
+        else:
+            raise AssertionError("a reconnect onto a mod without the 0.8.0 features was accepted")
+        assert fake.configures == 1, "the refused mod was configured"
+        assert fake.drops == 1 and not env._connected
+    finally:
+        env.close()
+
+
+def test_a_memory_recycle_onto_an_old_dll_is_refused_loudly():
+    """`_recycle_own_game_if_fat` swallows every other failure; this one must escape it, not be logged as a
+    memory error and latch the recycle off."""
+    env, fake = tech_env(bridge_relaunch=True, game_memory_growth_gb=1.0)
+    # Both hooks are stubbed BEFORE the first reset: the real ones read the live fleet's memory and relaunch a
+    # real game on this port.
+    fleet = {env.cfg.port: int(1.4e9), env.cfg.port + 1: int(1.4e9)}
+    env._fleet_memory_hook = lambda: dict(fleet)
+
+    def relaunch_onto_an_old_dll(deadline):
+        fake.features, fake.mod_version = [], "0.7.2"
+        fleet[env.cfg.port] = int(1.4e9)
+        return True
+
+    env._relaunch_own_game = relaunch_onto_an_old_dll
+    events: list[str] = []
+    try:
+        env.reset()  # a healthy fleet: nothing is recycled
+        assert fake.mod_version == "0.8.0"
+        env.envlog.event = lambda name, **_: events.append(name)
+        fleet[env.cfg.port] = int(6e9)
+        try:
+            env._recycle_own_game_if_fat(time.monotonic() + 30.0)
+        except BridgeIncompatible:
+            pass
+        else:
+            raise AssertionError("the recycle swallowed an incompatible mod")
+        assert "mem_recycle_error" not in events and "mod_incompatible" in events, events
+        assert env._mem_recycle_off is False
+    finally:
+        env.close()
 
 
 def test_bridge_incompatible_escapes_every_recovery_handler():

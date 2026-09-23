@@ -694,7 +694,13 @@ class UltrakillEnv(gym.Env):
         if self._recovery_deadline is not None:
             retry = self._clamp(retry, self._recovery_deadline)
         hello = self.client.connect(retry_seconds=retry)
-        self._check_mod(hello)
+        try:
+            self._check_mod(hello)
+        except BridgeIncompatible:
+            # Hang up before raising. `_connected` stays False, so `close()` would skip this socket and the next
+            # connect would overwrite it, open. No `release`: this client never took control of the game.
+            self.client._drop()
+            raise
         mod_layout = self.cfg.layout.mod_config()
         # Ask the mod for more enemies than the policy sees so damage rewards aren't missed.
         mod_layout["max_enemies"] = max(32, self.cfg.layout.max_enemies)
@@ -1196,6 +1202,10 @@ class UltrakillEnv(gym.Env):
                 # fat. Relaunching again would be an infinite loop that never trains, so this env stops.
                 self._mem_recycle_off = True
                 self.envlog.event("mem_recycle_disabled", after_mb=after // PROC_MB, limit_mb=limit // PROC_MB)
+        except BridgeIncompatible:
+            # Not a memory problem: the relaunched game runs a mod this config cannot use. Loud here, rather
+            # than logged as a mem_recycle_error and raised again by the reset's own connect.
+            raise
         except Exception as exc:  # noqa: BLE001 - never turn a memory check into a failed reset
             self._mem_recycle_off = True
             self.envlog.event("mem_recycle_error", error="%s: %s" % (type(exc).__name__, exc))

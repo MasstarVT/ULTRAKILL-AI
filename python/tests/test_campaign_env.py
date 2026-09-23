@@ -170,6 +170,7 @@ class FakeLevel:
         self.connects = 0
         self.configures = 0
         self.closes = 0
+        self.drops = 0
         self._load()
 
     def fail_next_resets(self, exc: BaseException, times: int = 1) -> None:
@@ -237,6 +238,10 @@ class FakeLevel:
 
     def close(self) -> None:
         self.closes += 1
+
+    def _drop(self) -> None:
+        """The hang-up without `release` that UltrakillEnv uses on a mod it refuses (BridgeIncompatible)."""
+        self.drops += 1
 
     def get_obs(self) -> dict:
         return self._obs()

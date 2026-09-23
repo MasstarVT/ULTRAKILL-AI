@@ -82,10 +82,17 @@ class BridgeIncompatible(RuntimeError):
     """The mod on the other end cannot serve what this client is configured for -- e.g. `tech_layout: v2` against
     a 0.7.2 DLL, which would otherwise train 530 inputs of which 51 are always zero.
 
-    DELIBERATELY NOT a BridgeError and NOT in RECOVERABLE. `UltrakillEnv._try_reconnect_until` retries every
-    BridgeError, and its last rung relaunches the game: a wrong DLL would then cost a relaunch loop across twelve
-    games. This escapes every handler instead, so the worker -- and with it the trainer -- dies with this message in
-    runs/<run>_train.log. That is the loud failure spec §4.7 asks for.
+    DELIBERATELY NOT a BridgeError and NOT in RECOVERABLE. `UltrakillEnv`'s recovery ladder retries every
+    BridgeError for up to `bridge_recovery_budget_s` (~540 s) and its last rung relaunches the env's own game;
+    against a wrong DLL both are wasted, since no retry can change what the DLL serves. This escapes every env
+    handler instead, so the worker dies at once with this message in runs/<run>_train.log.
+
+    What it does NOT do is stop the fleet. The dead worker's SubprocVecEnv parent sees EOFError and the trainer
+    exits; the stage supervisor treats that as an ordinary crash and relaunches all twelve games and the trainer,
+    up to `max_restarts_per_hour` (3) times, before the driver gives up and exits 1. The fleet-level refusal is
+    the driver's layout guard (the plan's Task 5), which refuses a checkpoint whose shapes do not match
+    `tech_layout` before any trainer starts; it does not read the installed DLL, so a v2 config against a 0.7.2
+    fleet still ends in the restart sequence above.
     """
 
 
