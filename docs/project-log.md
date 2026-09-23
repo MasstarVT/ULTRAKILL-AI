@@ -5663,3 +5663,145 @@ other levels' DeathZones behave the same; the effect size; the slide's cause.
 `CLAUDE.md`: the stale "Live" line (round 7, rung 2, 100 s) was replaced in place by the current one (round 14,
 rung 3, 85 s, the slide, `fall_hp` dormant) and the levers line gained `fall_hp` OFF; still 219 lines;
 `AGENTS.md` regenerated with `scripts/sync_agents_md.py`.
+
+## 2026-09-22 — The post-reboot slide: weights ROLLED BACK to 55,645,054, and what an abrupt kill leaves stale
+
+**What happened.** The PC restarted for an update at ~17:40. The desktop app owned the process tree, so the
+driver, the round-14 trainer, the helpers and all twelve games died at once, with no graceful save (the last
+logged step was **55,662,598**; the newest checkpoint was `ckpt_55645054_steps.zip`, 17:38:17; `latest.zip`
+was 11:21's 52,245,598). At 18:03 the driver, now under Task Scheduler, resumed from `ckpt_55645054`. From
+there the policy ran ~10 s slower at every quantile for 3M steps and did not recover, so the lead rolled the
+weights back to the last pre-reboot checkpoint and restarted cleanly. `fall_hp` stays OFF until the baseline
+is back.
+
+### The buckets (fresh completions per full 500k bucket, `runs/spec_0-1_speed/episodes.jsonl`)
+
+| bucket | n fresh | p10 / median / p90 / best | rate | deaths/ep | oob decisions/ep |
+|---|---|---|---|---|---|
+| 54.0M | 271 | 81.3 / 101.1 / 142.8 / 71.2 | 0.95 | 1.21 | 318 |
+| 54.5M | 261 | 82.1 / 99.5 / 154.0 / 70.1 | 0.90 | 1.25 | 273 |
+| 55.0M | 251 | 80.7 / 97.8 / 159.9 / 65.0 | 0.89 | 1.20 | 386 |
+| 55.5M | 246 | 81.2 / 102.1 / 156.6 / 67.1 | 0.92 | 1.25 | 390 |
+| **56.0M** | 256 | **90.4 / 110.2** / 149.8 / 73.9 | 0.93 | 1.00 | 253 |
+| **56.5M** | 251 | **85.7 / 108.4** / 153.8 / 72.2 | 0.92 | 0.96 | 224 |
+| **57.0M** | 254 | **89.4 / 112.0** / 167.7 / 76.7 | 0.96 | 1.09 | 220 |
+| **57.5M** | 245 | **86.5 / 108.6** / 162.0 / 74.8 | 0.93 | 1.33 | 355 |
+| **58.0M** | 257 | **87.6 / 109.6** / 155.4 / 74.2 | 0.94 | 1.38 | 285 |
+
+Seven full buckets from 52.5M to 55.5M all read 97-102 s. **The 55.5M bucket is mixed, not pre-reboot**: its
+86 fresh rows before 18:03 (80 completions) read median **97.4 s**, and its 160 fresh rows after the restart
+(146 completions) read **104.3 s**. So the slide shows from the first ~350k steps after the restart.
+
+**Ruled out before this entry (the lead's reading):** the config (no commit touched env, rewards, trainer,
+driver, configs or mod between the `oob` activation at 46.35M and 18:03); difficulty (4 on every row);
+decisions per official second (~16.4 either side); PPO statistics (explained variance 0.92-0.95, approx_kl
+0.031-0.035, clip fraction 0.23-0.24, unchanged); `Prefs.json` (unchanged since 09-20); the plugin DLL
+(09-18). Round-boundary restarts (rounds 8-14, each from `latest.zip` after a graceful teardown) never
+produced a slide like this.
+
+### What an abrupt kill could have left stale, read from the code (step 1, read-only)
+
+**Nothing the env persists explains a lasting ~10 s slowdown.**
+
+- **Exploration archives** (`models/spec_0-1_speed/explore_Level_0-1_<port>.npz`). They are NOT written only
+  at teardown. `UltrakillEnv.step` checks every 500 steps (`ARCHIVE_CHECK_EVERY`) and saves every 600 s of
+  wall time or 20,000 env steps, whichever comes first (`archive_save_seconds` / `archive_save_steps`). It
+  also saves every 20 episodes and in `close()`, and each save is atomic (temp file, then rename). So a hard
+  kill loses at most ~10 minutes of visit counts per game, about 4 episodes. The route's cells hold
+  ~1,450-1,650 visits each. One risk in the code: `ExplorationArchive.load` silently returns an EMPTY archive
+  when a file is unreadable, so a torn file would reset novelty and the 9-value exploration map in the
+  observation. **That did not happen.** At 23:36 all 12 archives were consistent with each other: 33.8k-57.7k
+  cells, 719k-749k visits, max count 1,574-1,654, and 177-189 cells at or above 1,000 per port. An archive
+  reset at 18:03 would show a max of ~120-130 (the fresh episodes each port has run since). Both the
+  observation feature (`min(1, log1p(N) / log 1001)`) and the novelty pay (`0.2 / sqrt(N + 1)`, ~0.005 per
+  cell) are flat at these counts. Missing ~10 minutes of counts changes neither.
+- **`curriculum.json`**: this run does not use one (`levels: []`, `curriculum_path: ''`, and no file in the run
+  directory).
+- **`status.json`**: `ProgressCallback._restore` carries only totals, `best_time`, the difficulty and the
+  target back into the trainer. It does not carry the windows, and none of it reaches the env or the reward.
+- **`best_runs/Level_0-1.json`**: written by the env and never read back into the reward or the observation.
+  It was unchanged throughout (09:59:50).
+- **The model zip**: `CheckpointCallback` and the teardown `latest.zip` both come from `model.save`, with the
+  same contents (weights, Adam state, `ep_info_buffer`). The first logged rollout after 18:03 and after this
+  restart is identical: `total_timesteps` 55,647,094, `ep_rew_mean` 410, `ep_len_mean` 1.81e3.
+- **The entropy controller** restarts at the base `ent_coef` 0.004 on EVERY resume, round boundaries
+  included, so it is not specific to this restart.
+- **`Binds.json`** (default binds, `modifiedActions: {}`) has mtime **17:40:04.36**, the same second the
+  bridges logged "Connection closed by the game". So a game wrote it on its way down, from the binds it held
+  in memory, which it had loaded from that file at boot. The old contents were therefore very likely the
+  same. This is not proven.
+- **No code change is needed for the archives.** A cheap fix for next time: have the env log the archive's
+  cell count and max at load. No such line exists today, so the counts loaded at 18:03 can only be inferred:
+  each port's current max minus the episodes it has run since 18:03 gives ~1,450-1,524.
+
+**What the rollback does NOT reset** (the leads if the slide comes back): the OS update itself, the cold boot
+of all twelve games at once under the new Task Scheduler lineage (the games run as descendants of
+`mem_guard`, at the BelowNormal priority `games.py` always sets), and `Binds.json`.
+
+### The rollback, 2026-09-22 23:28-23:30
+
+Nothing connected to a bridge port. `games.py launch` / `stop` were never run, and this operation stopped no
+game. `mem_guard` kept recycling them on its normal schedule throughout (47807 at 23:32, 47801 at 23:36,
+47806 at 23:40), and 12/12 were listening before and after.
+
+| time | step |
+| --- | --- |
+| 23:28 | `ckpt_55645054_steps.zip` (SHA-256 `d2fdefc0…6af36def`), `latest.zip` (`45f182a4…4c73d923`), `best.zip` and `best.json` copied to `python/runs/rollback_backup_2026-09-22_reboot/` **before anything was touched**, with `driver_state.json` beside them |
+| 23:28:20 | `runs/specialists/DRIVER_PAUSE` created |
+| 23:28:31 | driver stopped **by pid**: 32964 (python), then its venv shim 30080, then the task's `cmd` wrapper 34420. The task went to `Ready` and the 12 games stayed up. **`mem_guard` (32012) was left running**: it is the parent of all twelve games |
+| 23:28:41 | `poll_status`, `keep_best`, `post_times` and `dashboard` stopped by pid |
+| 23:28:47 | the trainer stopped **force-first, the real trainer process (2920) BEFORE its workers**, then its 12 `multiprocessing-fork` workers, then the shim 27056 and the `cmd` 6408. Killing the workers first would have let the parent's `finally:` run `model.save(latest)` with post-reboot weights (or leave a torn `latest.zip`). Afterwards `latest.zip` had the same SHA-256 and the same 11:20:54 mtime, and the train log has no "Saved" line |
+| 23:29 | **59 checkpoints MOVED** (never deleted) to `models/spec_0-1_speed/rolled_back_2026-09-22_reboot/`: `ckpt_55695046` … `ckpt_58594582`, 744.9 MB. `supervise.zip_timesteps` agreed with every file name (804 checkpoints, 0 mismatches). `latest.zip` (52,245,598) **stayed**. `best.zip`/`best.json` **stayed**: `best.json` records `at_timesteps` 52,858,030 (`ckpt_52845502`) and the zip reads 52,845,502, both before the rollback point. `models/specialists/Level_0-1.zip` was not touched |
+| 23:29 | `supervise.choose_resume` re-read: `ckpt_55645054_steps.zip` at 55,645,054 |
+| 23:29:23 | run files rotated, the originals kept as `.reboot-55.65M-58.64M`: `episodes.jsonl` (15,114 rows with `timesteps` < 55,645,054 kept, 1,505 aside), `metrics_log.csv` (4,309 rows kept under the same 109-column header, 655 aside), `status.json` (the stale 58,643,458 reading, moved aside with no replacement). The cut also drops the ~17.5k-step pre-reboot tail (55,645,054-55,662,250), which came from weights past the rollback point and overlaps the new counter |
+| 23:29 | `driver_state.json` checked and left alone: `current` = Level 0-1 speed, round 14, rung index 2 (85 s), `start_steps` 52,245,598, `stale_below` 52,245,598, `target_reached_at` null. New samples start at 55.645M, above `stale_below`. With `status.json` rotated the windows start empty, so nothing can latch on a stale reading. The round counts 3.4M steps into its 8M cap again |
+| 23:29:3x | `DRIVER_PAUSE` removed as its own command. `campaign_driver.py --dry-run`: "FOCUS on Level 0-1 … now on rung 3 of 10, target 85.00 s" and "would start the trainer: … --resume …/ckpt_55645054_steps.zip". `driver_state.json` was byte-identical afterwards |
+| 23:29:49 | `schtasks /Run /TN "ULTRAKILL-AI driver"`. The new driver (16580) adopted the running games and started the trainer at 23:29:50: "`started trainer for Level 0-1 (pid 11664, resume ckpt_55645054_steps.zip at 55,645,054 steps)`". It started four helpers and adopted the running `mem_guard` |
+
+**This start is also the first trainer start on the `fall_hp` code** (merged 20:40, after the 18:03 start),
+with the weight at **0.0**. The term is `-0.0 * rescue_hp`, it is not fed to the stuck clock, and the
+observation is unchanged. So the only difference from the pre-reboot code is four new per-episode readings
+(`rescues`, `rescue_hp`, `rescue_floored`, `hp_lost_other`), which now appear in `episodes.jsonl`. The
+generated `env_config.yaml` now lists `fall_hp: 0.0` (it did not exist before).
+
+### Verification, from files only (23:36-23:41, 7-11 minutes after the trainer started)
+
+- Train log, the new start: `hyperparameters in force: gamma=0.998, gae_lambda=0.95, n_steps=170,
+  batch_size=512, n_epochs=5, ent_coef=0.004, target_kl=0.03 | rollout buffer: gamma=0.998, gae_lambda=0.95`.
+  The first rollout reads `total_timesteps 55647094` (55,645,054 + 2,040). No traceback after that line.
+  Explained variance 0.965 and approx_kl 0.032 at 55.74M.
+- `status.json` is fresh and stepping: `start_timesteps` **55,645,054**, 55,743,790 at 23:40:30, 171 steps/s,
+  `campaign.difficulty` **4**, `target_seconds` **85.0**. All 39 new episodes are Level 0-1 on difficulty 4,
+  across all 12 envs, and each carries the rescue readings.
+- `models/spec_0-1_speed/env_config.yaml` (23:29:55): `difficulty: 4`, `death: 12.0`, `oob: 0.035`,
+  `fall_hp: 0.0`, `speed_target_seconds: 85.0`.
+- 12/12 bridge ports listening (`games.py status`), 12 games, 12 workers, five helpers (the kept `mem_guard`
+  plus the new `poll_status`, `keep_best`, `post_times`, `dashboard`). `check_run.py`: **`ALERTS none`**,
+  system commit 78% (`mem_guard.log`: 74% after each recycle).
+- `models/specialists/Level_0-1.zip` untouched: SHA-256 `CD812F25816D94B8E4EE1BBC544F8E76AA217EF1260DECB4ED8A78BA4039683D`,
+  mtime 2026-09-22 08:59:36, before and after.
+- **Archive counts loaded at this restart** (the 23:25:23 saves, which the force-killed workers left): max
+  1,574-1,654 per port, the same cells as before (33.8k-57.7k per port). Inferred for 18:03: ~1,450-1,524.
+  Both are far above the observation map's saturation point (1,000).
+- The first 39 fresh episodes read median 103.6 s (36 completions), best 78.5 s. **Not judged**: it is 100k
+  steps, and the first 350k after 18:03 read 104.3 s as well.
+
+### The restoration check (the lead applies it)
+
+**The first two FULL 500k buckets after 55.645M (56.0M and 56.5M on the restored counter) should read
+~97-102 s**, with p10 back near 80-82 s and best-of-bucket near 65-71 s. These are the weights that produced
+those buckets, under the same config, so there is no adaptation to wait out. **If the slide recurs** (both
+buckets at ~108 s or above, p10 at ~86 s or above), **the restart itself is the bug**. Then nothing more gets
+tuned until it is found, starting with the things this rollback does not reset (above). `fall_hp` is
+switched on only after the two buckets confirm the 97-102 s policy is back.
+
+### Found in passing, not changed
+
+- **The driver task has `ExecutionTimeLimit` PT72H.** Task Scheduler stops a task that is still running 72 h
+  after it started, which here would be ~2026-09-25 23:29. Whether the stop takes the games with it was not
+  tested. The task also has a one-off 23:58 trigger, which does nothing while the task is running
+  (`MultipleInstances IgnoreNew`). The task settings were not touched.
+
+**Not verified.** Whether the rollback restores the 97-102 s policy: only the two full buckets can say that.
+The actual cause of the slide. What `Binds.json` held before 17:40. The archive counts loaded at 18:03
+(inferred, not logged). Any in-game behaviour: no eval was run and no bridge port was connected to.

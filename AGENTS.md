@@ -179,8 +179,8 @@ Python (`python/`) builds observations and rewards from the raw game state and t
   to go back to the plan; the focus stops itself, loudly, when the ladder is done. **The plan is read once,
   at driver start** — a running driver must be restarted before any `focus:` edit means anything.
 - **Live: `Level 0-1` (SPEED) ROUND 14 = FOCUS RUNG 3 of 10 (85 s), run `spec_0-1_speed`**, Brutal, 12 games;
-  `speed.rewards` = `death` 12 + `oob` 0.035. `fall_hp` (pit HP) is built but DORMANT: bucket medians slid ~98 ->
-  108-110 s after the 55.65M restart, cause unknown (log 2026-09-22). Best **61.996 s**, record **19.798 s**.
+  `speed.rewards` = `death` 12 + `oob` 0.035; `fall_hp` DORMANT. **ROLLED BACK to 55,645,054** after a post-reboot
+  slide (~98 -> 110 s): next 2 full buckets must read 97-102 s (log 2026-09-22). Best **62.0 s**, record **19.798 s**.
   0-2 speed round 2 was ENDED BY THE OPERATOR at 29.23M steps ("unfinished", nothing promoted): its death
   5->12 experiment got only ~1.8M steps and has **NO VERDICT** (deaths/episode 4.58 -> 4.66). Its standing
   finding holds: 0-2 speed is a DEATH problem, not navigation (OLS **+22.3 s/death**, intercept 121.1 s;
