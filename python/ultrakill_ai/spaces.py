@@ -13,6 +13,8 @@ from typing import Any
 import numpy as np
 from gymnasium import spaces
 
+from ultrakill_ai.rewards import macro_landed
+
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
@@ -32,19 +34,39 @@ ACTION_NVEC = np.array(BASE_NVEC, dtype=np.int64)  # 11 dims, 42 logits: Cyber G
 ACTION_NVEC_CAMPAIGN = np.array((*BASE_NVEC, LOOK_MODES), dtype=np.int64)  # 12 dims, 45 logits
 LOOK_MODE_INDEX = len(BASE_NVEC)
 
+# ---------------------------------------------------------------------------
+# The v2 TECH action layout -- stage S7 of docs/superpowers/specs/2026-09-20-speedrun-tech.md, §4.1.
+# APPEND ONLY: every campaign logit row 0-44 keeps its index, which is what lets scripts/add_tech_heads.py copy
+# rows 0-44 verbatim and makes the migration exact.
+# ---------------------------------------------------------------------------
+TECH_LAYOUTS = ("v1", "v2")  # EnvConfig.tech_layout; ultrakill_ai/ckpt_layout.py carries the same literal
+MACROS = ("none", "ssj", "ssj_wall", "core_nuke", "rocket_down", "coin_rocket")  # the mod's own values 0..5
+VARIANT_CHOICES = 4  # 0 keep, 1..3 = variation 0..2 of the held slot (the mod's `variant`)
+HOOK_CHOICES = 2  # 0 off, 1 hold the whiplash (the mod's `hook` HoldButton)
+ACTION_NVEC_TECH = np.array((*ACTION_NVEC_CAMPAIGN, len(MACROS), VARIANT_CHOICES, HOOK_CHOICES),
+                            dtype=np.int64)  # 15 dims, 57 logits
+MACRO_INDEX, VARIANT_INDEX, HOOK_INDEX = 12, 13, 14
+_CAMPAIGN_LOGITS = int(ACTION_NVEC_CAMPAIGN.sum())  # 45
+MACRO_ROWS = range(_CAMPAIGN_LOGITS, _CAMPAIGN_LOGITS + len(MACROS))  # 45-50
+VARIANT_ROWS = range(MACRO_ROWS.stop, MACRO_ROWS.stop + VARIANT_CHOICES)  # 51-54
+HOOK_ROWS = range(VARIANT_ROWS.stop, VARIANT_ROWS.stop + HOOK_CHOICES)  # 55-56
 
-def action_space(campaign: bool = False) -> spaces.MultiDiscrete:
-    return spaces.MultiDiscrete(ACTION_NVEC_CAMPAIGN if campaign else ACTION_NVEC)
+
+def action_space(campaign: bool = False, tech: bool = False) -> spaces.MultiDiscrete:
+    if tech and not campaign:
+        raise ValueError("the tech action layout is campaign-only: Cyber Grind's 11-dimension space never widens")
+    return spaces.MultiDiscrete(ACTION_NVEC_TECH if tech else ACTION_NVEC_CAMPAIGN if campaign else ACTION_NVEC)
 
 
 def decode_action(a: np.ndarray) -> dict[str, Any]:
-    """The mod command for one action. The width tells the mode apart: 12 values carry a look mode, 11 do not."""
+    """The mod command for one action. The width tells the mode apart: 15 values carry the tech heads, 12 a look
+    mode, 11 neither. A 12- or 11-wide action decodes to exactly the dict it always did (tests/test_tech_layout.py)."""
     a = np.asarray(a, dtype=np.int64)
     forward = int(a[0]) - 1
     side = int(a[1]) - 1
     pressed = [name for name, bit in zip(BUTTONS, a[2 : 2 + len(BUTTONS)]) if bit]
     i = 2 + len(BUTTONS)
-    return {
+    out = {
         "move": [side, forward],
         "buttons": pressed,
         "slot": int(a[i]),
@@ -52,17 +74,40 @@ def decode_action(a: np.ndarray) -> dict[str, Any]:
         # env.step resolves this and pops it: it is a Python-side look policy, never sent to the mod.
         "look_mode": int(a[LOOK_MODE_INDEX]) if len(a) > LOOK_MODE_INDEX else 0,
     }
+    if len(a) > HOOK_INDEX:
+        # v2 only. env.step pops all three and decides what reaches the wire (UltrakillEnv._apply_tech): a raw
+        # policy value is never sent as is.
+        out["macro"] = int(a[MACRO_INDEX])
+        out["variant"] = int(a[VARIANT_INDEX])
+        out["hook"] = bool(a[HOOK_INDEX])
+    return out
 
 
-def noop_action(campaign: bool = False) -> np.ndarray:
-    """Stand still and look straight ahead. Explicit indices: negative ones address the wrong slots at width 12."""
-    nvec = ACTION_NVEC_CAMPAIGN if campaign else ACTION_NVEC
+def noop_action(campaign: bool = False, tech: bool = False) -> np.ndarray:
+    """Stand still and look straight ahead. Explicit indices: negative ones address the wrong slots at width 12+."""
+    nvec = ACTION_NVEC_TECH if tech else ACTION_NVEC_CAMPAIGN if campaign else ACTION_NVEC
     a = np.zeros(len(nvec), dtype=np.int64)
     a[0] = a[1] = 1
     i = 2 + len(BUTTONS)
     a[i + 1] = YAW_BINS.index(0.0)
     a[i + 2] = PITCH_BINS.index(0.0)
-    return a  # the look-mode slot stays 0 (free look)
+    return a  # look mode 0 (free look); under v2 also no macro, keep the variant, no hook
+
+
+def pinned_action_rows(live_macros, variant: bool, hook: bool) -> list[int]:
+    """The v2 logit rows whose value can never reach the game under these gates, ascending.
+
+    training.pin_action_rows freezes them (the plan's "Spec deviations" 2): a head that cannot act receives only
+    the entropy bonus and would drift toward uniform, losing the §4.4 prior before its stage opens. A dimension
+    with NO live non-default value is pinned whole; otherwise only its dead values are.
+    """
+    live = {int(v) for v in live_macros if 0 < int(v) < len(MACROS)}
+    rows = list(MACRO_ROWS) if not live else [MACRO_ROWS[v] for v in range(1, len(MACROS)) if v not in live]
+    if not variant:
+        rows += list(VARIANT_ROWS)
+    if not hook:
+        rows += list(HOOK_ROWS)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +122,31 @@ NUM_WEAPON_SLOTS = 6
 # held cycles between them (`WeaponRedrawBehaviour` 0, spec §3.4). Bookkeeping only -- no observation packs it.
 NUM_WEAPON_VARIATIONS = 3
 CAMPAIGN_BLOCK = 36  # campaign values packed after the Cyber Grind two (see campaign_block)
+# The v2 TECH block (§4.3): 51 floats appended AFTER the campaign block, so indices 0-478 keep their meaning.
+# Offsets inside the block; the absolute start is ObsLayout.tech_start (479 at the defaults).
+TECH_BLOCK = 51
+TECH_MOVE = slice(0, 12)  # block A, live at S7           -> 479-490
+TECH_WEAPON = slice(12, 22)  # block B, reserved 0.0 (S9)   -> 491-500
+TECH_PROJECTILES = slice(22, 40)  # block C, reserved (S10) -> 501-518
+TECH_MACRO = slice(40, 43)  # block D, live at S7          -> 519-521
+TECH_HAZARD = slice(43, 51)  # block E, reserved (S11)     -> 522-529
+# Block A in packing order: (mod key, divisor, low, high). The scales come from the decompiled NewMovement and
+# are DERIVED, not measured -- the S6 slam check reads the real ranges. `slide_grace`, NOT `slide_since`: the
+# mod review's finding 2 (2026-09-20). Never pack slide_since, slide_timestamp or jump_timestamp (docs/protocol.md).
+MOVE_TECH_FIELDS = (
+    ("heavy_fall", 1.0, 0.0, 1.0),
+    ("slam_force", 10.0, 0.0, 1.0),  # 1 at slam start, +5/s while heavyFall; >= 5.5 is the 12.5x bounce
+    ("bounce_window", 1.0, 0.0, 1.0),
+    ("coyote", 1.0, 0.0, 1.0),  # gc.sinceLastGrounded, game seconds (999 without a ground check)
+    ("wall_jumps", 3.0, 0.0, 1.0),  # currentWallJumps; the budget is 3
+    ("wall_available", 1.0, 0.0, 1.0),
+    ("boost", 1.0, 0.0, 1.0),
+    ("boost_left", 100.0, 0.0, 1.0),  # dash i-frames: 100 at Dodge(), -4 per fixed step
+    ("pre_slide_speed", 3.0, 0.0, 2.0),  # |v|/24 or slamForce; StartSlide clamps it to 3
+    ("jump_cooldown", 1.0, 0.0, 1.0),
+    ("slide_grace", 1.0, 0.0, 1.0),  # the fraction of the SSJ window still open
+    ("riding_rocket", 1.0, 0.0, 1.0),
+)
 
 
 @dataclass
@@ -87,6 +157,7 @@ class ObsLayout:
     ray_length: float = 50.0
     ground_ray_length: float = 30.0
     campaign: bool = False  # campaign levels: the level block replaces the 5 retired route values (448 -> 479)
+    tech: bool = False  # tech_layout v2: the 51-float TECH block (479 -> 530)
 
     @property
     def player_size(self) -> int:
@@ -104,6 +175,16 @@ class ObsLayout:
         return 2 + (CAMPAIGN_BLOCK if self.campaign else 5)
 
     @property
+    def campaign_start(self) -> int:
+        """Absolute index of the campaign block's first value (443 at the defaults)."""
+        return self.player_size + self.max_enemies * self.enemy_size + self.horizontal_rays + self.ground_rays + 2
+
+    @property
+    def tech_start(self) -> int:
+        """Absolute index of the v2 TECH block (479 at the defaults). Meaningful only when `tech` is set."""
+        return self.campaign_start + CAMPAIGN_BLOCK
+
+    @property
     def size(self) -> int:
         return (
             self.player_size
@@ -111,6 +192,7 @@ class ObsLayout:
             + self.horizontal_rays
             + self.ground_rays
             + self.mode_size
+            + (TECH_BLOCK if self.tech else 0)
         )
 
     def mod_config(self) -> dict[str, Any]:
@@ -205,6 +287,39 @@ def campaign_block(obs: dict[str, Any], explore: list[float] | None = None, targ
     return out
 
 
+def _scalar(value: Any) -> float:
+    """A mod field as a float: a bool is 0/1; missing, null, non-numeric or non-finite is 0.0 (the old-DLL value)."""
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if math.isfinite(f) else 0.0
+
+
+def tech_block(obs: dict[str, Any]) -> list[float]:
+    """The 51 v2 values (index map: docs/superpowers/plans/2026-09-23-tech-break-python.md).
+
+    Every read defaults to 0.0, so a 0.7.2 DLL, an `obs_move_tech` that is off, or a frame with no player all
+    pack the vector scripts/add_tech_heads.py initialised the new input columns for. Blocks B, C and E are
+    reserved and stay 0.0 even if the mod sends their source blocks: their packers are written at S9-S11.
+    """
+    out = [0.0] * TECH_BLOCK
+    move = obs.get("move_tech") if obs.get("player") else None
+    if isinstance(move, dict):
+        for k, (name, divisor, low, high) in enumerate(MOVE_TECH_FIELDS):
+            out[TECH_MOVE.start + k] = min(high, max(low, _scalar(move.get(name)) / divisor))
+    report = obs.get("macro")
+    if isinstance(report, dict):
+        ran = report.get("result") == "ran"
+        out[TECH_MACRO.start] = 1.0 if ran else 0.0
+        out[TECH_MACRO.start + 1] = 0.0 if ran else 1.0
+        if macro_landed(report):
+            out[TECH_MACRO.start + 2] = _scalar(report.get("ssj_bucket")) / 3.0
+    return out
+
+
 def pack_observation(
     obs: dict[str, Any],
     layout: ObsLayout,
@@ -272,6 +387,9 @@ def pack_observation(
 
     # Cyber Grind keeps 5 zeros where the route waypoint used to be, so its 448-input checkpoints still load.
     put(campaign_block(obs, explore, target) if layout.campaign else [0.0] * 5)
+
+    if layout.tech:
+        put(tech_block(obs))
 
     assert i == layout.size, f"packed {i} values, layout expects {layout.size}"
     return out

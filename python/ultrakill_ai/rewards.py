@@ -156,6 +156,24 @@ def damage_share(removed: float, max_health: float | None, fallback: float | Non
     return 1.0
 
 
+def macro_landed(report: Any) -> bool:
+    """THE S8 GATE (spec §4.5): the mod RAN a macro and its own instrument reports an accepted SSJ bucket.
+
+    Accepted means 1-3: `TrySSJ` computes `(int)(dt / 0.008)` and rejects bucket 0 and anything at or past
+    `ssjMaxFrames` (4). Never a speed delta -- that gate is perversely signed, because `TrySSJ` OVERWRITES the
+    velocity with `velocityAfterSlide` (floored at 24) plus the bonus, so a speed bar pays most when the player
+    is slow. `ssj_bucket` / `ssj_landed` are populated only when `result == "ran"` (docs/protocol.md, the mod
+    review's finding 3); `result` is checked again here so a refused macro can never pay or read as landed.
+    """
+    if not isinstance(report, dict) or report.get("result") != "ran" or not report.get("ssj_landed"):
+        return False
+    try:
+        bucket = int(report.get("ssj_bucket"))
+    except (TypeError, ValueError):
+        return False
+    return 1 <= bucket <= 3
+
+
 @dataclass
 class CampaignStep:
     """What the level did this step, measured by the env (see campaign.py)."""
