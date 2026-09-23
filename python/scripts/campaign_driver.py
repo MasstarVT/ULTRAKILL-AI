@@ -118,6 +118,15 @@ target 150 with median 147.16 puts the focus on the 120 rung. When the last rung
 says so loudly, and the ordinary plan takes over. `focus: null` (or no block at all) is exactly today's
 behaviour.
 
+**A mod that cannot serve the stage's config** (`runs/<run>/MOD_INCOMPATIBLE`, exit code 4). A `tech_layout: v2`
+config against a DLL without the 0.8.0 features is refused by every worker at its first connect, and each writes
+that file into the stage's run directory before dying (`protocol.BridgeIncompatible`). `ensure_trainer` reads it
+before it launches a game or spawns a trainer, and the stage supervisor's restart path does the same; while it
+exists the driver starts NOTHING, logs the file, and exits with `supervise.EXIT_MOD_INCOMPATIBLE` (4). Like
+`layout_mismatch` it is not a stage outcome: the history is not touched and `current` stays, so the next start
+after the fix resumes the same stage and round. Nothing deletes the file: remove `runs/<run>/MOD_INCOMPATIBLE` by
+hand after installing the mod (or after setting tech_layout back to v1), then start the driver again.
+
 **State** lives in `runs/specialists/driver_state.json` (current stage, its start step count, the history), so
 restarting the driver resumes the stage it was on instead of starting the ladder again. The plan file is
 re-read on every start and the state is matched to it by `(level, kind)` (`DriverState.reconcile`), so stages
@@ -1690,13 +1699,19 @@ class Driver:
         """Starts this stage's trainer when no process is running it.
 
         `"running"` (one is already there, so the supervisor judges it), `"started"` (this call spawned it),
-        `"waiting"` (the games are not up yet; try again next poll rather than spending a restart on it) or
-        `"layout_mismatch"` (the resume file's layout does not match the stage config; the trainer is not started).
+        `"waiting"` (the games are not up yet; try again next poll rather than spending a restart on it),
+        `"layout_mismatch"` (the resume file's layout does not match the stage config; the trainer is not started)
+        or `"mod_incompatible"` (runs/<run>/MOD_INCOMPATIBLE exists: no game and no trainer is started, and `run`
+        exits with code 4 -- remove the file after installing the mod).
         """
         mine = supervise.self_and_ancestors(procs, sup.pid)
         if any(p.pid not in mine and supervise.matches_script(p.cmdline, "train.py", stage.run, sup.cfg.config)
                for p in procs):
             return "running"
+        # Before the games too: a worker refused the installed DLL, and neither a relaunched game nor a respawned
+        # trainer can change which DLL is installed. Without this a dead trainer is respawned every poll, forever.
+        if sup.mod_incompatible(log=self.log):
+            return "mod_incompatible"
         if not self.ensure_games(sup):
             self.log("games did not come up; trying again at the next poll")
             return "waiting"
@@ -1958,7 +1973,7 @@ class Driver:
             return trainer  # "started" (grace now runs) or "waiting" (no games yet)
 
         health = sup.tick()
-        if health in ("budget", "no_resume"):
+        if health in ("budget", "no_resume", "mod_incompatible"):
             self.log("the stage supervisor gave up (%s); the driver stops with it" % health)
             return health
 
@@ -2092,6 +2107,8 @@ class Driver:
                 action = "error"
             if action in ("budget", "no_resume", "no_init", "no_checkpoint", "held"):
                 return 1
+            if action == "mod_incompatible":
+                return supervise.EXIT_MOD_INCOMPATIBLE  # 4: install the mod, remove runs/<run>/MOD_INCOMPATIBLE
             if action == "finished":
                 return 0
             if self.cfg.dry_run:

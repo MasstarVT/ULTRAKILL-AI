@@ -41,6 +41,7 @@ from ultrakill_ai.protocol import (
     DEFAULT_PORT,
     DEFAULT_RESET_TIMEOUT,
     DEFAULT_STEP_TIMEOUT,
+    MOD_INCOMPATIBLE_FILE,
     RECOVERABLE,
     TECH_LAYOUT_FEATURES,
     BridgeClient,
@@ -50,6 +51,7 @@ from ultrakill_ai.protocol import (
     BridgeSceneUnknown,
     BridgeTimeout,
     mod_features,
+    write_mod_incompatible,
 )
 from ultrakill_ai.envlog import EnvLog, env_log_path
 from ultrakill_ai.procmem import GB as PROC_GB
@@ -755,11 +757,38 @@ class UltrakillEnv(gym.Env):
         missing = sorted(need - self._mod_features)
         if missing:
             self.envlog.event("mod_incompatible", mod=version, missing=",".join(missing))
-            raise BridgeIncompatible(
+            message = (
                 f"port {self.cfg.port}: tech_layout {self.cfg.tech_layout!r} needs mod features {missing}; the game "
                 f"runs mod {version!r} with features {sorted(self._mod_features) or 'none'}. Install mod 0.8.0 "
                 "(docs/commands.md, 'S7 -- the one break') or set tech_layout back to v1.")
+            self._write_mod_incompatible(message, version, missing)
+            raise BridgeIncompatible(message)
         self.envlog.event("mod_features_ok", mod=version, layout=self.cfg.tech_layout)
+
+    def _write_mod_incompatible(self, message: str, version: Any, missing: list[str]) -> None:
+        """`runs/<run>/MOD_INCOMPATIBLE`, so the refusal stops the FLEET and not just this worker (see
+        BridgeIncompatible). Only a training run has a run directory -- `env_log_dir`, which train.py alone fills
+        (`fill_run_dirs`) -- so an eval, a check script or a test only raises. Written, never deleted: a successful
+        connect leaves an old file alone, because only the operator may declare the mod fixed.
+        """
+        if not self.cfg.env_log_dir:
+            return
+        path = Path(self.cfg.env_log_dir) / MOD_INCOMPATIBLE_FILE
+        text = "\n".join([
+            message,
+            "mod_version: %s" % version,
+            "features_seen: %s" % (", ".join(sorted(self._mod_features)) or "none"),
+            "features_missing: %s" % ", ".join(missing),
+            "tech_layout: %s" % self.cfg.tech_layout,
+            "port: %d" % self.cfg.port,
+            "written_at: %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+            "While this file exists campaign_driver.py and supervise.py start no game and no trainer for this run "
+            "(they exit with code 4). Remove %s after installing the mod (or after setting tech_layout back to "
+            "v1); nothing removes it for you." % path,
+        ]) + "\n"
+        written = write_mod_incompatible(self.cfg.env_log_dir, text)
+        self.envlog.event("mod_incompatible_file", path=written.as_posix() if written else None,
+                          written=bool(written))
 
     def _tech_mod_config(self) -> dict[str, Any]:
         """The mod 0.8.0 settings, sent EXPLICITLY on every connect -- or nothing at all to a 0.7.x DLL.

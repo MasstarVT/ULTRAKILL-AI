@@ -76,6 +76,14 @@ reading the step count out of both instead of trusting the name. `latest.zip`'s 
 
 After `--max-restarts-per-hour` restarts inside one hour the supervisor gives up and exits non-zero:
 something is wrong that restarting cannot fix, and a restart loop would grind the checkpoints.
+
+**A mod that cannot serve the config** is the one failure known in advance that no restart can fix: a
+`tech_layout: v2` config against a DLL without the 0.8.0 features. Every worker refuses it at its first connect
+(`BridgeIncompatible`) and, before dying, writes `runs/<run>/MOD_INCOMPATIBLE`. `restart` reads that file before
+it kills, stops, launches or spawns anything; while it exists the supervisor relaunches NOTHING, logs the file,
+and exits with code 4 (`EXIT_MOD_INCOMPATIBLE`) instead of spending three fleet relaunches on a configuration
+error. `campaign_driver.py` makes the same check before any trainer start. Nothing deletes the file: remove
+`runs/<run>/MOD_INCOMPATIBLE` by hand after installing the mod (or after setting tech_layout back to v1).
 """
 
 from __future__ import annotations
@@ -100,6 +108,7 @@ from ultrakill_ai.procmem import cap_blas_threads  # noqa: E402
 cap_blas_threads()  # a watchdog must never be the process that runs the box out of commit
 
 from ultrakill_ai.envlog import tail as envlog_tail  # noqa: E402
+from ultrakill_ai.protocol import MOD_INCOMPATIBLE_FILE, read_mod_incompatible  # noqa: E402  (stdlib only)
 
 HOUR = 3600.0
 MB = 1024 * 1024
@@ -110,6 +119,10 @@ ENV_LOG_TAIL = 4  # lines of each worker's runs/<run>/env_<port>.log quoted into
 DETACHED = 0x00000200 | 0x08000000  # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 TAIL_LINES = 30
 STOP_WAIT_S = 5.0  # between closing the games and relaunching them
+# The process exit code when runs/<run>/MOD_INCOMPATIBLE refuses a restart -- here and in campaign_driver.py. Not
+# 1 (the restart budget, no resume file, the held ladder), not 2 (argparse) and not 3 (train.py's layout refusal):
+# an operator or a scheduled task can tell "install the mod" from every other stop by the code alone.
+EXIT_MOD_INCOMPATIBLE = 4
 
 # Command lines that are ABOUT a script rather than an instance of it. The query that lists the
 # processes necessarily contains the words being searched for, and so does this supervisor's own
@@ -535,6 +548,7 @@ class Supervisor:
         run_dir = cfg.cwd / cfg.runs_dir / cfg.run
         self.status_path = run_dir / "status.json"
         self.pause_path = run_dir / "SUPERVISOR_PAUSE"
+        self.mod_incompatible_path = run_dir / MOD_INCOMPATIBLE_FILE  # written by the env, removed by the operator
         self.model_dir = cfg.cwd / cfg.models_dir / cfg.run
         self.train_log = cfg.cwd / cfg.runs_dir / f"{cfg.run}_train.log"
         self.log_path = cfg.cwd / cfg.runs_dir / f"{cfg.run}_supervisor.log"
@@ -767,6 +781,10 @@ class Supervisor:
         self.report_sick()
         for line in tail_lines(self.train_log):
             self.log("  | %s" % line)
+        # BEFORE anything is killed, stopped, launched or spawned: a worker refused the installed mod, and no
+        # relaunch changes which DLL is installed (see the module docstring).
+        if self.mod_incompatible():
+            return "mod_incompatible"
 
         resume, steps = choose_resume(self.model_dir, self.zip_steps)
         if resume is None:
@@ -812,6 +830,27 @@ class Supervisor:
         self.grace_until = self.now() + self.cfg.start_grace_seconds
         self.ensure_helpers(self.processes())
         return "restarted"
+
+    def mod_incompatible(self, log: Callable[[str], None] | None = None) -> bool:
+        """True -- after saying so loudly, through `log` (default: this supervisor's own) -- when
+        runs/<run>/MOD_INCOMPATIBLE exists. The caller then starts no game and no trainer for this run.
+
+        The file is the env's (`UltrakillEnv._write_mod_incompatible`) and the operator's: it is read here and
+        never deleted, because a file that cleared itself would re-arm the restart loop it exists to stop.
+        """
+        text = read_mod_incompatible(self.run_dir)
+        if text is None:
+            return False
+        log = log or self.log
+        log("MOD INCOMPATIBLE -- %s exists: a worker refused the installed mod. NOT relaunching the games and NOT "
+            "starting a trainer for %s; restarting cannot change which DLL is installed." % (
+                self.mod_incompatible_path, self.cfg.run))
+        for line in text.splitlines():
+            if line.strip():
+                log("  ! %s" % line)
+        log("remove %s after installing the mod (or after setting tech_layout back to v1), then start this again. "
+            "Exiting with code %d." % (self.mod_incompatible_path, EXIT_MOD_INCOMPATIBLE))
+        return True
 
     # -- the helper processes ---------------------------------------------------------------------
 
@@ -866,6 +905,8 @@ class Supervisor:
                 action = "error"
             if action in ("budget", "no_resume"):
                 return 1
+            if action == "mod_incompatible":
+                return EXIT_MOD_INCOMPATIBLE
             if action == "finished":
                 return 0
             if self.cfg.dry_run:

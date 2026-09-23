@@ -51,6 +51,22 @@ def test_age_of_last_stamp_reads_the_newest_stamped_line():
         assert check_run.age_of_last_stamp(path / "missing") is None
 
 
+
+def test_every_runs_mod_incompatible_file_is_one_alert():
+    """While runs/<run>/MOD_INCOMPATIBLE exists the driver starts nothing for that run: say so, per run, in ALERTS."""
+    with tempfile.TemporaryDirectory() as tmp:
+        runs = Path(tmp) / "runs"
+        assert check_run.mod_incompatible_alerts(runs) == [], "no runs directory at all is no alert"
+        for run, text in (("spec_0-2_speed", ""),
+                          ("spec_0-1_speed", "\nport 47800: needs mod 0.8.0\nmod_version: 0.7.2\n")):
+            (runs / run).mkdir(parents=True)
+            (runs / run / "MOD_INCOMPATIBLE").write_text(text, encoding="utf-8")
+        (runs / "spec_0-3").mkdir()
+        assert check_run.mod_incompatible_alerts(runs) == [
+            "MOD_INCOMPATIBLE exists for spec_0-1_speed: port 47800: needs mod 0.8.0",
+            "MOD_INCOMPATIBLE exists for spec_0-2_speed: (empty)"]
+
+
 if __name__ == "__main__":
     tests = [(name, fn) for name, fn in sorted(globals().items()) if name.startswith("test_") and callable(fn)]
     for name, fn in tests:

@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from ultrakill_ai.procmem import GB, commit_fraction, private_bytes  # noqa: E402
+from ultrakill_ai.protocol import MOD_INCOMPATIBLE_FILE, read_mod_incompatible  # noqa: E402  (stdlib only)
 
 TAIL_BYTES = 600_000  # ~1,000 episode rows; the file itself is never read whole
 
@@ -54,6 +55,17 @@ def age_of_last_stamp(path: Path) -> float | None:
         except ValueError:
             continue
     return None
+
+
+def mod_incompatible_alerts(runs_dir: Path) -> list[str]:
+    """One ALERTS line per `runs/<run>/MOD_INCOMPATIBLE`, whichever run it is in: while one exists the driver and
+    supervise.py start no game and no trainer for that run, and nothing but the operator removes it."""
+    alerts = []
+    for path in sorted(runs_dir.glob("*/" + MOD_INCOMPATIBLE_FILE)):
+        text = read_mod_incompatible(path.parent) or ""
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "(empty)")
+        alerts.append("MOD_INCOMPATIBLE exists for %s: %s" % (path.parent.name, first))
+    return alerts
 
 
 DRIVER_QUERY = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
@@ -167,6 +179,7 @@ def main() -> int:
         alerts.append("the driver has logged nothing for over 75 min: is it running?")
     if (ROOT / "runs" / "specialists" / "DRIVER_PAUSE").exists():
         alerts.append("DRIVER_PAUSE exists (a bounce in progress, or one left behind)")
+    alerts.extend(mod_incompatible_alerts(ROOT / "runs"))
 
     print("ALERTS    %s" % ("; ".join(alerts) if alerts else "none"))
     return 1 if alerts else 0

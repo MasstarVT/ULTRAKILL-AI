@@ -25,8 +25,10 @@ listening yet is the ordinary state of a booting game, not a fatal error.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import time
+from pathlib import Path
 from typing import Any
 
 PROTOCOL_VERSION = 1
@@ -87,17 +89,64 @@ class BridgeIncompatible(RuntimeError):
     against a wrong DLL both are wasted, since no retry can change what the DLL serves. This escapes every env
     handler instead, so the worker dies at once with this message in runs/<run>_train.log.
 
-    What it does NOT do is stop the fleet. The dead worker's SubprocVecEnv parent sees EOFError and the trainer
-    exits; the stage supervisor treats that as an ordinary crash and relaunches all twelve games and the trainer,
-    up to `max_restarts_per_hour` (3) times, before the driver gives up and exits 1. The fleet-level refusal is
-    the driver's layout guard (the plan's Task 5), which refuses a checkpoint whose shapes do not match
-    `tech_layout` before any trainer starts; it does not read the installed DLL, so a v2 config against a 0.7.2
-    fleet still ends in the restart sequence above.
+    The worker dying does not stop the FLEET: its SubprocVecEnv parent sees EOFError and the trainer exits, and
+    both restart paths would start it again -- the driver's `ensure_trainer` at its next poll (no budget), and
+    `supervise.Supervisor.restart` by stopping and relaunching all twelve games (up to `max_restarts_per_hour`).
+    What stops the fleet is the file the refusal leaves behind: before raising, the env writes
+    `runs/<run>/MOD_INCOMPATIBLE` (`MOD_INCOMPATIBLE_FILE`; only a training run has a run directory -- the
+    `env_log_dir` train.py alone fills), and both paths read it before any trainer (re)start. While it exists
+    neither relaunches a game or a trainer, and both exit with code 4 (`supervise.EXIT_MOD_INCOMPATIBLE`).
+    NOTHING deletes it but the operator, after installing the mod. The driver's layout guard (the plan's Task 5)
+    is the other half: it refuses a checkpoint whose shapes do not match `tech_layout`, without reading the DLL.
     """
 
 
 # What a `tech_layout: v2` client needs in `hello.features` (docs/protocol.md). A 0.7.x DLL sends no such array.
 TECH_LAYOUT_FEATURES = ("monotonic_input_clock", "macro.ssj", "obs.move_tech")
+
+
+# The fleet-level half of BridgeIncompatible: `runs/<run>/MOD_INCOMPATIBLE`. Written by the refusing env, read by
+# `supervise.Supervisor.restart`, `campaign_driver.Driver.ensure_trainer` and `check_run.py`, removed by the
+# OPERATOR ONLY -- after installing the mod (or setting tech_layout back to v1). A file that cleared itself would
+# re-arm the very restart loop it exists to stop. Stdlib only: the driver and the supervisor read it.
+MOD_INCOMPATIBLE_FILE = "MOD_INCOMPATIBLE"
+
+
+def write_mod_incompatible(run_dir: str | os.PathLike[str], text: str) -> Path | None:
+    """Writes `<run_dir>/MOD_INCOMPATIBLE` atomically and returns its path, or None when it could not be written.
+
+    Twelve workers refuse the same DLL within a second of each other, so each writes its own temp file and
+    `os.replace`s it in: a reader sees one whole report, never two interleaved. A replace that loses the race (or
+    any other OSError) is swallowed -- the caller raises BridgeIncompatible either way, and one winner is enough.
+    """
+    path = Path(run_dir) / MOD_INCOMPATIBLE_FILE
+    tmp = path.with_name("%s.%d.tmp" % (MOD_INCOMPATIBLE_FILE, os.getpid()))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
+    return path
+
+
+def read_mod_incompatible(run_dir: str | os.PathLike[str]) -> str | None:
+    """The text of `<run_dir>/MOD_INCOMPATIBLE`, or None when there is no such file.
+
+    PRESENCE is the signal: a file that exists but cannot be read right now (a writer's replace in flight) still
+    refuses, with a placeholder text, rather than reading as absent.
+    """
+    path = Path(run_dir) / MOD_INCOMPATIBLE_FILE
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return "(%s exists but could not be read: %s: %s)" % (path, type(exc).__name__, exc)
 
 
 def mod_features(hello: dict[str, Any] | None) -> frozenset[str]:
