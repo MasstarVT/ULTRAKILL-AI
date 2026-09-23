@@ -6031,3 +6031,56 @@ of fresh completions. **Expectation, not verified**: 1-3 s off the median.
 driver by pid, edit, test, commit + push, unpause, dry run, `schtasks /Run`, END_STAGE). Also watch: a new
 focus-rung latch inside the horizon (median_time_50 <= 85 plus the 300k settle) would promote and move the
 ladder to 72 s, a second change; at a 101.7 s baseline median it is not expected.
+
+### Activation, 2026-09-23 08:47-08:52 -- **S = 54,958,294 steps, round 15 trainer started 08:51:37**
+
+The plan, tests, this entry and `CLAUDE.md` were committed and pushed first (`bca422d`). Nothing connected to a
+bridge port; `games.py launch` / `stop` were never run; no game was stopped by hand.
+
+| time | step |
+| --- | --- |
+| 08:47:32 | `mem_guard.py --dry-run`: 12 games, 23.5 GB, fattest 2.3 GB, commit 74%; 12/12 ports listening. `runs/specialists/DRIVER_PAUSE` created |
+| 08:48:11 | the driver logged `PAUSED` |
+| 08:48:24 | driver stopped **by pid only**: 16580 (python), 13572 (venv shim), 33080 (the task's `cmd`). Task `Ready`. The trainer (33976 -> 30012 -> 24540), the five helpers (`mem_guard` 32012 is the games' parent) and all 12 games stayed up |
+| 08:48:33 | `campaign_driver.py --dry-run` while paused: plan loads, "now on rung 3 of 10, target 85.00 s", then `PAUSED` |
+| 08:48:3x | `DRIVER_PAUSE` removed as its own command |
+| 08:48:40 | `--dry-run` again: same rung/target, `healthy: trainer pid 33976, 54,947,686 steps`; `driver_state.json` byte-identical afterwards |
+| 08:48:45 | `schtasks /Run /TN "ULTRAKILL-AI driver"`. New driver 14240 (cmd 33340, shim 25044): `driver up` 08:48:47, `healthy: trainer pid 33976, 54,948,334 steps` 08:48:48 -- it adopted the running trainer and helpers (one of each, 12/12 ports) |
+| 08:49:0x | **the config gate**: the next round's config generated the driver's own way (`write_stage_config`, `kind=speed`, `target_seconds=85.0`) into a temp dir and diffed against the live `configs/generated/spec_0-1_speed.yaml`: **3 changed lines**, `+    fall_hp: 0.04` and `timesteps: 61245598 -> 63945166`. Nothing else |
+| 08:49:08 | `Set-Content runs\specialists\END_STAGE "Level 0-1 speed"` (status.json 54,951,826) |
+| 08:49:49 | `END_STAGE: ending Level 0-1 (speed, round 14)` -> `STAGE END ... unfinished -- ended by operator (rate 0.940 over 50 fresh, median 104.65, best 63.50, target 85.00, 2,712,240 steps into the stage)`; the driver killed the trainer, the helpers and (as `mem_guard`'s descendants) the 12 games |
+| 08:49:55 | the trainer's teardown wrote `models/spec_0-1_speed/latest.zip` (train log `Saved models\spec_0-1_speed\latest.zip`; SHA-256 `2FB77A46EEFE18BA…8D49B4C6DF`, 54,958,294 steps) |
+| 08:50:02 | `NOT promoting Level 0-1 (speed): it ended 'unfinished' ...`; `stage config ... (init 54,958,294 steps)`; `STAGE 2/33 Level 0-1 (speed, round 15) ... resuming from ...latest.zip`; FOCUS rung 3 of 10, 85.00 s |
+| 08:50:03 | `launching 12 games` (all 12 ports down, as expected at a round boundary); 08:51:37 `boot gate: all 12 instances are over 600 MB for 2 polls` |
+| 08:51:37 | **`started trainer for Level 0-1 (pid 21556, resume latest.zip at 54,958,294 steps)`** |
+
+**Step loss: none measurable** -- round 14's last reading was 54,957,838 and the resume point is 54,958,294, the
+CURRENT weights (not the replay's 52.25M start). The live generated config now differs from the gate copy only
+in `timesteps` (63,958,294 = S + 8M + 1M slack).
+
+**So: ignore S -> 55,358,294; post-change buckets start at 55,358,294 (first full one 55,358,294-55,858,294); no
+verdict before 57,858,294.**
+
+**Verified from files, 09:02-09:04 (~10.5 min after the trainer started):**
+- train log: `hyperparameters in force: gamma=0.998, gae_lambda=0.95, n_steps=170, batch_size=512, n_epochs=5,
+  ent_coef=0.004, target_kl=0.03 | rollout buffer: gamma=0.998, gae_lambda=0.95` -- unchanged. The first rollout
+  reads `total_timesteps` 54,960,334 (S + 2,040). The `EOFError` traceback above that line is the old trainer
+  being killed; **no traceback in the 1,862 lines after it**. Explained variance 0.959, approx_kl 0.028 at 55.06M.
+- `models/spec_0-1_speed/env_config.yaml` (08:51:39): `difficulty: 4`, `death: 12.0`, `oob: 0.035`,
+  **`fall_hp: 0.04`**, `damage_taken: 0.01`, `time: 0.02`, `speed_target_seconds: 85.0`.
+- `status.json` stepping: `start_timesteps` 54,958,294, 55,066,786 at ~09:03, 143-174 steps/s, `difficulty` 4,
+  `target_seconds` 85.0. **`reward_parts_mean_100["fall_hp"]` = -3.71 over the first 48 episodes, then -5.33 over
+  51** -- the jump is ONE episode (55,063,030, env 4: 32 deaths, 142 rescues, 2,045 rescue HP = -81.8 of
+  `fall_hp`, completed at 573.7 s, reward -231.4). The 51 new rows: `rescue_hp` 132.9/episode (x 0.04 = 5.32, so the
+  part and the column agree), all Level 0-1, difficulty 4, all 12 envs. `oob` part -6.37 (48 eps).
+- 12/12 ports listening, 12 games, one trainer, five helpers (`mem_guard` 27492, `poll_status`, `keep_best`,
+  `post_times`, `dashboard`), driver 14240. `check_run.py` 09:02: `Level 0-1 [speed, round 15]`, **`ALERTS none`**,
+  system commit 69% (the relaunch reset the games' leak).
+- `models/specialists/Level_0-1.zip` untouched: SHA-256 `CD812F25816D94B8E4EE1BBC544F8E76AA217EF1260DECB4ED8A78BA4039683D`,
+  mtime 2026-09-22 08:59:36, before and after.
+- The first ~100k steps (49 completions, median 95.3 s, best 69.9 s) are inside the ignored 0.4M: **not judged**.
+
+**Not verified.** Any effect of the lever (nothing is judged before 57.86M); whether the per-life farm bounds
+hold in practice on multi-death pit loops like the 32-death episode above (each life's falls are still bounded
+by ~99 HP x 0.04 = 3.96 < `death` 12, by design; the episode total is not bounded); in-game behaviour (no eval
+ran, no bridge port was touched); the per-leg re-recording that trigger 7 needs.
