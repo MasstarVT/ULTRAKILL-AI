@@ -23,6 +23,10 @@ numbers print at the end.
 The action-space change makes every earlier campaign checkpoint unloadable against the new env: this script is
 the only migration path. Cyber Grind is untouched (its action space does not change), and
 scripts/transfer_weights.py does the same widening on the Cyber Grind -> campaign path.
+
+After the S7 tech break (docs/superpowers/specs/2026-09-20-speedrun-tech.md) this script's shape guard refuses
+every v2 checkpoint (530 inputs, 15 action dims). That is correct, not a regression: its job ended at the
+look-mode migration, and the only path across the tech break is scripts/add_tech_heads.py.
 """
 
 from __future__ import annotations
