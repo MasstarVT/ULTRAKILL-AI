@@ -156,6 +156,23 @@ def damage_share(removed: float, max_health: float | None, fallback: float | Non
     return 1.0
 
 
+def landed_ssj_bucket(report: Any) -> int:
+    """The accepted SSJ bucket of a macro report as an int, 1-3, or 0 when the macro did not land.
+
+    The ONE reading of the bucket: `macro_landed` (the S8 gate) and `spaces.tech_block` (obs index 521, which
+    packs this value / 3) both call it, so the gate and the observation can never disagree. `int()` truncates a
+    fractional value the way the mod's own `(int)` cast does; a missing, non-numeric, NaN or infinite bucket
+    (`int(inf)` raises OverflowError) is 0, never an exception inside a training worker.
+    """
+    if not isinstance(report, dict) or report.get("result") != "ran" or not report.get("ssj_landed"):
+        return 0
+    try:
+        bucket = int(report.get("ssj_bucket"))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return bucket if 1 <= bucket <= 3 else 0
+
+
 def macro_landed(report: Any) -> bool:
     """THE S8 GATE (spec §4.5): the mod RAN a macro and its own instrument reports an accepted SSJ bucket.
 
@@ -165,13 +182,7 @@ def macro_landed(report: Any) -> bool:
     is slow. `ssj_bucket` / `ssj_landed` are populated only when `result == "ran"` (docs/protocol.md, the mod
     review's finding 3); `result` is checked again here so a refused macro can never pay or read as landed.
     """
-    if not isinstance(report, dict) or report.get("result") != "ran" or not report.get("ssj_landed"):
-        return False
-    try:
-        bucket = int(report.get("ssj_bucket"))
-    except (TypeError, ValueError):
-        return False
-    return 1 <= bucket <= 3
+    return landed_ssj_bucket(report) > 0
 
 
 @dataclass

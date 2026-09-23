@@ -3,8 +3,10 @@
 The v1 half is a PIN, not a behaviour test: it was written against the unchanged spaces.py and must pass both
 before and after the tech layout lands. The live trainer re-imports this package at every round boundary, so a
 v1 packing or action table that moved by one float would reach twelve games unannounced. The hashes below were
-taken on 2026-09-23 from exactly this fixture; if one fails on a clean main, do not "update the hash" -- find
-what changed the v1 vector.
+taken on 2026-09-23 from exactly these fixtures, packed by the PRE-TECH spaces.py (commit 7f81722); if one fails
+on a clean main, do not "update the hash" -- find what changed the v1 vector. The golden vectors in
+fixtures/tech_layout_v1_golden.npz are those same packings, kept only so a mismatch can name the first float that
+moved; the hash stays the pin.
 """
 
 from __future__ import annotations
@@ -61,8 +63,14 @@ PIN_EXPLORE = [0.1, 0.0, 0.25, 0.5, 1.0, 0.0, 0.75, 0.2, 0.05]
 PIN_TARGET = {"key": "40,1,408", "pos": [40.0, 1.0, 108.5], "hops": 9, "open": True, "locked": False,
               "active": True}
 PIN_ENEMY_MAX = {101: 1.0, 102: 5.0}
+# The exit sentinel (no `hops`): exit scales 100/200, the +-4 clip on the far z, and `open` / `locked` ignored.
+PIN_EXIT_TARGET = {"key": "exit", "pos": [60.0, -5.0, 520.0], "open": True, "locked": True, "active": True}
+PIN_GRIND_RAW = {**PIN_RAW, "cybergrind": {"wave": 7, "enemies_left": 12}}
 V1_CAMPAIGN_SHA256 = "ff3c2c8040590275974a586fe0351d6324521cecdb28c9119b861ab791265644"
+V1_CAMPAIGN_EXIT_SHA256 = "eb9ac020b287fe00982498250394f11d1a73f873d01168e24fb59a72b438ffe3"
 V1_GRIND_SHA256 = "3fee7c7fcf166e5bd92e9faa658965c9fbfe76455ed7f46f0c9dd140c74093c6"
+V1_GRIND_WAVE_SHA256 = "8fe894f6ab8170c4f6299c9e8369408d32746dd83473c9c593db26f1eba5d337"
+GOLDEN = ROOT / "tests" / "fixtures" / "tech_layout_v1_golden.npz"
 V1_CAMPAIGN_NVEC = (3, 3, 2, 2, 2, 2, 2, 2, 6, 11, 7, 3)
 V1_DECODE_CASES = [
     ([1, 1, 0, 0, 0, 0, 0, 0, 0, 5, 3, 0],
@@ -81,20 +89,68 @@ def sha(values: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(values, dtype=np.float32).tobytes()).hexdigest()
 
 
-def pinned_campaign_vector() -> np.ndarray:
-    return pack_observation(PIN_RAW, ObsLayout(campaign=True), PIN_ENEMY_MAX, PIN_EXPLORE, PIN_TARGET)
+def assert_pinned(out: np.ndarray, name: str, pinned_sha: str) -> None:
+    """The hash decides. On a mismatch the golden vector `name` only says WHERE: the first float whose bits moved."""
+    got = sha(out)
+    if got == pinned_sha:
+        return
+    with np.load(GOLDEN) as golden_file:
+        golden = golden_file[name]
+    where = f"{name}: sha {got} is not the pin {pinned_sha}"
+    if sha(golden) != pinned_sha:
+        raise AssertionError(f"{where}, and the golden {name} no longer matches the pin either: {GOLDEN}")
+    out = np.ascontiguousarray(out, dtype=np.float32)
+    if out.shape != golden.shape:
+        raise AssertionError(f"{where}; shape {out.shape}, pinned {golden.shape}")
+    k = int(np.flatnonzero(out.view(np.uint32) != golden.view(np.uint32))[0])
+    raise AssertionError(f"{where}; first differing index {k}: got {out[k]!r}, pinned {golden[k]!r}")
+
+
+def pinned_campaign_vector(target: dict | None = PIN_TARGET) -> np.ndarray:
+    return pack_observation(PIN_RAW, ObsLayout(campaign=True), PIN_ENEMY_MAX, PIN_EXPLORE, target)
+
+
+def pinned_grind_vector(raw: dict = PIN_RAW) -> np.ndarray:
+    return pack_observation(raw, ObsLayout(), PIN_ENEMY_MAX)
 
 
 def test_v1_campaign_packing_is_pinned_byte_for_byte():
     out = pinned_campaign_vector()
     assert out.shape == (479,) and out.dtype == np.float32
-    assert sha(out) == V1_CAMPAIGN_SHA256, sha(out)
+    assert_pinned(out, "campaign", V1_CAMPAIGN_SHA256)
+    assert_pinned(pinned_campaign_vector(PIN_EXIT_TARGET), "campaign_exit", V1_CAMPAIGN_EXIT_SHA256)
 
 
 def test_v1_cyber_grind_packing_is_pinned_byte_for_byte():
-    out = pack_observation(PIN_RAW, ObsLayout(), PIN_ENEMY_MAX)
+    out = pinned_grind_vector()
     assert out.shape == (448,)
-    assert sha(out) == V1_GRIND_SHA256, sha(out)
+    assert_pinned(out, "grind", V1_GRIND_SHA256)
+    assert_pinned(pinned_grind_vector(PIN_GRIND_RAW), "grind_wave", V1_GRIND_WAVE_SHA256)
+
+
+def test_the_golden_vectors_are_the_pinned_vectors():
+    pins = {"campaign": V1_CAMPAIGN_SHA256, "campaign_exit": V1_CAMPAIGN_EXIT_SHA256, "grind": V1_GRIND_SHA256,
+            "grind_wave": V1_GRIND_WAVE_SHA256}
+    with np.load(GOLDEN) as golden:
+        assert sorted(golden.files) == sorted(pins)
+        for name, pinned_sha in pins.items():
+            assert golden[name].dtype == np.float32 and sha(golden[name]) == pinned_sha, name
+
+
+def test_a_pin_mismatch_names_the_first_differing_index():
+    pinned = pinned_campaign_vector()
+    moved = pinned.copy()
+    moved[20] += 0.5  # enemy 0's forward offset, 9 / 50
+    moved[400] = -1.0  # a later change: only the first is named
+    try:
+        assert_pinned(moved, "campaign", V1_CAMPAIGN_SHA256)
+    except AssertionError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("a moved float must fail the pin")
+    assert pinned[20] != 0.0
+    assert "first differing index 20:" in message, message
+    assert f"got {moved[20]!r}, pinned {pinned[20]!r}" in message, message
 
 
 def test_v1_action_tables_are_pinned():
@@ -112,7 +168,7 @@ def test_v1_decoding_is_pinned():
     assert list(noop_action()) == [1, 1, 0, 0, 0, 0, 0, 0, 0, 5, 3]
 
 
-from ultrakill_ai.rewards import macro_landed  # noqa: E402
+from ultrakill_ai.rewards import landed_ssj_bucket, macro_landed  # noqa: E402
 from ultrakill_ai.spaces import (  # noqa: E402
     ACTION_NVEC_TECH,
     HOOK_INDEX,
@@ -190,7 +246,7 @@ def test_v2_packing_keeps_indices_0_to_478_exactly():
            "macro": {"requested": "ssj", "result": "ran", "ssj_bucket": 1, "ssj_landed": True}}
     v2 = pack_observation(raw, ObsLayout(campaign=True, tech=True), PIN_ENEMY_MAX, PIN_EXPLORE, PIN_TARGET)
     assert v2.shape == (530,)
-    assert sha(v2[:479]) == V1_CAMPAIGN_SHA256, "the tech keys must not move one v1 float"
+    assert_pinned(v2[:479], "campaign", V1_CAMPAIGN_SHA256)  # the tech keys must not move one v1 float
     assert np.allclose(v2[479:491], EXPECTED_A, atol=1e-6)
     assert np.allclose(v2[519:522], [1.0, 0.0, 1.0 / 3.0], atol=1e-6)
     assert not v2[491:519].any() and not v2[522:530].any()
@@ -211,6 +267,40 @@ def test_block_a_clips_every_scale():
     negative = {**MOVE_TECH, "slam_force": -3.0, "coyote": -1.0, "pre_slide_speed": -2.0}
     low = tech_block({"player": PLAYER, "move_tech": negative})
     assert low[1] == 0.0 and low[3] == 0.0 and low[8] == 0.0
+
+
+def test_a_non_numeric_or_non_finite_field_packs_zero():
+    for bad in (float("nan"), float("inf"), float("-inf"), 1e400, "fast", None):
+        block = tech_block({"player": PLAYER, "move_tech": {name: bad for name, *_ in MOVE_TECH_FIELDS}})
+        assert block == [0.0] * TECH_BLOCK, bad
+    assert tech_block({"player": PLAYER, "move_tech": {}}) == [0.0] * TECH_BLOCK, "every key missing"
+
+
+def test_a_partial_move_tech_packs_what_is_there_and_zeros_the_rest():
+    partial = {"slam_force": 6.5, "wall_jumps": 2, "slide_grace": 0.25, "boost": True}
+    expected = [0.0] * 12
+    expected[1], expected[4], expected[6], expected[10] = 0.65, 2.0 / 3.0, 1.0, 0.25
+    assert np.allclose(tech_block({"player": PLAYER, "move_tech": partial})[0:12], expected, atol=1e-6)
+
+
+def test_the_tech_observation_layout_is_campaign_only():
+    try:
+        ObsLayout(tech=True)
+    except ValueError as exc:
+        assert "campaign" in str(exc)
+    else:
+        raise AssertionError("a tech layout without the campaign block must be refused (it would pack at 448)")
+    assert ObsLayout(campaign=True, tech=True).size == 530
+
+
+def test_an_action_of_any_other_width_fails_loudly():
+    for width in (13, 14, 16):
+        try:
+            decode_action(np.array(V1_DECODE_CASES[1][0] + [0] * (width - 12)))
+        except AssertionError as exc:
+            assert str(width) in str(exc), exc
+        else:
+            raise AssertionError(f"a {width}-wide action must not decode")
 
 
 def test_the_wall_clock_fields_are_never_packed():
@@ -236,6 +326,22 @@ def test_block_d_reports_ran_not_run_and_the_landed_bucket():
     assert tech_block({"player": PLAYER})[40:43] == [0.0, 0.0, 0.0]
 
 
+def test_a_fractional_bucket_packs_the_int_bucket_the_gate_accepts():
+    for bucket, packed in ((3.5, 1.0), (1.9, 1.0 / 3.0), (0.9, 0.0), ("2", 2.0 / 3.0), ("2.5", 0.0)):
+        report = {"result": "ran", "ssj_bucket": bucket, "ssj_landed": True}
+        block = tech_block({"player": PLAYER, "macro": report})
+        assert np.isclose(block[42], packed, atol=1e-6) and 0.0 <= block[42] <= 1.0, (bucket, block[42])
+        assert landed_ssj_bucket(report) == round(packed * 3), bucket
+        assert macro_landed(report) == (packed > 0.0), bucket
+
+
+def test_a_non_finite_bucket_never_lands_and_never_raises():
+    for bucket in (float("inf"), float("-inf"), 1e400, float("nan"), "inf", None, [2]):
+        report = {"result": "ran", "ssj_bucket": bucket, "ssj_landed": True}
+        assert landed_ssj_bucket(report) == 0 and macro_landed(report) is False, bucket
+        assert tech_block({"player": PLAYER, "macro": report})[40:43] == [1.0, 0.0, 0.0], bucket
+
+
 def test_reserved_blocks_stay_zero_even_when_the_mod_sends_them():
     raw = {"player": PLAYER, "move_tech": MOVE_TECH,
            "weapon_tech": {"gun_ready": True, "coin_charge": 400, "variation": 1},
@@ -254,6 +360,17 @@ def test_the_pinned_rows_at_each_gate_setting():
     assert pinned_action_rows(set(), False, False) == list(range(45, 57)), "no live macro: the whole dim"
     assert pinned_action_rows({1, 2}, True, True) == [48, 49, 50]
     assert pinned_action_rows({1}, True, False) == [47, 48, 49, 50, 55, 56]
+    assert pinned_action_rows(frozenset({np.int64(1)}), False, False) == pinned_action_rows({1}, False, False)
+
+
+def test_a_bad_live_macro_is_refused_by_name():
+    for bad in (6, -1, 0, "ssj", 1.0, True, None):
+        try:
+            pinned_action_rows({bad}, False, False)
+        except ValueError as exc:
+            assert repr(bad) in str(exc), (bad, exc)
+        else:
+            raise AssertionError(f"live macro {bad!r} must be refused, not dropped")
 
 
 if __name__ == "__main__":

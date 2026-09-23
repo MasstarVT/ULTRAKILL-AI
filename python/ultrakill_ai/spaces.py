@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 from gymnasium import spaces
 
-from ultrakill_ai.rewards import macro_landed
+from ultrakill_ai.rewards import landed_ssj_bucket
 
 # ---------------------------------------------------------------------------
 # Actions
@@ -62,6 +62,10 @@ def decode_action(a: np.ndarray) -> dict[str, Any]:
     """The mod command for one action. The width tells the mode apart: 15 values carry the tech heads, 12 a look
     mode, 11 neither. A 12- or 11-wide action decodes to exactly the dict it always did (tests/test_tech_layout.py)."""
     a = np.asarray(a, dtype=np.int64)
+    # Any other width is a layout mismatch: a 13- or 14-wide action would otherwise decode as a 12-wide one and
+    # silently drop the tech heads.
+    assert len(a) in (len(ACTION_NVEC), len(ACTION_NVEC_CAMPAIGN), len(ACTION_NVEC_TECH)), (
+        f"an action is 11, 12 or 15 values wide, got {len(a)}")
     forward = int(a[0]) - 1
     side = int(a[1]) - 1
     pressed = [name for name, bit in zip(BUTTONS, a[2 : 2 + len(BUTTONS)]) if bit]
@@ -100,8 +104,15 @@ def pinned_action_rows(live_macros, variant: bool, hook: bool) -> list[int]:
     training.pin_action_rows freezes them (the plan's "Spec deviations" 2): a head that cannot act receives only
     the entropy bonus and would drift toward uniform, losing the §4.4 prior before its stage opens. A dimension
     with NO live non-default value is pinned whole; otherwise only its dead values are.
+
+    `live_macros` holds macro VALUES 1-5 (`MACROS[1:]`); 0 "none" is never a gate. Anything else -- 6, -1, a
+    name, a float, a bool -- raises, where it used to be dropped silently and pin the whole macro dimension.
     """
-    live = {int(v) for v in live_macros if 0 < int(v) < len(MACROS)}
+    live = set()
+    for v in live_macros:
+        if isinstance(v, bool) or not isinstance(v, (int, np.integer)) or not 0 < v < len(MACROS):
+            raise ValueError(f"a live macro is an int 1-{len(MACROS) - 1} ({', '.join(MACROS[1:])}), got {v!r}")
+        live.add(int(v))
     rows = list(MACRO_ROWS) if not live else [MACRO_ROWS[v] for v in range(1, len(MACROS)) if v not in live]
     if not variant:
         rows += list(VARIANT_ROWS)
@@ -158,6 +169,12 @@ class ObsLayout:
     ground_ray_length: float = 30.0
     campaign: bool = False  # campaign levels: the level block replaces the 5 retired route values (448 -> 479)
     tech: bool = False  # tech_layout v2: the 51-float TECH block (479 -> 530)
+
+    def __post_init__(self) -> None:
+        # The TECH block follows the campaign block: without one, `tech_start` would say 479 while
+        # pack_observation put the block at 448.
+        if self.tech and not self.campaign:
+            raise ValueError("the tech observation layout is campaign-only: it is appended after the campaign block")
 
     @property
     def player_size(self) -> int:
@@ -315,8 +332,7 @@ def tech_block(obs: dict[str, Any]) -> list[float]:
         ran = report.get("result") == "ran"
         out[TECH_MACRO.start] = 1.0 if ran else 0.0
         out[TECH_MACRO.start + 1] = 0.0 if ran else 1.0
-        if macro_landed(report):
-            out[TECH_MACRO.start + 2] = _scalar(report.get("ssj_bucket")) / 3.0
+        out[TECH_MACRO.start + 2] = landed_ssj_bucket(report) / 3.0  # the S8 gate's own int bucket, 0 if none
     return out
 
 
