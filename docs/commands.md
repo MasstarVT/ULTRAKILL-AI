@@ -682,3 +682,28 @@ task that is already RUNNING without stopping it, use `Set-ScheduledTask -TaskNa
 `schtasks /Delete` would stop the running instance.)
 The driver then relaunches the games and the trainer by itself. After any app restart: `python scripts/check_run.py`;
 if it shows 0/12 ports, no `campaign_driver.py` process and no `DRIVER_PAUSE`, run the `/Run` line above.
+
+## The hourly watch routine, and why it once slept for 18 hours (2026-09-23)
+
+The cheap hourly check is the desktop app's scheduled task `ultrakill-training-watch` (prompt file
+`C:\Users\tyler\.claude\scheduled-tasks\ultrakill-training-watch\SKILL.md`, cron `47 * * * *`, local time; it
+runs only while the app is open). Each run is a fresh session in the task's own permission mode, and a run that
+stops on a permission prompt stays "running" for good: the scheduler then SKIPS every later slot ("the
+previous run was still in progress"), while `list_scheduled_tasks` still shows the task enabled. That is how
+the 2026-09-22 17:53 run, stuck on its first PowerShell call, cost 18 hourly checks before anyone noticed.
+Three things keep it from happening again:
+
+1. The prompt runs ONE fixed command, character for character, with the Bash tool and absolute paths, so the
+   approval text never varies:
+   `F:/Github/ULTRAKILL-AI/python/.venv/Scripts/python.exe F:/Github/ULTRAKILL-AI/python/scripts/check_run.py`.
+   `check_run.py` prints the driver's pids itself (`driver    pid 25044,14240, ...` or `NOT RUNNING`), so the
+   watch needs no second process query.
+2. `C:\Users\tyler\.claude\settings.json` carries `permissions.allow` rules for exactly that command, the
+   `games.py relaunch --port *` repair, `schtasks /Run /TN "ULTRAKILL-AI driver"` and `sleep 300`, in both
+   `Bash(...)` and `PowerShell(...)` forms. The docs say user-level allow rules apply to scheduled-task sessions;
+   the repo's `.claude/` is gitignored, so the rules live in the user file, not the project. (The task's
+   permission mode can also be set to Auto in its Edit form in the app, which only the user can do.)
+3. At the start of every lead session: `list_task_runs` for the task. A run with status `running` whose
+   `last_activity_at` is more than a few minutes old is stalled: stop it with the session-management
+   `stop_session` tool, and the schedule resumes (a catch-up run fires at once). Then `Run now` once
+   (`run_scheduled_task`) and read its transcript: a healthy run is one Bash call and a 6-line report.

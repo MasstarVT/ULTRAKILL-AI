@@ -6084,3 +6084,51 @@ verdict before 57,858,294.**
 hold in practice on multi-death pit loops like the 32-death episode above (each life's falls are still bounded
 by ~99 HP x 0.04 = 3.96 < `death` 12, by design; the episode total is not bounded); in-game behaviour (no eval
 ran, no bridge port was touched); the per-leg re-recording that trigger 7 needs.
+
+## 2026-09-23 12:40 — `fall_hp` at three full post-switch buckets: no trigger fired, mechanism not moved; and the hourly watch had slept 18 h
+
+**Reading** (`spec_0-1_speed/episodes.jsonl`, fresh Brutal 0-1, buckets anchored at S + 0.4M = 55,358,294, the
+same columns as the 08:40 baseline table; last row 56,982,118, 2.02M into the round):
+
+| bucket | n | rate | p10 / median / p90 / best | deathless med (n) | deaths | oob | rescues | rescue_hp | floors | floored | hp_lost_other | stuck/100 (pit) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 54.958-55.358 (ignored) | 216 | 0.968 | 77.7 / 95.1 / 135.3 / 66.7 | 84.9 (60) | 1.21 | 261 | 9.25 | 100.4 | 1.21 | 0.884 | 260 | 1.9 (0) |
+| **55.358-55.858** | 282 | 0.947 | 80.1 / **100.1** / 137.0 / 63.8 | 89.0 (59) | **1.2199** | 244 | 7.89 | 94.9 | 1.05 | 0.812 | 272 | 1.8 (1) |
+| **55.858-56.358** | 269 | 0.941 | 83.2 / **104.0** / 143.1 / 67.3 | 92.1 (47) | **1.3011** | 288 | 10.00 | 105.3 | 1.22 | 0.874 | 284 | 3.3 (5) |
+| **56.358-56.858** | 270 | 0.926 | 80.0 / **97.4** / 143.9 / 62.2 | 89.0 (63) | **1.2778** | 279 | 9.87 | 96.5 | 1.25 | 0.893 | 289 | 4.1 (4) |
+| 56.858- (partial) | 68 | 0.941 | 78.9 / 104.3 / 146.9 / 65.0 | 88.5 (15) | 1.22 | 375 | 7.96 | 105.4 | 1.25 | 0.882 | 248 | 1.5 (1) |
+
+`reward_parts_mean_100["fall_hp"]` -4.17 at 56.75M, -4.38 at 56.82M, -4.05 at 56.99M (= 0.04 x the rescue_hp
+column, as predicted; not shrinking). `mean_100` deaths 1.42 -> 1.52 -> 1.12 over the same three readings.
+`kills_per_min` 20.7 / 19.9 / 20.0 and `on_target_frac` 0.163 / 0.167 / 0.180 per bucket (the other PPO
+columns are not in this `metrics_log.csv` header).
+
+**Triggers, applied to the letter.** (1) median 100.1 / 104.0 / 97.4 vs > 108.7: no. (2) deaths 1.2199 /
+**1.3011** / **1.2778** vs > 1.28 on two consecutive full buckets: **NOT fired** -- bucket 2 is above, bucket 3
+is 0.0022 below the line, and the partial bucket 4 reads 1.22 with the last-100 at 1.12. Noted plainly: all
+three post-switch buckets sit above the baseline's 0.84-1.09 band, but the baseline was already climbing
+(0.97, 0.84, 1.01, 1.09, then 1.01 in its partial tail; the ignored window's 1.21 is 1.07 without the one
+32-death episode), so the rise is not attributable to the lever from this data; the rule, not the trend, is
+what decides. (3) rate 0.947 / 0.941 / 0.926 vs < 0.85: no. (4) p10 80.1 / 83.2 / 80.0 vs > 90.3: no. (5) stuck
+1.8 / 3.3 / 4.1 per 100 vs > 15: no. (6) `hp_lost_other` 272 / 284 / 289 vs >= 311: no, and `rescue_hp` is not
+falling. (7) no per-leg re-recording has been made (a 13th game at 82% commit, with the guard already recycling
+8 games an hour against the 24 GB fleet budget, was judged not worth it before the verdict).
+
+**Mechanism: NOT moved.** "Moved" needs two consecutive full buckets with `rescue_hp` < 91.3 or floors < 1.09:
+`rescue_hp` 94.9 / 105.3 / 96.5, floors 1.05 / 1.22 / 1.25 -- one bucket of floors below the band, then two
+above. The pre-registered **inert** rule ("neither by the 4th full post-change bucket: remove the line and do
+not reason from the median") is decided at S + 0.4M + 2.0M = **57,358,294**; the primary (median) verdict not
+before **57,858,294**. Next reading at the 4th full bucket. Best this round 62.2 s (Brutal); `times.md` still
+1:00.851.
+
+**The hourly watch had not run for 18 hours.** `list_task_runs` for `ultrakill-training-watch` showed its
+2026-09-22 17:53 (local) run still `running` with its last activity 3 s after start: it had called PowerShell
+once and sat on a permission prompt (routine sessions run in the task's own permission mode, default = prompt;
+nobody was there), and the scheduler skips a slot while the previous run is still in progress -- 18 hourly
+runs silently never started while `list_scheduled_tasks` showed the task enabled. The overnight checks that
+did happen were this session's own one-shot background timers. Fix (verified 12:2x with a Run-now that
+completed in 2 turns with no prompt): the routine's prompt now runs ONE fixed absolute-path command with the
+Bash tool, `check_run.py` prints the driver's pids itself (`b611621`, with `tests/test_check_run.py`, 4
+tests), and `C:\Users\tyler\.claude\settings.json` carries `permissions.allow` rules for exactly that command
+and the three repair commands in Bash and PowerShell forms. Recipe and the session-start check (a `running`
+run with old `last_activity_at` is stalled: stop it) in `docs/commands.md`, "The hourly watch routine".
