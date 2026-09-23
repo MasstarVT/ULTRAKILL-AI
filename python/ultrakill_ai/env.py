@@ -55,7 +55,14 @@ from ultrakill_ai.envlog import EnvLog, env_log_path
 from ultrakill_ai.procmem import GB as PROC_GB
 from ultrakill_ai.procmem import MB as PROC_MB
 from ultrakill_ai.procmem import derive_game_limit, private_bytes
-from ultrakill_ai.rewards import CampaignStep, RewardConfig, aim_errors, compute_reward, horizon_elevation
+from ultrakill_ai.rewards import (
+    CampaignStep,
+    RewardConfig,
+    aim_errors,
+    compute_reward,
+    horizon_elevation,
+    macro_landed,
+)
 from ultrakill_ai.spaces import (
     MOVE_TECH_FIELDS,
     NUM_WEAPON_SLOTS,
@@ -400,7 +407,15 @@ BEHAVIOUR_KEYS = ("steps", "firing", "on_target", "firing_on_target", "enemy_vis
                   # Both indexed by slot KEY - 1: entry 0 is key 1 (the revolver) and entry 5 is key 6, which
                   # the game has but no action can select. NOT by `weapon_slot` raw, which is the key itself.
                   *("held_slot_%d" % i for i in range(NUM_WEAPON_SLOTS)),     # decisions each slot was held
-                  *("kills_slot_%d" % i for i in range(NUM_WEAPON_SLOTS)))    # kills while each slot was held
+                  *("kills_slot_%d" % i for i in range(NUM_WEAPON_SLOTS)),    # kills while each slot was held
+                  # STAGE S7, the macro channel. All zero under v1, and `_info` emits them only under v2.
+                  #   macro_request  decisions whose policy macro value was not 0 (raw use of the head)
+                  #   macro_sent     ... and the gates forwarded it to the mod
+                  #   macro_ran / macro_refused  the mod's `result` for a sent macro (refused = refused, degraded
+                  #                  or disabled); macro_landed = ran with an accepted SSJ bucket
+                  #   variant_request / hook_request  raw use of the other two heads, masked or not
+                  "macro_request", "macro_sent", "macro_ran", "macro_refused", "macro_landed",
+                  "variant_request", "hook_request")
 
 
 def _slot_owned(player: dict[str, Any], slot: int) -> bool | None:
@@ -833,6 +848,7 @@ class UltrakillEnv(gym.Env):
         self._steps_since_progress = 0
         self._deaths = 0
         self._behaviour = dict.fromkeys(BEHAVIOUR_KEYS, 0)
+        self._macro_reasons = {}
         self._last_end_reason = ""
         self._wedge_run = 0
         self._wedged_steps = 0
@@ -902,6 +918,9 @@ class UltrakillEnv(gym.Env):
         # The look mode is resolved here, against the observation the policy acted on, and popped: the wire
         # `action` message is unchanged and the mod never sees it.
         look_mode = int(command.pop("look_mode", 0))
+        # v2: the three tech heads come off the command HERE, so no raw policy value can reach the wire;
+        # `_apply_tech` below puts back exactly what the gates allow. None under v1, and then nothing changes.
+        tech = self._pop_tech(command)
         raw_pitch_cmd = command["look"][1]
         # Skull carry (§6.7 of the multi-level/skull spec): within punch range of a sub-goal the env takes the
         # camera, because the punch that picks up or places is a 4 m raycast along camera forward and the policy
@@ -931,10 +950,17 @@ class UltrakillEnv(gym.Env):
         # suppressed is counted separately, inside `_sticky_slot`, as `slot_dropped` / `slot_blocked`.
         self._note_behaviour(prev, command, raw_pitch_cmd, applied_mode)
         self._sticky_slot(prev, command)
+        self._apply_tech(command, tech)
         campaign = self.cfg.mode == "campaign"
         cur = self.client.step(command)
+        # The mod reports a macro on THIS reply only. `_skip_locked` can replace `cur` with a later frame (an input
+        # lock right after the step), so the report is taken first and put back for block D's packer.
+        macro_report = cur.get("macro") if tech is not None else None
         if campaign:
             cur = self._guard_exit(self._skip_locked(cur))
+        if macro_report is not None and "macro" not in cur:
+            cur["macro"] = macro_report
+        self._note_macro_result(macro_report)
         self._raw = cur
         self._steps += 1
         self._lifetime_steps += 1
@@ -1805,6 +1831,78 @@ class UltrakillEnv(gym.Env):
         else:
             self._slot_cooldown = max(0, int(self.cfg.sticky_slot_switch_every) - 1)
 
+    def _pop_tech(self, command: dict[str, Any]) -> dict[str, Any] | None:
+        """Takes the three v2 heads off the decoded command. None under v1 (`decode_action` adds them at width 15)."""
+        if "macro" not in command:
+            return None
+        return {"macro": int(command.pop("macro")), "variant": int(command.pop("variant")),
+                "hook": bool(command.pop("hook"))}
+
+    def _apply_tech(self, command: dict[str, Any], tech: dict[str, Any] | None) -> None:
+        """Puts on the wire exactly what the gates allow, and counts every request whether or not it was sent.
+
+        A masked value leaves the message as the v1 action message; it is never charged (spec §4.2: a charge
+        teaches the policy to avoid the head rather than to learn its preconditions).
+        """
+        if tech is None:
+            return
+        b = self._behaviour
+        if tech["macro"]:
+            b["macro_request"] += 1
+            if tech["macro"] in self._gates.macros:
+                command["macro"] = tech["macro"]
+                b["macro_sent"] += 1
+        if tech["variant"]:
+            b["variant_request"] += 1
+            if self._gates.variant:
+                command["variant"] = tech["variant"]
+        if tech["hook"]:
+            b["hook_request"] += 1
+            if self._gates.hook:
+                command["buttons"] = [*command["buttons"], "hook"]
+
+    def _note_macro_result(self, report: dict[str, Any] | None) -> None:
+        """The mod's verdict on a sent macro. Refusal reasons are kept per episode: a macro refused ~always is a
+        design bug (§4.2), and the reason says which precondition.
+
+        `macro_landed` is counted through `rewards.macro_landed`, the ONE landed-bucket reader: the counter, obs
+        index 521 and the S8 gate can never disagree about what landed.
+        """
+        if not isinstance(report, dict):
+            return
+        b = self._behaviour
+        if report.get("result") == "ran":
+            b["macro_ran"] += 1
+            if macro_landed(report):
+                b["macro_landed"] += 1
+        else:
+            b["macro_refused"] += 1
+            reason = str(report.get("reason") or report.get("result") or "unknown")
+            self._macro_reasons[reason] = self._macro_reasons.get(reason, 0) + 1
+
+    def _note_tech_obs(self, raw: dict[str, Any]) -> None:
+        """Warns ONCE per env when a v2 env keeps receiving frames with a player and no usable `move_tech`.
+
+        Block A then packs 0.0 -- the old-DLL vector, so nothing breaks -- but the policy is blind to exactly what
+        the break was for. The handshake already refused a DLL without `obs.move_tech`; this catches a flag lost
+        inside the game (a per-process config another client overwrote) or a renamed field.
+        """
+        if self._move_tech_warned or not raw.get("player"):
+            return
+        move = raw.get("move_tech")
+        names = [name for name, *_ in MOVE_TECH_FIELDS]
+        missing = [n for n in names if n not in move] if isinstance(move, dict) else names
+        if not missing:
+            self._move_tech_missing = 0
+            return
+        self._move_tech_missing += 1
+        if self._move_tech_missing >= MOVE_TECH_GRACE:
+            self._move_tech_warned = True
+            what = "no move_tech block" if not isinstance(move, dict) else "move_tech without " + ",".join(missing)
+            self.envlog.event("move_tech_missing", frames=self._move_tech_missing, what=what)
+            print(f"WARNING port {self.cfg.port}: {self._move_tech_missing} frames with a player and {what}; "
+                  "block A packs 0.0 (warned once per env)", flush=True)
+
     def _note_slot_kills(self, prev: dict[str, Any], cur: dict[str, Any]) -> None:
         """STAGE S0: kills attributed to the weapon slot that was held when the shot went out.
 
@@ -2456,6 +2554,8 @@ class UltrakillEnv(gym.Env):
         save_best_run(path, run)
 
     def _pack(self, raw: dict[str, Any]) -> np.ndarray:
+        if self._tech:
+            self._note_tech_obs(raw)
         player = raw.get("player")
         explore = None
         if self.cfg.mode == "campaign" and player:
@@ -2537,6 +2637,20 @@ class UltrakillEnv(gym.Env):
         info["held_variation_frac"] = [b["held_variation_%d" % i] / var_known for i in range(NUM_WEAPON_VARIATIONS)]
         info["variation0_frac"] = b["held_variation_0"] / var_known
         info["variation_known_frac"] = b["variation_known"] / steps
+        if self._tech:
+            # STAGE S7, the macro channel -- v2 only, so a v1 info dict is byte for byte what it was. Per decision,
+            # like the slot counters. `macro_request_frac` is the policy's raw use of the head (0.10 at the 5 x 2%
+            # prior); `macro_sent_frac` what the gates let through (M1 alone at S7); `macro_ran_share` the share of
+            # sent macros the mod RAN -- near 0 is a design bug (§4.2), and `macro_refusal_reasons` says why.
+            info["macro_request_frac"] = b["macro_request"] / steps
+            info["macro_sent_frac"] = b["macro_sent"] / steps
+            info["macro_ran_frac"] = b["macro_ran"] / steps
+            info["macro_refused_frac"] = b["macro_refused"] / steps
+            info["macro_landed_frac"] = b["macro_landed"] / steps
+            info["macro_ran_share"] = b["macro_ran"] / max(1, b["macro_sent"])
+            info["variant_request_frac"] = b["variant_request"] / steps
+            info["hook_request_frac"] = b["hook_request"] / steps
+            info["macro_refusal_reasons"] = dict(self._macro_reasons)
         if self.cfg.mode == "campaign":
             # The level this episode RAN on: `info` is built in step() before SubprocVecEnv calls reset(), so a
             # switch episode's row still carries the level it played. Deliberately not in CAMPAIGN_INFO_KEYS,

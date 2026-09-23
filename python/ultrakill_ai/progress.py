@@ -90,6 +90,12 @@ SLOT_METRICS = ("slot_press_frac", "slot_same_frac", "slot_switch_frac", "slot_u
                 "fire1_frac", "fire2_frac", "punch_frac",
                 "slot_held_top_frac", "slot_known_frac", "slot_dropped_frac", "slot_blocked_frac",
                 "variation0_frac", "variation_known_frac")
+# STAGE S7's macro channel (UltrakillEnv._info, tech_layout v2 only). A mean each in status.json's `mean_100` ONLY
+# when the window carries them, and raw in episodes.jsonl only when the env reported them -- so a v1 run's two
+# files are byte for byte what they were. Not in metrics_log.csv: adding a column mid-run would misalign that file.
+TECH_METRICS = ("macro_request_frac", "macro_sent_frac", "macro_ran_frac", "macro_refused_frac",
+                "macro_landed_frac", "macro_ran_share", "variant_request_frac", "hook_request_frac")
+TECH_LOG_RAW = ("macro_refusal_reasons",)
 
 
 def _num(value: Any) -> float | None:
@@ -523,6 +529,7 @@ class ProgressCallback(BaseCallback):
             # Stage S0's weapon-channel counters, all passive. `field()` routes them through `_num`, so an env
             # or a mod that never reports them writes None rather than breaking the row.
             **{name: field(name) for name in SLOT_METRICS},
+            **{name: field(name) for name in TECH_METRICS},
         }
         self.episodes += 1
         self.episodes_recent.append(stats)
@@ -718,6 +725,7 @@ class ProgressCallback(BaseCallback):
             "slot_same_frac": stats["slot_same_frac"],
         }
         line.update({name: info.get(name) for name in EPISODE_LOG_RAW})
+        line.update({name: info[name] for name in (*TECH_METRICS, *TECH_LOG_RAW) if name in info})
         try:
             self.episodes_path.parent.mkdir(parents=True, exist_ok=True)
             with self.episodes_path.open("a", encoding="utf-8") as f:
@@ -822,6 +830,11 @@ class ProgressCallback(BaseCallback):
                                                  "targets_parked", "exit_banished", "route_source", "ladder_collapsed",
                                                  "look_free_frac", "look_enemy_frac", "look_gate_frac",
                                                  *SLOT_METRICS)}
+        # S7's macro channel: present only when the window carries it (see TECH_METRICS).
+        for key in TECH_METRICS:
+            value = _mean(ep.get(key) for ep in self.episodes_recent)
+            if value is not None:
+                recent[key] = value
         fresh_recent = {key: self._fresh_mean(key) for key in ("gates_reached", "checkpoints_level", "completed", "wedged_steps")}
         part_names = sorted({name for ep in self.episodes_recent for name in ep["reward_parts"]})
         n = len(self.episodes_recent)

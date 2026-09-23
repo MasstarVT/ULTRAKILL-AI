@@ -10,6 +10,7 @@ key for key (the key sets below were read off FakeLevel on 2026-09-23, before th
 
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import sys
@@ -388,6 +389,267 @@ def test_the_plan_validator_accepts_the_tech_fields_and_refuses_a_bad_layout():
             assert needle in str(exc), exc
         else:
             raise AssertionError(f"accepted {block}")
+
+
+# ---------------------------------------------------------------------------------------------
+# Task 3: the wire, block A / D through the env, the counters, info, status.json
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_v1_step_puts_todays_keys_on_the_wire():
+    env, fake = make_env()
+    try:
+        env.reset()
+        env.step(forward())
+        assert set(fake.last_action) == V1_WIRE_KEYS
+    finally:
+        env.close()
+
+
+def test_v2_forwards_the_ssj_macro_and_masks_every_reserved_value():
+    env, fake = tech_env()
+    try:
+        env.reset()
+        env.step(tech_action(macro=1))
+        assert fake.last_action["macro"] == 1
+        for value in (0, 2, 3, 4, 5):
+            env.step(tech_action(macro=value))
+            assert set(fake.last_action) == V1_WIRE_KEYS, value
+    finally:
+        env.close()
+
+
+def test_v2_masks_variant_and_hook_until_their_stages_open():
+    env, fake = tech_env()
+    try:
+        env.reset()
+        env.step(tech_action(variant=2, hook=1))
+        assert set(fake.last_action) == V1_WIRE_KEYS and "hook" not in fake.last_action["buttons"]
+    finally:
+        env.close()
+    env, fake = tech_env(variant_switching=True, hook_action=True, macro_ssj_wall=True)
+    try:
+        env.reset()
+        env.step(tech_action(macro=2, variant=2, hook=1))
+        assert fake.last_action["macro"] == 2 and fake.last_action["variant"] == 2
+        assert "hook" in fake.last_action["buttons"]
+    finally:
+        env.close()
+
+
+def test_block_a_and_block_d_are_packed_from_the_mod_reports():
+    env, fake = tech_env()
+    try:
+        obs, _ = env.reset()
+        assert np.allclose(obs[479:491], EXPECTED_A, atol=1e-6)
+        obs, *_ = env.step(tech_action(macro=1))
+        assert np.allclose(obs[519:522], [1.0, 0.0, 1.0 / 3.0], atol=1e-6)
+        obs, *_ = env.step(tech_action())
+        assert not obs[519:522].any(), "no macro sent, no report: zeros"
+        fake.macro_outcome = dict(REFUSED)
+        obs, *_ = env.step(tech_action(macro=1))
+        assert np.allclose(obs[519:522], [0.0, 1.0, 0.0])
+        assert not obs[491:519].any() and not obs[522:530].any()
+    finally:
+        env.close()
+
+
+def test_the_macro_report_survives_an_input_lock_after_the_step():
+    env, fake = tech_env()
+    try:
+        env.reset()
+        fake.lock_steps = 3
+        before = fake.steps
+        obs, *_ = env.step(tech_action(macro=1))
+        assert fake.steps - before > 1, "the env stepped through the lock"
+        assert obs[519] == 1.0, "block D kept the macro step's own report"
+        assert env._behaviour["macro_ran"] == 1
+    finally:
+        env.close()
+
+
+def test_the_counters_and_the_v2_info_keys():
+    env, fake = tech_env()
+    try:
+        env.reset()
+        env.step(tech_action(macro=1))  # sent, ran, landed
+        fake.macro_outcome = dict(REFUSED)
+        env.step(tech_action(macro=1))  # sent, refused: not_sliding
+        env.step(tech_action(macro=4))  # requested, masked
+        _, _, _, _, info = env.step(tech_action(variant=1, hook=1))
+        assert info["macro_request_frac"] == 3 / 4 and info["macro_sent_frac"] == 2 / 4
+        assert info["macro_ran_frac"] == 1 / 4 and info["macro_refused_frac"] == 1 / 4
+        assert info["macro_landed_frac"] == 1 / 4 and info["macro_ran_share"] == 1 / 2
+        assert info["variant_request_frac"] == 1 / 4 and info["hook_request_frac"] == 1 / 4
+        assert info["macro_refusal_reasons"] == {"not_sliding": 1}
+    finally:
+        env.close()
+
+
+def test_a_v1_info_carries_no_tech_keys():
+    env, _ = make_env()
+    try:
+        env.reset()
+        _, _, _, _, info = env.step(forward())
+        assert not [k for k in info if k.startswith(("macro_", "variant_request", "hook_request"))]
+    finally:
+        env.close()
+
+
+def test_a_missing_move_tech_is_warned_once_and_packs_zeros():
+    env, _ = tech_env(level_cls=lambda: FakeTechLevel(emit_move_tech=False))
+    try:
+        obs, _ = env.reset()
+        for _ in range(40):
+            obs, *_ = env.step(tech_action(move=False))
+        assert env._move_tech_warned and not obs[479:491].any()
+    finally:
+        env.close()
+
+
+def test_progress_carries_the_macro_channel_only_when_the_env_reports_it():
+    from test_progress import episode_info  # noqa: PLC0415
+
+    from ultrakill_ai.progress import ProgressCallback  # noqa: PLC0415
+
+    tech = {"macro_request_frac": 0.1, "macro_sent_frac": 0.02, "macro_ran_frac": 0.005,
+            "macro_refused_frac": 0.015, "macro_landed_frac": 0.005, "macro_ran_share": 0.25,
+            "variant_request_frac": 0.15, "hook_request_frac": 0.1,
+            "macro_refusal_reasons": {"not_sliding": 3}}
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, extra in (("v1", {}), ("v2", tech)):
+            run = Path(tmp) / name
+            cb = ProgressCallback(run / "status.json", 1000, name, 1, update_every_s=0.0)
+            cb._on_training_start()
+            cb._record_episode(0, {**episode_info("Level 0-1", completed=1, seconds=90.0), **extra})
+            cb._write(time.time())
+            mean = json.loads((run / "status.json").read_text(encoding="utf-8"))["mean_100"]
+            line = json.loads((run / "episodes.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+            if extra:
+                assert mean["macro_sent_frac"] == 0.02 and line["macro_refusal_reasons"] == {"not_sliding": 3}
+            else:
+                assert "macro_sent_frac" not in mean and "macro_refusal_reasons" not in line
+
+
+# ---------------------------------------------------------------------------------------------
+# Task 3's v1 pins: the step bytes, the step outputs, the info keys and the status.json / episodes.jsonl keys
+# of a v1 env, against the BASE COMMIT 0be539f (the code the live fleet imports). Computed on 2026-09-23 by a
+# scratch runner that imported `ultrakill_ai` from `git archive 0be539f python/ultrakill_ai` BEFORE importing this
+# module, then called `v1_script()` / `v1_progress_keys()` -- the same way V1_CONFIG_LINE pins the connect. A v1
+# env's step, info and status files may not change by one byte; if one of these fails, the v1 path moved.
+# ---------------------------------------------------------------------------------------------
+
+V1_SCRIPT_SEED, V1_SCRIPT_STEPS = 20260923, 400
+# `forward()` as BridgeClient.send puts it on the socket.
+V1_FORWARD_LINE = '{"type":"step","action":{"move":[0,1],"buttons":[],"slot":0,"look":[0.0,0.0]}}'
+V1_WIRE_LINES = 420  # 400 decisions + 20 input-lock skip steps
+# every step line of the script, "\n"-joined
+V1_WIRE_SHA256 = "9dffae29607482b005bd25ace5ceaa6269ddfbb81832b1297b25b47aad48f8a1"
+# every (obs bytes, reward, terminated, truncated, info) of the script, in order
+V1_OUTPUTS_SHA256 = "4781c3d7928659e8d26feb0cda80a4ced1453aa910aace33fb94068695ab3a75"
+# the sorted union of the script's info keys (79 of them)
+V1_INFO_KEYS_SHA256 = "41a187e9ada19713cc2b1af49020a165d9d0c7e2e9288c5a75fcdd76056d725a"
+# status.json's top-level, mean_100 (59) and campaign keys, in order, and every episodes.jsonl line's keys
+V1_PROGRESS_KEYS_SHA256 = "8178818d96a63d0c11054f144c22242ae35a6a3bb8aeb94307cc12eb1e192112"
+
+
+class WireLevel(FakeLevel):
+    """FakeLevel keeping every step line exactly as `BridgeClient.step` / `send` serialize it onto the socket."""
+
+    def __init__(self):
+        super().__init__()
+        self.wire: list[str] = []
+
+    def step(self, action: dict) -> dict:
+        self.wire.append(json.dumps({"type": "step", "action": action}, separators=(",", ":")))
+        return super().step(action)
+
+
+def _sha(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def v1_script() -> dict:
+    """A v1 env driven through a fixed seeded script against FakeLevel -- mod 0.5.0, no `features`, so nothing 0.8
+    is configured: the live fleet's situation. Random actions over the whole 12-dim space (look modes 1 / 2 and
+    slot presses included), input locks, deaths and one-shot kills injected at fixed steps, and a reset after
+    every episode end. Returns the wire lines, a digest of every step output, and every info dict."""
+    env, _ = make_env()
+    env.client = fake = WireLevel()
+    rng = np.random.default_rng(V1_SCRIPT_SEED)
+    outputs = hashlib.sha256()
+    infos: list[dict] = []
+
+    def record(obs, info, *step):
+        # `reset_seconds` is a perf_counter reading: the one wall-clock value in an info.
+        info = {k: v for k, v in info.items() if k != "reset_seconds"}
+        infos.append(info)
+        outputs.update(np.asarray(obs, dtype=np.float32).tobytes())
+        outputs.update(json.dumps([*step, info], separators=(",", ":"), default=str).encode("utf-8"))
+
+    try:
+        record(*env.reset())
+        for i in range(V1_SCRIPT_STEPS):
+            if i % 41 == 7:
+                fake.lock_steps = 2
+            if i % 67 == 30:
+                fake.kill_next = True
+            if i % 53 == 11:
+                fake.kill_enemy_next = True
+            obs, reward, terminated, truncated, info = env.step(rng.integers(0, env.action_space.nvec))
+            record(obs, info, reward, terminated, truncated)
+            if terminated or truncated:
+                record(*env.reset())
+    finally:
+        env.close()
+    return {"wire": fake.wire, "outputs": outputs.hexdigest(), "infos": infos}
+
+
+def v1_progress_keys(infos: list[dict]) -> dict:
+    """The key shape of status.json and episodes.jsonl after ProgressCallback records the script's episodes."""
+    from ultrakill_ai.progress import ProgressCallback  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp) / "v1"
+        cb = ProgressCallback(run / "status.json", 1000, "v1", 1, update_every_s=0.0)
+        cb._on_training_start()
+        for info in infos:
+            if "end_reason" in info:
+                cb._record_episode(0, {**info, "episode": {"r": 1.0, "l": 100.0}})
+        cb._write(time.time())
+        status = json.loads((run / "status.json").read_text(encoding="utf-8"))
+        lines = [json.loads(s) for s in (run / "episodes.jsonl").read_text(encoding="utf-8").splitlines()]
+    return {"status": list(status), "mean_100": list(status["mean_100"]),
+            "campaign": list(status.get("campaign") or {}), "episodes": len(lines),
+            "line": [list(line) for line in lines]}
+
+
+def test_the_v1_step_bytes_are_the_base_commits():
+    env, _ = make_env()
+    env.client = fake = WireLevel()
+    try:
+        env.reset()
+        env.step(forward())
+        assert fake.wire == [V1_FORWARD_LINE], fake.wire
+    finally:
+        env.close()
+    wire = v1_script()["wire"]
+    digest = hashlib.sha256("\n".join(wire).encode("utf-8")).hexdigest()
+    assert (len(wire), digest) == (V1_WIRE_LINES, V1_WIRE_SHA256), (len(wire), digest)
+
+
+def test_the_v1_step_outputs_and_info_keys_are_the_base_commits():
+    run = v1_script()
+    keys = sorted({k for info in run["infos"] for k in info})
+    assert _sha(keys) == V1_INFO_KEYS_SHA256, keys
+    assert not [k for k in keys if k.startswith(("macro_", "variant_request", "hook_request"))], keys
+    assert run["outputs"] == V1_OUTPUTS_SHA256, run["outputs"]
+
+
+def test_the_v1_status_json_and_episode_line_keys_are_the_base_commits():
+    shape = v1_progress_keys(v1_script()["infos"])
+    assert shape["episodes"] >= 2, "the script must end several episodes for the pin to mean anything"
+    assert _sha(shape) == V1_PROGRESS_KEYS_SHA256, shape
 
 
 if __name__ == "__main__":
