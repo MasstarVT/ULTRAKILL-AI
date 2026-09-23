@@ -55,6 +55,9 @@ NEW_INFO_KEYS = {
     "slot_held_frac", "slot_held_top_frac", "slot_kills", "slot_known_frac",
     "held_variation_frac", "variation0_frac", "variation_known_frac",
 }
+# ... and the four rescue readings the speed stage's `fall_hp` weight added on 2026-09-22 (env._note_rescue),
+# pinned here so this file's "nothing else" claim stays exact. tests/test_speed_fall_hp_weight.py owns them.
+FALL_HP_INFO_KEYS = {"rescues", "rescue_hp", "rescue_floored", "hp_lost_other"}
 
 
 def slot_action(slot: int, *, move: bool = False):
@@ -69,7 +72,8 @@ def test_the_info_gains_the_slot_counters_and_nothing_else():
     try:
         env.reset()
         _, _, _, _, info = env.step(forward())
-        assert set(info) == BASELINE_INFO_KEYS | NEW_INFO_KEYS, sorted(set(info) ^ (BASELINE_INFO_KEYS | NEW_INFO_KEYS))
+        expected = BASELINE_INFO_KEYS | NEW_INFO_KEYS | FALL_HP_INFO_KEYS
+        assert set(info) == expected, sorted(set(info) ^ expected)
     finally:
         env.close()
 

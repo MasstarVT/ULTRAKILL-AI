@@ -175,16 +175,17 @@ def test_the_hold_line_sits_in_front_of_every_stage_past_0_3():
     assert all(s.level not in ("Level 0-1", "Level 0-2", "Level 0-3") for s in p.stages[hold:])
 
 
-def test_a_speed_stage_only_adds_the_bonus_switch_the_death_weight_and_oob():
+def test_a_speed_stage_only_adds_the_bonus_switch_the_death_weight_oob_and_fall_hp():
     """No observation or action change, so the level's own specialist loads into it unchanged.
 
-    TWO reward weights differ from a complete stage's, and only for this kind: `death` 5.0 -> 12.0
-    (2026-09-20) and `oob` 0.0 -> 0.035 (2026-09-22), the second of which exists ONLY in a speed stage's
-    config because `RewardConfig.oob` defaults to 0.0 and the shared configs never name it. A reward weight is
+    THREE reward weights differ from a complete stage's, and only for this kind: `death` 5.0 -> 12.0
+    (2026-09-20), `oob` 0.0 -> 0.035 and `fall_hp` 0.0 -> 0.04 (both 2026-09-22), the last two of which exist
+    ONLY in a speed stage's config because their RewardConfig defaults are 0.0 and the shared configs never
+    name them. A reward weight is
     not a policy parameter -- it is a scalar read into `RewardConfig` at env construction -- so every existing
     checkpoint still loads. The derivations are in configs/specialists.yaml beside the keys and in
-    docs/project-log.md; the farm bounds are pinned in tests/test_speed_death_weight.py and
-    tests/test_speed_oob_weight.py.
+    docs/project-log.md; the farm bounds are pinned in tests/test_speed_death_weight.py,
+    tests/test_speed_oob_weight.py and tests/test_speed_fall_hp_weight.py.
     """
     p = plan()
     complete = campaign_driver.stage_config(p, "Level 0-2")["env"]
@@ -199,16 +200,18 @@ def test_a_speed_stage_only_adds_the_bonus_switch_the_death_weight_and_oob():
     assert changed == {"fresh_start_prob", "rewards"}
     assert speed["fresh_start_prob"] == 1.0 and complete["fresh_start_prob"] == 0.2
     # ... and inside `rewards`, exactly what the plan's `speed.rewards:` block names and nothing else: one
-    # weight MOVED (`death`) and one weight ADDED (`oob`, which no shared config carries because its
-    # RewardConfig default of 0.0 is what every non-speed run means).
-    assert set(speed["rewards"]) - set(complete["rewards"]) == {"oob"}, "only `oob` appears"
+    # weight MOVED (`death`) and two weights ADDED (`oob` and `fall_hp`, which no shared config carries
+    # because their RewardConfig default of 0.0 is what every non-speed run means).
+    assert set(speed["rewards"]) - set(complete["rewards"]) == {"oob", "fall_hp"}, \
+        "only `oob` and `fall_hp` appear"
     assert not set(complete["rewards"]) - set(speed["rewards"]), "no weight disappears"
     moved = {k for k in set(speed["rewards"]) & set(complete["rewards"])
              if speed["rewards"][k] != complete["rewards"][k]}
     assert moved == {"death"}
-    assert set(p.speed_rewards) == {"death", "oob"}
+    assert set(p.speed_rewards) == {"death", "oob", "fall_hp"}
     assert (speed["rewards"]["death"], complete["rewards"]["death"]) == (12.0, 5.0)
     assert speed["rewards"]["oob"] == 0.035 and "oob" not in complete["rewards"]
+    assert speed["rewards"]["fall_hp"] == 0.04 and "fall_hp" not in complete["rewards"]
     assert {k: v for k, v in speed.items() if k not in added | changed} == \
         {k: v for k, v in complete.items() if k not in changed}
     cfg = EnvConfig.from_dict(speed)
@@ -217,8 +220,9 @@ def test_a_speed_stage_only_adds_the_bonus_switch_the_death_weight_and_oob():
     assert cfg.speed_target_scale == 1.0, "the plan's target_scale (§8b), applied in the env and nowhere else"
     base = EnvConfig.from_dict(complete).rewards
     assert base.oob == 0.0, "a complete stage builds the RewardConfig default: the term is inert there"
-    assert dataclasses.replace(cfg.rewards, death=base.death, oob=base.oob) == base, \
-        "every reward weight but `death` and `oob` is the complete stage's"
+    assert base.fall_hp == 0.0, "... and the same for `fall_hp`"
+    assert dataclasses.replace(cfg.rewards, death=base.death, oob=base.oob, fall_hp=base.fall_hp) == base, \
+        "every reward weight but `death`, `oob` and `fall_hp` is the complete stage's"
     env = UltrakillEnv(cfg)
     try:
         assert env.observation_space.shape == (479,), "the same policy shape: an existing checkpoint loads"
