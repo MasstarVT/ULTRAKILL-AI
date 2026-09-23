@@ -6132,3 +6132,80 @@ Bash tool, `check_run.py` prints the driver's pids itself (`b611621`, with `test
 tests), and `C:\Users\tyler\.claude\settings.json` carries `permissions.allow` rules for exactly that command
 and the three repair commands in Bash and PowerShell forms. Recipe and the session-start check (a `running`
 run with old `last_activity_at` is stalled: stop it) in `docs/commands.md`, "The hourly watch routine".
+
+## 2026-09-23 13:30 — `fall_hp` REVERTED: inert at the 4th full bucket
+
+**Decision** (the lead's, on the pre-registered rule; not re-litigated here): `speed.rewards.fall_hp: 0.04` is
+REMOVED from `python/configs/specialists.yaml`. The rule, from the activation entry above: "**Inert** = neither by
+the 4th full post-change bucket: remove the line and do not reason from the median", where "moved" = two
+consecutive full buckets with `rescue_hp` < 91.3 or floors < 1.09. **The weights are kept** (no rollback): round
+16 resumes from the stage's own newest weights, as the driver chooses by itself.
+
+**The mechanism over the four full post-switch buckets** (`spec_0-1_speed/episodes.jsonl`, fresh Brutal 0-1,
+anchored at S + 0.4M = 55,358,294; recomputed read-only at 13:4x, reproducing the 12:40 table and the lead's
+bucket-4 numbers exactly):
+
+| bucket | n | rate | p10 / median / p90 / best | deathless med (n) | deaths | oob | rescues | rescue_hp | floors | floored | hp_lost_other | stuck/100 (pit) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 54.958-55.358 (ignored) | 216 | 0.968 | 77.7 / 95.1 / 135.3 / 66.7 | 84.9 (60) | 1.21 | 261 | 9.25 | 100.4 | 1.21 | 0.884 | 260 | 1.9 (0) |
+| **55.358-55.858** | 282 | 0.947 | 80.1 / **100.1** / 137.0 / 63.8 | 89.0 (59) | 1.22 | 244 | 7.89 | **94.9** | **1.05** | 0.812 | 272 | 1.8 (1) |
+| **55.858-56.358** | 269 | 0.941 | 83.2 / **104.0** / 143.1 / 67.3 | 92.1 (47) | 1.30 | 288 | 10.00 | **105.3** | **1.22** | 0.874 | 284 | 3.3 (5) |
+| **56.358-56.858** | 270 | 0.926 | 80.0 / **97.4** / 143.9 / 62.2 | 89.0 (63) | 1.28 | 279 | 9.87 | **96.5** | **1.25** | 0.893 | 289 | 4.1 (4) |
+| **56.858-57.358** | 287 | 0.937 | 79.2 / **98.2** / 149.3 / 65.0 | 89.8 (77) | 1.00 | 303 | 8.93 | **102.3** | **1.20** | 0.875 | 235 | 3.1 (5) |
+| 57.358- (partial, round end) | 99 | 0.960 | 76.8 / 94.2 / 147.8 / 64.9 | 81.6 (27) | 0.85 | 248 | 7.56 | 97.4 | 1.11 | 0.828 | 201 | 1.0 (0) |
+
+Baseline band (the 08:40 entry): `rescue_hp` 91.3-112.0 (mean 103.8), floors 1.09-1.26 (mean 1.18). `rescue_hp`
+never went below 91.3 in any full bucket; floors went below 1.09 once (bucket 1) and never twice in a row: **not
+moved, so INERT.** No other trigger fired at bucket 4 (median 98.2 vs 108.7; deaths 1.00 vs 1.28; rate 0.937 vs
+0.85; p10 79.2 vs 90.3; stuck 3.1/100 vs 15; `hp_lost_other` 235 vs 311).
+
+**Caveat, noted and not used:** the partial 5th bucket read, at 55 episodes, `rescue_hp` 89.9 / floors 1.07 /
+median 93.6 with the last-100 deaths 0.94 and `reward_parts_mean_100["fall_hp"]` shrunk to -3.69 -- the first
+reading below the band. By the round's end (99 episodes, last row 57,521,686) the same bucket read 97.4 / 1.11 /
+94.2, back inside the band. The rule was decided at the 4th full bucket; one partial bucket is not two full ones.
+
+### Procedure, 2026-09-23 13:31-13:40 (mirrors the 08:47-08:52 activation) -- **round 16 trainer started 13:39:33 at 57,524,386**
+
+Nothing connected to a bridge port; `games.py launch` / `stop` and `supervise.py` were never run; no game,
+trainer or helper was stopped by hand; nothing was staged with `git add -A`.
+
+| time | step |
+| --- | --- |
+| 13:31:06 | `check_run.py`: round 15, trainer running 57,469,918, 12/12 listening, commit 72%, driver `pid 25044,14240`, **ALERTS none**. Process query: driver python 14240 (parent 25044), venv shim 25044 (parent 33340), task `cmd` 33340 running `start_driver.cmd`; trainer 21556 (cmd) -> 10084 -> 24536; 12 games |
+| 13:31:21 | `runs\specialists\DRIVER_PAUSE` created |
+| 13:31:26 | the driver logged `PAUSED` |
+| 13:31:29-32 | driver stopped **by pid only**: `Stop-Process -Id 14240`, then `Stop-Process -Id 25044`; the task's `cmd` 33340 had exited by itself (gone from the next query). Task `Ready`. Trainer 21556/10084/24536, the five helpers and all 12 games stayed up |
+| 13:31:41 | `check_run.py`: 12/12, trainer running 57,475,270, `driver NOT RUNNING`, ALERT = driver not running + `DRIVER_PAUSE` exists (the expected picture) |
+| 13:32-13:33 | plan line removed and its comment rewritten; `CLAUDE.md` "Live:" and "Still open" edited in place (219 lines); `AGENTS.md` regenerated. Test pins flipped to the dormant form: `test_speed_fall_hp_weight.py` 23, `test_specialists_config.py` 14, `test_speed_overrides.py` 14, `test_speed_oob_weight.py` 15, `test_campaign_driver.py` 87, `test_agents_md.py` 4, `test_check_run.py` 4 -- all pass |
+| 13:33:56 | `campaign_driver.py --dry-run` while paused: plan loads, "now on rung 3 of 10, target 85.00 s", then `PAUSED`, exit 0 |
+| 13:34:10 | **the config gate**: `write_stage_config(plan, "Level 0-1", tmp, init_steps=54,958,294, kind=speed, target_seconds=85.0)` diffed against the live `configs/generated/spec_0-1_speed.yaml` (init held equal to isolate the plan change): **one line, `<     fall_hp: 0.04`, and nothing else** |
+| 13:36:17 | full no-game suite: **41 files, all pass** |
+| 13:36:23-28 | committed `46fa3c7` (six explicit paths) and pushed |
+| 13:36:3x | `DRIVER_PAUSE` removed as its own command |
+| 13:36:34 | `--dry-run` again: same rung/target, `healthy: trainer pid 21556, 57,515,830 steps`; `driver_state.json` hash identical before and after |
+| 13:36:36 | `schtasks /Run /TN "ULTRAKILL-AI driver"`. New driver 20900 (shim 7108, cmd 27496): `driver up` 13:36:37, `healthy: trainer pid 21556, 57,515,830 steps` 13:36:38 -- it adopted the running trainer and helpers. `check_run.py` 13:36:44: 12/12, driver `pid 7108,20900`, ALERTS none |
+| 13:36:48 | `Set-Content runs\specialists\END_STAGE "Level 0-1 speed"` (status.json 57,515,914) |
+| 13:37:39 | `END_STAGE: ending Level 0-1 (speed, round 15)` -> `STAGE END ... unfinished -- ended by operator (rate 0.960 over 50 fresh, median 94.95, best 62.16, target 85.00, 2,565,864 steps into the stage)`; the driver killed the trainer, the helpers and the 12 games |
+| 13:37:39 | the trainer's teardown wrote `models/spec_0-1_speed/latest.zip` (train log `Saved models\spec_0-1_speed\latest.zip`; 57,524,386 steps; SHA-256 `4817b8267f22c242...ca81398b272`). Highest `ckpt_*` was `ckpt_57507886_steps.zip` |
+| 13:37:58 | `NOT promoting Level 0-1 (speed)`; `stage config ... (init 57,524,386 steps)`; `STAGE 2/33 Level 0-1 (speed, round 16) ... resuming from ...latest.zip`; FOCUS rung 3 of 10, 85.00 s; `launching 12 games` |
+| 13:39:33 | boot gate passed; **`started trainer for Level 0-1 (pid 32712, resume latest.zip at 57,524,386 steps)`**; five helpers restarted |
+| 13:39:55 | `check_run.py`: `round 16`, trainer running 57,524,938 (552 into the stage), 12/12, commit 63%, ALERTS none |
+
+**Step loss: none measurable** -- round 15's last status reading was 57,515,914 and the resume point is 57,524,386,
+the current weights (latest.zip written at the kill, as on 08:49; `choose_resume` took it over the 57,507,886
+checkpoint because it has more steps).
+
+**Verified from files:** `configs/generated/spec_0-1_speed.yaml` (13:37:58) has **no `fall_hp` line**, `death:
+12.0`, `oob: 0.035`, `difficulty: 4`, `speed_target_seconds: 85.0`, gamma 0.998, gae_lambda 0.95, `timesteps:
+66524386` -- and differs from the 13:34 gate copy only in that `timesteps` line. `models/spec_0-1_speed/
+env_config.yaml` (13:39:36, the new trainer's): **`fall_hp: 0.0`**, `death: 12.0`, `oob: 0.035`, `difficulty: 4`,
+`speed_target_seconds: 85.0`. `runs/spec_0-1_speed_train.log` line 874,644, after the old trainer's
+`BrokenPipeError` teardown traceback: `hyperparameters in force: gamma=0.998, gae_lambda=0.95, n_steps=170,
+batch_size=512, n_epochs=5, ent_coef=0.004, target_kl=0.03` -- unchanged. `status.json` `start_timesteps`
+57,524,386. `models/specialists/Level_0-1.zip` untouched (SHA-256 `CD812F25...9683D`, mtime 2026-09-22 08:59:36).
+
+**THE NEW BASELINE for anything that follows:** round 16 of `spec_0-1_speed` runs `speed.rewards` = `death` 12.0 +
+`oob` 0.035 only, difficulty 4 (Brutal), focus rung 3 target 85 s, gamma 0.998 / gae_lambda 0.95, obs 479,
+action 12 x 45, from the round-15 weights at **S16 = 57,524,386**. **The first 0.4M steps after the restart (to
+57,924,386) are not judged**; 500k buckets anchor there. `docs/commands.md`'s `fall_hp` section header still says
+"ON since 2026-09-23" and needs the same one-word update.
