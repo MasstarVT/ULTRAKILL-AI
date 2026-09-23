@@ -34,6 +34,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CallbackList, Check
 from stable_baselines3.common.utils import obs_as_tensor  # noqa: E402
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv  # noqa: E402
 
+from ultrakill_ai.ckpt_layout import TECH_LAYOUTS, resume_problem  # noqa: E402
 from ultrakill_ai.env import CAMPAIGN_INFO_KEYS, EnvConfig  # noqa: E402
 from ultrakill_ai.envfactory import make_env  # noqa: E402
 from ultrakill_ai.progress import ProgressCallback  # noqa: E402
@@ -111,6 +112,20 @@ def hyperparams_in_force(model, hyper: dict) -> str:
                      if name in hyper or hasattr(model, name))
     return "hyperparameters in force: %s | rollout buffer: gamma=%s, gae_lambda=%s" % (
         live, getattr(buffer, "gamma", "?"), getattr(buffer, "gae_lambda", "?"))
+
+
+def resume_refusal(resume: str | None, env_cfg: EnvConfig) -> str | None:
+    """Why `--resume` cannot be trained under this config's layout, or None. Checked BEFORE any worker or game.
+
+    SB3's own `load(env=...)` would also refuse a space mismatch, but only after twelve SubprocVecEnv workers exist
+    and with a message that names no migration. Under the driver that is a restart loop; here it is one line
+    naming scripts/add_tech_heads.py and exit code 3.
+    """
+    if not resume or env_cfg.mode != "campaign":
+        return None
+    if env_cfg.tech_layout not in TECH_LAYOUTS:
+        return f"unknown tech_layout {env_cfg.tech_layout!r} (expected one of {list(TECH_LAYOUTS)})"
+    return resume_problem(resume, env_cfg.tech_layout)
 
 
 class EpisodeStatsCallback(BaseCallback):
@@ -343,6 +358,10 @@ def main() -> None:
 
     env_cfg_dict, train_cfg = load_config(args.config)
     env_cfg = EnvConfig.from_dict(env_cfg_dict)
+    refusal = resume_refusal(args.resume, env_cfg)
+    if refusal:
+        print(f"REFUSING TO RESUME {args.resume}: {refusal}", flush=True)
+        raise SystemExit(3)
 
     algo = args.algo or train_cfg.get("algo", "ppo")
     timesteps = args.timesteps or train_cfg.get("timesteps", 5_000_000)

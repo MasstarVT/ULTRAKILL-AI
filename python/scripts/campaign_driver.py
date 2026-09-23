@@ -150,6 +150,7 @@ import yaml  # noqa: E402
 
 import supervise  # noqa: E402
 from ultrakill_ai.campaign import CAMPAIGN_LEVELS_SHIPPED, safe_name  # noqa: E402
+from ultrakill_ai import ckpt_layout  # noqa: E402  (stdlib only)
 from ultrakill_ai.rewards import RewardConfig  # noqa: E402
 from ultrakill_ai.times import UNKNOWN_DIFFICULTY, difficulty_rank, short_level, valid_official_seconds  # noqa: E402
 
@@ -1688,8 +1689,9 @@ class Driver:
     def ensure_trainer(self, stage: Stage, sup: StageSupervisor, procs: list[supervise.Proc]) -> str:
         """Starts this stage's trainer when no process is running it.
 
-        `"running"` (one is already there, so the supervisor judges it), `"started"` (this call spawned it) or
-        `"waiting"` (the games are not up yet; try again next poll rather than spending a restart on it).
+        `"running"` (one is already there, so the supervisor judges it), `"started"` (this call spawned it),
+        `"waiting"` (the games are not up yet; try again next poll rather than spending a restart on it) or
+        `"layout_mismatch"` (the resume file's layout does not match the stage config; the trainer is not started).
         """
         mine = supervise.self_and_ancestors(procs, sup.pid)
         if any(p.pid not in mine and supervise.matches_script(p.cmdline, "train.py", stage.run, sup.cfg.config)
@@ -1701,6 +1703,14 @@ class Driver:
         resume, steps = supervise.choose_resume(self.model_dir(stage.level, stage.kind), self.zip_steps)
         if resume is None:
             resume, steps = Path(stage.init), self.zip_steps(Path(stage.init))
+        problem = self.layout_problem(resume, sup.cfg.config)
+        if problem:
+            # NOT a crash loop: training.main would refuse the same file at every restart, twelve games up and
+            # nothing learning. Say it once and keep polling; check_run.py's ALERTS shows the missing trainer. The
+            # fix is the S7 runbook's migration -- after it, the next poll starts the trainer by itself.
+            self.log_once("layout:%s" % stage.run, "LAYOUT MISMATCH -- trainer NOT started for %s (%s): %s"
+                          % (stage.level, stage.kind, problem))
+            return "layout_mismatch"
         command = supervise.shell_command(
             self.cfg.python, "scripts/train.py",
             ["--config", sup.cfg.config, "--resume", resume.as_posix()],
@@ -1714,6 +1724,23 @@ class Driver:
         sup.grace_until = self.now() + self.cfg.start_grace_seconds
         sup.ensure_helpers(self.processes())
         return "started"
+
+    def layout_problem(self, resume: Path, config: str) -> str | None:
+        """None, or why `resume` must not be trained under the generated config `config` (plan Task 5).
+
+        The generated YAML and the zip's JSON only -- no numpy, no torch -- and only on the path that is about to
+        spawn a trainer. An unreadable file of either kind is None: train.py and SB3 decide then.
+        """
+        try:
+            data = yaml.safe_load((self.cfg.cwd / config).read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            return None
+        env = data.get("env") or {}
+        if env.get("mode") != "campaign":
+            return None
+        path = Path(resume)
+        path = path if path.is_absolute() else self.cfg.cwd / path
+        return ckpt_layout.resume_problem(path, str(env.get("tech_layout", "v1")))
 
     # -- ending a stage -----------------------------------------------------------------------------
 
