@@ -591,7 +591,7 @@ it is copied. **S4 (halving `gate`, `gate_approach`, `checkpoint`, `door_unlock`
 — an earlier measurement says cutting gate pay lowers the speed gradient, and it needs its own evidence after
 S1–S3.
 
-### `fall_hp` — HP lost to rescue teleports, through `speed.rewards:` (built 2026-09-22, ON since 2026-09-23)
+### `fall_hp` — HP lost to rescue teleports, through `speed.rewards:` (built 2026-09-22, ON 2026-09-23 round 15, REVERTED 2026-09-23 round 16: inert)
 
 The env counts every rescue (a >= 12 m one-decision move on a non-death step: the game's non-instakill
 DeathZone putting the player back on the walkway) and writes four columns to `episodes.jsonl` from the next
